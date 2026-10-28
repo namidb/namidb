@@ -95,8 +95,9 @@ impl Session {
             Session::Reader(r) => {
                 let mut r = lock_until(r, deadline).await?;
                 match deadline {
-                    // A refresh cut short leaves the version already loaded
-                    // in place; a later read finishes it.
+                    // keep_alive is cancel-safe: a refresh cut short leaves
+                    // the version already loaded in place and releases the
+                    // lease it took, and a later read finishes it.
                     Some(d) => {
                         let _ = tokio::time::timeout_at(d.into(), r.keep_alive()).await;
                     }
@@ -779,8 +780,9 @@ impl Client {
 
     /// Release the retention lease a `read_only` client holds on the
     /// version it serves, so the writer's cleanup can reclaim it right away
-    /// instead of when the lease expires. The client keeps working; its next
-    /// `refresh()` that advances takes a new lease. A no-op on a writer.
+    /// instead of when the lease expires. The client keeps working: its next
+    /// read or `refresh()` reloads the newest version under a new lease. A
+    /// no-op on a writer.
     /// `with Client(...) as c:` calls this on exit.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| self.runtime.block_on(self.session.close()))
@@ -1159,24 +1161,27 @@ impl Client {
                     // Read-modify-write against the RYOW overlay, so nodes staged
                     // by earlier calls count too.
                     let snap = guard.overlay_snapshot().with_cache(cache);
-                    // One batched read warms the decoded row groups, so the
-                    // per-id lookups below (label-agnostic, to union labels)
-                    // stay in memory instead of decoding an SST per row.
+                    // One batched read for every id. The empty label asks for
+                    // each node under whatever labels it has, so they can be
+                    // unioned; a per-id point read would decode a whole row
+                    // group of a compacted SST for every row.
                     let mut distinct: Vec<NodeId> = parsed.iter().map(|(id, _)| *id).collect();
                     distinct.sort_unstable();
                     distinct.dedup();
-                    snap.batch_lookup_nodes(&label, &distinct)
+                    let found = snap
+                        .batch_lookup_nodes("", &distinct)
                         .await
                         .map_err(map_storage_err)?;
+                    let mut stored: std::collections::HashMap<NodeId, NodeView> = distinct
+                        .into_iter()
+                        .zip(found)
+                        .filter_map(|(id, view)| view.map(|view| (id, view)))
+                        .collect();
                     for (id, props) in parsed {
                         let i = match slot.get(&id) {
                             Some(&i) => i,
                             None => {
-                                let (labels, base) = match snap
-                                    .lookup_node_by_id(id)
-                                    .await
-                                    .map_err(map_storage_err)?
-                                {
+                                let (labels, base) = match stored.remove(&id) {
                                     Some(n) => (n.labels.into_iter().collect(), n.properties),
                                     None => (Vec::new(), BTreeMap::new()),
                                 };

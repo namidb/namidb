@@ -35,7 +35,8 @@ crates.io release will establish and document that API explicitly.
   and a node with labels `A` and `B` merged under `A` lost `B`. Each row is
   now merged into the stored node: unmentioned keys are kept, a `None`
   value removes the key, and the label is added to the node's labels. Rows
-  that repeat an id in one call merge in order. The old replace behaviour
+  that repeat an id in one call merge in order. The stored nodes are read in
+  one batch per call, not one point read per row. The old replace behaviour
   lives on as the new `put_nodes`, which skips the read and is the faster
   choice for a first load. In `put_nodes` the last row for an id wins, and
   unique constraints are checked against each id's final value only.
@@ -83,7 +84,10 @@ crates.io release will establish and document that API explicitly.
   files. `refresh()` moves it to the newest commit, and a read on a
   version more than an hour old, or whose lease may have expired,
   refreshes on its own so a forgotten reader cannot hold back cleanup
-  forever. `close()` (or a `with` block) drops the lease. Every mutator
+  forever. `close()` (or a `with` block) drops the lease, and a read after
+  that reloads the newest version under a new one. A read that times out
+  while the client renews or refreshes leaves no lease behind and drops
+  none another read still needs. Every mutator
   raises `PermissionError`. The storage side is
   `namidb_storage::ReaderSession`.
 
@@ -279,9 +283,16 @@ crates.io release will establish and document that API explicitly.
   so a hub with 1.7M neighbours decoded 1.7M rows even if a handful were
   devices. A single hop now proves the label from the label index and
   loads only the nodes that carry it, and skips the others without a read
-  even when the hop is too wide to keep its neighbours in memory.
-  Variable-length hops still visit every neighbour, since the label only
-  decides which ones are results.
+  even when the hop is too wide to keep its neighbours in memory. This also
+  holds when node SSTs overlap, as they do once a store has more than one
+  level: each neighbour is checked against the label index of the newest
+  SST that can hold it, and the SST's node locator tells a newer version
+  that is not a match from one that is not there, so a small recent flush
+  without a bloom filter does not send every neighbour to the point reader.
+  Only unflushed writes are read whole. If the overlapping SSTs also share
+  a range of LSNs, every neighbour is read as before. Variable-length hops
+  still visit every neighbour, since the label only decides which ones are
+  results.
 
 - **`id(n)`, `labels(n)` and `count(n)` decoded every property of `n`.** The
   planner treated any use of a node variable inside a function or an
@@ -314,9 +325,12 @@ crates.io release will establish and document that API explicitly.
   full page of candidates first. Each skipped candidate makes the next batch
   of lookups larger, and on a dense label a LIMIT that keeps hitting stale
   postings (say after a bulk relabel) gives up and uses the two-pass scan
-  below. Scans and filtered LIMITs take this route only when the label is at
-  most a quarter of the node rows, memtable included, since each candidate
-  is a full record lookup and a filter may reject them all. Counts and
+  below. Scans, filtered LIMITs and LIMITs above 4,096 rows take this route
+  only when the label is at most a quarter of the node rows, memtable
+  included, since each candidate is a full record lookup and a filter may
+  reject them all. That includes the hidden limit a row cap adds to a node
+  scan, so a capped query over a dense label is not looked up one record at
+  a time. Counts and
   other unbounded id-only scans never take it: the first pass of the two-pass scan answers
   them without reading any property.
 

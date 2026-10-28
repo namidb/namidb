@@ -17,7 +17,7 @@
 //! half-TTL renewal leaves minutes of skew budget.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -55,10 +55,11 @@ pub struct RetentionPin {
     path: Path,
     version: u64,
     ttl: Duration,
-    /// When the next [`RetentionPin::renew_if_due`] should actually rewrite
-    /// the lease: half the TTL after the last write, so a healthy holder
-    /// always renews long before expiry.
-    pub(crate) renew_due_at: Instant,
+    /// The `expires_at_unix` of the last lease written. Renewal and lapse
+    /// are judged against it on the wall clock, the one the sweep uses: a
+    /// monotonic clock stops while the host sleeps, and a lease written
+    /// before a long suspend would still look fresh after it.
+    pub(crate) expires_at_unix: i64,
 }
 
 impl RetentionPin {
@@ -78,7 +79,7 @@ impl RetentionPin {
             path,
             version,
             ttl,
-            renew_due_at: Instant::now(),
+            expires_at_unix: 0,
         };
         pin.write_lease().await?;
         Ok(pin)
@@ -96,18 +97,22 @@ impl RetentionPin {
     /// elapsed since the last write. Cheap enough to call once per copied
     /// object; a no-op most of the time.
     pub async fn renew_if_due(&mut self) -> Result<()> {
-        if Instant::now() >= self.renew_due_at {
+        if unix_now() >= self.expires_at_unix - self.ttl_secs() / 2 {
             self.write_lease().await?;
         }
         Ok(())
     }
 
-    /// Whether the lease may already have expired: renewal is overdue by
-    /// more than a quarter of the TTL, the clock skew budget left before the
-    /// written expiry. A sweep may have ignored a lapsed lease, so renewing
-    /// it does not show that the pinned objects still exist.
+    /// Whether the lease may already have expired: the written expiry is
+    /// less than a quarter of the TTL away, the clock skew budget. A sweep
+    /// may have ignored a lapsed lease, so renewing it does not show that
+    /// the pinned objects still exist.
     pub fn lapsed(&self) -> bool {
-        Instant::now() >= self.renew_due_at + self.ttl / 4
+        unix_now() >= self.expires_at_unix - self.ttl_secs() / 4
+    }
+
+    fn ttl_secs(&self) -> i64 {
+        i64::try_from(self.ttl.as_secs()).unwrap_or(i64::MAX)
     }
 
     /// Delete the lease. Failing here is benign — the lease expires on its
@@ -122,13 +127,13 @@ impl RetentionPin {
     async fn write_lease(&mut self) -> Result<()> {
         let lease = PinLease {
             version: self.version,
-            expires_at_unix: unix_now().saturating_add(self.ttl.as_secs() as i64),
+            expires_at_unix: unix_now().saturating_add(self.ttl_secs()),
         };
         self.store
             .put(&self.path, PutPayload::from(serde_json::to_vec(&lease)?))
             .await
             .map_err(Error::ObjectStore)?;
-        self.renew_due_at = Instant::now() + self.ttl / 2;
+        self.expires_at_unix = lease.expires_at_unix;
         Ok(())
     }
 }
@@ -200,9 +205,9 @@ mod tests {
                 .unwrap();
         assert_eq!(unchanged.expires_at_unix, before.expires_at_unix);
 
-        // Force the deadline into the present and grow the TTL, so the
+        // Bring the expiry within half a TTL and grow the TTL, so the
         // renewal both fires and observably pushes the expiry forward.
-        pin.renew_due_at = Instant::now();
+        pin.expires_at_unix = unix_now();
         pin.ttl = Duration::from_secs(3600);
         pin.renew_if_due().await.unwrap();
         let after: PinLease =
@@ -213,5 +218,18 @@ mod tests {
             after.expires_at_unix > before.expires_at_unix,
             "renewal must push the expiry forward"
         );
+    }
+
+    #[tokio::test]
+    async fn lapsed_follows_the_written_expiry_on_the_wall_clock() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut pin = RetentionPin::acquire(store, &paths(), 1, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!pin.lapsed());
+        // The host slept past the expiry: no monotonic time passed, but the
+        // sweep's clock did.
+        pin.expires_at_unix = unix_now() - 1;
+        assert!(pin.lapsed());
     }
 }

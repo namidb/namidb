@@ -64,6 +64,41 @@ def test_merge_nodes_keeps_extra_labels(client: tg.Client) -> None:
     assert node["properties"] == {"x": 1, "y": 2}
 
 
+def test_merge_nodes_reads_flushed_nodes_in_one_batch(tmp_path) -> None:
+    # A per-row point read decodes a whole row group of the node SST for
+    # every row. The batch read answers from the exact-record index instead,
+    # so with the Parquet bodies set aside a merge must still see the stored
+    # labels and properties.
+    uri = f"file://{tmp_path}?ns=merge"
+    writer = tg.Client(uri)
+    ids = [str(uuid.uuid4()) for _ in range(4)]
+    for i, node_id in enumerate(ids):
+        writer.upsert_node_with_labels(["A", "B"], node_id, {"x": i})
+    writer.commit()
+    writer.flush()
+    del writer
+    bodies = {body: body.read_bytes() for body in tmp_path.rglob("*-nodes.parquet")}
+    assert bodies
+    for body in bodies:
+        body.unlink()
+
+    client = tg.Client(uri)
+    staged = [{"_id": node_id, "y": i} for i, node_id in enumerate(ids)]
+    assert client.merge_nodes("A", staged + [{"_id": ids[0], "y": 9}]) == 5
+    client.commit()
+    for body, data in bodies.items():
+        body.write_bytes(data)
+    rows = client.cypher(
+        "MATCH (n:B) RETURN n.x AS x, n.y AS y, labels(n) AS l ORDER BY x"
+    ).rows()
+    assert rows == [
+        {"x": 0, "y": 9, "l": ["A", "B"]},
+        {"x": 1, "y": 1, "l": ["A", "B"]},
+        {"x": 2, "y": 2, "l": ["A", "B"]},
+        {"x": 3, "y": 3, "l": ["A", "B"]},
+    ]
+
+
 def test_merge_nodes_same_id_twice_in_batch(client: tg.Client) -> None:
     node_id = str(uuid.uuid4())
     n = client.merge_nodes(

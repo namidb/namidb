@@ -64,6 +64,9 @@ pub struct ReaderSession {
     retired: Vec<(Arc<OwnedSnapshot>, RetentionPin)>,
     /// When `current` was last confirmed to be the newest version.
     checked_at: Instant,
+    /// [`Self::release`] dropped the leases; the next read reloads with a
+    /// fresh one rather than serve files nothing protects.
+    released: bool,
 }
 
 impl ReaderSession {
@@ -89,6 +92,7 @@ impl ReaderSession {
             pin,
             retired: Vec::new(),
             checked_at: Instant::now(),
+            released: false,
         })
     }
 
@@ -105,16 +109,22 @@ impl ReaderSession {
     /// namespace has not advanced since the last load; the retention pins
     /// are renewed either way. Replays the WAL tail the new manifest
     /// references, so the cost is proportional to the unflushed writes.
+    /// After [`Self::release`] it reloads even when nothing advanced, to
+    /// take a new lease.
+    ///
+    /// Cancel-safe: dropped part way, it leaves the session on the version
+    /// it had and releases a lease the load already took.
     pub async fn refresh(&mut self) -> Result<bool> {
         let head = self.manifest_store.load_current().await?;
         let advanced = head.manifest.version != self.manifest_version();
-        if advanced {
+        if advanced || self.released {
             let (current, pin) =
                 load(&self.manifest_store, &self.wal_store, &self.cache, head).await?;
             let old = std::mem::replace(&mut self.current, current);
             if let Some(old_pin) = std::mem::replace(&mut self.pin, pin) {
                 self.retired.push((old, old_pin));
             }
+            self.released = false;
         }
         self.checked_at = Instant::now();
         self.renew_pins().await;
@@ -123,12 +133,13 @@ impl ReaderSession {
 
     /// Call once per read. Renews the leases that are due and releases the
     /// ones no read needs any more. Once the served version is
-    /// [`MAX_VERSION_AGE`] old, or its lease may have lapsed, it refreshes
-    /// instead; a failed refresh is logged and the session keeps serving the
-    /// version it has.
+    /// [`MAX_VERSION_AGE`] old, or its lease may have lapsed or was
+    /// released, it refreshes instead; a failed refresh is logged and the
+    /// session keeps serving the version it has. Cancel-safe, like
+    /// [`Self::refresh`] and [`Self::renew_pins`].
     pub async fn keep_alive(&mut self) {
         let lapsed = self.pin.as_ref().is_some_and(RetentionPin::lapsed);
-        if lapsed || self.checked_at.elapsed() >= MAX_VERSION_AGE {
+        if self.released || lapsed || self.checked_at.elapsed() >= MAX_VERSION_AGE {
             match self.refresh().await {
                 Ok(_) => return,
                 Err(e) => warn!(error = %e, "reader could not refresh a stale version"),
@@ -138,11 +149,12 @@ impl ReaderSession {
     }
 
     /// Delete every retention lease this session holds, including those of
-    /// snapshots a read may still be using. The session keeps serving reads
-    /// without a lease; the next refresh that advances pins again. Dropping
-    /// the session without calling this leaves the leases to expire on
-    /// their own.
+    /// snapshots a read may still be using. The session stays usable: the
+    /// next [`Self::keep_alive`] or [`Self::refresh`] reloads the newest
+    /// version under a new lease. Dropping the session without calling this
+    /// leaves the leases to expire on their own.
     pub async fn release(&mut self) -> Result<()> {
+        self.released = true;
         let retired = std::mem::take(&mut self.retired)
             .into_iter()
             .map(|(_, pin)| pin);
@@ -160,6 +172,10 @@ impl ReaderSession {
     /// [`MAX_VERSION_AGE`] old and no read holds it, its lease is left to
     /// lapse: an idle session then stops holding back cleanup, and the next
     /// [`Self::keep_alive`] refreshes.
+    ///
+    /// Cancel-safe: every pin stays in the session until it is released, so
+    /// a read that stops waiting part way cannot drop a lease another read
+    /// still needs renewed.
     pub async fn renew_pins(&mut self) {
         let in_use = Arc::strong_count(&self.current) > 1;
         if let Some(pin) = &mut self.pin {
@@ -167,13 +183,17 @@ impl ReaderSession {
                 renew_pin(pin).await;
             }
         }
-        for (snapshot, mut pin) in std::mem::take(&mut self.retired) {
+        let mut i = 0;
+        while i < self.retired.len() {
             // This session holds one reference; any other is a read in flight.
-            if Arc::strong_count(&snapshot) == 1 {
+            if Arc::strong_count(&self.retired[i].0) == 1 {
+                // Cut short, the release leaves a lease nothing reads to
+                // expire on its own.
+                let (_, pin) = self.retired.swap_remove(i);
                 release_pin(pin).await;
             } else {
-                renew_pin(&mut pin).await;
-                self.retired.push((snapshot, pin));
+                renew_pin(&mut self.retired[i].1).await;
+                i += 1;
             }
         }
     }
@@ -210,13 +230,15 @@ async fn load_version(
     let store = manifest_store.store().clone();
     let paths = manifest_store.paths();
     let version = current.manifest.version;
-    let pin = match RetentionPin::acquire(store.clone(), paths, version, DEFAULT_PIN_TTL).await {
-        Ok(pin) => Some(pin),
-        Err(e) => {
-            warn!(error = %e, version, "reader could not write a retention pin");
-            None
-        }
-    };
+    let mut pin = ReleaseOnDrop(
+        match RetentionPin::acquire(store.clone(), paths, version, DEFAULT_PIN_TTL).await {
+            Ok(pin) => Some(pin),
+            Err(e) => {
+                warn!(error = %e, version, "reader could not write a retention pin");
+                None
+            }
+        },
+    );
     // Close the load-then-pin race the same way a backup does: once the body
     // is confirmed present after the lease exists, every later sweep keeps
     // this version's closure.
@@ -228,7 +250,7 @@ async fn load_version(
     let recovered = match recovered {
         Ok(r) => r,
         Err(e) => {
-            if let Some(pin) = pin {
+            if let Some(pin) = pin.0.take() {
                 release_pin(pin).await;
             }
             return Err(e);
@@ -249,7 +271,22 @@ async fn load_version(
         exact_node_counts: None,
         memtable_claimant_cell: None,
     };
-    Ok((Arc::new(snapshot), pin))
+    Ok((Arc::new(snapshot), pin.0.take()))
+}
+
+/// The pin of a load in progress. A load dropped part way (a read that
+/// timed out during a refresh) releases it in the background instead of
+/// leaving a lease nothing renews to hold back cleanup until it expires.
+struct ReleaseOnDrop(Option<RetentionPin>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(pin) = self.0.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(release_pin(pin));
+            }
+        }
+    }
 }
 
 async fn renew_pin(pin: &mut RetentionPin) {
@@ -308,13 +345,38 @@ mod tests {
     }
 
     /// Delegating store that can fail one `head` of a chosen path with
-    /// `NotFound` (a sweep racing the load) and refuse every pin lease PUT
-    /// (read-only credentials).
+    /// `NotFound` (a sweep racing the load), refuse every pin lease PUT
+    /// (read-only credentials), and hang every PUT or `head` whose path
+    /// contains `stall` (a slow request a timeout gives up on).
     #[derive(Debug)]
     struct FaultyStore {
         inner: Arc<dyn ObjectStore>,
         vanish_once: Mutex<Option<Path>>,
         deny_pins: bool,
+        stall: Mutex<Option<String>>,
+    }
+
+    impl FaultyStore {
+        fn wrap(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                vanish_once: Mutex::new(None),
+                deny_pins: false,
+                stall: Mutex::new(None),
+            })
+        }
+
+        async fn maybe_stall(&self, location: &Path) {
+            let stalled = self
+                .stall
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|part| location.as_ref().contains(part.as_str()));
+            if stalled {
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     impl std::fmt::Display for FaultyStore {
@@ -337,6 +399,7 @@ mod tests {
                     source: "read-only credentials".into(),
                 });
             }
+            self.maybe_stall(location).await;
             self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(
@@ -360,6 +423,9 @@ mod tests {
                     path: location.to_string(),
                     source: "swept".into(),
                 });
+            }
+            if options.head {
+                self.maybe_stall(location).await;
             }
             self.inner.get_opts(location, options).await
         }
@@ -612,7 +678,7 @@ mod tests {
         // Nothing renewed the lease for a TTL, and a sweep dropped it and
         // the files only the reader's version needed.
         let pin = reader.pin.as_mut().unwrap();
-        pin.renew_due_at = Instant::now().checked_sub(DEFAULT_PIN_TTL).unwrap();
+        pin.expires_at_unix = 0;
         let expired = crate::PinLease {
             version: pin.version(),
             expires_at_unix: 0,
@@ -656,7 +722,7 @@ mod tests {
         reader.checked_at = Instant::now().checked_sub(MAX_VERSION_AGE).unwrap();
         let in_flight = reader.snapshot();
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        reader.pin.as_mut().unwrap().renew_due_at = Instant::now();
+        reader.pin.as_mut().unwrap().expires_at_unix = crate::pin::unix_now();
         reader.renew_pins().await;
         let renewed = expiry(store.clone(), pin_path.clone()).await;
         assert!(renewed > written);
@@ -664,7 +730,7 @@ mod tests {
         // Nothing holds it any more: the lease is left to expire.
         drop(in_flight);
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        reader.pin.as_mut().unwrap().renew_due_at = Instant::now();
+        reader.pin.as_mut().unwrap().expires_at_unix = crate::pin::unix_now();
         reader.renew_pins().await;
         assert_eq!(expiry(store.clone(), pin_path).await, renewed);
     }
@@ -680,6 +746,7 @@ mod tests {
             inner,
             vanish_once: Mutex::new(Some(paths.manifest_version(writer.manifest_version()))),
             deny_pins: false,
+            stall: Mutex::new(None),
         });
         let store: Arc<dyn ObjectStore> = faulty.clone();
         let reader = ReaderSession::open(store.clone(), paths.clone(), None)
@@ -708,6 +775,7 @@ mod tests {
             inner,
             vanish_once: Mutex::new(None),
             deny_pins: true,
+            stall: Mutex::new(None),
         });
         let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
             .await
@@ -739,5 +807,100 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(pins(&store, &paths).await, 0);
+    }
+
+    #[tokio::test]
+    async fn renew_pins_cut_short_keeps_the_leases_reads_still_need() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-renew-cancel");
+        let mut writer = WriterSession::open(inner.clone(), paths.clone())
+            .await
+            .unwrap();
+        let faulty = FaultyStore::wrap(inner);
+        let mut reader = ReaderSession::open(faulty.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        let in_flight = reader.snapshot();
+        writer
+            .upsert_node("Person", NodeId::from_uuid(Uuid::now_v7()), &node("a"))
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        assert!(reader.refresh().await.unwrap());
+        assert_eq!(reader.retired.len(), 1);
+
+        // The retired lease is due, and its renewal never answers: a read
+        // with a timeout gives up while it waits.
+        reader.retired[0].1.expires_at_unix = crate::pin::unix_now();
+        *faulty.stall.lock().unwrap() = Some("/pins/".into());
+        let renew = tokio::time::timeout(Duration::from_millis(50), reader.renew_pins());
+        assert!(renew.await.is_err());
+        *faulty.stall.lock().unwrap() = None;
+
+        assert_eq!(reader.retired.len(), 1, "the in-flight read lost its lease");
+        reader.renew_pins().await;
+        assert!(!reader.retired[0].1.lapsed());
+        drop(in_flight);
+        reader.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_cut_short_releases_the_lease_it_took() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-refresh-cancel");
+        let mut writer = WriterSession::open(inner.clone(), paths.clone())
+            .await
+            .unwrap();
+        let faulty = FaultyStore::wrap(inner);
+        let store: Arc<dyn ObjectStore> = faulty.clone();
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        let served = reader.manifest_version();
+        writer
+            .upsert_node("Person", NodeId::from_uuid(Uuid::now_v7()), &node("a"))
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        // The load takes its lease, then hangs confirming the new version.
+        let next = paths.manifest_version(writer.manifest_version());
+        *faulty.stall.lock().unwrap() = Some(next.as_ref().to_string());
+        let refresh = tokio::time::timeout(Duration::from_millis(50), reader.refresh());
+        assert!(refresh.await.is_err());
+        *faulty.stall.lock().unwrap() = None;
+        assert_eq!(reader.manifest_version(), served);
+        // The dropped load releases its lease in the background.
+        for _ in 0..100 {
+            if pins(&store, &paths).await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            pins(&store, &paths).await,
+            1,
+            "the cut-short load leaked a lease"
+        );
+
+        assert!(reader.refresh().await.unwrap());
+        assert_eq!(pins(&store, &paths).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_released_session_takes_a_new_lease_on_its_next_read() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-reuse");
+        WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        reader.release().await.unwrap();
+        assert_eq!(pins(&store, &paths).await, 0);
+
+        reader.keep_alive().await;
+        assert!(reader.pin.is_some());
+        assert_eq!(pins(&store, &paths).await, 1);
+        reader.release().await.unwrap();
     }
 }

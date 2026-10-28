@@ -125,6 +125,10 @@ const SNAPSHOT_ROW_GROUP_CACHE_MAX_ENTRIES: usize = 2;
 const SNAPSHOT_EDGE_READER_CACHE_MAX_ENTRIES: usize = 32;
 const SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_ENTRIES: usize = 32;
 const SNAPSHOT_CACHE_ENTRY_OVERHEAD_BYTES: usize = 256;
+/// Largest LIMIT that the overlap routes treat as bounded. ponytail: fixed
+/// cut; the row cap's guard (cap + 1, a million by default) is far past it,
+/// so a capped scan of a dense label is not mistaken for a LIMIT.
+const BOUNDED_LIMIT: usize = 4096;
 
 /// Small byte- and count-bounded cache owned by one immutable query snapshot.
 ///
@@ -3902,22 +3906,6 @@ impl<'mt> Snapshot<'mt> {
         Ok(result)
     }
 
-    /// Prove label membership for many node ids without materialising their
-    /// property maps.
-    ///
-    /// This accelerator is exact only when persisted node ranges are
-    /// disjoint and there is no node memtable: in that layout each id can
-    /// belong to at most one SST, and its SST-bound `(LabelId, NodeId)`
-    /// sidecar contains the complete live membership set. Missing/corrupt
-    /// sidecars, overlapping generations and an empty `labels` constraint
-    /// return `None`; callers must then use the ordinary node point reader.
-    ///
-    /// The result preserves input order and duplicates. `false` covers an
-    /// absent/tombstoned node as well as a live node missing any requested
-    /// label. B+tree probes are grouped by page and capped inside
-    /// `batch_label_contains_from_source`, so a high-degree graph expansion
-    /// does not issue one header/footer read or hydrate one embedding per
-    /// relationship endpoint.
     /// Past this many labels in one descriptor, an existence proof costs
     /// more probes than the row read it is avoiding.
     const EXISTENCE_PROBE_MAX_LABELS: usize = 8;
@@ -4076,6 +4064,23 @@ impl<'mt> Snapshot<'mt> {
         Ok(Some(output))
     }
 
+    /// Prove label membership for many node ids without materialising their
+    /// property maps.
+    ///
+    /// With disjoint node ranges and no node memtable each id can belong to
+    /// at most one SST, and that SST's `(LabelId, NodeId)` sidecar holds its
+    /// complete live membership. Otherwise
+    /// [`Self::try_batch_nodes_have_labels_overlapping`] resolves each id's
+    /// newest version. Missing/corrupt sidecars and an empty `labels`
+    /// constraint return `None`; callers must then use the ordinary node
+    /// point reader.
+    ///
+    /// The result preserves input order and duplicates. `false` covers an
+    /// absent/tombstoned node as well as a live node missing any requested
+    /// label. B+tree probes are grouped by page and capped inside
+    /// `batch_label_contains_from_source`, so a high-degree graph expansion
+    /// does not issue one header/footer read or hydrate one embedding per
+    /// relationship endpoint.
     pub async fn try_batch_nodes_have_labels(
         &self,
         labels: &[String],
@@ -4092,12 +4097,6 @@ impl<'mt> Snapshot<'mt> {
             }
             return Ok(None);
         }
-        let Some(descriptors) = self.disjoint_node_descriptors() else {
-            if let Some(cache) = &self.cache {
-                cache.record_label_membership_fallback();
-            }
-            return Ok(None);
-        };
         let mut label_ids = Vec::with_capacity(labels.len());
         for label in labels {
             let Some(label_id) = self.manifest.manifest.label_dict.id(label) else {
@@ -4108,6 +4107,19 @@ impl<'mt> Snapshot<'mt> {
             };
             label_ids.push(label_id);
         }
+        let Some(descriptors) = self.disjoint_node_descriptors() else {
+            let result = self
+                .try_batch_nodes_have_labels_overlapping(labels, &label_ids, ids)
+                .await?;
+            if let Some(cache) = &self.cache {
+                if result.is_some() {
+                    cache.record_label_membership_fast_path();
+                } else {
+                    cache.record_label_membership_fallback();
+                }
+            }
+            return Ok(result);
+        };
 
         let mut probes_by_descriptor = BTreeMap::<usize, Vec<(usize, [u8; 16])>>::new();
         for (position, id) in ids.iter().enumerate() {
@@ -4130,68 +4142,24 @@ impl<'mt> Snapshot<'mt> {
         let mut output = vec![false; ids.len()];
         for (descriptor_index, probes) in probes_by_descriptor {
             let descriptor = &self.manifest.manifest.ssts[descriptor_index];
-            let Some(index) = &descriptor.label_index else {
+            let Some(source) = self.label_membership_source(descriptor).await? else {
                 if let Some(cache) = &self.cache {
                     cache.record_label_membership_fallback();
                 }
                 return Ok(None);
-            };
-            if index.format != PropertyIndexFormat::PagedV1
-                || index.per_label_counts.is_empty()
-                || self
-                    .validated_node_descriptor_live_count(descriptor)
-                    .is_none()
-            {
-                if let Some(cache) = &self.cache {
-                    cache.record_label_membership_fallback();
-                }
-                return Ok(None);
-            }
-            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), index.path);
-            let source = match self
-                .pinned_sidecar_source(&absolute, Some(index.size_bytes))
-                .await
-            {
-                Ok(source) => source,
-                Err(error) if optional_accelerator_fallback(&error) => {
-                    if let Some(cache) = &self.cache {
-                        cache.record_label_membership_fallback();
-                    }
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
             };
             let probe_ids = probes.iter().map(|(_, id)| *id).collect::<Vec<_>>();
             let mut descriptor_matches = vec![true; probes.len()];
             for label_id in &label_ids {
-                let (matches, stats) =
-                    match crate::sst::paged_index::batch_label_contains_from_source(
-                        &source,
-                        label_id.get(),
-                        &probe_ids,
-                        *descriptor.id.as_bytes(),
-                        &index.per_label_counts,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(error) if optional_accelerator_fallback(&error) => {
-                            if let Some(cache) = &self.cache {
-                                cache.record_label_membership_fallback();
-                            }
-                            return Ok(None);
-                        }
-                        Err(error) => return Err(error),
-                    };
-                if let Some(cache) = &self.cache {
-                    cache.record_label_membership_probe(probe_ids.len(), stats);
-                }
-                if matches.len() != probes.len() || stats.index_entries != index.posting_count {
+                let Some(matches) = self
+                    .probe_label_membership(descriptor, &source, label_id.get(), &probe_ids)
+                    .await?
+                else {
                     if let Some(cache) = &self.cache {
                         cache.record_label_membership_fallback();
                     }
                     return Ok(None);
-                }
+                };
                 for (combined, one_label) in descriptor_matches.iter_mut().zip(matches) {
                     *combined &= one_label;
                 }
@@ -4207,6 +4175,276 @@ impl<'mt> Snapshot<'mt> {
             cache.record_label_membership_fast_path();
         }
         Ok(Some(output))
+    }
+
+    /// [`Self::try_batch_nodes_have_labels`] when node SSTs overlap or the
+    /// memtable holds nodes.
+    ///
+    /// An id can then have a version in several SSTs, and the newest one
+    /// decides. When every two SSTs that share keys also have disjoint LSN
+    /// ranges, newest is an SST order, so each id walks the SSTs that can
+    /// hold it, newest first:
+    /// - a bloom filter that rules the id out sends it to the next SST;
+    /// - a posting under every requested label proves a live member, and a
+    ///   posting under only some of them proves a live version that is not
+    ///   one;
+    /// - in the last SST that can hold it, no requested posting means
+    ///   `false`, as in the disjoint layout;
+    /// - otherwise the SST's node locator says whether it holds a version
+    ///   (a tombstone, or a live node without the labels), which means
+    ///   `false`, or not, which sends the id to the next SST. That keeps an
+    ///   SST too small for a bloom filter off the point reader;
+    /// - without a usable locator, a posting under any other label of that
+    ///   SST proves a live version that is not a member, and an id with no
+    ///   posting at all may be a tombstone and goes to the point reader.
+    ///
+    /// Memtable ids go to the point reader too. It costs what the caller's
+    /// own fallback would, so an id the postings cannot prove is slower,
+    /// never wrong. `None` (overlapping LSN ranges, a sidecar that cannot
+    /// prove completeness) leaves the whole batch to the caller.
+    async fn try_batch_nodes_have_labels_overlapping(
+        &self,
+        labels: &[String],
+        label_ids: &[LabelId],
+        ids: &[NodeId],
+    ) -> Result<Option<Vec<bool>>> {
+        let ssts = &self.manifest.manifest.ssts;
+        let mut order: Vec<usize> = self
+            .manifest
+            .index
+            .node_descriptors()
+            .into_iter()
+            .filter(|idx| ssts[*idx].row_count > 0)
+            .collect();
+        if order.iter().any(|idx| {
+            ssts[*idx].min_key > ssts[*idx].max_key || ssts[*idx].min_lsn > ssts[*idx].max_lsn
+        }) {
+            return Ok(None);
+        }
+        order.sort_by_key(|idx| Reverse(ssts[*idx].max_lsn));
+        let holds =
+            |idx: usize, id: &[u8; 16]| ssts[idx].min_key <= *id && *id <= ssts[idx].max_key;
+        for (rank, &newer) in order.iter().enumerate() {
+            for &older in &order[rank + 1..] {
+                let shares_keys = ssts[newer].min_key <= ssts[older].max_key
+                    && ssts[older].min_key <= ssts[newer].max_key;
+                if shares_keys && ssts[older].max_lsn >= ssts[newer].min_lsn {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let mut output = vec![false; ids.len()];
+        let mut point_read = Vec::new();
+        let mut pending = Vec::new();
+        for (position, id) in ids.iter().enumerate() {
+            if self.node_mem_entry(*id).is_some() {
+                point_read.push(position);
+            } else {
+                pending.push((position, *id.as_bytes()));
+            }
+        }
+        for (rank, &idx) in order.iter().enumerate() {
+            if pending.is_empty() {
+                break;
+            }
+            let desc = &ssts[idx];
+            let (mut here, rest): (Vec<_>, Vec<_>) =
+                pending.into_iter().partition(|(_, id)| holds(idx, id));
+            pending = rest;
+            if here.is_empty() {
+                continue;
+            }
+            if let Some(bloom) = self.bloom_filter(desc).await? {
+                let (admitted, absent): (Vec<_>, Vec<_>) =
+                    here.into_iter().partition(|(_, id)| bloom.contains(id));
+                here = admitted;
+                pending.extend(absent);
+            }
+            if here.is_empty() {
+                continue;
+            }
+            let Some(source) = self.label_membership_source(desc).await? else {
+                return Ok(None);
+            };
+            let probe_ids: Vec<[u8; 16]> = here.iter().map(|(_, id)| *id).collect();
+            let mut hits = vec![0_usize; here.len()];
+            for label_id in label_ids {
+                let Some(found) = self
+                    .probe_label_membership(desc, &source, label_id.get(), &probe_ids)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                for (hit, found) in hits.iter_mut().zip(found) {
+                    *hit += usize::from(found);
+                }
+            }
+            let older = &order[rank + 1..];
+            let mut unproved = Vec::new();
+            for ((position, id), hit) in here.into_iter().zip(hits) {
+                if hit == label_ids.len() {
+                    output[position] = true;
+                } else if hit == 0 && older.iter().any(|older| holds(*older, &id)) {
+                    unproved.push((position, id));
+                }
+            }
+            if unproved.is_empty() {
+                continue;
+            }
+            // The node locator lists every row of this SST, tombstones
+            // included, so it settles the rest without a bloom filter: a
+            // version here is the newest one and lacks the labels, and an
+            // id it lacks moves on to the older SSTs.
+            let unproved_ids: Vec<[u8; 16]> = unproved.iter().map(|(_, id)| *id).collect();
+            if let Some(present) = self.node_locator_presence(desc, &unproved_ids).await? {
+                pending.extend(unproved.into_iter().filter(|(_, id)| !present.contains(id)));
+                continue;
+            }
+            // A posting under any other label proves a live version here,
+            // which is the newest one and is not a member.
+            let Some(index) = &desc.label_index else {
+                return Ok(None);
+            };
+            let mut live = vec![false; unproved.len()];
+            for (other, count) in &index.per_label_counts {
+                if *count == 0 || label_ids.iter().any(|label_id| label_id.get() == *other) {
+                    continue;
+                }
+                let Some(found) = self
+                    .probe_label_membership(desc, &source, *other, &unproved_ids)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                for (live, found) in live.iter_mut().zip(found) {
+                    *live |= found;
+                }
+            }
+            point_read.extend(
+                unproved
+                    .into_iter()
+                    .zip(live)
+                    .filter(|(_, live)| !live)
+                    .map(|((position, _), _)| position),
+            );
+        }
+        // Whatever is still pending is in no SST, so it is absent.
+
+        if !point_read.is_empty() {
+            let point_ids: Vec<NodeId> = point_read.iter().map(|position| ids[*position]).collect();
+            let views = self.batch_lookup_nodes(&labels[0], &point_ids).await?;
+            if let Some(cache) = &self.cache {
+                cache.record_label_membership_point_reads(point_ids.len());
+            }
+            for (position, view) in point_read.into_iter().zip(views) {
+                output[position] =
+                    view.is_some_and(|view| labels.iter().all(|label| view.labels.contains(label)));
+            }
+        }
+        Ok(Some(output))
+    }
+
+    /// Which of `ids` have a row (live or tombstone) in the node SST `desc`,
+    /// from its node locator. `None` when the locator is missing,
+    /// unreadable or does not cover every row.
+    async fn node_locator_presence(
+        &self,
+        desc: &SstDescriptor,
+        ids: &[[u8; 16]],
+    ) -> Result<Option<BTreeSet<[u8; 16]>>> {
+        let Some(locator) = desc
+            .node_locator
+            .as_ref()
+            .filter(|locator| locator.entry_count == desc.row_count)
+        else {
+            return Ok(None);
+        };
+        let absolute = format!(
+            "{}/{}",
+            self.paths.namespace_prefix().as_ref(),
+            locator.path
+        );
+        let probed = match self
+            .pinned_sidecar_source(&absolute, Some(locator.size_bytes))
+            .await
+        {
+            Ok(source) => {
+                crate::sst::paged_index::probe_node_locator_from_source(&source, ids).await
+            }
+            Err(error) => Err(error),
+        };
+        match probed {
+            Ok((found, stats)) if stats.index_entries == locator.entry_count => {
+                if let Some(cache) = &self.cache {
+                    cache.record_node_locator_probe(stats);
+                }
+                Ok(Some(found.into_keys().collect()))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if optional_accelerator_fallback(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Open the label sidecar of a node SST for membership probes. `None`
+    /// when it is missing, unreadable or cannot prove completeness.
+    async fn label_membership_source(
+        &self,
+        desc: &SstDescriptor,
+    ) -> Result<Option<crate::range_cache::PinnedObjectRangeSource>> {
+        let Some(index) = &desc.label_index else {
+            return Ok(None);
+        };
+        if index.format != PropertyIndexFormat::PagedV1
+            || index.per_label_counts.is_empty()
+            || self.validated_node_descriptor_live_count(desc).is_none()
+        {
+            return Ok(None);
+        }
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), index.path);
+        match self
+            .pinned_sidecar_source(&absolute, Some(index.size_bytes))
+            .await
+        {
+            Ok(source) => Ok(Some(source)),
+            Err(error) if optional_accelerator_fallback(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Which of `ids` carry `label_id` in the label sidecar of `desc`, in
+    /// order. `None` when the sidecar fails its checks.
+    async fn probe_label_membership(
+        &self,
+        desc: &SstDescriptor,
+        source: &crate::range_cache::PinnedObjectRangeSource,
+        label_id: u32,
+        ids: &[[u8; 16]],
+    ) -> Result<Option<Vec<bool>>> {
+        let Some(index) = &desc.label_index else {
+            return Ok(None);
+        };
+        let (matches, stats) = match crate::sst::paged_index::batch_label_contains_from_source(
+            source,
+            label_id,
+            ids,
+            *desc.id.as_bytes(),
+            &index.per_label_counts,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) if optional_accelerator_fallback(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if let Some(cache) = &self.cache {
+            cache.record_label_membership_probe(ids.len(), stats);
+        }
+        if matches.len() != ids.len() || stats.index_entries != index.posting_count {
+            return Ok(None);
+        }
+        Ok(Some(matches))
     }
 
     /// Batched analogue of [`Self::lookup_node`]: probe many `ids` for
@@ -6034,9 +6272,9 @@ impl<'mt> Snapshot<'mt> {
     ///
     /// Each candidate costs a full exact-record lookup, so the route runs
     /// only when that work is bounded: by the label being sparse, or by a
-    /// bare LIMIT whose candidates mostly confirm. A LIMIT that keeps hitting
-    /// superseded postings gives up after a budget. Anything else is left to
-    /// the two-phase scan.
+    /// small bare LIMIT whose candidates mostly confirm. A LIMIT that keeps
+    /// hitting superseded postings gives up after a budget. Anything else,
+    /// including the row cap's guard limit, is left to the two-phase scan.
     async fn try_scan_overlapping_label_sidecars(
         &self,
         label: &str,
@@ -6047,8 +6285,9 @@ impl<'mt> Snapshot<'mt> {
         const CANDIDATE_BATCH: usize = 512;
 
         // A filter can reject every candidate, so only a bare LIMIT bounds
-        // the lookups by the rows returned.
-        let bounded = limit.is_some() && predicates.is_empty();
+        // the lookups by the rows returned, and only a small one bounds them
+        // by much.
+        let bounded = predicates.is_empty() && limit.is_some_and(|limit| limit <= BOUNDED_LIMIT);
         // An unbounded projected scan is better served by the two-phase scan:
         // an id-only one (a count) never leaves its structural pass, and a
         // projected one reads property pages. Full exact records would decode
@@ -6380,15 +6619,20 @@ impl<'mt> Snapshot<'mt> {
                     return Ok(rows);
                 }
             }
-            if let Some(rows) = self
-                .try_scan_overlapping_nodes_limited(label, predicates, projection, limit)
-                .await?
-            {
-                if let Some(cache) = &self.cache {
-                    cache.record_limited_node_scan_fast_path();
-                    cache.record_limited_node_scan_work(0, 0, rows.len(), 0, 0);
+            // A labelled scan past the bound (the row cap's guard) reads
+            // cheaper through the two-phase scan than one point read per
+            // member.
+            if label.is_none() || limit <= BOUNDED_LIMIT {
+                if let Some(rows) = self
+                    .try_scan_overlapping_nodes_limited(label, predicates, projection, limit)
+                    .await?
+                {
+                    if let Some(cache) = &self.cache {
+                        cache.record_limited_node_scan_fast_path();
+                        cache.record_limited_node_scan_work(0, 0, rows.len(), 0, 0);
+                    }
+                    return Ok(rows);
                 }
-                return Ok(rows);
             }
             if let Some(cache) = &self.cache {
                 cache.record_limited_node_scan_fallback();
@@ -9686,8 +9930,16 @@ impl<'mt> Snapshot<'mt> {
     /// threshold — see [`crate::sst::bloom::BLOOM_OMIT_THRESHOLD_BYTES`])
     /// always admit, falling back to the body GET that follows.
     async fn bloom_admits(&self, desc: &SstDescriptor, key: &[u8; 16]) -> Result<bool> {
+        Ok(match self.bloom_filter(desc).await? {
+            Some(filter) => filter.contains(key),
+            None => true,
+        })
+    }
+
+    /// The bloom side-car of `desc`, or `None` when the SST has none.
+    async fn bloom_filter(&self, desc: &SstDescriptor) -> Result<Option<Arc<BloomFilter>>> {
         let Some(bloom_desc) = &desc.bloom else {
-            return Ok(true);
+            return Ok(None);
         };
         let absolute = format!(
             "{}/{}",
@@ -9696,7 +9948,7 @@ impl<'mt> Snapshot<'mt> {
         );
         if let Some(cache) = self.cache.as_ref() {
             if let Some(filter) = cache.get_bloom_filter(&absolute) {
-                return Ok(filter.contains(key));
+                return Ok(Some(filter));
             }
         }
         let body = self.fetch_bytes(&absolute).await?;
@@ -9704,7 +9956,7 @@ impl<'mt> Snapshot<'mt> {
         if let Some(cache) = self.cache.as_ref() {
             cache.insert_bloom_filter(absolute, filter.clone());
         }
-        Ok(filter.contains(key))
+        Ok(Some(filter))
     }
 
     /// Cache-only check: returns `Some(body)` if the cache has it,
@@ -16393,6 +16645,204 @@ mod tests {
         // The structural merge then finds no Device without a full scan.
         assert_eq!(cache.limited_node_scan_fast_paths(), 1);
         assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+
+        // The row cap's guard limit (cap + 1) is not a LIMIT: a capped scan
+        // of a dense label goes to the two-phase scan without walking the
+        // postings, instead of looking up every stale one under a skip
+        // budget as large as the cap.
+        let cache = SstCache::new(16 * 1024 * 1024);
+        let snap = snap.with_cache(cache.clone());
+        let rows = snap
+            .scan_label_with_predicates_and_projection_limited("Device", &[], None, 1_000_001)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(cache.node_locator_probes(), 0);
+        assert_eq!(cache.limited_node_scan_fast_paths(), 0);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
+    }
+
+    #[tokio::test]
+    async fn label_membership_over_overlapping_ssts_follows_the_newest_version() {
+        let store = make_store();
+        let paths = make_paths("overlap-membership");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        // Even ids are Devices, odd ones Other.
+        let first = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            (0..2000_u16)
+                .map(|i| {
+                    let label = if i % 2 == 0 { DEVICE } else { OTHER };
+                    (
+                        spread_node_id(i),
+                        u64::from(i) + 1,
+                        MemOp::Upsert(labelled_payload("old", vec![label])),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        // A newer SST over the same key range relabels and deletes some ids
+        // and adds new ones. Incompressible names make it big enough to get
+        // a bloom filter, which keeps the ids it lacks off the point reader.
+        let noise = |seed: u16| {
+            let mut x = (u64::from(seed) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (0..80)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    format!("{x:016x}")
+                })
+                .collect::<String>()
+        };
+        let committed = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            (0..2050_u16)
+                .filter_map(|i| {
+                    let op = match i % 10 {
+                        _ if i >= 2000 => MemOp::Upsert(labelled_payload(&noise(i), vec![DEVICE])),
+                        0 => MemOp::Upsert(labelled_payload(&noise(i), vec![OTHER])),
+                        5 => MemOp::Upsert(labelled_payload(&noise(i), vec![DEVICE])),
+                        3 | 8 => MemOp::Tombstone,
+                        _ => return None,
+                    };
+                    Some((spread_node_id(i), 5000 + u64::from(i), op))
+                })
+                .collect(),
+        )
+        .await;
+        let newest = committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+            .max_by_key(|desc| desc.max_lsn)
+            .unwrap();
+        assert!(newest.bloom.is_some(), "the newer SST needs a bloom filter");
+        // The memtable turns an Other into a Device and deletes a Device.
+        let mut live = Memtable::new();
+        live.apply(
+            MemKey::Node {
+                id: spread_node_id(1),
+            },
+            9000,
+            MemOp::Upsert(labelled_payload("m", vec![DEVICE])),
+        );
+        live.apply(
+            MemKey::Node {
+                id: spread_node_id(2),
+            },
+            9001,
+            MemOp::Tombstone,
+        );
+        let live_view = live.snapshot_view();
+        let mut ids: Vec<NodeId> = (0..2100_u16).map(spread_node_id).collect();
+        ids.push(spread_node_id(5));
+        let device = vec!["Device".to_string()];
+
+        let snap = Snapshot::new(committed.clone(), &live_view, store.clone(), paths.clone());
+        assert!(snap.disjoint_node_descriptors().is_none());
+        let expected: Vec<bool> = snap
+            .batch_lookup_nodes("", &ids)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|view| view.is_some_and(|view| view.labels.contains("Device")))
+            .collect();
+        assert!(expected[1] && !expected[2] && !expected[10] && expected[15] && !expected[13]);
+
+        let cache = SstCache::new(16 * 1024 * 1024);
+        let snap = Snapshot::new(committed.clone(), &live_view, store.clone(), paths.clone())
+            .with_cache(cache.clone());
+        assert_eq!(
+            snap.try_batch_nodes_have_labels(&device, &ids)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(cache.label_membership_fast_paths(), 1);
+        // The node locators settle the deletes too, so only the two memtable
+        // ids are read whole.
+        assert_eq!(cache.label_membership_point_reads(), 2);
+
+        // A small recent flush gets no bloom filter, and every id in its key
+        // range reaches its postings. The locator still keeps the ones it
+        // does not hold off the point reader.
+        let with_manifest = |edit: &dyn Fn(&mut SstDescriptor)| {
+            let mut manifest = committed.manifest.clone();
+            manifest
+                .ssts
+                .iter_mut()
+                .filter(|desc| desc.kind == SstKind::Nodes)
+                .for_each(edit);
+            LoadedManifest::new(
+                committed.pointer.clone(),
+                committed.pointer_etag.clone(),
+                committed.pointer_version.clone(),
+                manifest,
+            )
+        };
+        let unbloomed = with_manifest(&|desc| desc.bloom = None);
+        let cache = SstCache::new(16 * 1024 * 1024);
+        let snap = Snapshot::new(unbloomed, &live_view, store.clone(), paths.clone())
+            .with_cache(cache.clone());
+        assert_eq!(
+            snap.try_batch_nodes_have_labels(&device, &ids)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(cache.label_membership_point_reads(), 2);
+
+        // Without locators the ids the postings cannot settle are read whole,
+        // and the answer is the same.
+        let unlocated = with_manifest(&|desc| desc.node_locator = None);
+        assert_eq!(
+            Snapshot::new(unlocated, &live_view, store.clone(), paths.clone())
+                .try_batch_nodes_have_labels(&device, &ids)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&expected)
+        );
+
+        // SSTs that share keys and LSNs have no newest one: fail closed.
+        let mut tangled = committed.clone();
+        for desc in tangled
+            .manifest
+            .ssts
+            .iter_mut()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            desc.max_lsn = 1_000_000;
+        }
+        let tangled = LoadedManifest::new(
+            tangled.pointer,
+            tangled.pointer_etag,
+            tangled.pointer_version,
+            tangled.manifest,
+        );
+        assert_eq!(
+            Snapshot::new(tangled, &live_view, store, paths)
+                .try_batch_nodes_have_labels(&device, &ids)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     fn spread_node_id(i: u16) -> NodeId {

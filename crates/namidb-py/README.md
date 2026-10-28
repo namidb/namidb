@@ -150,7 +150,8 @@ lease is left to expire, and the next read refreshes first. A read also
 refreshes first when the lease may have expired anyway (the process was
 suspended, say). `close()`, or leaving a
 `with namidb.Client(uri, read_only=True) as reader:` block, drops the
-lease right away; otherwise it expires about 15 minutes after it was last
+lease right away, and a read after that reloads the newest version under a
+new lease; otherwise it expires about 15 minutes after it was last
 renewed, or after the process dies. Credentials that cannot write under
 `manifest/pins/` get no lease, and then only the writer's sweep age
 margin protects the reader's files. `refresh()` replays the writer's
