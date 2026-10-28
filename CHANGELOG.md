@@ -24,8 +24,10 @@ crates.io release will establish and document that API explicitly.
   map, after `AS` or in an index property list can only be a name, so it is
   now read as one, spelled exactly as written. Variables and labels still
   need backticks (`` MATCH (`order`) ``), and so does a later reference to a
-  keyword alias. `` RETURN `order` `` now names the column `order`, without
-  the backticks.
+  keyword alias. A bare backtick-quoted variable now names its column
+  without the backticks, like Neo4j: `` RETURN `order` `` gives a column
+  `order` and `` RETURN `my node` `` a column `my node` (it used to be
+  `` `my node` ``, backticks included).
 
 ### Added
 
@@ -370,6 +372,8 @@ crates.io release will establish and document that API explicitly.
   namespace is still fully quiesced before anything reopens it.
   had their properties read, here, from property pages or in the full
   reconciliation.
+  disagree, or that carries any other parameter (say a mistyped `?nss=`),
+  now fails with a clear error instead of an invalid-character one.
 
 ## [2.6.19] - 2026-09-16
 

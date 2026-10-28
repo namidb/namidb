@@ -3,7 +3,7 @@
 //!
 //! Supported schemes:
 //!
-//! - `memory://<namespace>` (or `memory://?ns=<namespace>`) — ephemeral,
+//! - `memory://<namespace>` (or `memory://?ns=<namespace>`): ephemeral,
 //!   single-process.
 //! - `file:///abs/dir?ns=<namespace>` (or `file://./rel?ns=<ns>`) —
 //!   local filesystem with manifest CAS via `flock` + atomic rename.
@@ -122,6 +122,13 @@ fn parse_memory(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), Uri
         for (key, val) in url::form_urlencoded::parse(q.as_bytes()) {
             if key == "ns" || key == "namespace" {
                 ns_query = Some(val.into_owned());
+            } else {
+                // memory:// takes nothing else, so a typo like `?nss=`
+                // must not quietly open the host namespace.
+                return Err(UriError::Malformed {
+                    uri: uri.to_string(),
+                    reason: format!("unknown memory:// parameter '{key}'"),
+                });
             }
         }
     }
@@ -486,10 +493,13 @@ mod tests {
             parse_uri("memory://?ns="),
             Err(UriError::BadNamespace { .. })
         ));
-        assert!(matches!(
-            parse_uri("memory://?foo=bar"),
-            Err(UriError::Malformed { .. })
-        ));
+        for uri in ["memory://?foo=bar", "memory://acme?nss=prod"] {
+            let err = parse_uri(uri).expect_err(uri);
+            assert!(
+                err.to_string().contains("unknown memory:// parameter"),
+                "{uri}: {err}"
+            );
+        }
         let (_store, paths) = parse_uri("memory://forensic_case").unwrap();
         assert_eq!(paths.namespace().as_str(), "forensic_case");
     }

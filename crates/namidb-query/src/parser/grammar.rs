@@ -216,7 +216,8 @@ impl<'src> Parser<'src> {
                     next.span,
                 )
                 .with_help(format!(
-                    "quote it as `` `{label}` `` to use it as a label or variable name"
+                    "quote it as `` `{}` `` to use it as a label or variable name",
+                    &self.src[next.span.start..next.span.end]
                 )))
             }
             other => Err(ParseError::new(
@@ -2424,6 +2425,11 @@ impl<'src> Parser<'src> {
                 }
                 self.parse_after_identifier(id)
             }
+            // A keyword here was most likely meant as a variable (`RETURN
+            // order` after `AS order`); give the backtick hint.
+            Some(other) if other.is_reserved_keyword() => {
+                Err(self.expect_identifier().unwrap_err())
+            }
             Some(other) => Err(ParseError::new(
                 ErrorCode::UnexpectedToken,
                 format!("expected expression, found `{}`", other.label()),
@@ -3882,7 +3888,8 @@ mod tests {
     #[test]
     fn reserved_keyword_variable_still_reports_e003() {
         let err = first_err("WITH 1 AS order RETURN order");
-        assert_eq!(err.code, ErrorCode::UnexpectedToken);
+        assert_eq!(err.code, ErrorCode::ReservedKeyword);
+        assert!(err.help.as_deref().unwrap_or("").contains("`order`"));
         let err = first_err("MATCH (n:X) SET by.x = 1");
         assert_eq!(err.code, ErrorCode::ReservedKeyword);
     }
