@@ -24,6 +24,14 @@ crates.io release will establish and document that API explicitly.
   one, spelled exactly as written. Variables and labels still need backticks
   (`` MATCH (`order`) ``), and so does a later reference to a keyword alias.
 
+### Added
+
+- **macOS x86_64 Python wheel.** Intel Macs and x86_64 Pythons on Apple
+  silicon (a Rosetta terminal, `python3-intel64`) found no matching wheel,
+  fell back to the sdist and failed without a Rust toolchain. The release
+  now ships a `macosx_*_x86_64` wheel, cross-built on the arm64 runner and
+  smoke-tested under Rosetta.
+
 ### Changed
 
 - **Namespace names can contain `_`.** `forensic_case` used to be rejected

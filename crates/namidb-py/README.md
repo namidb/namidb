@@ -12,10 +12,10 @@ pip install 'namidb[pandas]'    # + DataFrame interop
 pip install 'namidb[polars]'    # + polars interop
 ```
 
-Wheels go out for Linux (x86_64, aarch64), macOS (arm64), and Windows
-(x86_64) from the `python-wheels.yml` workflow on every `py-v*` tag.
-`pyarrow >= 14` is a hard transitive dependency. Intel macOS falls back
-to the sdist, which is slower to install but behaves the same at runtime.
+Wheels go out for Linux (x86_64, aarch64), macOS (arm64, x86_64), and
+Windows (x86_64) from the `python-wheels.yml` workflow on every `py-v*` tag.
+`pyarrow >= 14` is a hard transitive dependency. Any other platform falls
+back to the sdist, which needs a Rust toolchain to install.
 
 ## Build from source
 
@@ -427,8 +427,8 @@ Run every command below from the repository root.
         "$(git rev-parse "py-v$VERSION^{commit}")"
    git push --atomic origin "v$VERSION" "py-v$VERSION"
    ```
-6. `python-wheels.yml` builds 4 wheels (Linux x86_64/aarch64, macOS
-   arm64, Windows x86_64) plus the sdist, smoke-tests one wheel on
+6. `python-wheels.yml` builds 5 wheels (Linux x86_64/aarch64, macOS
+   arm64/x86_64, Windows x86_64) plus the sdist, smoke-tests one wheel on
    Python 3.9 and 3.13, then publishes to PyPI via OIDC trusted
    publishing (set up once per account at
    https://pypi.org/manage/account/publishing/).
