@@ -161,6 +161,44 @@ crates.io release will establish and document that API explicitly.
   included) of every row it scanned. These calls now read only the id and
   label columns. `keys(n)`, `properties(n)` and a bare `n` still load
   everything.
+- **A label scan on a store with more than one node SST decoded every node
+  in the store.** Node ids are random, so two node SSTs always overlap in key
+  range, and every label accelerator turned itself off. The fallback then
+  parsed the overflow JSON of every row of every label and kept a full view
+  of each one in memory before filtering by label. Reading 9 `:Device` nodes
+  out of 2.8M took 23 s and 12.5 GB.
+
+  The fallback now checks the label first. A row outside the label is kept
+  only as a marker for last-writer-wins, so a newer version that dropped the
+  label still hides the older one, and its properties are never decoded.
+  The same applies to property-page projections.
+
+- **`MATCH (n:L) RETURN n LIMIT k` and `count` read the whole store once
+  there was more than one node SST.** The LIMIT prefix scan and the label
+  index both required node SSTs with disjoint key ranges and an empty
+  memtable, which a store with more than one level never has. They now work
+  with overlap too: the label postings of every SST and the memtable ids
+  that carry the label are merged in id order, each candidate resolves to
+  its newest version, and versions that lost the label or were deleted are
+  skipped. A LIMIT stops as soon as it has its rows and no longer fetches a
+  full page of candidates first. Scans, counts and filtered LIMITs take this
+  route only when the label is at most a quarter of the node rows, memtable
+  included, since each candidate is a full record lookup and a filter may
+  reject them all. A dense label goes through the two-pass scan below.
+
+### Changed
+
+- **Label scans over overlapping node SSTs no longer load whole SST files.**
+  A denser label, or a projected scan that is better served by property
+  pages, now runs in two passes. The first reads only the id, tombstone,
+  lsn and label columns of each SST and settles which version of each id
+  wins. The second reads properties for the winning rows of the label only:
+  from property pages for a projected scan, or from Parquet with a row
+  selection that skips every other page. `RETURN id(n)` style scans stop
+  after the first pass. Any mismatch between the passes falls back to the
+  full reconciliation. This also covers the BM25 and hybrid search label
+  walks. `SstCache::label_selected_node_rows()` reports how many label rows
+  had their properties read, here or from property pages.
 
 ## [2.6.19] - 2026-09-16
 

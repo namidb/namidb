@@ -15,7 +15,9 @@ use std::sync::Arc;
 use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::schema::Schema;
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSession};
+use namidb_storage::{
+    EdgeWriteRecord, NamespacePaths, NodeWriteRecord, SessionCaches, SstCache, WriterSession,
+};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -439,6 +441,43 @@ async fn limit_fills_past_many_edgeless_seeds() {
         let snapshot = &snapshot;
         async move {
             let plan = lower(&parse(&query).unwrap()).unwrap();
+async fn nodescan_limit_uses_prefix_on_multi_level_layout() {
+    // Two flushes that rewrite some of the same random ids leave two node
+    // SSTs whose key ranges overlap, the normal shape of a store with more
+    // than one level. The scan used to give up on its LIMIT prefix there and
+    // reconcile every node; it must now stop early and still return exactly
+    // the uncapped prefix, with or without a WITH in between.
+    let sst_cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-multi-level"), caches)
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = (0..40).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("L", *id, &node_with("k", i as i64))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    for (i, id) in ids.iter().enumerate().step_by(3) {
+        writer
+            .upsert_node("L", *id, &node_with("k", 100 + i as i64))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    assert!(
+        snapshot.metadata_node_count(None).is_none(),
+        "the two node SSTs must overlap"
+    );
+    let exec = |query: &str| {
+        let plan = lower(&parse(query).unwrap()).unwrap();
+        let snapshot = &snapshot;
+        async move {
             execute_flat_path(&plan, snapshot, &Params::new())
                 .await
                 .unwrap()
@@ -456,4 +495,16 @@ async fn limit_fills_past_many_edgeless_seeds() {
         );
         assert_eq!(got, &full[..limit.min(full.len())], "LIMIT {limit}");
     }
+    let full = exec("MATCH (n:L) RETURN keys(n) AS ks, n.k AS k").await;
+    assert_eq!(full.len(), 40);
+    let fast_paths = sst_cache.limited_node_scan_fast_paths();
+    let fallbacks = sst_cache.limited_node_scan_fallbacks();
+    for query in [
+        "MATCH (n:L) RETURN keys(n) AS ks, n.k AS k LIMIT 2",
+        "MATCH (n:L) WITH n LIMIT 2 RETURN keys(n) AS ks, n.k AS k",
+    ] {
+        assert_eq!(exec(query).await, full[..2].to_vec(), "{query}");
+    }
+    assert_eq!(sst_cache.limited_node_scan_fast_paths(), fast_paths + 2);
+    assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
 }

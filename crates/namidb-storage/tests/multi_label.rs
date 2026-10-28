@@ -141,6 +141,50 @@ async fn relabel_via_reupsert_is_last_write_wins() {
     );
 }
 
+/// Relabels and a delete land in a second node SST whose key range overlaps
+/// the first, with no compaction in between. Every label read (full scan,
+/// LIMIT prefix, count) must follow the newest version of each id.
+#[tokio::test]
+async fn relabel_across_overlapping_ssts_is_last_write_wins() {
+    let mut s = WriterSession::open(store(), paths("ml-relabel-overlap"))
+        .await
+        .unwrap();
+    for i in 1..=6 {
+        s.upsert_node_with_labels(labels(&["A"]), nid(i), &rec("old"))
+            .unwrap();
+    }
+    s.upsert_node_with_labels(labels(&["B"]), nid(7), &rec("old"))
+        .unwrap();
+    s.commit_batch().await.unwrap();
+    s.flush(Schema::empty()).await.unwrap();
+
+    s.upsert_node_with_labels(labels(&["B"]), nid(1), &rec("new"))
+        .unwrap();
+    s.upsert_node_with_labels(labels(&["A", "B"]), nid(7), &rec("new"))
+        .unwrap();
+    s.tombstone_node("A", nid(2)).unwrap();
+    s.commit_batch().await.unwrap();
+    s.flush(Schema::empty()).await.unwrap();
+
+    let snap = s.snapshot();
+    assert!(
+        snap.metadata_node_count(None).is_none(),
+        "the two node SSTs must overlap for this test to mean anything"
+    );
+    let ids = |rows: Vec<namidb_storage::NodeView>| rows.into_iter().map(|row| row.id).collect();
+    let a: Vec<NodeId> = ids(snap.scan_label("A").await.unwrap());
+    assert_eq!(a, vec![nid(3), nid(4), nid(5), nid(6), nid(7)]);
+    let b: Vec<NodeId> = ids(snap.scan_label("B").await.unwrap());
+    assert_eq!(b, vec![nid(1), nid(7)]);
+    let prefix: Vec<NodeId> = ids(snap
+        .scan_label_with_predicates_and_projection_limited("A", &[], None, 2)
+        .await
+        .unwrap());
+    assert_eq!(prefix, vec![nid(3), nid(4)]);
+    assert_eq!(snap.count_nodes(Some("A")).await.unwrap(), 5);
+    assert_eq!(snap.count_nodes(Some("B")).await.unwrap(), 2);
+}
+
 /// Reopen a fresh `WriterSession` on the same store after flush: the label set
 /// survives via the manifest's dictionary + the on-row `__labels` column, with
 /// no live memtable.

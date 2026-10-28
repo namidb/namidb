@@ -1117,9 +1117,13 @@ struct CacheStats {
     /// full row-group decode in performance regressions.
     node_sparse_filter_scans: AtomicU64,
     node_sparse_filter_rows: AtomicU64,
-    /// Exact LIMIT pushdown over globally-disjoint node SSTs. These counters
-    /// distinguish a true lazy prefix scan from the legacy full scan followed
-    /// by `take(k)`.
+    /// Label rows whose properties a label scan read, in the second pass of
+    /// a two-phase scan or from property pages. Rows outside the label never
+    /// count.
+    node_label_selected_rows: AtomicU64,
+    /// Exact LIMIT pushdown over node SSTs (a disjoint prefix scan or merged
+    /// label postings). These counters distinguish a true lazy prefix scan
+    /// from the legacy full scan followed by `take(k)`.
     node_limited_scan_fast_paths: AtomicU64,
     node_limited_scan_fallbacks: AtomicU64,
     node_limited_scan_decoded_rows: AtomicU64,
@@ -1284,6 +1288,10 @@ impl std::fmt::Debug for SstCache {
             .field(
                 "node_sparse_filter_rows",
                 &self.stats.node_sparse_filter_rows.load(Ordering::Relaxed),
+            )
+            .field(
+                "node_label_selected_rows",
+                &self.stats.node_label_selected_rows.load(Ordering::Relaxed),
             )
             .field(
                 "node_limited_scan_fast_paths",
@@ -2264,6 +2272,16 @@ impl SstCache {
 
     pub fn sparse_node_filter_rows(&self) -> u64 {
         self.stats.node_sparse_filter_rows.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_label_selected_node_rows(&self, rows: usize) {
+        self.stats
+            .node_label_selected_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    pub fn label_selected_node_rows(&self) -> u64 {
+        self.stats.node_label_selected_rows.load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_limited_node_scan_fast_path(&self) {
