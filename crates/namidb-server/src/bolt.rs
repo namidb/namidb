@@ -2779,6 +2779,56 @@ mod tests {
         assert!(state.writer.try_lock().is_ok());
     }
 
+    /// The multi-tenant backend forwards the access mode to its namespace
+    /// delegate, so a read BEGIN on a namespace whose writer is busy still
+    /// opens instead of timing out on the writer lock.
+    #[tokio::test]
+    async fn multi_tenant_read_mode_begin_does_not_take_writer_lock() {
+        use std::time::Duration;
+
+        let (store, _) = namidb_storage::parse_uri("memory://mt-bolt-read-tx").unwrap();
+        let metrics = crate::metrics::Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(crate::registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            Default::default(),
+        ));
+        let shared = crate::shared::SharedAppState::new(
+            registry.clone(),
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::from_millis(50),
+            "acme".to_string(),
+        );
+        let backend = MultiTenantBackend::new(
+            shared,
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+
+        let ns = registry.get_or_open("acme").await.unwrap();
+        let _held = ns.writer.clone().lock_owned().await;
+        backend
+            .begin_tx_on_mode(Some("acme"), true)
+            .await
+            .expect("a read transaction must not wait for the writer");
+        backend
+            .run_in_tx("MATCH (t:T) RETURN count(t) AS c", Params::new())
+            .await
+            .unwrap();
+        backend.commit_tx().await.unwrap();
+    }
+
     #[tokio::test]
     async fn read_mode_tx_rejects_write() {
         let (store, paths) = namidb_storage::parse_uri("memory://bolt-read-tx-write").unwrap();

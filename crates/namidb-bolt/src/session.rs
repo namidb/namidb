@@ -2663,6 +2663,97 @@ mod tests {
         assert!(!read_only_from_extra(&BTreeMap::new()));
     }
 
+    /// BEGIN {mode: "r", db} must reach the backend as a read-only begin on
+    /// that database, not the plain `begin_tx_on` that takes the writer.
+    #[tokio::test]
+    async fn begin_passes_read_access_mode_to_the_backend() {
+        struct ModeBackend {
+            begun: std::sync::Mutex<Option<(Option<String>, bool)>>,
+        }
+
+        #[async_trait]
+        impl Backend for ModeBackend {
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                panic!("no RUN in this test")
+            }
+
+            async fn begin_tx_on_mode(
+                &self,
+                db: Option<&str>,
+                read_only: bool,
+            ) -> std::result::Result<(), BackendError> {
+                *self.begun.lock().unwrap() = Some((db.map(str::to_string), read_only));
+                Ok(())
+            }
+        }
+
+        let backend = Arc::new(ModeBackend {
+            begun: std::sync::Mutex::new(None),
+        });
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-begin-mode".into(),
+            },
+            AuthPolicy::Open,
+            backend.clone(),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map(BTreeMap::from([(
+                    "scheme".into(),
+                    Value::String("none".into()),
+                )]))],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::BEGIN,
+                fields: vec![Value::Map(BTreeMap::from([
+                    ("mode".into(), Value::String("r".into())),
+                    ("db".into(), Value::String("acme".into())),
+                ]))],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+        assert_eq!(
+            *backend.begun.lock().unwrap(),
+            Some((Some("acme".to_string()), true))
+        );
+
+        drop(client);
+        let _ = task.await.expect("session task panicked");
+    }
+
     #[tokio::test]
     async fn decode_admission_rejection_in_tx_rolls_back_before_failed() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
