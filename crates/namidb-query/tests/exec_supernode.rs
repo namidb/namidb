@@ -64,6 +64,22 @@ async fn count_value(writer: &WriterSession, query: &str) -> i64 {
     }
 }
 
+/// The single column of every row, sorted.
+async fn sorted_column(writer: &WriterSession, query: &str) -> Vec<String> {
+    let snapshot = writer.snapshot();
+    let plan = lower(&parse(query).unwrap()).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let mut out: Vec<String> = rows
+        .iter()
+        .map(|row| match row.bindings.values().next() {
+            Some(RuntimeValue::String(s)) => s.clone(),
+            other => panic!("expected a string column, got {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn traversals_cross_a_flushed_supernode_exactly() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -281,6 +297,23 @@ async fn mixed_label_neighbours_resolve_without_per_edge_reads() {
     )
     .await;
     assert_eq!(all, (FANIN * 2) as i64);
+
+    // `RETURN id(t)` reads only the identity, so it takes the same id-only
+    // route as `count(t)`; `WITH t` keeps the node hydrated.
+    let stub_ids = sorted_column(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Green) RETURN id(t) AS i",
+    )
+    .await;
+    assert_eq!(stub_ids.len(), FANIN);
+    assert_eq!(
+        stub_ids,
+        sorted_column(
+            &writer,
+            "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Green) WITH t RETURN id(t) AS i",
+        )
+        .await
+    );
 }
 
 /// An UNLABELLED expansion target must be proven to exist, and deleting a

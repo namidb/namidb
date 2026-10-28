@@ -6747,13 +6747,16 @@ fn should_skip_target_materialize(
 /// Over-collecting into `full` is the safe direction — it costs a hydration,
 /// where under-collecting returns nulls for real values.
 ///
-/// The three admitted forms, and why each reads only the id:
+/// The admitted forms, and why each reads only the id:
 /// * `count(x)` — counts non-null occurrences; a stub is non-null exactly
 ///   where the node is.
 /// * `count(DISTINCT x)` — dedups on `fingerprint_value`, whose node arm is
 ///   `N{id};` (walker.rs, `fingerprint_into`): id alone, no properties, no
 ///   labels.
 /// * `count(id(x))` — `id()` reads the id, which the stub carries correctly.
+/// * a projected `id(x)` / `elementId(x)` item (`RETURN id(x)`), for the same
+///   reason. A bare `RETURN x` returns the whole node and stays a full
+///   reference.
 fn collect_identity_only_aliases(
     plan: &LogicalPlan,
     all_refs: &BTreeSet<String>,
@@ -6778,42 +6781,60 @@ fn identity_only_count_arg(expr: &Expression) -> Option<String> {
     use crate::parser::ExpressionKind;
     match &expr.kind {
         ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
-        // `id(<variable>)` and nothing else — any other function, or any
-        // argument that is not a bare variable, is a full-value reference.
-        ExpressionKind::FunctionCall {
-            name,
-            args,
-            distinct,
-        } => {
-            // Unqualified `id(...)` only: a namespaced call is a different
-            // function and must not inherit the fast path.
-            let is_id = name.segments.len() == 1
-                && name.segments[0].name.eq_ignore_ascii_case("id")
-                && args.len() == 1
-                && !*distinct;
-            if !is_id {
-                return None;
-            }
-            match &args[0].kind {
-                ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
-                _ => None,
-            }
-        }
+        _ => identity_call_arg(expr),
+    }
+}
+
+/// The alias `id(<variable>)` / `elementId(<variable>)` reads, and nothing
+/// else: any other function, or any argument that is not a bare variable, is
+/// a full-value reference.
+fn identity_call_arg(expr: &Expression) -> Option<String> {
+    use crate::parser::ExpressionKind;
+    let ExpressionKind::FunctionCall {
+        name,
+        args,
+        distinct,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    // Unqualified calls only: a namespaced call is a different function and
+    // must not inherit the fast path.
+    let is_id = name.segments.len() == 1
+        && (name.segments[0].name.eq_ignore_ascii_case("id")
+            || name.segments[0].name.eq_ignore_ascii_case("elementid"))
+        && args.len() == 1
+        && !*distinct;
+    if !is_id {
+        return None;
+    }
+    match &args[0].kind {
+        ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
         _ => None,
     }
 }
 
-/// The aliases read by identity-only aggregate arguments.
+/// The aliases read by identity-only aggregate arguments and projections.
 fn collect_identity_count_args(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     use crate::plan::logical::AggregateExpr;
-    if let LogicalPlan::Aggregate { aggregations, .. } = plan {
-        for (_alias, agg) in aggregations {
-            if let AggregateExpr::Count { arg: Some(e), .. } = agg {
-                if let Some(alias) = identity_only_count_arg(e) {
-                    out.insert(alias);
+    match plan {
+        LogicalPlan::Aggregate { aggregations, .. } => {
+            for (_alias, agg) in aggregations {
+                if let AggregateExpr::Count { arg: Some(e), .. } = agg {
+                    if let Some(alias) = identity_only_count_arg(e) {
+                        out.insert(alias);
+                    }
                 }
             }
         }
+        LogicalPlan::Project { items, .. } => {
+            out.extend(
+                items
+                    .iter()
+                    .filter_map(|item| identity_call_arg(&item.expression)),
+            );
+        }
+        _ => {}
     }
     for child in plan.children() {
         collect_identity_count_args(child, out);
@@ -10204,6 +10225,11 @@ fn collect_plan_references(
         }
         LogicalPlan::Project { items, .. } => {
             for it in items {
+                // A projected `id(x)` reads only the identity, like the
+                // identity-only counts below.
+                if skip_identity_counts && identity_call_arg(&it.expression).is_some() {
+                    continue;
+                }
                 collect_referenced_variables(&it.expression, out);
             }
         }
@@ -10774,6 +10800,29 @@ mod identity_only_tests {
                 false,
             ),
             ("MATCH (a:P)-[:E]->(b:Q) RETURN b.n AS n", "b", false),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i", "b", true),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN elementId(b) AS i",
+                "b",
+                true,
+            ),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i, b.n AS n",
+                "b",
+                false,
+            ),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN b", "b", false),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN id(b) + '' AS i", "b", false),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) WITH b RETURN id(b) AS i",
+                "b",
+                false,
+            ),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i ORDER BY b.n",
+                "b",
+                false,
+            ),
         ] {
             let r = routing_for(q);
             assert_eq!(

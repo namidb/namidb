@@ -375,6 +375,36 @@ async fn meaning_preserving_rewrites_agree() {
     )
     .await;
 
+    // `RETURN id(b)` reads only the identity too. `WITH b` passes the whole
+    // node on, which keeps it hydrated, so it is the reference spelling.
+    assert_equivalent(
+        &w,
+        "projected id() agrees with the hydrated spelling",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i",
+            "MATCH (a:P)-[:E]->(b:Q) WITH b RETURN id(b) AS i",
+        ],
+    )
+    .await;
+    assert_equivalent(
+        &w,
+        "projected elementId() still proves the target label",
+        &[
+            "MATCH (a:P)-[:E]->(b:S) RETURN elementId(b) AS i",
+            "MATCH (a:P)-[:E]->(b:S) WITH b RETURN elementId(b) AS i",
+        ],
+    )
+    .await;
+    assert_equivalent(
+        &w,
+        "projected id() beside a property stays hydrated",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i, b.n AS n",
+            "MATCH (a:P)-[:E]->(b:Q) WITH b RETURN id(b) AS i, b.n AS n",
+        ],
+    )
+    .await;
+
     // THE DANGEROUS CASE. `b` is counted AND read for a property in the same
     // statement, so it must NOT be classified identity-only. If it were, the
     // stub's empty properties would make `max(b.n)` null while the count
