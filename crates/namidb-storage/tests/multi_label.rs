@@ -13,6 +13,9 @@ use object_store::ObjectStore;
 use uuid::Uuid;
 
 use namidb_core::{NamespaceId, NodeId, Schema, Value};
+use namidb_storage::manifest::ManifestStore;
+use namidb_storage::memtable::Memtable;
+use namidb_storage::read::Snapshot;
 use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 
 fn store() -> Arc<dyn ObjectStore> {
@@ -146,9 +149,8 @@ async fn relabel_via_reupsert_is_last_write_wins() {
 /// LIMIT prefix, count) must follow the newest version of each id.
 #[tokio::test]
 async fn relabel_across_overlapping_ssts_is_last_write_wins() {
-    let mut s = WriterSession::open(store(), paths("ml-relabel-overlap"))
-        .await
-        .unwrap();
+    let (st, ns) = (store(), paths("ml-relabel-overlap"));
+    let mut s = WriterSession::open(st.clone(), ns.clone()).await.unwrap();
     for i in 1..=6 {
         s.upsert_node_with_labels(labels(&["A"]), nid(i), &rec("old"))
             .unwrap();
@@ -183,6 +185,18 @@ async fn relabel_across_overlapping_ssts_is_last_write_wins() {
     assert_eq!(prefix, vec![nid(3), nid(4)]);
     assert_eq!(snap.count_nodes(Some("A")).await.unwrap(), 5);
     assert_eq!(snap.count_nodes(Some("B")).await.unwrap(), 2);
+
+    // The writer's snapshot answers counts from its count cache. A plain
+    // reader has none, so its count runs the label scan over the overlap.
+    let loaded = ManifestStore::new(st.clone(), ns.clone())
+        .load_current()
+        .await
+        .unwrap();
+    let memtable = Memtable::new();
+    let view = memtable.snapshot_view();
+    let reader = Snapshot::new(loaded, &view, st, ns);
+    assert_eq!(reader.count_nodes(Some("A")).await.unwrap(), 5);
+    assert_eq!(reader.count_nodes(Some("B")).await.unwrap(), 2);
 }
 
 /// Reopen a fresh `WriterSession` on the same store after flush: the label set
