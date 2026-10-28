@@ -5333,18 +5333,9 @@ async fn snapshot_to_algo_graph(
                 g.add_node(id);
             }
         }
-        // Requested labels are validated against the observed set so a typo
-        // errors instead of silently projecting an empty graph (GDS parity).
+        // A label with no nodes yet projects nothing rather than failing the
+        // call: a pipeline can name labels before the data lands.
         Some(ls) => {
-            let known = snapshot.observed_labels();
-            for l in ls {
-                if !known.iter().any(|k| k == l) {
-                    return Err(proc_unsupported(format!(
-                        "unknown label `{l}` in algo projection (known: {})",
-                        known.join(", ")
-                    )));
-                }
-            }
             for label in ls {
                 // Only the node ids are needed: an EMPTY property projection
                 // skips decoding every declared property column and the
@@ -5364,19 +5355,9 @@ async fn snapshot_to_algo_graph(
         .labels
         .as_ref()
         .map(|_| g.nodes().iter().copied().collect());
+    // Same for edge types: one with no edges scans empty and adds nothing.
     let edge_types = match &projection.edge_types {
-        Some(ts) => {
-            let known = snapshot.observed_edge_types();
-            for t in ts {
-                if !known.iter().any(|k| k == t) {
-                    return Err(proc_unsupported(format!(
-                        "unknown edge type `{t}` in algo projection (known: {})",
-                        known.join(", ")
-                    )));
-                }
-            }
-            ts.clone()
-        }
+        Some(ts) => ts.clone(),
         None => snapshot.observed_edge_types(),
     };
     for et in &edge_types {

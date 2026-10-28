@@ -15,6 +15,14 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`CALL algo.*` failed when a projected label or edge type had no data
+  yet.** An edge type that was never declared and had no edges, or a label
+  with no nodes, made the whole call error with `unknown edge type` /
+  `unknown label`, so a pipeline could not name a type before ingest reached
+  it. Such a label or type now just contributes no nodes or edges.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

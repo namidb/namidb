@@ -1158,7 +1158,7 @@ async fn call_degree_projection_direction_reverse_and_undirected() {
 }
 
 #[tokio::test]
-async fn call_projection_unknown_label_errors() {
+async fn call_projection_bad_shape_errors() {
     let mut writer = WriterSession::open(store(), paths("call-proj-unknown"))
         .await
         .unwrap();
@@ -1166,8 +1166,6 @@ async fn call_projection_unknown_label_errors() {
     let snapshot = writer.snapshot();
 
     for bad in [
-        "CALL algo.wcc({labels: ['Nope']}) YIELD node_id, component",
-        "CALL algo.wcc({edge_types: ['NOPE']}) YIELD node_id, component",
         "CALL algo.wcc({direction: 'sideways'}) YIELD node_id, component",
         "CALL algo.wcc({labels: []}) YIELD node_id, component",
     ] {
@@ -1177,6 +1175,45 @@ async fn call_projection_unknown_label_errors() {
         let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
         assert!(err.is_unsupported(), "{bad} should error, got {err}");
     }
+}
+
+/// Labels and edge types with no data yet (never written, never declared)
+/// project nothing instead of failing the call, so a pipeline can name them
+/// before ingest reaches them.
+#[tokio::test]
+async fn call_projection_skips_labels_and_edge_types_without_data() {
+    let mut writer = WriterSession::open(store(), paths("call-proj-missing"))
+        .await
+        .unwrap();
+    let (people, _posts) = build_two_domains(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let rows = run(
+        &snapshot,
+        "CALL algo.pagerank({labels: ['Person', 'NotYet'], edge_types: ['KNOWS', 'NOT_YET']}) \
+         YIELD node_id, score",
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "only people are ranked");
+    assert_eq!(node_of(&rows[0]), *people[2].as_bytes());
+
+    // The projection-only path (wcc) behaves the same.
+    let rows = run(
+        &snapshot,
+        "CALL algo.wcc({labels: ['Person'], edge_types: ['NOT_YET']}) YIELD node_id, component",
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "people stay, as isolates");
+    let comps: std::collections::BTreeSet<i64> =
+        rows.iter().map(|r| int_col(r, "component")).collect();
+    assert_eq!(comps.len(), 3, "no edges were projected");
+
+    let rows = run(
+        &snapshot,
+        "CALL algo.wcc({labels: ['Nope']}) YIELD node_id, component",
+    )
+    .await;
+    assert!(rows.is_empty());
 }
 
 #[tokio::test]
