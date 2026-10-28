@@ -875,7 +875,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(pins(&store, &paths).await, 1, "the cut-short load leaked a lease");
+        assert_eq!(
+            pins(&store, &paths).await,
+            1,
+            "the cut-short load leaked a lease"
+        );
 
         assert!(reader.refresh().await.unwrap());
         assert_eq!(pins(&store, &paths).await, 1);

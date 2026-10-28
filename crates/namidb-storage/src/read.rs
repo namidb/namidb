@@ -4211,7 +4211,8 @@ impl<'mt> Snapshot<'mt> {
             return Ok(None);
         }
         order.sort_by_key(|idx| Reverse(ssts[*idx].max_lsn));
-        let holds = |idx: usize, id: &[u8; 16]| ssts[idx].min_key <= *id && *id <= ssts[idx].max_key;
+        let holds =
+            |idx: usize, id: &[u8; 16]| ssts[idx].min_key <= *id && *id <= ssts[idx].max_key;
         for (rank, &newer) in order.iter().enumerate() {
             for &older in &order[rank + 1..] {
                 let shares_keys = ssts[newer].min_key <= ssts[older].max_key
@@ -16691,7 +16692,9 @@ mod tests {
         let snap = Snapshot::new(committed.clone(), &live_view, store.clone(), paths.clone())
             .with_cache(cache.clone());
         assert_eq!(
-            snap.try_batch_nodes_have_labels(&device, &ids).await.unwrap(),
+            snap.try_batch_nodes_have_labels(&device, &ids)
+                .await
+                .unwrap(),
             Some(expected)
         );
         assert_eq!(cache.label_membership_fast_paths(), 1);
