@@ -108,6 +108,59 @@ crates.io release will establish and document that API explicitly.
   A variable-length or `shortestPath` path was left unbound, so `RETURN p`
   failed with "binding `p` not bound", and a fixed-length path came back as
   a path holding NULL elements. Both are now NULL.
+- **`WHERE id(n) IN $ids` scanned the whole label.** Only `id(n) = $x` was
+  turned into a point lookup, and only when it was the entire `WHERE`. An
+  `IN` list, an id equality next to another condition, and the
+  `UNWIND $ids AS x MATCH (n) WHERE id(n) = x` workaround all fell back to
+  a full scan plus filter. They now seek each id, and the ids of one lookup
+  are resolved in a single batched read instead of one cold read per id.
+
+  An id seek now behaves exactly like the filter it replaces: a null, a
+  non-string or a malformed id matches no node instead of failing the
+  query, and only the lowercase id string that `id()` returns matches. An
+  upper-case or braced UUID, or a node passed where its id was meant
+  (`WHERE id(b) = m`), used to find the node through `id(n) = $x` while the
+  same value found nothing in any other spelling of the query. One
+  difference remains: `id(n) IN $ids` with a value that is not a list
+  fails with an UNWIND error, as Neo4j also rejects it, where the scan
+  returned no rows.
+
+  `MATCH (n:L {_id: $x})` still accepts any UUID spelling and a node, like
+  `CREATE (n:L {_id: $x})` does, but a null or malformed `_id` now matches
+  nothing instead of failing the query.
+
+- **`RETURN id(t)` decoded every expanded neighbour.** A target used only
+  through `count(t)` or `count(id(t))` already skipped loading its row, but
+  projecting `id(t)` or `elementId(t)` counted as reading the whole node, so
+  listing the ids around a hub decoded the properties of every neighbour.
+  It now takes the same id-only route.
+
+- **A pattern pinned by `id()` on its last node started from the first.**
+  `MATCH (i:Identifier)-[:R]->(d:Device) WHERE id(d) = $id` scanned every
+  `Identifier` and expanded forward, while the reversed spelling answered
+  at once. The planner already re-anchored a pattern at a target pinned by
+  an indexed property; it now does the same for `id(d) = ...` and
+  `id(d) IN ...`, with or without a label on the target, unless a literal
+  id list is longer than the label it would replace scanning. Still single
+  hop only: a longer chain pinned at its far end keeps its written order.
+
+- **A labelled hop decoded every neighbour to check its label.** When the
+  query read a property of the target (`-[:R]->(t:Device) RETURN t.name`),
+  each distinct neighbour was loaded first and the label was tested after,
+  so a hub with 1.7M neighbours decoded 1.7M rows even if a handful were
+  devices. A single hop now proves the label from the label index and
+  loads only the nodes that carry it, and skips the others without a read
+  even when the hop is too wide to keep its neighbours in memory.
+  Variable-length hops still visit every neighbour, since the label only
+  decides which ones are results.
+
+- **`id(n)`, `labels(n)` and `count(n)` decoded every property of `n`.** The
+  planner treated any use of a node variable inside a function or an
+  aggregate as a read of the whole node, so `WITH labels(n) AS l, count(*)
+  AS c, collect(id(n))[0..1] AS s` parsed the overflow JSON (embeddings
+  included) of every row it scanned. These calls now read only the id and
+  label columns. `keys(n)`, `properties(n)` and a bare `n` still load
+  everything.
 
 ## [2.6.19] - 2026-09-16
 

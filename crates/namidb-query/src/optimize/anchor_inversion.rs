@@ -23,6 +23,8 @@
 //! - `optional: false` only — OPTIONAL nullifies the *target* side; swapping
 //!   endpoints would nullify the wrong side.
 //! - `back_reference: false`, `shortest: None`, no `path_binding`.
+//! - An id equality or `IN` on the target (`WHERE id(c) = $id`) anchors
+//!   through `NodeById` instead, always: each id is at most one row.
 //! - The source must be a bare `NodeScan` (no pushed predicates, no
 //!   projection): if the source is filtered too, choosing sides needs real
 //!   cost comparison, which stays with the join-reorder work.
@@ -34,7 +36,7 @@ use crate::cost::StatsCatalog;
 use crate::parser::RelationshipDirection;
 use crate::plan::LogicalPlan;
 
-use super::unique_lookup::extract_indexed_conjunct;
+use super::unique_lookup::{extract_indexed_conjunct, extract_node_id_conjunct, id_seek};
 
 pub fn apply_anchor_inversion(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     rewrite(plan, catalog)
@@ -355,48 +357,38 @@ fn try_invert(
     // The equality must pin the expand TARGET under its declared label. A
     // multi-label (conjunctive) target keeps the scan-side plan: the lookup
     // could only prove one of the labels.
-    let [target_label] = target_labels.as_slice() else {
-        return None;
-    };
-    let indexed = extract_indexed_conjunct(
-        predicate,
-        target_alias,
-        Some(target_label.as_str()),
-        catalog,
-        None,
-    )?;
-    if indexed.label != *target_label {
+    if target_labels.len() > 1 {
         return None;
     }
-    if indexed.multi {
-        // A posting-list anchor fans out; only take it when the target label
-        // is provably no larger than the label(s) we would otherwise scan —
-        // a disjunction source counts as the SUM of its disjunct labels.
-        let target_count = catalog.label(target_label).map(|stats| stats.node_count);
-        let source_count = match &source_disjunction {
-            Some((_, labels)) => labels.iter().try_fold(0u64, |total, label| {
-                catalog
-                    .label(label)
-                    .map(|stats| total.saturating_add(stats.node_count))
-            }),
-            None => source_label
-                .as_deref()
-                .and_then(|label| catalog.label(label))
-                .map(|stats| stats.node_count),
-        };
-        match (target_count, source_count) {
-            (Some(target), Some(source)) if target <= source => {}
-            _ => return None,
+    let source_labels = source_disjunction
+        .as_ref()
+        .map(|(_, labels)| labels.as_slice());
+    let source_count = source_node_count(source_label.as_deref(), source_labels, catalog);
+    // An id seek is at most one row per id and proves the target exists, so
+    // it anchors, labelled or not, unless a literal id list is longer than
+    // the source scan it would replace.
+    let id_anchor = extract_node_id_conjunct(predicate, target_alias, None).filter(|seek| {
+        match (&seek.value.kind, source_count) {
+            (crate::parser::ast::ExpressionKind::List(ids), Some(count)) if seek.many => {
+                ids.len() as u64 <= count
+            }
+            _ => true,
         }
-    }
-
-    let anchor = LogicalPlan::NodeByPropertyValue {
-        input: Box::new(LogicalPlan::Empty),
-        label: indexed.label,
-        alias: target_alias.clone(),
-        property: indexed.property,
-        value: indexed.value,
-        multi: indexed.multi,
+    });
+    let (anchor, residual) = match id_anchor {
+        Some(seek) => id_seek(
+            target_labels.first().cloned(),
+            target_alias,
+            seek,
+            LogicalPlan::Empty,
+        ),
+        None => property_anchor(
+            predicate,
+            target_alias,
+            target_labels.first()?,
+            source_count,
+            catalog,
+        )?,
     };
     let inverted = LogicalPlan::Expand {
         input: Box::new(anchor),
@@ -425,13 +417,72 @@ fn try_invert(
         },
         None => inverted,
     };
-    if let Some(residual) = indexed.residual {
+    if let Some(residual) = residual {
         result = LogicalPlan::Filter {
             input: Box::new(result),
             predicate: residual,
         };
     }
     Some(result)
+}
+
+/// Rows the source scan would produce, when the catalog knows: a
+/// disjunction source counts as the SUM of its disjunct labels.
+fn source_node_count(
+    source_label: Option<&str>,
+    source_disjunction: Option<&[String]>,
+    catalog: &StatsCatalog,
+) -> Option<u64> {
+    match source_disjunction {
+        Some(labels) => labels.iter().try_fold(0u64, |total, label| {
+            catalog
+                .label(label)
+                .map(|stats| total.saturating_add(stats.node_count))
+        }),
+        None => source_label
+            .and_then(|label| catalog.label(label))
+            .map(|stats| stats.node_count),
+    }
+}
+
+/// The `NodeByPropertyValue` anchor (plus residual) for an index-answerable
+/// equality on the target, when it is worth taking over the source scan.
+fn property_anchor(
+    predicate: &crate::parser::Expression,
+    target_alias: &str,
+    target_label: &String,
+    source_count: Option<u64>,
+    catalog: &StatsCatalog,
+) -> Option<(LogicalPlan, Option<crate::parser::Expression>)> {
+    let indexed = extract_indexed_conjunct(
+        predicate,
+        target_alias,
+        Some(target_label.as_str()),
+        catalog,
+        None,
+    )?;
+    if indexed.label != *target_label {
+        return None;
+    }
+    if indexed.multi {
+        // A posting-list anchor fans out; only take it when the target label
+        // is provably no larger than the label(s) we would otherwise scan.
+        let target_count = catalog.label(target_label).map(|stats| stats.node_count);
+        match (target_count, source_count) {
+            (Some(target), Some(source)) if target <= source => {}
+            _ => return None,
+        }
+    }
+
+    let anchor = LogicalPlan::NodeByPropertyValue {
+        input: Box::new(LogicalPlan::Empty),
+        label: indexed.label,
+        alias: target_alias.to_owned(),
+        property: indexed.property,
+        value: indexed.value,
+        multi: indexed.multi,
+    };
+    Some((anchor, indexed.residual))
 }
 
 #[cfg(test)]
@@ -487,7 +538,15 @@ mod tests {
             ..
         } = plan
         {
-            if matches!(input.as_ref(), LogicalPlan::NodeByPropertyValue { .. }) {
+            // An id seek keeps its exact `id(c) = key` check on top.
+            let anchor = match input.as_ref() {
+                LogicalPlan::Filter { input, .. } => input.as_ref(),
+                other => other,
+            };
+            if matches!(
+                anchor,
+                LogicalPlan::NodeByPropertyValue { .. } | LogicalPlan::NodeById { .. }
+            ) {
                 return Some((
                     source.clone(),
                     *direction,
@@ -534,6 +593,54 @@ mod tests {
             has_filter(&plan),
             "w.since must survive as a residual filter"
         );
+    }
+
+    #[test]
+    fn id_equality_or_in_on_target_inverts_the_anchor() {
+        for q in [
+            "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(c) = $cid RETURN id(p)",
+            "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE elementId(c) IN $cids RETURN p",
+            "MATCH (p:Person)-[w:WORKS_AT]->(c) WHERE id(c) = $cid AND w.since = 0 RETURN p",
+        ] {
+            // No statistics at all: an id seek needs none to win.
+            let plan = rewrite_query(q, &StatsCatalog::empty());
+            let (source, direction, target_alias, target_labels) =
+                find_inverted(&plan).unwrap_or_else(|| panic!("`{q}` must invert: {plan:?}"));
+            assert_eq!(source, "c");
+            assert_eq!(direction, RelationshipDirection::Left);
+            assert_eq!(target_alias, "p");
+            assert_eq!(target_labels, vec!["Person".to_string()]);
+            assert!(!plan_has_node_scan(&plan), "`{q}`: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn id_on_the_source_or_a_multi_label_target_does_not_invert() {
+        for q in [
+            "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(p) = $pid RETURN c",
+            "MATCH (p:Person)-[w:WORKS_AT]->(c:Company:Listed) WHERE id(c) = $cid RETURN p",
+        ] {
+            let plan = rewrite_query(q, &StatsCatalog::empty());
+            assert!(find_inverted(&plan).is_none(), "`{q}`: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn a_literal_id_list_longer_than_the_source_does_not_invert() {
+        // 3 Person rows: a 4-id list costs more seeks and reverse hops than
+        // scanning them; a 3-id list (or a parameter) still anchors.
+        let cat = catalog(true, false, 10, 3);
+        let ids = |n: usize| {
+            let ids: Vec<String> = (0..n).map(|i| format!("'{i}'")).collect();
+            format!(
+                "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(c) IN [{}] RETURN p",
+                ids.join(", ")
+            )
+        };
+        assert!(find_inverted(&rewrite_query(&ids(4), &cat)).is_none());
+        assert!(find_inverted(&rewrite_query(&ids(3), &cat)).is_some());
+        let q = "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(c) IN $cids RETURN p";
+        assert!(find_inverted(&rewrite_query(q, &cat)).is_some());
     }
 
     #[test]

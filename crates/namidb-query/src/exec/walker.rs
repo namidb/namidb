@@ -412,21 +412,24 @@ pub(crate) fn execute_inner_with_routing<'a>(
             } => {
                 let input_rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                let mut out = Vec::with_capacity(input_rows.len());
+                let mut keyed = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
-                    let id_value = evaluate(id, &row, params)?;
-                    let node_id = node_id_from_value(&id_value, id.span)?;
-                    let found = match label {
-                        Some(l) => snapshot.lookup_node(l, node_id).await?,
-                        None => scan_node_for_id(snapshot, node_id).await?,
-                    };
-                    if let Some(view) = found {
-                        let mut new_row = row;
-                        new_row.set(
+                    if let Some(node_id) = seek_node_id(&evaluate(id, &row, params)?) {
+                        keyed.push((row, node_id));
+                    }
+                }
+                let ids: Vec<NodeId> = keyed.iter().map(|(_, node_id)| *node_id).collect();
+                let found = snapshot
+                    .batch_lookup_nodes(label.as_deref().unwrap_or(""), &ids)
+                    .await?;
+                let mut out = Vec::with_capacity(keyed.len());
+                for ((mut row, _), view) in keyed.into_iter().zip(found) {
+                    if let Some(view) = view {
+                        row.set(
                             alias.clone(),
                             RuntimeValue::Node(Box::new(NodeValue::from(view))),
                         );
-                        out.push(new_row);
+                        out.push(row);
                     }
                 }
                 Ok(out)
@@ -2047,7 +2050,9 @@ pub(crate) async fn execute_expand(
                             // it describes nodes of ANY label — which is what lets
                             // a multi-hop traversal use it too.
                             match views.get(&target_id) {
-                                Some(v) => {
+                                // Proven not to carry the label (single hop).
+                                Some(None) => continue,
+                                Some(Some(v)) => {
                                     if target_labels.iter().all(|l| v.labels.contains(l)) {
                                         Some(v.clone())
                                     } else if max > 1 {
@@ -2080,6 +2085,10 @@ pub(crate) async fn execute_expand(
                                     None => continue,
                                 },
                             }
+                        } else if matches!(&target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
+                        {
+                            // Proven not to carry the label (single hop, over budget).
+                            continue;
                         } else if let Some(label) = target_labels.first() {
                             if max > 1 {
                                 // Multi-hop: traverse through any existing node; the
@@ -6853,10 +6862,13 @@ pub(crate) enum ExpandTargets {
     /// entries before the per-edge loop reached them (sixth field report:
     /// instant at degree 3.8k, fatal at 53k — a step function at a capacity
     /// boundary, arriving EARLIER when the CSR cache is enabled because
-    /// that shrinks the node cache's share of the budget).
-    Views(HashMap<NodeId, namidb_storage::NodeView>),
-    /// Nothing prepared: each edge resolves its own endpoint.
-    Cold,
+    /// that shrinks the node cache's share of the budget). `None` marks an
+    /// endpoint a single hop proved lacks the target label, so its edge is
+    /// skipped without reading the node.
+    Views(HashMap<NodeId, Option<namidb_storage::NodeView>>),
+    /// Nothing prepared: each edge resolves its own endpoint, except the
+    /// endpoints a single hop already proved lack the target label.
+    Cold(std::collections::HashSet<NodeId>),
 }
 
 /// Upper bound on endpoint views held for one hop. Beyond it the batch is
@@ -6882,7 +6894,7 @@ async fn prepare_expand_targets(
         return Ok(if skip_target_materialize {
             ExpandTargets::Membership(HashMap::new())
         } else {
-            ExpandTargets::Cold
+            ExpandTargets::Cold(Default::default())
         });
     }
     if skip_target_materialize {
@@ -6969,20 +6981,48 @@ async fn prepare_expand_targets(
     // returns every endpoint, a miss means genuinely absent, and the fallback
     // becomes the rare path it was written to be.
     let label = "";
-    let _ = multi_hop;
-    if !views_usable || unique_targets.len() > expand_target_view_budget() {
-        let _ = snapshot.batch_lookup_nodes(label, unique_targets).await?;
-        return Ok(ExpandTargets::Cold);
+    // A single hop's target label decides the edge, so prove it on the
+    // compact label sidecar first and hydrate only the members: a hub whose
+    // neighbours mostly carry other labels no longer decodes every one of
+    // them. Multi-hop traverses THROUGH non-members and needs them all.
+    let mut views = HashMap::new();
+    let members: Vec<NodeId>;
+    let mut candidates = unique_targets;
+    if !multi_hop && !target_labels.is_empty() {
+        if let Some(matches) = snapshot
+            .try_batch_nodes_have_labels(target_labels, unique_targets)
+            .await?
+        {
+            if matches.len() != unique_targets.len() {
+                return Err(ExecError::Runtime(
+                    "batched endpoint membership returned a misaligned result".into(),
+                ));
+            }
+            let mut kept = Vec::new();
+            for (id, is_member) in unique_targets.iter().copied().zip(matches) {
+                if is_member {
+                    kept.push(id);
+                } else {
+                    views.insert(id, None);
+                }
+            }
+            members = kept;
+            candidates = &members;
+        }
     }
-    let views = snapshot.batch_lookup_nodes(label, unique_targets).await?;
-    Ok(ExpandTargets::Views(
-        unique_targets
+    if !views_usable || candidates.len() > expand_target_view_budget() {
+        let _ = snapshot.batch_lookup_nodes(label, candidates).await?;
+        return Ok(ExpandTargets::Cold(views.into_keys().collect()));
+    }
+    let fetched = snapshot.batch_lookup_nodes(label, candidates).await?;
+    views.extend(
+        candidates
             .iter()
             .copied()
-            .zip(views)
-            .filter_map(|(id, view)| view.map(|view| (id, view)))
-            .collect(),
-    ))
+            .zip(fetched)
+            .filter_map(|(id, view)| view.map(|view| (id, Some(view)))),
+    );
+    Ok(ExpandTargets::Views(views))
 }
 
 /// Decide whether an Expand target may be represented by an id-only stub.
@@ -7025,13 +7065,16 @@ fn should_skip_target_materialize(
 /// Over-collecting into `full` is the safe direction — it costs a hydration,
 /// where under-collecting returns nulls for real values.
 ///
-/// The three admitted forms, and why each reads only the id:
+/// The admitted forms, and why each reads only the id:
 /// * `count(x)` — counts non-null occurrences; a stub is non-null exactly
 ///   where the node is.
 /// * `count(DISTINCT x)` — dedups on `fingerprint_value`, whose node arm is
 ///   `N{id};` (walker.rs, `fingerprint_into`): id alone, no properties, no
 ///   labels.
 /// * `count(id(x))` — `id()` reads the id, which the stub carries correctly.
+/// * a projected `id(x)` / `elementId(x)` item (`RETURN id(x)`), for the same
+///   reason. A bare `RETURN x` returns the whole node and stays a full
+///   reference.
 fn collect_identity_only_aliases(
     plan: &LogicalPlan,
     all_refs: &BTreeSet<String>,
@@ -7056,42 +7099,60 @@ fn identity_only_count_arg(expr: &Expression) -> Option<String> {
     use crate::parser::ExpressionKind;
     match &expr.kind {
         ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
-        // `id(<variable>)` and nothing else — any other function, or any
-        // argument that is not a bare variable, is a full-value reference.
-        ExpressionKind::FunctionCall {
-            name,
-            args,
-            distinct,
-        } => {
-            // Unqualified `id(...)` only: a namespaced call is a different
-            // function and must not inherit the fast path.
-            let is_id = name.segments.len() == 1
-                && name.segments[0].name.eq_ignore_ascii_case("id")
-                && args.len() == 1
-                && !*distinct;
-            if !is_id {
-                return None;
-            }
-            match &args[0].kind {
-                ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
-                _ => None,
-            }
-        }
+        _ => identity_call_arg(expr),
+    }
+}
+
+/// The alias `id(<variable>)` / `elementId(<variable>)` reads, and nothing
+/// else: any other function, or any argument that is not a bare variable, is
+/// a full-value reference.
+fn identity_call_arg(expr: &Expression) -> Option<String> {
+    use crate::parser::ExpressionKind;
+    let ExpressionKind::FunctionCall {
+        name,
+        args,
+        distinct,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    // Unqualified calls only: a namespaced call is a different function and
+    // must not inherit the fast path.
+    let is_id = name.segments.len() == 1
+        && (name.segments[0].name.eq_ignore_ascii_case("id")
+            || name.segments[0].name.eq_ignore_ascii_case("elementid"))
+        && args.len() == 1
+        && !*distinct;
+    if !is_id {
+        return None;
+    }
+    match &args[0].kind {
+        ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
         _ => None,
     }
 }
 
-/// The aliases read by identity-only aggregate arguments.
+/// The aliases read by identity-only aggregate arguments and projections.
 fn collect_identity_count_args(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     use crate::plan::logical::AggregateExpr;
-    if let LogicalPlan::Aggregate { aggregations, .. } = plan {
-        for (_alias, agg) in aggregations {
-            if let AggregateExpr::Count { arg: Some(e), .. } = agg {
-                if let Some(alias) = identity_only_count_arg(e) {
-                    out.insert(alias);
+    match plan {
+        LogicalPlan::Aggregate { aggregations, .. } => {
+            for (_alias, agg) in aggregations {
+                if let AggregateExpr::Count { arg: Some(e), .. } = agg {
+                    if let Some(alias) = identity_only_count_arg(e) {
+                        out.insert(alias);
+                    }
                 }
             }
         }
+        LogicalPlan::Project { items, .. } => {
+            out.extend(
+                items
+                    .iter()
+                    .filter_map(|item| identity_call_arg(&item.expression)),
+            );
+        }
+        _ => {}
     }
     for child in plan.children() {
         collect_identity_count_args(child, out);
@@ -7846,6 +7907,19 @@ fn sum_values(vals: &[RuntimeValue]) -> Result<RuntimeValue, ExecError> {
 
 // ───────────────────────── NodeId conversion ─────────────────────────
 
+/// The id a `NodeById` seek looks up for `value`. It reads a key the way
+/// `CREATE (n {_id: ...})` does (a Node value, any UUID spelling), so the
+/// `{_id: ...}` sigil finds what it created. A null or a value that names no
+/// node matches nothing instead of failing the query. A seek planned from
+/// `WHERE id(n) = ...` keeps that comparison on top to stay exact.
+fn seek_node_id(value: &RuntimeValue) -> Option<NodeId> {
+    match value {
+        RuntimeValue::String(s) => uuid::Uuid::parse_str(s).ok().map(NodeId::from_uuid),
+        RuntimeValue::Node(n) => Some(n.id),
+        _ => None,
+    }
+}
+
 pub(crate) fn node_id_from_value(v: &RuntimeValue, span: SourceSpan) -> Result<NodeId, ExecError> {
     match v {
         RuntimeValue::String(s) => match uuid::Uuid::parse_str(s) {
@@ -8326,15 +8400,19 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 // materialising the whole chain is correct now.
                 let arena_view = input_set.arena.clone();
                 let mut next_arena = input_set.arena;
+                let mut keyed = Vec::with_capacity(input_set.leaves.len());
                 for leaf in input_set.leaves {
                     let row = arena_view.materialize(leaf, None);
-                    let id_value = evaluate(id, &row, params)?;
-                    let node_id = node_id_from_value(&id_value, id.span)?;
-                    let found = match label {
-                        Some(l) => snapshot.lookup_node(l, node_id).await?,
-                        None => scan_node_for_id(snapshot, node_id).await?,
-                    };
-                    if let Some(view) = found {
+                    if let Some(node_id) = seek_node_id(&evaluate(id, &row, params)?) {
+                        keyed.push((leaf, node_id));
+                    }
+                }
+                let ids: Vec<NodeId> = keyed.iter().map(|(_, node_id)| *node_id).collect();
+                let found = snapshot
+                    .batch_lookup_nodes(label.as_deref().unwrap_or(""), &ids)
+                    .await?;
+                for ((leaf, _), view) in keyed.into_iter().zip(found) {
+                    if let Some(view) = view {
                         let slot = Slot {
                             name: alias_arc.clone(),
                             value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
@@ -9307,7 +9385,9 @@ async fn execute_expand_factor(
                         // it describes nodes of ANY label — which is what lets
                         // a multi-hop traversal use it too.
                         match views.get(&target_id) {
-                            Some(v) => {
+                            // Proven not to carry the label (single hop).
+                            Some(None) => continue,
+                            Some(Some(v)) => {
                                 if target_labels.iter().all(|l| v.labels.contains(l)) {
                                     Some(v.clone())
                                 } else if max > 1 {
@@ -9340,6 +9420,10 @@ async fn execute_expand_factor(
                                 None => continue,
                             },
                         }
+                    } else if matches!(&target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
+                    {
+                        // Proven not to carry the label (single hop, over budget).
+                        continue;
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
                             match scan_node_for_id(snapshot, target_id).await? {
@@ -10480,6 +10564,11 @@ fn collect_plan_references(
         }
         LogicalPlan::Project { items, .. } => {
             for it in items {
+                // A projected `id(x)` reads only the identity, like the
+                // identity-only counts below.
+                if skip_identity_counts && identity_call_arg(&it.expression).is_some() {
+                    continue;
+                }
                 collect_referenced_variables(&it.expression, out);
             }
         }
@@ -11050,6 +11139,29 @@ mod identity_only_tests {
                 false,
             ),
             ("MATCH (a:P)-[:E]->(b:Q) RETURN b.n AS n", "b", false),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i", "b", true),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN elementId(b) AS i",
+                "b",
+                true,
+            ),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i, b.n AS n",
+                "b",
+                false,
+            ),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN b", "b", false),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN id(b) + '' AS i", "b", false),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) WITH b RETURN id(b) AS i",
+                "b",
+                false,
+            ),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i ORDER BY b.n",
+                "b",
+                false,
+            ),
         ] {
             let r = routing_for(q);
             assert_eq!(
