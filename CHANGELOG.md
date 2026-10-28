@@ -37,8 +37,10 @@ crates.io release will establish and document that API explicitly.
   that carry the label are merged in id order, each candidate resolves to
   its newest version, and versions that lost the label or were deleted are
   skipped. A LIMIT stops as soon as it has its rows and no longer fetches a
-  full page of candidates first. Scans and counts without a LIMIT take this
-  route when the label is at most a quarter of the stored node rows.
+  full page of candidates first. Scans, counts and filtered LIMITs take this
+  route only when the label is at most a quarter of the node rows, memtable
+  included, since each candidate is a full record lookup and a filter may
+  reject them all. A dense label goes through the two-pass scan below.
 
 ### Changed
 
@@ -51,8 +53,8 @@ crates.io release will establish and document that API explicitly.
   selection that skips every other page. `RETURN id(n)` style scans stop
   after the first pass. Any mismatch between the passes falls back to the
   full reconciliation. This also covers the BM25 and hybrid search label
-  walks. `SstCache::label_selected_node_rows()` reports how many rows
-  the second pass read.
+  walks. `SstCache::label_selected_node_rows()` reports how many label rows
+  had their properties read, here or from property pages.
 
 ## [2.6.19] - 2026-09-16
 

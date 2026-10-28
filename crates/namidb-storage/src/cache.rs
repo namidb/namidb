@@ -1117,8 +1117,9 @@ struct CacheStats {
     /// full row-group decode in performance regressions.
     node_sparse_filter_scans: AtomicU64,
     node_sparse_filter_rows: AtomicU64,
-    /// Winning label rows whose properties a two-phase label scan read over
-    /// overlapping node SSTs. Rows outside the label never count.
+    /// Label rows whose properties a label scan read, in the second pass of
+    /// a two-phase scan or from property pages. Rows outside the label never
+    /// count.
     node_label_selected_rows: AtomicU64,
     /// Exact LIMIT pushdown over node SSTs (a disjoint prefix scan or merged
     /// label postings). These counters distinguish a true lazy prefix scan

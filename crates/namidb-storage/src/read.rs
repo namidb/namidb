@@ -6022,6 +6022,10 @@ impl<'mt> Snapshot<'mt> {
     /// every source. A winner that is gone or lost the label is an older
     /// version rather than corruption, so it is skipped, not a reason to bail.
     /// The per-SST posting counts are still checked against the manifest.
+    ///
+    /// Each candidate costs a full exact-record lookup, so the route runs
+    /// only when that work is bounded: by a bare LIMIT, or by the label being
+    /// sparse. Anything else is left to the two-phase scan.
     async fn try_scan_overlapping_label_sidecars(
         &self,
         label: &str,
@@ -6031,10 +6035,13 @@ impl<'mt> Snapshot<'mt> {
     ) -> Result<Option<Vec<NodeView>>> {
         const CANDIDATE_BATCH: usize = 512;
 
-        // As in the disjoint route, an unlimited projected scan is better
+        // A filter can reject every candidate, so only a bare LIMIT bounds
+        // the lookups by the rows returned.
+        let bounded = limit.is_some() && predicates.is_empty();
+        // As in the disjoint route, an unbounded projected scan is better
         // served by property pages than by full exact records. An id-only
-        // projection or a LIMIT bounds the payloads to the rows returned.
-        if limit.is_none()
+        // projection needs no payload either way.
+        if !bounded
             && projection.is_some_and(|columns| !columns.is_empty())
             && self
                 .manifest
@@ -6050,6 +6057,19 @@ impl<'mt> Snapshot<'mt> {
         }
 
         let dict = &self.manifest.manifest.label_dict;
+        let mut memtable_ids = Vec::new();
+        for (key, entry) in self.node_entries() {
+            if let (MemKey::Node { id }, MemOp::Upsert(payload)) = (key, &entry.op) {
+                if record_carries_label(&NodeWriteRecord::decode(payload)?, label, dict) {
+                    memtable_ids.push(*id);
+                }
+            }
+        }
+        if !bounded && !self.label_is_sparse(label, memtable_ids.len()) {
+            return Ok(None);
+        }
+        memtable_ids.sort_unstable();
+
         let label_id = dict.id(label);
         let mut cursors = Vec::new();
         for idx in self.manifest.index.node_descriptors() {
@@ -6067,15 +6087,6 @@ impl<'mt> Snapshot<'mt> {
         if label_id.is_none() {
             return Ok(Some(Vec::new()));
         }
-        let mut memtable_ids = Vec::new();
-        for (key, entry) in self.node_entries() {
-            if let (MemKey::Node { id }, MemOp::Upsert(payload)) = (key, &entry.op) {
-                if record_carries_label(&NodeWriteRecord::decode(payload)?, label, dict) {
-                    memtable_ids.push(*id);
-                }
-            }
-        }
-        memtable_ids.sort_unstable();
 
         let requested_projection: Option<BTreeSet<&str>> =
             projection.map(|columns| columns.iter().map(String::as_str).collect());
@@ -6265,9 +6276,10 @@ impl<'mt> Snapshot<'mt> {
         ))
     }
 
-    /// Whether `label` is a small enough share of the stored node rows for
-    /// one point lookup per member to beat a pass over every row.
-    fn label_is_sparse(&self, label: &str) -> bool {
+    /// Whether `label` is a small enough share of the node rows for one point
+    /// lookup per member to beat a pass over every row. `memtable_members`
+    /// is how many memtable nodes carry it, which the manifest cannot know.
+    fn label_is_sparse(&self, label: &str, memtable_members: usize) -> bool {
         // ponytail: fixed 25% cut on manifest counts; measure the crossover
         // if dense labels start choosing the wrong route.
         let rows: u64 = self
@@ -6276,8 +6288,12 @@ impl<'mt> Snapshot<'mt> {
             .node_descriptors()
             .into_iter()
             .map(|idx| self.manifest.manifest.ssts[idx].row_count)
-            .sum();
-        self.live_row_estimate(label).saturating_mul(4) <= rows
+            .sum::<u64>()
+            .saturating_add(self.node_entries().count() as u64);
+        self.live_row_estimate(label)
+            .saturating_add(memtable_members as u64)
+            .saturating_mul(4)
+            <= rows
     }
 
     /// Shared exact implementation for the two public limited node scans.
@@ -6717,6 +6733,9 @@ impl<'mt> Snapshot<'mt> {
 
         // id -> (winning lsn, the winner's structural view and physical row
         // when it carries `label`). Anything else is only a shadow.
+        // ponytail: one entry per stored id, shadows included, so memory is
+        // corpus-sized even for a tiny label; collect the label's ids first
+        // and check shadows only for those if that ever matters.
         let mut latest: BTreeMap<NodeId, (u64, Option<Box<LabelScanRow>>)> = BTreeMap::new();
         for (key, entry) in self.node_entries() {
             let MemKey::Node { id } = key else {
@@ -7017,12 +7036,9 @@ impl<'mt> Snapshot<'mt> {
                 )
                 .await?
             } else {
-                let mut rows = None;
-                if self.label_is_sparse(label) {
-                    rows = self
-                        .try_scan_overlapping_label_sidecars(label, predicates, projection, None)
-                        .await?;
-                }
+                let mut rows = self
+                    .try_scan_overlapping_label_sidecars(label, predicates, projection, None)
+                    .await?;
                 if rows.is_none() {
                     rows = self
                         .try_scan_label_two_phase(
@@ -9794,6 +9810,9 @@ impl<'mt> Snapshot<'mt> {
             }
             Err(error) => return Err(error),
         };
+        if let Some(cache) = self.cache.as_ref().filter(|_| label.is_some()) {
+            cache.record_label_selected_node_rows(projected.len());
+        }
         if projected.len() != wanted_ids.len() {
             return Ok(None);
         }
@@ -15713,8 +15732,20 @@ mod tests {
             limited.iter().map(|node| node.id).collect::<Vec<_>>(),
             vec![sorted_node_id(4), sorted_node_id(5), sorted_node_id(6)]
         );
+        // Every node is a Doc, so a filter could reject every candidate and
+        // the filtered LIMIT scans instead. A bare LIMIT uses the postings.
+        assert_eq!(cache.limited_node_scan_fast_paths(), 0);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
+        let bare = snap
+            .scan_label_with_predicates_and_projection_limited("Doc", &[], None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            bare.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![sorted_node_id(1), sorted_node_id(3), sorted_node_id(4)]
+        );
         assert_eq!(cache.limited_node_scan_fast_paths(), 1);
-        assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
 
         // A second L0 range updates existing ids. With overlapping ranges a
         // posting may name a superseded version; it must be skipped, not
@@ -15760,8 +15791,19 @@ mod tests {
             limited.iter().map(|node| node.id).collect::<Vec<_>>(),
             vec![sorted_node_id(6), sorted_node_id(8), sorted_node_id(10)]
         );
+        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 0);
+        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 1);
+        let bare = overlap
+            .scan_label_with_predicates_and_projection_limited("Doc", &[], None, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            bare.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![sorted_node_id(1), sorted_node_id(2), sorted_node_id(3)]
+        );
+        assert_eq!(bare[1].properties["vigente"], Value::Bool(false));
         assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 1);
-        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 0);
+        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 1);
     }
 
     #[tokio::test]
@@ -16087,10 +16129,39 @@ mod tests {
         .await;
         let empty = Memtable::new();
         let empty_view = empty.snapshot_view();
+        // The memtable deletes the one live persisted Device, turns an Other
+        // into a Device and gives 21 back the label its newest SST took away.
+        let mut live = Memtable::new();
+        live.apply(
+            MemKey::Node {
+                id: sorted_node_id(3),
+            },
+            50,
+            MemOp::Tombstone,
+        );
+        for (id, lsn) in [(5, 51), (21, 52)] {
+            live.apply(
+                MemKey::Node {
+                    id: sorted_node_id(id),
+                },
+                lsn,
+                MemOp::Upsert(labelled_payload("m", vec![DEVICE])),
+            );
+        }
+        let live_view = live.snapshot_view();
+        let name_is_o10 = ScanPredicate::Eq {
+            column: "name".into(),
+            value: crate::sst::stats::StatScalar::Utf8("o10".into()),
+        };
+        let name_is_d3 = ScanPredicate::Eq {
+            column: "name".into(),
+            value: crate::sst::stats::StatScalar::Utf8("d3".into()),
+        };
+
         let snap = Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone());
         assert!(snap.disjoint_node_descriptors().is_none());
-        assert!(snap.label_is_sparse("Device"));
-        assert!(!snap.label_is_sparse("Other"));
+        assert!(snap.label_is_sparse("Device", 0));
+        assert!(!snap.label_is_sparse("Other", 0));
         assert_eq!(
             view_ids(&snap.scan_label("Device").await.unwrap()),
             sorted_ids(&[3])
@@ -16100,6 +16171,53 @@ mod tests {
             sorted_ids(&[3])
         );
         assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 1);
+
+        // A label that lives mostly in the memtable is not sparse, even when
+        // the manifest has never seen it.
+        let mut memtable_heavy = Memtable::new();
+        for id in 100..=120 {
+            memtable_heavy.apply(
+                MemKey::Node {
+                    id: sorted_node_id(id),
+                },
+                u64::from(id),
+                MemOp::Upsert(labelled_payload("m", vec![DEVICE])),
+            );
+        }
+        let heavy_view = memtable_heavy.snapshot_view();
+        let heavy = Snapshot::new(committed.clone(), &heavy_view, store.clone(), paths.clone());
+        assert!(!heavy.label_is_sparse("Device", 21));
+        assert_eq!(heavy.scan_label("Device").await.unwrap().len(), 22);
+
+        // A filtered LIMIT takes the postings only for the sparse label: on a
+        // dense one a filter can reject every candidate, so it is a full scan.
+        for (label, predicate, ids, fast) in [
+            ("Device", &name_is_d3, &[3][..], true),
+            ("Other", &name_is_o10, &[10][..], false),
+        ] {
+            let cache = SstCache::new(4 * 1024 * 1024);
+            let rows = Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                .with_cache(cache.clone())
+                .scan_label_with_predicates_and_projection_limited(
+                    label,
+                    std::slice::from_ref(predicate),
+                    None,
+                    5,
+                )
+                .await
+                .unwrap();
+            assert_eq!(view_ids(&rows), sorted_ids(ids), "{label}");
+            assert_eq!(cache.limited_node_scan_fast_paths(), u64::from(fast));
+            assert_eq!(cache.limited_node_scan_fallbacks(), u64::from(!fast));
+        }
+
+        let with_memtable =
+            Snapshot::new(committed.clone(), &live_view, store.clone(), paths.clone());
+        assert!(with_memtable.label_is_sparse("Device", 2));
+        assert_eq!(
+            reconciled_label_ids(&with_memtable, "Device").await,
+            sorted_ids(&[5, 21])
+        );
 
         // The Device answer comes from label postings and exact node records
         // alone: it still holds with every node Parquet body gone, while the
@@ -16113,12 +16231,18 @@ mod tests {
             let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), desc.path);
             store.delete(&Path::from(absolute)).await.unwrap();
         }
-        let snap = Snapshot::new(committed, &empty_view, store, paths);
+        let snap = Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone());
         let devices = snap.scan_label("Device").await.unwrap();
         assert_eq!(view_ids(&devices), sorted_ids(&[3]));
         assert_eq!(devices[0].properties["name"], Value::Str("d3".into()));
         assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 1);
         assert!(snap.scan_label("Other").await.is_err());
+
+        let snap = Snapshot::new(committed, &live_view, store, paths);
+        let devices = snap.scan_label("Device").await.unwrap();
+        assert_eq!(view_ids(&devices), sorted_ids(&[5, 21]));
+        assert_eq!(devices[1].properties["name"], Value::Str("m".into()));
+        assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 2);
     }
 
     fn spread_node_id(i: u16) -> NodeId {
@@ -16262,6 +16386,28 @@ mod tests {
             assert_eq!(scan().await, expected, "corrupt pages");
             store.put(&path, original.into()).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn projected_label_scan_probes_property_pages_for_label_rows_only() {
+        let store = make_store();
+        let paths = make_paths("label-page-probes");
+        let committed = relabel_overlap_fixture(&store, &paths).await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let cache = SstCache::new(4 * 1024 * 1024);
+        // The full-body mode skips the two-phase scan, so the reconciliation
+        // loop projects each SST through its property pages.
+        let rows = Snapshot::new(committed, &empty_view, store, paths)
+            .with_ranged_reads(false)
+            .with_cache(cache.clone())
+            .scan_label_with_predicates_and_projection("Device", &[], Some(&["name".into()]))
+            .await
+            .unwrap();
+        assert_eq!(view_ids(&rows), sorted_ids(&[2, 4, 6]));
+        // Ids 1, 3, 4 and 6 carry Device in the older SST, id 2 in the newer
+        // one. The other four rows are Others or tombstones.
+        assert_eq!(cache.label_selected_node_rows(), 5);
     }
 
     #[tokio::test]
