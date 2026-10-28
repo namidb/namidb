@@ -496,3 +496,40 @@ async fn with_alias_predicate_still_anchors_at_the_indexed_target() {
     assert_eq!(fmt(&rows_aliased), fmt(&rows_pattern));
     assert!(!rows_aliased.is_empty());
 }
+
+/// The target is pinned by `id()` instead of a property: the forward
+/// spelling must anchor at the target too, and agree with the reversed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn id_anchored_target_matches_reversed_spelling() {
+    for (route, flush) in [("memtable", false), ("flushed", true)] {
+        let (writer, companies) = corpus(&format!("anchor-inv-id-{route}"), flush).await;
+        let (one, two) = (companies[2], companies[4]);
+        let per_company = (PEOPLE / COMPANIES) as usize;
+        for (pin, expected) in [
+            (format!("id(c) = '{one}'"), per_company),
+            (
+                format!("elementId(c) IN ['{one}', '{two}', '{one}', null]"),
+                2 * per_company,
+            ),
+        ] {
+            let slow = format!(
+                "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE {pin} \
+                 RETURN id(p) AS p, w.since AS since"
+            );
+            let fast = format!(
+                "MATCH (c:Company)<-[w:WORKS_AT]-(p:Person) WHERE {pin} \
+                 RETURN id(p) AS p, w.since AS since"
+            );
+            let snapshot = writer.snapshot();
+            let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+            let plan = optimize(lower(&parse(&slow).unwrap()).unwrap(), &catalog);
+            assert!(
+                !plan_has_node_scan_of(&plan, "Person"),
+                "{route}: `{slow}` must anchor at the id-pinned target: {plan:?}"
+            );
+            let rows = rows_canonical(&writer, &slow).await;
+            assert_eq!(rows.len(), expected, "{route}: `{slow}`");
+            assert_eq!(rows, rows_canonical(&writer, &fast).await, "{route}: {pin}");
+        }
+    }
+}

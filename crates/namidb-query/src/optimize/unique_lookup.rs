@@ -172,7 +172,8 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
                 let LogicalPlan::CrossProduct { left, .. } = *input else {
                     unreachable!("correlated id seek was matched as CrossProduct")
                 };
-                return id_seek(label, &alias, seek, rewrite(*left, catalog));
+                let lookup = id_seek(label, &alias, seek.value, false, rewrite(*left, catalog));
+                return with_residual(lookup, seek.residual);
             }
             if let Some((alias, indexed)) = correlated {
                 let LogicalPlan::CrossProduct { left, .. } = *input else {
@@ -210,7 +211,14 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             {
                 if predicates.is_empty() && projection.is_none() {
                     if let Some(seek) = extract_node_id_conjunct(&predicate, alias, None) {
-                        return id_seek(label.clone(), alias, seek, LogicalPlan::Empty);
+                        let lookup = id_seek(
+                            label.clone(),
+                            alias,
+                            seek.value,
+                            seek.many,
+                            LogicalPlan::Empty,
+                        );
+                        return with_residual(lookup, seek.residual);
                     }
                 }
             }
@@ -824,27 +832,28 @@ pub(super) fn extract_node_id_conjunct(
     })
 }
 
-/// Build the `NodeById` for `seek` over `input`, plus its residual filter.
-/// An `IN` seek unwinds the list into a hidden binding first; the `Distinct`
-/// keeps a repeated id to one row, as the filter it replaces would.
+/// Build the `NodeById` for `value` over `input`. An `IN` seek (`many`)
+/// unwinds the list into a hidden binding first; the `Distinct` keeps a
+/// repeated id to one row, as the filter it replaces would.
 pub(super) fn id_seek(
     label: Option<String>,
     alias: &str,
-    seek: IdSeek,
+    value: Expression,
+    many: bool,
     input: LogicalPlan,
 ) -> LogicalPlan {
-    let (input, id) = if seek.many {
+    let (input, id) = if many {
         let slot = format!("__idseek_{alias}");
         let id = Expression {
-            span: seek.value.span,
+            span: value.span,
             kind: ExpressionKind::Variable(crate::parser::ast::Identifier::new(
                 slot.clone(),
-                seek.value.span,
+                value.span,
             )),
         };
         let unwind = LogicalPlan::Unwind {
             input: Box::new(input),
-            list: seek.value,
+            list: value,
             alias: slot,
         };
         (
@@ -854,20 +863,23 @@ pub(super) fn id_seek(
             id,
         )
     } else {
-        (input, seek.value)
+        (input, value)
     };
-    let lookup = LogicalPlan::NodeById {
+    LogicalPlan::NodeById {
         input: Box::new(input),
         label,
         alias: alias.to_owned(),
         id,
-    };
-    match seek.residual {
-        Some(residual) => LogicalPlan::Filter {
-            input: Box::new(lookup),
-            predicate: residual,
+    }
+}
+
+fn with_residual(plan: LogicalPlan, residual: Option<Expression>) -> LogicalPlan {
+    match residual {
+        Some(predicate) => LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate,
         },
-        None => lookup,
+        None => plan,
     }
 }
 

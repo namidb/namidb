@@ -36,6 +36,14 @@ crates.io release will establish and document that API explicitly.
   listing the ids around a hub decoded the properties of every neighbour.
   It now takes the same id-only route.
 
+- **A pattern pinned by `id()` on its last node started from the first.**
+  `MATCH (i:Identifier)-[:R]->(d:Device) WHERE id(d) = $id` scanned every
+  `Identifier` and expanded forward, while the reversed spelling answered
+  at once. The planner already re-anchored a pattern at a target pinned by
+  an indexed property; it now does the same for `id(d) = ...` and
+  `id(d) IN ...`, with or without a label on the target. Still single hop
+  only: a longer chain pinned at its far end keeps its written order.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed
