@@ -11,7 +11,7 @@
 #![allow(clippy::useless_conversion)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -60,20 +60,28 @@ use query_errors::{QueryRowCapError, QueryTimeoutError};
 /// claims the writer epoch (`read_only=True`).
 #[derive(Clone)]
 enum Session {
-    Writer(Arc<Mutex<WriterSession>>),
+    Writer(Arc<Writer>),
     Reader(Arc<Mutex<ReaderSession>>),
 }
 
 impl Session {
-    /// The committed snapshot reads run on. The lock is held only to clone
-    /// it, so a long read never blocks writers or other reads. Waiting for
-    /// the lock gives up at `deadline`.
+    /// The committed snapshot reads run on. A writer's is taken without its
+    /// lock, so reads never wait for a write. A reader's lock is held only to
+    /// clone it; waiting for that lock, or for a refresh it is due, gives up
+    /// at `deadline`.
     async fn snapshot(&self, deadline: Option<Instant>) -> PyResult<Arc<OwnedSnapshot>> {
         Ok(match self {
-            Session::Writer(w) => lock_until(w, deadline).await?.owned_snapshot(),
+            Session::Writer(w) => w.published(),
             Session::Reader(r) => {
                 let mut r = lock_until(r, deadline).await?;
-                r.keep_alive().await;
+                match deadline {
+                    // A refresh cut short leaves the version already loaded
+                    // in place; a later read finishes it.
+                    Some(d) => {
+                        let _ = tokio::time::timeout_at(d.into(), r.keep_alive()).await;
+                    }
+                    None => r.keep_alive().await,
+                }
                 r.snapshot()
             }
         })
@@ -86,13 +94,91 @@ impl Session {
         }
     }
 
-    fn writer(&self) -> PyResult<&Arc<Mutex<WriterSession>>> {
+    fn writer(&self) -> PyResult<&Arc<Writer>> {
         match self {
             Session::Writer(w) => Ok(w),
             Session::Reader(_) => Err(PyPermissionError::new_err(
                 "this Client was opened with read_only=True",
             )),
         }
+    }
+}
+
+/// The namespace's writer and the snapshot of its last commit. Every lock
+/// guard publishes the writer's snapshot when it drops, if the call moved
+/// the manifest, so reads pick up a commit as soon as the call returns
+/// without waiting for whatever write holds the lock next.
+struct Writer {
+    session: Mutex<WriterSession>,
+    published: std::sync::Mutex<Arc<OwnedSnapshot>>,
+}
+
+impl Writer {
+    fn new(session: WriterSession) -> Self {
+        Self {
+            published: std::sync::Mutex::new(session.owned_snapshot()),
+            session: Mutex::new(session),
+        }
+    }
+
+    fn published(&self) -> Arc<OwnedSnapshot> {
+        Arc::clone(&self.published.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    async fn lock(&self) -> WriterGuard<'_> {
+        WriterGuard {
+            guard: self.session.lock().await,
+            published: &self.published,
+        }
+    }
+
+    async fn lock_until(&self, deadline: Option<Instant>) -> PyResult<WriterGuard<'_>> {
+        Ok(WriterGuard {
+            guard: lock_until(&self.session, deadline).await?,
+            published: &self.published,
+        })
+    }
+}
+
+struct WriterGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, WriterSession>,
+    published: &'a std::sync::Mutex<Arc<OwnedSnapshot>>,
+}
+
+impl std::ops::Deref for WriterGuard<'_> {
+    type Target = WriterSession;
+    fn deref(&self) -> &WriterSession {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WriterSession {
+        &mut self.guard
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        let mut published = self.published.lock().unwrap_or_else(|e| e.into_inner());
+        // Staging alone does not move the manifest, so per-row upserts skip
+        // the snapshot rebuild.
+        if published.manifest_version() != self.guard.manifest_version() {
+            *published = self.guard.owned_snapshot();
+        }
+    }
+}
+
+/// Renew a `read_only` client's leases between reads, so a read that
+/// outlasts the lease TTL keeps its files. Ends once the client is gone.
+async fn renew_reader_pins(reader: Weak<Mutex<ReaderSession>>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let Some(reader) = reader.upgrade() else {
+            return;
+        };
+        reader.lock().await.renew_pins().await;
     }
 }
 
@@ -171,10 +257,12 @@ impl Client {
                         let reader =
                             ReaderSession::open(store.clone(), paths.clone(), Some(cache.clone()))
                                 .await?;
-                        Session::Reader(Arc::new(Mutex::new(reader)))
+                        let reader = Arc::new(Mutex::new(reader));
+                        tokio::spawn(renew_reader_pins(Arc::downgrade(&reader)));
+                        Session::Reader(reader)
                     } else {
                         let writer = WriterSession::open(store.clone(), paths.clone()).await?;
-                        Session::Writer(Arc::new(Mutex::new(writer)))
+                        Session::Writer(Arc::new(Writer::new(writer)))
                     })
                 })
             })
@@ -847,8 +935,9 @@ impl Client {
     /// the end of every write plan. Call `client.flush()` to push the
     /// memtable into L0 SSTs once enough writes have accumulated.
     ///
-    /// Reads run on the latest committed snapshot without holding the
-    /// writer lock, so several threads can query one client at once.
+    /// Reads run on the latest committed snapshot without waiting for the
+    /// writer lock, so several threads can query one client at once and a
+    /// long write does not hold them up.
     ///
     /// `timeout_ms` aborts the query with `QueryTimeoutError` once that much
     /// wall time has passed since the call, waiting for the client's lock
@@ -1042,7 +1131,7 @@ struct CompactionReport {
 /// free to acquire `session` throughout the expensive prepare phase. Storage's
 /// install step folds those newer writes/flushes into the current manifest.
 async fn run_compaction_inner(
-    session: Arc<Mutex<WriterSession>>,
+    session: Arc<Writer>,
     compaction_lock: Arc<Mutex<()>>,
 ) -> PyResult<CompactionReport> {
     let _compaction_guard = compaction_lock.lock().await;
@@ -1168,8 +1257,7 @@ async fn run_cypher(
             return Ok(result);
         }
     }
-    let writer = session.writer()?;
-    let mut guard = lock_until(writer, deadline).await?;
+    let mut guard = session.writer()?.lock_until(deadline).await?;
     run_write(&mut guard, &parsed, params, deadline).await
 }
 
@@ -1801,18 +1889,22 @@ fn lower_err_to_pyerr(e: LowerError) -> PyErr {
 
 fn exec_err_to_pyerr(e: ExecError) -> PyErr {
     match e {
-        // Python has no admin cancel path, so a cancel can only come from
-        // the same deadline machinery.
-        // A deadline that fires in a write's commit tail arrives as a storage
-        // error.
-        ExecError::Timeout
-        | ExecError::Cancelled
-        | ExecError::Storage(namidb_storage::Error::Timeout | namidb_storage::Error::Cancelled) => {
-            QueryTimeoutError::new_err(e.to_string())
-        }
+        _ if is_deadline(&e) => QueryTimeoutError::new_err(e.to_string()),
         ExecError::RowCap(_) => QueryRowCapError::new_err(e.to_string()),
         _ => PyRuntimeError::new_err(format!("Cypher execution error: {e}")),
     }
+}
+
+/// Whether `e` is the query's own `timeout_ms` firing. Python has no admin
+/// cancel path, so a cancel can only come from the same deadline machinery.
+/// A deadline that fires in a write's commit tail arrives as a storage error.
+fn is_deadline(e: &ExecError) -> bool {
+    matches!(
+        e,
+        ExecError::Timeout
+            | ExecError::Cancelled
+            | ExecError::Storage(namidb_storage::Error::Timeout | namidb_storage::Error::Cancelled)
+    )
 }
 
 // ── pyarrow helpers ───────────────────────────────────────────────────
@@ -1916,4 +2008,23 @@ fn _lib(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("QueryRowCapError", py.get_type_bound::<QueryRowCapError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The commit tail cannot be hit on purpose from Python: a deadline that
+    // short fires while staging.
+    #[test]
+    fn a_deadline_in_the_commit_is_a_timeout() {
+        assert!(is_deadline(&ExecError::Timeout));
+        assert!(is_deadline(&ExecError::Storage(
+            namidb_storage::Error::Timeout
+        )));
+        assert!(is_deadline(&ExecError::Storage(
+            namidb_storage::Error::Cancelled
+        )));
+        assert!(!is_deadline(&ExecError::RowCap(1)));
+    }
 }

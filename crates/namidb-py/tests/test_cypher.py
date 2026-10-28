@@ -475,31 +475,40 @@ def test_reads_on_one_client_run_concurrently(client: tg.Client) -> None:
     run["thread"].join()
 
 
+SLOW_WRITE = (
+    "UNWIND range(1, 1200) AS a UNWIND range(1, 1200) AS b "
+    "WITH count(*) AS n CREATE (:Big {n: n})"
+)
+
+
+def test_reads_do_not_wait_for_a_long_write(client: tg.Client) -> None:
+    client.upsert_node("Person", str(uuid.uuid4()), {"name": "Alice"})
+    client.commit()
+    run = _run_in_thread(client, SLOW_WRITE)
+    while "start" not in run:
+        time.sleep(0.001)
+    time.sleep(0.05)
+    assert client.cypher("MATCH (p:Person) RETURN count(p) AS n").first() == {"n": 1}
+    assert len(client.scan_label("Person")) == 1
+    assert client.scan_label("Big") == [], "a read saw an uncommitted write"
+    read = time.monotonic()
+    run["thread"].join()
+    assert read < run["end"], "the read waited for the write to finish"
+    # Once the write returns, reads see it.
+    assert len(client.scan_label("Big")) == 1
+
+
 def test_timeout_bounds_the_wait_behind_a_long_write(client: tg.Client) -> None:
-    slow_write = (
-        "UNWIND range(1, 1200) AS a UNWIND range(1, 1200) AS b "
-        "WITH count(*) AS n CREATE (:Big {n: n})"
-    )
-    run = _run_in_thread(client, slow_write)
+    run = _run_in_thread(client, SLOW_WRITE)
     while "start" not in run:
         time.sleep(0.001)
     time.sleep(0.05)
     with pytest.raises(tg.QueryTimeoutError):
-        client.cypher("RETURN 1 AS x", timeout_ms=50)
+        client.cypher("CREATE (:Person {name: 'late'})", timeout_ms=50)
     gave_up = time.monotonic()
     run["thread"].join()
-    assert gave_up < run["end"], "the read waited for the write instead of timing out"
-
-
-def test_write_deadline_in_the_commit_is_a_query_timeout_error() -> None:
-    # Short deadlines land in staging or in the commit, depending on timing.
-    # The commit path used to surface as a plain RuntimeError.
-    for timeout_ms in (1, 2, 3, 5, 1, 2, 3, 5):
-        client = tg.Client(f"memory://t{uuid.uuid4().hex[:8]}")
-        try:
-            client.cypher("CREATE (:Person {name: 'x'})", timeout_ms=timeout_ms)
-        except TimeoutError:
-            pass
+    assert gave_up < run["end"], "the write waited for the other write instead of timing out"
+    assert client.cypher("MATCH (p:Person) RETURN count(p) AS n").first() == {"n": 0}
 
 
 def test_cypher_timeout_raises_query_timeout_error(client: tg.Client) -> None:

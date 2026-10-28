@@ -22,8 +22,9 @@ crates.io release will establish and document that API explicitly.
   epoch, so a notebook that only wanted to look at the data fenced the
   process loading it. A read-only client loads the current manifest,
   replays the unflushed WAL so it sees every commit, and holds a retention
-  lease so the writer's cleanup keeps its files. `refresh()` moves it to
-  the newest commit, and a read on a version more than an hour old
+  lease, renewed in the background, so the writer's cleanup keeps its
+  files. `refresh()` moves it to the newest commit, and a read on a
+  version more than an hour old, or whose lease may have expired,
   refreshes on its own so a forgotten reader cannot hold back cleanup
   forever. `close()` (or a `with` block) drops the lease. Every mutator
   raises `PermissionError`. The storage side is
@@ -33,8 +34,9 @@ crates.io release will establish and document that API explicitly.
   are keyword-only and off by default. They raise the new
   `namidb.QueryTimeoutError` (a `TimeoutError`) and
   `namidb.QueryRowCapError` (a `RuntimeError`). The timeout also bounds
-  the wait for the client's lock behind a long write, and covers a
-  write's commit. A timed-out write is discarded, not committed.
+  a write's wait for the client's lock behind another write, a read-only
+  client's refresh, and a write's commit. A timed-out write is
+  discarded, not committed.
 
 - **Python: `limit=` on `scan_label`, `scan_label_arrow` and
   `scan_edge_type`, plus `iter_label` / `iter_edge_type`.** The iterators
@@ -50,9 +52,10 @@ crates.io release will establish and document that API explicitly.
 
 - **Python reads were serialised behind the writer lock.** `cypher` reads,
   `lookup_node`, `scan_*` and edge lookups held the writer mutex for the
-  whole query, so two threads could not read at once and a long read
-  stalled every write. Reads now run on the latest committed snapshot
-  without the lock. Write statements are planned again under the lock.
+  whole query, so two threads could not read at once, a long read
+  stalled every write, and a bulk load stalled every read. Reads now run
+  on the latest committed snapshot without waiting for the lock. Write
+  statements are planned again under the lock.
 
 ## [2.6.19] - 2026-09-16
 

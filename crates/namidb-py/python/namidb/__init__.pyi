@@ -277,8 +277,8 @@ class Client:
         runs inside `execute_write`. Call `flush()` periodically to
         push the memtable into L0 SSTs.
 
-        Reads run on the latest committed snapshot without the writer
-        lock. `timeout_ms` raises `QueryTimeoutError` once that much
+        Reads run on the latest committed snapshot without waiting for
+        the writer lock. `timeout_ms` raises `QueryTimeoutError` once that much
         time has passed since the call, waiting for the client's lock
         included (a timed-out write is discarded).
         `max_rows` raises `QueryRowCapError` when a read produces more
