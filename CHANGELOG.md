@@ -71,10 +71,13 @@ crates.io release will establish and document that API explicitly.
 - **`algo.shortest_path` takes an optional `target`.** It used to ignore
   `target` and return the distance to every reachable node. With a target it
   returns one row (none when it is unreachable) with `node_id`, `distance`,
-  `hops` and `path`, the node sequence from source to target. The search
-  runs on the stored adjacency without loading the projected graph, so it
-  only reads the part of the graph it explores before reaching the target;
-  an unreachable target still explores everything reachable from the source.
+  `hops` and `path`, the source to target node sequence with labels and
+  properties. In the default direction the search runs on the stored
+  adjacency without loading the projected graph, so it only reads the part
+  of the graph it explores before reaching the target; an unreachable target
+  still explores everything reachable from the source. With `direction:
+  'reverse'` or `'undirected'` it builds the projected graph first, like the
+  untargeted call.
   A null `target` is treated as no target. Without a target, `path` is null
   and the other columns are unchanged. The MCP `graph_algorithm` tool takes
   the same `target` for `shortest_path` and returns the route; a `target`

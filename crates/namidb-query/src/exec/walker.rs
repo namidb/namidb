@@ -3068,23 +3068,49 @@ async fn flat_call_procedure(
             let (source, target, weighted) = shortest_path_options(args, params)?;
             let cols = vec!["node_id", "distance", "hops", "path"];
             // With a target: one row (or none when unreachable) carrying the
-            // node sequence, searched against the snapshot adjacency without
-            // building the projected graph. It returns node ids only; for
-            // relationships use `MATCH p = shortestPath(...)` instead.
+            // node sequence. It returns nodes only; for relationships use
+            // `MATCH p = shortestPath(...)` instead.
             if let Some(target) = target {
-                let found =
-                    snapshot_shortest_path(snapshot, &projection, source, target, weighted).await?;
-                let raw = found
-                    .into_iter()
-                    .map(|(dist, path)| {
-                        vec![
-                            node_runtime(target),
-                            RuntimeValue::Float(dist),
-                            RuntimeValue::Integer(path.len() as i64 - 1),
-                            RuntimeValue::List(path.into_iter().map(node_runtime).collect()),
-                        ]
-                    })
-                    .collect();
+                // The natural direction searches the snapshot adjacency
+                // without building the projected graph. Reverse/undirected
+                // need in-edge probes, and an in-edge probe scans every
+                // unflushed edge of the type, once per settled node, so those
+                // build the graph once instead.
+                let found = if projection.direction == AlgoDirection::Natural {
+                    snapshot_shortest_path(snapshot, &projection, source, target, weighted).await?
+                } else {
+                    let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
+                    if weighted && graph.has_negative_weight() {
+                        return Err(proc_unsupported(NEGATIVE_WEIGHT_ERROR));
+                    }
+                    namidb_graph::algo::shortest_path_to_cancellable(
+                        &graph,
+                        source,
+                        target,
+                        weighted,
+                        &namidb_storage::cancel::deadline_exceeded,
+                    )
+                    .map_err(|_| ExecError::Timeout)?
+                };
+                let mut raw = Vec::new();
+                if let Some((dist, path)) = found {
+                    let hops = path.len() as i64 - 1;
+                    // The path is short and usually read for properties, so
+                    // hydrate its nodes (node_id stays an id-only node).
+                    let mut nodes = Vec::with_capacity(path.len());
+                    for id in path {
+                        nodes.push(match scan_node_for_id(snapshot, id).await? {
+                            Some(view) => RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            None => node_runtime(id),
+                        });
+                    }
+                    raw.push(vec![
+                        node_runtime(target),
+                        RuntimeValue::Float(dist),
+                        RuntimeValue::Integer(hops),
+                        RuntimeValue::List(nodes),
+                    ]);
+                }
                 return project_proc_rows("algo.shortest_path", &cols, raw, yield_items);
             }
             let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
@@ -4362,13 +4388,23 @@ fn proc_single_map(
     // A typo like `filtre` or `Filter` must not silently run UNFILTERED —
     // that is a data-exposure hazard, not a convenience. Reject any key the
     // procedure will not read.
+    reject_unknown_keys(proc, &map, allowed_keys)?;
+    Ok(map)
+}
+
+/// Fail a procedure call whose option map has a key outside `allowed_keys`.
+fn reject_unknown_keys(
+    proc: &str,
+    map: &std::collections::BTreeMap<String, RuntimeValue>,
+    allowed_keys: &[&str],
+) -> Result<(), ExecError> {
     if let Some(unknown) = map.keys().find(|key| !allowed_keys.contains(&key.as_str())) {
         return Err(proc_unsupported(format!(
             "{proc} does not recognise the option `{unknown}`; allowed options: {}",
             allowed_keys.join(", ")
         )));
     }
-    Ok(map)
+    Ok(())
 }
 
 /// A map value as an owned `String`, or `None` if it is not a string.
@@ -5493,15 +5529,12 @@ fn reject_unknown_algo_options(
     map: &std::collections::BTreeMap<String, RuntimeValue>,
     own: &[&str],
 ) -> Result<(), ExecError> {
-    const PROJECTION: [&str; 3] = ["labels", "edge_types", "direction"];
-    let allowed = || own.iter().chain(PROJECTION.iter());
-    if let Some(key) = map.keys().find(|k| !allowed().any(|a| a == k)) {
-        return Err(proc_unsupported(format!(
-            "algo.{name} does not recognise the option `{key}`; allowed options: {}",
-            allowed().copied().collect::<Vec<_>>().join(", ")
-        )));
-    }
-    Ok(())
+    let allowed: Vec<&str> = own
+        .iter()
+        .chain(&["labels", "edge_types", "direction"])
+        .copied()
+        .collect();
+    reject_unknown_keys(&format!("algo.{name}"), map, &allowed)
 }
 
 /// Build an in-memory `algo::Graph` from the snapshot: the projected nodes
@@ -5587,7 +5620,8 @@ const NEGATIVE_WEIGHT_ERROR: &str =
 /// endpoint is outside the projection.
 // Known limit: the search is one-sided, so a far or unreachable target still
 // walks the whole reachable component one lookup at a time. Go bidirectional
-// if that shows up on real graphs.
+// if that shows up on real graphs. Only the natural direction routes here
+// (see the caller): in-edge probes over unflushed edges are linear scans.
 async fn snapshot_shortest_path(
     snapshot: &Snapshot<'_>,
     projection: &AlgoProjection,
@@ -5652,11 +5686,9 @@ async fn snapshot_shortest_path(
                 } else {
                     1.0
                 };
-                if w < 0.0 {
-                    return Err(proc_unsupported(NEGATIVE_WEIGHT_ERROR));
-                }
-                let nd = d + w;
-                if nd >= dist.get(&v).copied().unwrap_or(f64::INFINITY) || outside.contains(&v) {
+                // Projection first: an edge leaving the projection is not
+                // part of the graph, so its weight must not fail the call.
+                if outside.contains(&v) {
                     continue;
                 }
                 if labels.is_some()
@@ -5664,6 +5696,16 @@ async fn snapshot_shortest_path(
                     && !projected(snapshot, labels, v).await?
                 {
                     outside.insert(v);
+                    continue;
+                }
+                if w < 0.0 {
+                    return Err(proc_unsupported(NEGATIVE_WEIGHT_ERROR));
+                }
+                let nd = d + w;
+                // A non-finite distance never relaxes, as in the kernel: a NaN
+                // would let the parent map form a cycle. Stored weights are
+                // JSON, where NaN reads back as null, so this is a backstop.
+                if !nd.is_finite() || nd >= dist.get(&v).copied().unwrap_or(f64::INFINITY) {
                     continue;
                 }
                 dist.insert(v, nd);

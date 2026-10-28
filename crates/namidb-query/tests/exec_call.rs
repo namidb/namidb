@@ -645,6 +645,80 @@ async fn call_shortest_path_to_target_weighted_and_edge_cases() {
     assert!(err.to_string().contains("negative"), "got {err}");
 }
 
+/// A negative edge that leaves the label projection is not part of the
+/// graph, so it must not fail the targeted search (the graph-build route
+/// already ignored it). The path carries hydrated nodes, and the reverse
+/// direction works on unflushed edges.
+#[tokio::test]
+async fn call_shortest_path_to_target_projection_reverse_and_hydration() {
+    let mut writer = WriterSession::open(store(), paths("call-sp-target-proj"))
+        .await
+        .unwrap();
+    let [s, t, x] = std::array::from_fn(|_| NodeId::new());
+    let named = |name: &str| NodeWriteRecord {
+        properties: BTreeMap::from([(
+            "name".to_string(),
+            namidb_core::Value::Str(name.to_string()),
+        )]),
+        schema_version: 1,
+        ..Default::default()
+    };
+    writer.upsert_node("N", s, &named("s")).unwrap();
+    writer.upsert_node("N", t, &named("t")).unwrap();
+    writer.upsert_node("Other", x, &named("x")).unwrap();
+    let weighted = |w: f64| EdgeWriteRecord {
+        properties: BTreeMap::from([("weight".to_string(), namidb_core::Value::F64(w))]),
+        schema_version: 1,
+    };
+    writer.upsert_edge("E", s, x, &weighted(-1.0)).unwrap();
+    writer.upsert_edge("E", s, t, &weighted(2.0)).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+    let ids = |ns: &[NodeId]| ns.iter().map(|n| *n.as_bytes()).collect::<Vec<_>>();
+
+    for target in ["", &format!(", target: \"{t}\"")] {
+        let rows = run(
+            &snapshot,
+            &format!(
+                "CALL algo.shortest_path({{source: \"{s}\"{target}, weighted: true, \
+                 labels: ['N']}}) YIELD node_id, distance \
+                 WITH node_id, distance WHERE id(node_id) = \"{t}\" \
+                 RETURN distance"
+            ),
+        )
+        .await;
+        assert_eq!(rows.len(), 1, "target {target:?}");
+        assert_eq!(rows[0].get("distance"), Some(&RuntimeValue::Float(2.0)));
+    }
+
+    let rows = run(
+        &snapshot,
+        &format!(
+            "CALL algo.shortest_path({{source: \"{s}\", target: \"{t}\"}}) YIELD path \
+             RETURN path, [n IN path | n.name] AS names"
+        ),
+    )
+    .await;
+    assert_eq!(path_col(&rows[0]), ids(&[s, t]));
+    assert_eq!(
+        rows[0].get("names"),
+        Some(&RuntimeValue::List(vec![
+            RuntimeValue::String("s".into()),
+            RuntimeValue::String("t".into()),
+        ]))
+    );
+
+    let rows = run(
+        &snapshot,
+        &format!(
+            "CALL algo.shortest_path({{source: \"{t}\", target: \"{s}\", direction: 'reverse'}}) \
+             YIELD path"
+        ),
+    )
+    .await;
+    assert_eq!(path_col(&rows[0]), ids(&[t, s]));
+}
+
 fn node_with_body(text: &str) -> NodeWriteRecord {
     let mut props = BTreeMap::new();
     props.insert(
