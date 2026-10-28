@@ -34,6 +34,7 @@ pub mod pin;
 pub mod property_index;
 pub mod range_cache;
 pub mod read;
+pub mod reader;
 pub mod recovery;
 pub mod route_telemetry;
 pub mod search_lsm;
@@ -101,6 +102,7 @@ pub use read::VectorFilterSearch;
 pub use read::{
     EdgeListView, EdgeView, NodeView, OwnedSnapshot, PinnedSnapshot, Snapshot, SnapshotCell,
 };
+pub use reader::ReaderSession;
 pub use recovery::{
     recover_memtable, recover_memtable_with_snapshot, write_memtable_snapshot,
     MemtableSnapshotEntry, MemtableSnapshotFile, RecoveredMemtable, WalEntry, WalOp,
