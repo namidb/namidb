@@ -1223,26 +1223,34 @@ fn execute_capped<'a>(
                 // Each round expands only the seeds the previous one did not
                 // see, so `out` stays the same prefix as the uncapped result
                 // and edgeless seeds cannot starve the budget. Any other
-                // input runs uncapped once, as before.
+                // input, or a snapshot whose node scan cannot stop early
+                // (memtable nodes or overlapping SSTs), runs uncapped once,
+                // as before.
                 // ponytail: when few seeds match, the rounds rescan the
                 // prefix (about 1.33x a full scan) and end up holding every
                 // seed; only the row cap bounds that case.
                 let mut want = match input.as_ref() {
-                    LogicalPlan::NodeScan { .. } => Some(cap.max(64)),
+                    LogicalPlan::NodeScan { .. } if snapshot.node_scan_is_disjoint() => {
+                        Some(cap.max(64))
+                    }
                     _ => None,
                 };
+                let row_cap = crate::exec::limits::scoped_row_cap();
                 let mut out: Vec<Row> = Vec::new();
                 let mut seen = 0usize;
+                let mut scan_time = std::time::Duration::ZERO;
                 loop {
                     let (rows, exhausted) = match want {
                         Some(w) => {
-                            let w = match crate::exec::limits::scoped_row_cap() {
-                                Some(row_cap) => w.min(row_cap.saturating_add(1)),
-                                None => w,
-                            };
+                            // One seed past the row cap is enough to tell
+                            // "more seeds" from "exhausted".
+                            let w = row_cap.map_or(w, |rc| w.min(rc.saturating_add(1)));
+                            crate::exec::limits::check_deadline()?;
+                            let start = std::time::Instant::now();
                             let rows =
                                 execute_capped(input, snapshot, params, outer, routing, w).await?;
-                            crate::exec::limits::check_row_cap(rows.len())?;
+                            scan_time += start.elapsed();
+                            crate::profile::record_op(input, scan_time, rows.len() as u64);
                             let exhausted = rows.len() < w;
                             (rows, exhausted)
                         }
@@ -1279,6 +1287,9 @@ fn execute_capped<'a>(
                     if out.len() >= cap || exhausted {
                         return Ok(out);
                     }
+                    // The budget is still open and more seeds remain, so
+                    // the next round would hold more than this one.
+                    crate::exec::limits::check_row_cap(total)?;
                     want = want.map(|w| w.saturating_mul(4));
                 }
             }

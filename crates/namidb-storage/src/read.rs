@@ -5680,6 +5680,13 @@ impl<'mt> Snapshot<'mt> {
             .await
     }
 
+    /// Whether the `_limited` node scans can stop early. When this is false
+    /// they reconcile every node first and truncate, so a caller pulling
+    /// growing prefixes would pay a full reconcile per call.
+    pub fn node_scan_is_disjoint(&self) -> bool {
+        self.disjoint_node_descriptors().is_some()
+    }
+
     /// Prove that every persisted node id has exactly one physical version and
     /// return SST descriptors in global node-id order.
     ///

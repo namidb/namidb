@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use namidb_core::id::{NamespaceId, NodeId};
+use namidb_core::schema::Schema;
 use namidb_core::value::Value as CoreValue;
 use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
@@ -401,7 +402,8 @@ async fn unlabelled_source_limit_over_untyped_expand_is_a_prefix() {
 
 /// The seed pull grows 64, 256, 1024: 500 edgeless nodes ahead of the
 /// connected ones force several rounds, and rows found across a round
-/// boundary must keep the uncapped order.
+/// boundary must keep the uncapped order. The flush puts the nodes in an
+/// SST, where the pull runs in rounds (from the memtable it scans once).
 #[tokio::test]
 async fn limit_fills_past_many_edgeless_seeds() {
     let mut writer = WriterSession::open(store(), paths("lp-edgeless"))
@@ -422,6 +424,7 @@ async fn limit_fills_past_many_edgeless_seeds() {
         writer.upsert_edge("TO", id, hub, &edge()).unwrap();
     }
     writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
     let snapshot = writer.snapshot();
 
     let values = |rows: Vec<Row>| -> Vec<i64> {

@@ -303,4 +303,38 @@ mod tests {
         let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
         assert!(rows.is_empty());
     }
+
+    #[tokio::test]
+    async fn profile_covers_the_seed_scan_under_a_limited_expand() {
+        // A bare LIMIT over an expand pulls its seeds through the capped
+        // path; the leaf NodeScan must still carry a profile entry.
+        let mut writer = WriterSession::open(store(), paths("profile-seed-pull"))
+            .await
+            .unwrap();
+        let ids: Vec<NodeId> = (0..3).map(|_| NodeId::new()).collect();
+        for id in &ids {
+            writer
+                .upsert_node("Person", *id, &NodeWriteRecord::default())
+                .unwrap();
+        }
+        writer
+            .upsert_edge("KNOWS", ids[0], ids[1], &Default::default())
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        writer
+            .flush(namidb_core::schema::Schema::empty())
+            .await
+            .unwrap();
+        let snap = writer.snapshot();
+
+        let q = parse("MATCH (x)-->(y) RETURN x LIMIT 10").unwrap();
+        let tree = profile_query_tree(&q, &snap, &Params::new(), &StatsCatalog::empty())
+            .await
+            .unwrap();
+        let mut leaf = &tree;
+        while let Some(child) = leaf.children.first() {
+            leaf = child;
+        }
+        assert_eq!(leaf.profile.as_ref().map(|p| p.rows_returned), Some(3));
+    }
 }
