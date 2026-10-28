@@ -4180,12 +4180,17 @@ impl<'mt> Snapshot<'mt> {
     /// hold it, newest first:
     /// - a bloom filter that rules the id out sends it to the next SST;
     /// - a posting under every requested label proves a live member, and a
-    ///   posting under only some of them, or under any other label of that
-    ///   SST, proves a live version that is not one;
+    ///   posting under only some of them proves a live version that is not
+    ///   one;
     /// - in the last SST that can hold it, no requested posting means
     ///   `false`, as in the disjoint layout;
-    /// - otherwise that SST may hold a tombstone the postings cannot show,
-    ///   and the id goes to the point reader.
+    /// - otherwise the SST's node locator says whether it holds a version
+    ///   (a tombstone, or a live node without the labels), which means
+    ///   `false`, or not, which sends the id to the next SST. That keeps an
+    ///   SST too small for a bloom filter off the point reader;
+    /// - without a usable locator, a posting under any other label of that
+    ///   SST proves a live version that is not a member, and an id with no
+    ///   posting at all may be a tombstone and goes to the point reader.
     ///
     /// Memtable ids go to the point reader too. It costs what the caller's
     /// own fallback would, so an id the postings cannot prove is slower,
@@ -4281,12 +4286,20 @@ impl<'mt> Snapshot<'mt> {
             if unproved.is_empty() {
                 continue;
             }
+            // The node locator lists every row of this SST, tombstones
+            // included, so it settles the rest without a bloom filter: a
+            // version here is the newest one and lacks the labels, and an
+            // id it lacks moves on to the older SSTs.
+            let unproved_ids: Vec<[u8; 16]> = unproved.iter().map(|(_, id)| *id).collect();
+            if let Some(present) = self.node_locator_presence(desc, &unproved_ids).await? {
+                pending.extend(unproved.into_iter().filter(|(_, id)| !present.contains(id)));
+                continue;
+            }
             // A posting under any other label proves a live version here,
             // which is the newest one and is not a member.
             let Some(index) = &desc.label_index else {
                 return Ok(None);
             };
-            let unproved_ids: Vec<[u8; 16]> = unproved.iter().map(|(_, id)| *id).collect();
             let mut live = vec![false; unproved.len()];
             for (other, count) in &index.per_label_counts {
                 if *count == 0 || label_ids.iter().any(|label_id| label_id.get() == *other) {
@@ -4324,6 +4337,48 @@ impl<'mt> Snapshot<'mt> {
             }
         }
         Ok(Some(output))
+    }
+
+    /// Which of `ids` have a row (live or tombstone) in the node SST `desc`,
+    /// from its node locator. `None` when the locator is missing,
+    /// unreadable or does not cover every row.
+    async fn node_locator_presence(
+        &self,
+        desc: &SstDescriptor,
+        ids: &[[u8; 16]],
+    ) -> Result<Option<BTreeSet<[u8; 16]>>> {
+        let Some(locator) = desc
+            .node_locator
+            .as_ref()
+            .filter(|locator| locator.entry_count == desc.row_count)
+        else {
+            return Ok(None);
+        };
+        let absolute = format!(
+            "{}/{}",
+            self.paths.namespace_prefix().as_ref(),
+            locator.path
+        );
+        let probed = match self
+            .pinned_sidecar_source(&absolute, Some(locator.size_bytes))
+            .await
+        {
+            Ok(source) => {
+                crate::sst::paged_index::probe_node_locator_from_source(&source, ids).await
+            }
+            Err(error) => Err(error),
+        };
+        match probed {
+            Ok((found, stats)) if stats.index_entries == locator.entry_count => {
+                if let Some(cache) = &self.cache {
+                    cache.record_node_locator_probe(stats);
+                }
+                Ok(Some(found.into_keys().collect()))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if optional_accelerator_fallback(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Open the label sidecar of a node SST for membership probes. `None`
@@ -16694,18 +16749,55 @@ mod tests {
         assert_eq!(
             snap.try_batch_nodes_have_labels(&device, &ids)
                 .await
-                .unwrap(),
-            Some(expected)
+                .unwrap()
+                .as_ref(),
+            Some(&expected)
         );
         assert_eq!(cache.label_membership_fast_paths(), 1);
-        // Only the ids the postings cannot settle are read whole: the 400 the
-        // newer SST deleted, the two memtable ids and the bloom's false
-        // positives. Without the bloom it would be every id below 2,000 the
-        // newer SST does not hold.
-        assert!(
-            cache.label_membership_point_reads() < 450,
-            "{} point reads",
-            cache.label_membership_point_reads()
+        // The node locators settle the deletes too, so only the two memtable
+        // ids are read whole.
+        assert_eq!(cache.label_membership_point_reads(), 2);
+
+        // A small recent flush gets no bloom filter, and every id in its key
+        // range reaches its postings. The locator still keeps the ones it
+        // does not hold off the point reader.
+        let with_manifest = |edit: &dyn Fn(&mut SstDescriptor)| {
+            let mut manifest = committed.manifest.clone();
+            manifest
+                .ssts
+                .iter_mut()
+                .filter(|desc| desc.kind == SstKind::Nodes)
+                .for_each(edit);
+            LoadedManifest::new(
+                committed.pointer.clone(),
+                committed.pointer_etag.clone(),
+                committed.pointer_version.clone(),
+                manifest,
+            )
+        };
+        let unbloomed = with_manifest(&|desc| desc.bloom = None);
+        let cache = SstCache::new(16 * 1024 * 1024);
+        let snap = Snapshot::new(unbloomed, &live_view, store.clone(), paths.clone())
+            .with_cache(cache.clone());
+        assert_eq!(
+            snap.try_batch_nodes_have_labels(&device, &ids)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(cache.label_membership_point_reads(), 2);
+
+        // Without locators the ids the postings cannot settle are read whole,
+        // and the answer is the same.
+        let unlocated = with_manifest(&|desc| desc.node_locator = None);
+        assert_eq!(
+            Snapshot::new(unlocated, &live_view, store.clone(), paths.clone())
+                .try_batch_nodes_have_labels(&device, &ids)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(&expected)
         );
 
         // SSTs that share keys and LSNs have no newest one: fail closed.
