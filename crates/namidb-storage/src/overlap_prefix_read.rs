@@ -19,8 +19,8 @@ use uuid::Uuid;
 use namidb_core::NodeId;
 
 use super::{
-    node_scan_limited_async, node_view_from_payload, node_view_matches_predicates,
-    row_carries_label, NodeView, RangedMode, Snapshot,
+    node_scan_limited_async, node_view_from_payload, row_carries_label, NodeView, RangedMode,
+    Snapshot,
 };
 use crate::error::{Error, Result};
 use crate::memtable::{MemKey, MemOp};
@@ -37,19 +37,25 @@ struct SstCursor {
 }
 
 impl Snapshot<'_> {
-    /// Whether a `_limited` node scan can stop before reading every node:
-    /// always on disjoint node SSTs, and through the merge below otherwise.
-    /// The merge needs ranged reads, so the full-body diagnostic mode keeps
-    /// the old reconcile-and-truncate fallback.
-    pub fn node_scan_stops_early(&self) -> bool {
-        self.node_scan_is_disjoint() || !matches!(self.ranged_mode, RangedMode::Force(false))
+    /// Whether a `_limited` node scan with `predicates` can stop before
+    /// reading every node: always on disjoint node SSTs, and through the
+    /// merge below otherwise. The merge only takes unfiltered scans and
+    /// needs ranged reads, so a filtered scan or the full-body diagnostic
+    /// mode keeps the reconcile-and-truncate fallback.
+    pub fn node_scan_stops_early(&self, predicates: &[ScanPredicate]) -> bool {
+        self.node_scan_is_disjoint()
+            || (predicates.is_empty() && !matches!(self.ranged_mode, RangedMode::Force(false)))
     }
 
     /// The first `limit` live nodes (optionally in `label`, matching every
     /// predicate) in id order, without reading the rest of the store.
     ///
-    /// `None` leaves the caller on the full reconciliation: the full-body
-    /// diagnostic mode, or an SST whose rows are not in id order.
+    /// `None` leaves the caller on the full reconciliation: a filtered scan,
+    /// the full-body diagnostic mode, or an SST whose rows are not in id
+    /// order. A filter could only be checked after the point read, so a
+    /// selective one would cost a point read per node in every SST holding
+    /// a version of it, where the reconcile reads the projected columns
+    /// once.
     pub(super) async fn try_scan_overlapping_nodes_limited(
         &self,
         label: Option<&str>,
@@ -57,7 +63,7 @@ impl Snapshot<'_> {
         projection: Option<&[String]>,
         limit: usize,
     ) -> Result<Option<Vec<NodeView>>> {
-        if matches!(self.ranged_mode, RangedMode::Force(false)) {
+        if !predicates.is_empty() || matches!(self.ranged_mode, RangedMode::Force(false)) {
             return Ok(None);
         }
         let dict = &self.manifest.manifest.label_dict;
@@ -113,16 +119,6 @@ impl Snapshot<'_> {
             ));
         }
 
-        let remaining = |out: &Vec<NodeView>| {
-            let left = limit - out.len();
-            // A predicate can reject what the label already admitted, so
-            // fetch a few more per round rather than one batch per survivor.
-            if predicates.is_empty() {
-                left
-            } else {
-                left.max(256)
-            }
-        };
         let mut out: Vec<NodeView> = Vec::with_capacity(limit.min(1024));
         let mut pending: Vec<NodeId> = Vec::new();
         loop {
@@ -202,16 +198,14 @@ impl Snapshot<'_> {
                 }
             }
 
-            if !pending.is_empty() && (exhausted || pending.len() >= remaining(&out)) {
+            if !pending.is_empty() && (exhausted || pending.len() >= limit - out.len()) {
                 for view in self
                     .batch_lookup_nodes("", &pending)
                     .await?
                     .into_iter()
                     .flatten()
                 {
-                    if label.is_some_and(|label| !view.labels.iter().any(|l| l == label))
-                        || !node_view_matches_predicates(&view, predicates)
-                    {
+                    if label.is_some_and(|label| !view.labels.iter().any(|l| l == label)) {
                         continue;
                     }
                     let mut view = view;

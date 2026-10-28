@@ -667,12 +667,16 @@ async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
         }
     }
 
-    // A bare labelled LIMIT takes the label postings. With a predicate on a
-    // label as dense as `A` the postings decline and the same merge serves
-    // it, deciding the label on each id's newest version.
+    // A bare labelled LIMIT takes the label postings. A filtered one on a
+    // label as dense as `A`, or on no label, is left to the full reconcile:
+    // the merge could only test the filter after point-reading each
+    // candidate, which on a selective filter is one point read per node.
     let predicate = [ScanPredicate::IsNotNull {
         column: "v".to_string(),
     }];
+    // So the seed pull does not run a full reconcile per round either.
+    assert!(snapshot.node_scan_stops_early(&[]));
+    assert!(!snapshot.node_scan_stops_early(&predicate));
     for label in [Some("A"), None] {
         let full = match label {
             Some(label) => snapshot
@@ -704,7 +708,64 @@ async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
                 &full[..limit.min(full.len())],
                 "{label:?} LIMIT {limit}"
             );
-            assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
+            assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks + 1);
         }
     }
+}
+
+/// When the seeds rarely expand, every round of the seed pull restarts the
+/// overlap merge and point-reads its whole prefix, so growing the rounds to
+/// the store size cost more point reads than the store has nodes. Past
+/// 4,096 seeds the last round is one full scan, and the rows are unchanged.
+#[tokio::test]
+async fn overlapping_seed_pull_stops_growing_when_seeds_rarely_expand() {
+    let sst_cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-overlap-rare"), caches)
+        .await
+        .unwrap();
+    const N: usize = 6000;
+    let ids: Vec<NodeId> = (0..N).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("A", *id, &node_with("v", i as i64))
+            .unwrap();
+    }
+    writer
+        .upsert_edge("RARE", ids[N - 2], ids[N - 1], &edge())
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    // A second SST spanning the first one's id range makes them overlap.
+    for i in [0, N / 2, N - 1] {
+        writer
+            .upsert_node("A", ids[i], &node_with("v", 10_000 + i as i64))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    assert!(!snapshot.node_scan_is_disjoint());
+    let output = sst_cache.limited_node_scan_output_rows();
+    let plan = lower(&parse("MATCH (a)-[:RARE]->(b) RETURN a.v AS v, b.v AS w LIMIT 10").unwrap())
+        .unwrap();
+    let rows = execute_flat_path(&plan, &snapshot, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("v"),
+        Some(&RuntimeValue::Integer((N - 2) as i64))
+    );
+    assert_eq!(
+        rows[0].get("w"),
+        Some(&RuntimeValue::Integer(10_000 + (N - 1) as i64))
+    );
+    let point_read = sst_cache.limited_node_scan_output_rows() - output;
+    assert!(
+        point_read <= 64 + 256 + 1024 + 4096,
+        "{point_read} seeds point-read"
+    );
 }

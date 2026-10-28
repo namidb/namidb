@@ -206,13 +206,17 @@ crates.io release will establish and document that API explicitly.
   SST): a limited scan there merges the SSTs in id order, reading only the
   id, tombstone, lsn and label columns, keeps the newest version of each id,
   and loads only the nodes it returns. A labelled scan still tries the label
-  postings first.
+  postings first. Two cases there still read in full: a scan with a pushed
+  down filter, which the merge could only test node by node, and a seed pull
+  whose first 4,096 seeds do not fill the limit, whose last round is one
+  full scan instead of more point reads.
 
 - **The query row cap did not bound memory for a node scan.** With a row cap
   in scope (`NAMIDB_QUERY_ROW_CAP` on the server), `MATCH (n) RETURN n`
   loaded every node and only then reported the cap. The scan now stops one
   row past the cap and fails with the same error, in the flat and factorized
-  executors. When the manifest shows the scan cannot reach the cap, it keeps
+  executors. A scan with a pushed down filter only stops early on node SSTs
+  that do not overlap. When the manifest shows the scan cannot reach the cap, it keeps
   the plain read, so the SST body is still cached across queries. A `LIMIT`
   that the first seeds of an expand already fill no longer trips a row cap
   smaller than the seed batch.

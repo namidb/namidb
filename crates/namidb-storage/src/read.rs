@@ -6386,6 +6386,7 @@ impl<'mt> Snapshot<'mt> {
             {
                 if let Some(cache) = &self.cache {
                     cache.record_limited_node_scan_fast_path();
+                    cache.record_limited_node_scan_work(0, 0, rows.len(), 0, 0);
                 }
                 return Ok(rows);
             }
@@ -15791,10 +15792,11 @@ mod tests {
             vec![sorted_node_id(4), sorted_node_id(5), sorted_node_id(6)]
         );
         // Every node is a Doc, so a filter could reject every candidate and
-        // the filtered LIMIT merges the SSTs' rows instead. A bare LIMIT uses
-        // the postings. Neither reconciles every node.
-        assert_eq!(cache.limited_node_scan_fast_paths(), 1);
-        assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+        // the filtered LIMIT scans instead: point-reading candidates one by
+        // one until the filter passes would cost more than one projected
+        // pass. A bare LIMIT uses the postings.
+        assert_eq!(cache.limited_node_scan_fast_paths(), 0);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
         let bare = snap
             .scan_label_with_predicates_and_projection_limited("Doc", &[], None, 3)
             .await
@@ -15803,8 +15805,8 @@ mod tests {
             bare.iter().map(|node| node.id).collect::<Vec<_>>(),
             vec![sorted_node_id(1), sorted_node_id(3), sorted_node_id(4)]
         );
-        assert_eq!(cache.limited_node_scan_fast_paths(), 2);
-        assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+        assert_eq!(cache.limited_node_scan_fast_paths(), 1);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
 
         // A second L0 range updates existing ids. With overlapping ranges a
         // posting may name a superseded version; it must be skipped, not
@@ -15850,8 +15852,8 @@ mod tests {
             limited.iter().map(|node| node.id).collect::<Vec<_>>(),
             vec![sorted_node_id(6), sorted_node_id(8), sorted_node_id(10)]
         );
-        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 1);
-        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 0);
+        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 0);
+        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 1);
         let bare = overlap
             .scan_label_with_predicates_and_projection_limited("Doc", &[], None, 3)
             .await
@@ -15861,8 +15863,8 @@ mod tests {
             vec![sorted_node_id(1), sorted_node_id(2), sorted_node_id(3)]
         );
         assert_eq!(bare[1].properties["vigente"], Value::Bool(false));
-        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 2);
-        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 0);
+        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 1);
+        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 1);
     }
 
     #[tokio::test]
@@ -16272,11 +16274,10 @@ mod tests {
         assert_eq!(heavy.scan_label("Device").await.unwrap().len(), 22);
 
         // A filtered LIMIT takes the postings only for the sparse label: on a
-        // dense one a filter can reject every candidate, so it merges the
-        // SSTs' rows instead. Neither reconciles every node.
-        for (label, predicate, ids) in [
-            ("Device", &name_is_d3, &[3][..]),
-            ("Other", &name_is_o10, &[10][..]),
+        // dense one a filter can reject every candidate, so it is a full scan.
+        for (label, predicate, ids, fast) in [
+            ("Device", &name_is_d3, &[3][..], true),
+            ("Other", &name_is_o10, &[10][..], false),
         ] {
             let cache = SstCache::new(4 * 1024 * 1024);
             let rows = Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
@@ -16290,8 +16291,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(view_ids(&rows), sorted_ids(ids), "{label}");
-            assert_eq!(cache.limited_node_scan_fast_paths(), 1);
-            assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+            assert_eq!(cache.limited_node_scan_fast_paths(), u64::from(fast));
+            assert_eq!(cache.limited_node_scan_fallbacks(), u64::from(!fast));
         }
 
         let with_memtable =
