@@ -30,6 +30,17 @@ class _CompactionReport(TypedDict):
     bloom_sidecars_written: int
 
 
+class _SweepReport(TypedDict):
+    orphans_found: int
+    orphans_deleted: int
+    bytes_freed: int
+    skipped_too_young: int
+    wal_segments_reclaimed: int
+    wal_bytes_freed: int
+    manifest_snapshots_reclaimed: int
+    manifest_bytes_freed: int
+
+
 class QueryResult:
     """Result of a Cypher query.
 
@@ -85,7 +96,16 @@ class Client:
         self,
         uri: str,
         cache_bytes: Optional[int] = ...,
-    ) -> None: ...
+        spool_dir: Optional[str] = None,
+        auto_sweep_min_age_secs: Optional[int] = 60,
+        compaction_l0_trigger: int = 8,
+    ) -> None:
+        """`spool_dir` holds compaction scratch files; it defaults to
+        `NAMIDB_SPOOL_DIR`, then `<root>/.namidb-spool` for `file://`
+        URIs. An applied compaction sweeps retired objects older than
+        `auto_sweep_min_age_secs` (`None` disables). `flush()` compacts
+        once a bucket holds `compaction_l0_trigger` L0 SSTs (`0`
+        disables)."""
 
     # ── Storage CRUD (stages into the current batch) ────────────────
 
@@ -129,15 +149,24 @@ class Client:
         empty."""
 
     def flush(self) -> None:
-        """Flush the memtable to L0 SSTs."""
+        """Flush the memtable to L0 SSTs, then run a compaction pass if
+        a bucket reached `compaction_l0_trigger` L0 SSTs."""
 
     def compact(self) -> _CompactionReport:
         """Run one leveled compaction pass. Expensive preparation runs
         without the writer mutex; the returned report describes whether
-        the pass applied and which immutable SSTs it replaced."""
+        the pass applied and which immutable SSTs it replaced. An
+        applied pass is followed by a sweep unless
+        `auto_sweep_min_age_secs` is `None`."""
 
     def acompact(self) -> Coroutine[Any, Any, _CompactionReport]:
         """Async sibling of [`Client.compact`], returning the same report."""
+
+    def sweep(self, min_age_secs: int = 60, dry_run: bool = False) -> _SweepReport:
+        """Delete objects no manifest version references any more and
+        that are at least `min_age_secs` old: SSTs a compaction merged
+        away, WAL segments a flush retired, superseded manifests. With
+        `dry_run=True` nothing is deleted."""
 
     # ── Bulk APIs (batched under one runtime + lock hop) ────────────
 

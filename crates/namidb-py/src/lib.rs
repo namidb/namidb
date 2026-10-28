@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use object_store::ObjectStore;
@@ -30,8 +31,8 @@ use namidb_query::{
     RuntimeValue, StatsCatalog,
 };
 use namidb_storage::{
-    CommitOutcome, EdgeListView, EdgeView, EdgeWriteRecord, NodeView, NodeWriteRecord, SstCache,
-    WriterSession,
+    sweep_orphans, CommitOutcome, EdgeListView, EdgeView, EdgeWriteRecord, JanitorReport,
+    ManifestStore, NodeView, NodeWriteRecord, SstCache, WriterSession,
 };
 
 /// A namespace handle: object store + writer session + a tokio runtime
@@ -47,6 +48,12 @@ pub struct Client {
     store: Arc<dyn ObjectStore>,
     paths: namidb_storage::NamespacePaths,
     cache: SstCache,
+    /// Orphan age for the sweep that follows an applied compaction; `None`
+    /// leaves reclaiming to explicit `sweep()` calls.
+    auto_sweep_min_age: Option<Duration>,
+    /// `flush()` compacts inline once a bucket holds this many L0 SSTs
+    /// (`0` disables).
+    compaction_l0_trigger: usize,
 }
 
 #[pymethods]
@@ -68,10 +75,24 @@ impl Client {
     /// - `az://<account>/<container>[/<prefix>]?ns=<ns>[&endpoint=...][&allow_http=true][&use_emulator=true]`
     /// — Azure Blob Storage. Auth from `AZURE_STORAGE_ACCOUNT_NAME`
     /// + `AZURE_STORAGE_ACCESS_KEY` (or SAS token via env).
+    ///
+    /// `spool_dir` is where compaction writes its scratch files. It defaults
+    /// to `NAMIDB_SPOOL_DIR`, then to `<root>/.namidb-spool` for `file://`
+    /// URIs. `auto_sweep_min_age_secs` reclaims objects an applied compaction
+    /// retired once they are that old (`None` disables), and `flush()`
+    /// compacts once a bucket reaches `compaction_l0_trigger` L0 SSTs (`0`
+    /// disables).
     #[new]
-    #[pyo3(signature = (uri, cache_bytes=None))]
-    fn new(uri: &str, cache_bytes: Option<usize>) -> PyResult<Self> {
+    #[pyo3(signature = (uri, cache_bytes=None, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8))]
+    fn new(
+        uri: &str,
+        cache_bytes: Option<usize>,
+        spool_dir: Option<String>,
+        auto_sweep_min_age_secs: Option<u64>,
+        compaction_l0_trigger: usize,
+    ) -> PyResult<Self> {
         let (store, paths) = parse_uri(uri)?;
+        configure_spool_dir(uri, spool_dir)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -87,6 +108,8 @@ impl Client {
             store,
             paths,
             cache,
+            auto_sweep_min_age: auto_sweep_min_age_secs.map(Duration::from_secs),
+            compaction_l0_trigger,
         })
     }
 
@@ -250,13 +273,24 @@ impl Client {
         Ok(last_lsn)
     }
 
-    /// Flush the memtable into L0 SSTs.
+    /// Flush the memtable into L0 SSTs, then run a compaction pass when a
+    /// bucket has reached `compaction_l0_trigger` L0 SSTs.
     fn flush(&self) -> PyResult<()> {
-        self.runtime.block_on(async {
+        let l0 = self.runtime.block_on(async {
             let mut session = self.session.lock().await;
             let schema = session.snapshot().manifest().manifest.schema.clone();
-            session.flush(schema).await.map_err(map_storage_err)
+            session.flush(schema).await.map_err(map_storage_err)?;
+            Ok::<_, PyErr>(session.max_l0_bucket_len())
         })?;
+        // Embedded mode has no maintenance loop, so without this L0 grows
+        // until someone calls compact() and every read fans out across it.
+        if self.compaction_l0_trigger > 0 && l0 >= self.compaction_l0_trigger {
+            self.runtime.block_on(run_compaction_inner(
+                self.session.clone(),
+                self.compaction_lock.clone(),
+                self.auto_sweep(),
+            ))?;
+        }
         Ok(())
     }
 
@@ -270,6 +304,7 @@ impl Client {
         let report = self.runtime.block_on(run_compaction_inner(
             self.session.clone(),
             self.compaction_lock.clone(),
+            self.auto_sweep(),
         ))?;
         compaction_report_to_py(py, &report)
     }
@@ -278,10 +313,46 @@ impl Client {
     fn acompact<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = self.session.clone();
         let compaction_lock = self.compaction_lock.clone();
+        let auto_sweep = self.auto_sweep();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let report = run_compaction_inner(session, compaction_lock).await?;
+            let report = run_compaction_inner(session, compaction_lock, auto_sweep).await?;
             Python::with_gil(|py| compaction_report_to_py(py, &report))
         })
+    }
+
+    /// Delete objects no manifest version references any more and that are
+    /// at least `min_age_secs` old: SSTs a compaction merged away, WAL
+    /// segments a flush retired, superseded manifests. With `dry_run=True`
+    /// nothing is deleted and the dict reports what would be.
+    #[pyo3(signature = (min_age_secs=60, dry_run=false))]
+    fn sweep(&self, py: Python<'_>, min_age_secs: u64, dry_run: bool) -> PyResult<Py<PyDict>> {
+        let session = self.session.clone();
+        let compaction_lock = self.compaction_lock.clone();
+        let manifest_store = ManifestStore::new(self.store.clone(), self.paths.clone());
+        let report = self.runtime.block_on(async move {
+            let _compaction_guard = compaction_lock.lock().await;
+            let guard = session.lock().await;
+            sweep_locked(
+                &guard,
+                &manifest_store,
+                Duration::from_secs(min_age_secs),
+                !dry_run,
+            )
+            .await
+        })?;
+        let d = PyDict::new_bound(py);
+        d.set_item("orphans_found", report.orphans_found)?;
+        d.set_item("orphans_deleted", report.orphans_deleted)?;
+        d.set_item("bytes_freed", report.bytes_freed)?;
+        d.set_item("skipped_too_young", report.skipped_too_young)?;
+        d.set_item("wal_segments_reclaimed", report.wal_segments_reclaimed)?;
+        d.set_item("wal_bytes_freed", report.wal_bytes_freed)?;
+        d.set_item(
+            "manifest_snapshots_reclaimed",
+            report.manifest_snapshots_reclaimed,
+        )?;
+        d.set_item("manifest_bytes_freed", report.manifest_bytes_freed)?;
+        Ok(d.into())
     }
 
     /// Look up a single node by `(label, id)`.
@@ -605,6 +676,16 @@ impl Client {
 }
 
 impl Client {
+    /// What an applied compaction should sweep afterwards, if anything.
+    fn auto_sweep(&self) -> Option<(ManifestStore, Duration)> {
+        self.auto_sweep_min_age.map(|age| {
+            (
+                ManifestStore::new(self.store.clone(), self.paths.clone()),
+                age,
+            )
+        })
+    }
+
     /// Shared body of [`Client::merge_nodes`] (`merge = true`) and
     /// [`Client::put_nodes`].
     fn stage_nodes(&self, label: &str, rows: &Bound<'_, PyList>, merge: bool) -> PyResult<usize> {
@@ -758,6 +839,7 @@ struct CompactionReport {
 async fn run_compaction_inner(
     session: Arc<Mutex<WriterSession>>,
     compaction_lock: Arc<Mutex<()>>,
+    auto_sweep: Option<(ManifestStore, Duration)>,
 ) -> PyResult<CompactionReport> {
     let _compaction_guard = compaction_lock.lock().await;
     let basis = {
@@ -797,9 +879,16 @@ async fn run_compaction_inner(
         .await
         .map_err(map_storage_err)?;
     let l0_after = guard.max_l0_bucket_len();
+    let applied = outcome.source_ssts_removed > 0;
+    if let Some((manifest_store, min_age)) = auto_sweep.filter(|_| applied) {
+        // The merged-away inputs and the WAL earlier flushes retired stay on
+        // disk until a sweep. The pass is already installed, so a failed sweep
+        // only leaves them for the next one.
+        let _ = sweep_locked(&guard, &manifest_store, min_age, true).await;
+    }
 
     Ok(CompactionReport {
-        applied: outcome.source_ssts_removed > 0,
+        applied,
         manifest_version_before,
         manifest_version_after: outcome.committed.manifest.version,
         l0_before,
@@ -808,6 +897,59 @@ async fn run_compaction_inner(
         new_ssts_written: outcome.new_ssts_written,
         bloom_sidecars_written: outcome.bloom_sidecars_written,
     })
+}
+
+/// Sweep orphaned objects with the current manifest version as the retention
+/// horizon. The caller holds both the compaction lock and the writer guard, so
+/// no prepared compaction output is waiting to be installed and no flush or
+/// commit sits between its object PUT and the manifest CAS. Embedded reads also
+/// run entirely under the writer guard, so no in-process reader holds an older
+/// version. Readers in other processes are covered by pin leases and `min_age`.
+async fn sweep_locked(
+    guard: &WriterSession,
+    manifest_store: &ManifestStore,
+    min_age: Duration,
+    delete: bool,
+) -> PyResult<JanitorReport> {
+    let horizon = guard.snapshot().manifest().manifest.version;
+    sweep_orphans(manifest_store, horizon, min_age, 1, delete)
+        .await
+        .map_err(map_storage_err)
+}
+
+/// Point compaction scratch at `spool_dir`, else `NAMIDB_SPOOL_DIR`, else
+/// `<root>/.namidb-spool` for a `file://` URI, so a big compaction fills the
+/// graph volume instead of `/var/tmp`. The leading dot keeps it from ever
+/// parsing as a namespace. A default that cannot be created (a read-only
+/// root) keeps the platform fallback; an explicit `spool_dir` must work.
+fn configure_spool_dir(uri: &str, spool_dir: Option<String>) -> PyResult<()> {
+    let explicit = spool_dir.is_some();
+    let dir = spool_dir
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("NAMIDB_SPOOL_DIR")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .or_else(|| {
+            let rest = uri.strip_prefix("file://")?;
+            let root = rest.split_once('?').map_or(rest, |(path, _)| path);
+            Some(std::path::Path::new(root).join(".namidb-spool"))
+        });
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => namidb_storage::set_default_spool_dir(Some(dir)),
+        Err(e) if explicit => {
+            return Err(PyValueError::new_err(format!(
+                "spool_dir {}: {e}",
+                dir.display()
+            )))
+        }
+        Err(_) => {}
+    }
+    Ok(())
 }
 
 fn compaction_report_to_py(py: Python<'_>, report: &CompactionReport) -> PyResult<Py<PyDict>> {

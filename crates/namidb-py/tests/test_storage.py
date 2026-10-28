@@ -235,3 +235,83 @@ def test_store_repr_is_string(client: tg.Client) -> None:
 def test_version_attr_exists() -> None:
     assert isinstance(tg.__version__, str)
     assert len(tg.__version__) > 0
+
+
+# ── embedded maintenance: spool dir, sweep, L0 trigger ─────────────────
+
+
+def _flush_rounds(client: tg.Client, rounds: int) -> None:
+    for i in range(rounds):
+        client.upsert_node("Person", _new_uuid(), {"i": i})
+        client.commit()
+        client.flush()
+
+
+def _file_count(directory) -> int:
+    return sum(1 for p in directory.rglob("*") if p.is_file())
+
+
+def test_spool_dir_defaults_inside_graph_root(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("NAMIDB_SPOOL_DIR", raising=False)
+    client = tg.Client(f"file://{tmp_path}?ns=spool")
+    _flush_rounds(client, 1)
+    assert (tmp_path / ".namidb-spool").is_dir()
+
+
+def test_spool_dir_kwarg_wins(tmp_path) -> None:
+    spool = tmp_path / "scratch"
+    tg.Client(f"file://{tmp_path / 'graph'}?ns=spool", spool_dir=str(spool))
+    assert spool.is_dir()
+    assert not (tmp_path / "graph" / ".namidb-spool").exists()
+
+
+def test_compact_then_sweep_reclaims_wal_and_l0(tmp_path) -> None:
+    client = tg.Client(
+        f"file://{tmp_path}?ns=gc",
+        auto_sweep_min_age_secs=None,
+        compaction_l0_trigger=0,
+    )
+    _flush_rounds(client, 3)
+    wal = tmp_path / "gc" / "wal"
+    level0 = tmp_path / "gc" / "sst" / "level0"
+    l0_files = _file_count(level0)
+    assert _file_count(wal) > 0
+
+    assert client.compact()["applied"] is True
+    # Nothing is reclaimed until a sweep runs, and a dry run deletes nothing.
+    assert _file_count(level0) == l0_files
+    dry = client.sweep(min_age_secs=0, dry_run=True)
+    assert dry["wal_segments_reclaimed"] > 0
+    assert _file_count(wal) > 0
+
+    report = client.sweep(min_age_secs=0)
+    assert report["wal_segments_reclaimed"] > 0
+    assert report["orphans_deleted"] > 0
+    assert _file_count(wal) == 0
+    assert _file_count(level0) < l0_files
+    assert len(client.scan_label("Person")) == 3
+
+
+def test_applied_compaction_sweeps_automatically(tmp_path) -> None:
+    client = tg.Client(
+        f"file://{tmp_path}?ns=gc",
+        auto_sweep_min_age_secs=0,
+        compaction_l0_trigger=0,
+    )
+    _flush_rounds(client, 3)
+    assert client.compact()["applied"] is True
+    assert _file_count(tmp_path / "gc" / "wal") == 0
+    assert len(client.scan_label("Person")) == 3
+
+
+def test_flush_auto_compacts_past_l0_trigger() -> None:
+    client = tg.Client(f"memory://trig-{uuid.uuid4().hex[:8]}", compaction_l0_trigger=2)
+    _flush_rounds(client, 3)
+    assert client.compact()["l0_before"] < 3
+    assert len(client.scan_label("Person")) == 3
+
+
+def test_flush_trigger_zero_disables() -> None:
+    client = tg.Client(f"memory://trig-{uuid.uuid4().hex[:8]}", compaction_l0_trigger=0)
+    _flush_rounds(client, 3)
+    assert client.compact()["l0_before"] == 3
