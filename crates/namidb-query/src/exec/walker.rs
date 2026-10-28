@@ -4212,13 +4212,23 @@ fn proc_single_map(
     // A typo like `filtre` or `Filter` must not silently run UNFILTERED —
     // that is a data-exposure hazard, not a convenience. Reject any key the
     // procedure will not read.
+    reject_unknown_keys(proc, &map, allowed_keys)?;
+    Ok(map)
+}
+
+/// Fail a procedure call whose option map has a key outside `allowed_keys`.
+fn reject_unknown_keys(
+    proc: &str,
+    map: &std::collections::BTreeMap<String, RuntimeValue>,
+    allowed_keys: &[&str],
+) -> Result<(), ExecError> {
     if let Some(unknown) = map.keys().find(|key| !allowed_keys.contains(&key.as_str())) {
         return Err(proc_unsupported(format!(
             "{proc} does not recognise the option `{unknown}`; allowed options: {}",
             allowed_keys.join(", ")
         )));
     }
-    Ok(map)
+    Ok(())
 }
 
 /// A map value as an owned `String`, or `None` if it is not a string.
@@ -5347,15 +5357,12 @@ fn reject_unknown_algo_options(
     map: &std::collections::BTreeMap<String, RuntimeValue>,
     own: &[&str],
 ) -> Result<(), ExecError> {
-    const PROJECTION: [&str; 3] = ["labels", "edge_types", "direction"];
-    let allowed = || own.iter().chain(PROJECTION.iter());
-    if let Some(key) = map.keys().find(|k| !allowed().any(|a| a == k)) {
-        return Err(proc_unsupported(format!(
-            "algo.{name} does not recognise the option `{key}`; allowed options: {}",
-            allowed().copied().collect::<Vec<_>>().join(", ")
-        )));
-    }
-    Ok(())
+    let allowed: Vec<&str> = own
+        .iter()
+        .chain(&["labels", "edge_types", "direction"])
+        .copied()
+        .collect();
+    reject_unknown_keys(&format!("algo.{name}"), map, &allowed)
 }
 
 /// Build an in-memory `algo::Graph` from the snapshot: the projected nodes
