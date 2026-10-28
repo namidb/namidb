@@ -198,23 +198,24 @@ crates.io release will establish and document that API explicitly.
 - **`MATCH (x)-->(y) RETURN x, y LIMIT 10` read every node before the first
   edge.** A bare `LIMIT` over an expand from an unlabelled (or labelled)
   scan ran the scan in full to feed the expand, which on a 2.4M node graph
-  was enough to get the process killed for memory. The scan is now pulled
-  in growing prefixes (64 nodes, then four times more each round) until the
+  was enough to get the process killed for memory. The scan is now pulled in
+  growing prefixes (64 nodes, then four times more each round) until the
   limit is filled, and the rows are the same ones, in the same order, as
-  before. This needs the nodes flushed to SSTs that do not overlap (one
-  flush, or after compaction). While nodes sit in the memtable or SSTs
-  overlap, a limited scan still reconciles every node, so the scan runs
-  once in full as before instead of once per round.
+  before. This also works while nodes sit in the memtable or node SSTs
+  overlap (with random ids, such as uuid5, any store with more than one node
+  SST): a limited scan there merges the SSTs in id order, reading only the
+  id, tombstone, lsn and label columns, keeps the newest version of each id,
+  and loads only the nodes it returns. A labelled scan still tries the label
+  postings first.
 
 - **The query row cap did not bound memory for a node scan.** With a row cap
   in scope (`NAMIDB_QUERY_ROW_CAP` on the server), `MATCH (n) RETURN n`
-  loaded every node and only then reported the cap. On flushed,
-  non-overlapping node SSTs the scan now stops one row past the cap and
-  fails with the same error, in the flat and factorized executors. When the
-  manifest shows the scan cannot reach the cap, it keeps the plain read, so
-  the SST body is still cached across queries. A `LIMIT` that the first
-  seeds of an expand already fill no longer trips a row cap smaller than the
-  seed batch.
+  loaded every node and only then reported the cap. The scan now stops one
+  row past the cap and fails with the same error, in the flat and factorized
+  executors. When the manifest shows the scan cannot reach the cap, it keeps
+  the plain read, so the SST body is still cached across queries. A `LIMIT`
+  that the first seeds of an expand already fill no longer trips a row cap
+  smaller than the seed batch.
 
 - **`OPTIONAL MATCH p = ...` did not give a NULL `p` when nothing matched.**
   A variable-length or `shortestPath` path was left unbound, so `RETURN p`

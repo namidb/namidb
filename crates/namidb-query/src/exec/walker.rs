@@ -1221,15 +1221,15 @@ fn execute_capped<'a>(
                 // millions of nodes must not materialise every node first.
                 // Each round expands only the seeds the previous one did not
                 // see, so `out` stays the same prefix as the uncapped result
-                // and edgeless seeds cannot starve the budget. Any other
-                // input, or a snapshot whose node scan cannot stop early
-                // (memtable nodes or overlapping SSTs), runs uncapped once,
-                // as before.
+                // and edgeless seeds cannot starve the budget. Memtable nodes
+                // and overlapping SSTs are merged in id order by the limited
+                // scan, so they stop early too. Any other input, or the
+                // full-body diagnostic read mode, runs uncapped once.
                 // NOTE: when few seeds match, the rounds rescan the prefix
                 // (about 1.33x a full scan) and end up holding every seed;
                 // only the row cap bounds that case.
                 let mut want = match input.as_ref() {
-                    LogicalPlan::NodeScan { .. } if snapshot.node_scan_is_disjoint() => {
+                    LogicalPlan::NodeScan { .. } if snapshot.node_scan_stops_early() => {
                         Some(cap.max(64))
                     }
                     _ => None,

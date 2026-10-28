@@ -15,6 +15,7 @@ use std::sync::Arc;
 use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::schema::Schema;
 use namidb_core::value::Value as CoreValue;
+use namidb_storage::sst::predicates::ScanPredicate;
 use namidb_storage::{
     EdgeWriteRecord, NamespacePaths, NodeWriteRecord, SessionCaches, SstCache, WriterSession,
 };
@@ -535,4 +536,169 @@ async fn nodescan_limit_uses_prefix_on_multi_level_layout() {
     }
     assert_eq!(sst_cache.limited_node_scan_fast_paths(), fast_paths + 2);
     assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
+}
+
+/// `MATCH (a)-->(b) RETURN ... LIMIT k` on two overlapping node SSTs plus
+/// memtable rows, with updates, deletes and a relabel spread over all three.
+/// The seed pull used to run only on disjoint SSTs, so this layout scanned
+/// every node in full (on a 2.4M node store, enough to be killed for
+/// memory). The unlabelled limited scan now merges the SSTs in id order and
+/// stops early, and the rows must still be the uncapped prefix.
+#[tokio::test]
+async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
+    let sst_cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-overlap-seed"), caches)
+        .await
+        .unwrap();
+    const N: usize = 400;
+    let ids: Vec<NodeId> = (0..N).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("A", *id, &node_with("v", i as i64))
+            .unwrap();
+    }
+    for i in 0..N {
+        writer
+            .upsert_edge("TO", ids[i], ids[(i + 1) % N], &edge())
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    // Second SST: rewrites, deletes and a relabel of first-SST ids, plus
+    // new nodes.
+    for (i, id) in ids.iter().enumerate() {
+        if i % 7 == 0 {
+            writer.tombstone_node("A", *id).unwrap();
+        } else if i % 5 == 0 {
+            writer
+                .upsert_node_with_labels(["B".to_string()], *id, &node_with("v", 5000 + i as i64))
+                .unwrap();
+        } else if i % 3 == 0 {
+            writer
+                .upsert_node("A", *id, &node_with("v", 10_000 + i as i64))
+                .unwrap();
+        }
+    }
+    let mut fresh = Vec::new();
+    for i in 0..20 {
+        let id = NodeId::new();
+        fresh.push(id);
+        let label = if i % 2 == 0 { "A" } else { "B" };
+        writer.upsert_node(label, id, &node_with("v", 30_000 + i)).unwrap();
+        writer.upsert_edge("TO", id, ids[1], &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    // Memtable on top: more rewrites and deletes, some undoing the SST ones.
+    for (i, id) in ids.iter().enumerate() {
+        if i % 13 == 0 {
+            writer.tombstone_node("A", *id).unwrap();
+        } else if i % 11 == 0 {
+            writer
+                .upsert_node("A", *id, &node_with("v", 20_000 + i as i64))
+                .unwrap();
+        }
+    }
+    // Only the newest version of these carries `A`: a labelled scan that
+    // settled on an older one would drop them.
+    for (i, id) in fresh.iter().enumerate().skip(1).step_by(2) {
+        writer
+            .upsert_node_with_labels(["A".to_string()], *id, &node_with("v", 40_000 + i as i64))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+
+    let snapshot = writer.snapshot();
+    assert!(
+        !snapshot.node_scan_is_disjoint(),
+        "the layout must overlap or the test proves nothing"
+    );
+    let values = |rows: Vec<Row>| -> Vec<(i64, i64)> {
+        rows.iter()
+            .map(|r| match (r.get("v"), r.get("w")) {
+                (Some(RuntimeValue::Integer(v)), Some(RuntimeValue::Integer(w))) => (*v, *w),
+                (Some(RuntimeValue::Integer(v)), None) => (*v, 0),
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect()
+    };
+    let run_query = |query: String| {
+        let snapshot = &snapshot;
+        async move {
+            let plan = lower(&parse(&query).unwrap()).unwrap();
+            values(
+                execute_flat_path(&plan, snapshot, &Params::new())
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+
+    for (body, labelled) in [
+        ("MATCH (a)-->(b) RETURN a.v AS v, b.v AS w", false),
+        ("MATCH (a) RETURN a.v AS v", false),
+        ("MATCH (a:A) RETURN a.v AS v", true),
+        ("MATCH (a:A)-->(b) RETURN a.v AS v, b.v AS w", true),
+        ("MATCH (a:B)-->(b) RETURN a.v AS v, b.v AS w", true),
+    ] {
+        let full = run_query(body.to_string()).await;
+        assert!(full.len() > 40, "{body}: {}", full.len());
+        for limit in [1usize, 5, 63, 64, 65, 300, 1000] {
+            let fast_paths = sst_cache.limited_node_scan_fast_paths();
+            let fallbacks = sst_cache.limited_node_scan_fallbacks();
+            let output = sst_cache.limited_node_scan_output_rows();
+            let got = run_query(format!("{body} LIMIT {limit}")).await;
+            assert_eq!(got, &full[..limit.min(full.len())], "{body} LIMIT {limit}");
+            assert_eq!(
+                sst_cache.limited_node_scan_fallbacks(),
+                fallbacks,
+                "{body} LIMIT {limit} reconciled every node"
+            );
+            assert!(sst_cache.limited_node_scan_fast_paths() > fast_paths);
+            if limit == 5 && !labelled {
+                // One round of 64 seeds is plenty: nearly every node has an
+                // out-edge.
+                assert!(sst_cache.limited_node_scan_output_rows() - output <= 64);
+            }
+        }
+    }
+
+    // A bare labelled LIMIT takes the label postings. With a predicate on a
+    // label as dense as `A` the postings decline and the same merge serves
+    // it, deciding the label on each id's newest version.
+    let predicate = [ScanPredicate::IsNotNull {
+        column: "v".to_string(),
+    }];
+    for label in [Some("A"), None] {
+        let full = match label {
+            Some(label) => snapshot
+                .scan_label_with_predicates_and_projection(label, &predicate, None)
+                .await
+                .unwrap(),
+            None => snapshot
+                .scan_all_nodes_with_predicates_and_projection(&predicate, None)
+                .await
+                .unwrap(),
+        };
+        assert!(full.len() > 250, "{label:?}: {}", full.len());
+        for limit in [1usize, 5, 300, 1000] {
+            let fallbacks = sst_cache.limited_node_scan_fallbacks();
+            let got = match label {
+                Some(label) => snapshot
+                    .scan_label_with_predicates_and_projection_limited(
+                        label, &predicate, None, limit,
+                    )
+                    .await
+                    .unwrap(),
+                None => snapshot
+                    .scan_all_nodes_with_predicates_and_projection_limited(&predicate, None, limit)
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(got, &full[..limit.min(full.len())], "{label:?} LIMIT {limit}");
+            assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
+        }
+    }
 }
