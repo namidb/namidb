@@ -110,7 +110,8 @@ crates.io release will establish and document that API explicitly.
   a path holding NULL elements. Both are now NULL.
 - **`WHERE id(n) IN $ids` scanned the whole label.** Only `id(n) = $x` was
   turned into a point lookup, and only when it was the entire `WHERE`. An
-  `IN` list, an id equality next to another condition, and the
+  `IN` list, an id equality next to another condition (including an inline
+  `{k: v}` on the first node of a longer pattern), and the
   `UNWIND $ids AS x MATCH (n) WHERE id(n) = x` workaround all fell back to
   a full scan plus filter. They now seek each id, and the ids of one lookup
   are resolved in a single batched read instead of one cold read per id.

@@ -2043,7 +2043,7 @@ pub(crate) async fn execute_expand(
                                 continue;
                             }
                             None
-                        } else if let ExpandTargets::Views(views) = &target_membership {
+                        } else if let ExpandTargets::Views(views, rejected) = &target_membership {
                             // The hop's own materialisation answers directly, so a
                             // large fan-out no longer depends on cache retention.
                             // The batch resolves by id across every descriptor, so
@@ -2051,8 +2051,8 @@ pub(crate) async fn execute_expand(
                             // a multi-hop traversal use it too.
                             match views.get(&target_id) {
                                 // Proven not to carry the label (single hop).
-                                Some(None) => continue,
-                                Some(Some(v)) => {
+                                None if rejected.contains(&target_id) => continue,
+                                Some(v) => {
                                     if target_labels.iter().all(|l| v.labels.contains(l)) {
                                         Some(v.clone())
                                     } else if max > 1 {
@@ -6862,10 +6862,13 @@ pub(crate) enum ExpandTargets {
     /// entries before the per-edge loop reached them (sixth field report:
     /// instant at degree 3.8k, fatal at 53k — a step function at a capacity
     /// boundary, arriving EARLIER when the CSR cache is enabled because
-    /// that shrinks the node cache's share of the budget). `None` marks an
-    /// endpoint a single hop proved lacks the target label, so its edge is
-    /// skipped without reading the node.
-    Views(HashMap<NodeId, Option<namidb_storage::NodeView>>),
+    /// that shrinks the node cache's share of the budget). The set holds the
+    /// endpoints a single hop proved lack the target label, so their edges
+    /// are skipped without reading the node.
+    Views(
+        HashMap<NodeId, namidb_storage::NodeView>,
+        std::collections::HashSet<NodeId>,
+    ),
     /// Nothing prepared: each edge resolves its own endpoint, except the
     /// endpoints a single hop already proved lack the target label.
     Cold(std::collections::HashSet<NodeId>),
@@ -6985,7 +6988,7 @@ async fn prepare_expand_targets(
     // compact label sidecar first and hydrate only the members: a hub whose
     // neighbours mostly carry other labels no longer decodes every one of
     // them. Multi-hop traverses THROUGH non-members and needs them all.
-    let mut views = HashMap::new();
+    let mut rejected = std::collections::HashSet::new();
     let members: Vec<NodeId>;
     let mut candidates = unique_targets;
     if !multi_hop && !target_labels.is_empty() {
@@ -7003,7 +7006,7 @@ async fn prepare_expand_targets(
                 if is_member {
                     kept.push(id);
                 } else {
-                    views.insert(id, None);
+                    rejected.insert(id);
                 }
             }
             members = kept;
@@ -7012,17 +7015,16 @@ async fn prepare_expand_targets(
     }
     if !views_usable || candidates.len() > expand_target_view_budget() {
         let _ = snapshot.batch_lookup_nodes(label, candidates).await?;
-        return Ok(ExpandTargets::Cold(views.into_keys().collect()));
+        return Ok(ExpandTargets::Cold(rejected));
     }
     let fetched = snapshot.batch_lookup_nodes(label, candidates).await?;
-    views.extend(
-        candidates
-            .iter()
-            .copied()
-            .zip(fetched)
-            .filter_map(|(id, view)| view.map(|view| (id, Some(view)))),
-    );
-    Ok(ExpandTargets::Views(views))
+    let views = candidates
+        .iter()
+        .copied()
+        .zip(fetched)
+        .filter_map(|(id, view)| view.map(|view| (id, view)))
+        .collect();
+    Ok(ExpandTargets::Views(views, rejected))
 }
 
 /// Decide whether an Expand target may be represented by an id-only stub.
@@ -9378,7 +9380,7 @@ async fn execute_expand_factor(
                             continue;
                         }
                         None
-                    } else if let ExpandTargets::Views(views) = &target_membership {
+                    } else if let ExpandTargets::Views(views, rejected) = &target_membership {
                         // The hop's own materialisation answers directly, so a
                         // large fan-out no longer depends on cache retention.
                         // The batch resolves by id across every descriptor, so
@@ -9386,8 +9388,8 @@ async fn execute_expand_factor(
                         // a multi-hop traversal use it too.
                         match views.get(&target_id) {
                             // Proven not to carry the label (single hop).
-                            Some(None) => continue,
-                            Some(Some(v)) => {
+                            None if rejected.contains(&target_id) => continue,
+                            Some(v) => {
                                 if target_labels.iter().all(|l| v.labels.contains(l)) {
                                     Some(v.clone())
                                 } else if max > 1 {

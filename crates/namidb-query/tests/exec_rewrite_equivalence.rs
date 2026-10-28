@@ -583,6 +583,8 @@ async fn id_seek_agrees_with_the_filter_it_replaces() {
         "MATCH (b:Q) WHERE id(b) = $nothing RETURN b.n AS n",
         "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) = x RETURN b.n AS n",
         "MATCH (m:Q) MATCH (b:Q) WHERE id(b) = m RETURN b.n AS n",
+        "MATCH (b:Q)-[:E]->(r) WHERE id(b) IN $ids AND b.n > 'q1' RETURN r.n AS n",
+        "MATCH (b:Q {n: 'q1'})-[:E]->(r) WHERE id(b) IN $ids RETURN r.n AS n",
     ] {
         let plan = optimize(lower(&parse(query).unwrap()).unwrap(), &catalog);
         assert!(plan_has_node_by_id(&plan), "`{query}` must seek: {plan:?}");
@@ -622,6 +624,20 @@ async fn id_seek_agrees_with_the_filter_it_replaces() {
             [
                 "MATCH (b:Q) WHERE id(b) IN $ids AND b.n <> 'q2' RETURN b.n AS n",
                 "MATCH (b:Q) WHERE id(b) + '' IN $ids AND b.n <> 'q2' RETURN b.n AS n",
+            ],
+        ),
+        (
+            "id IN on an expand source with a pushed conjunct",
+            [
+                "MATCH (b:Q)-[:E]->(r) WHERE id(b) IN $ids AND b.n > 'q1' RETURN r.n AS n",
+                "MATCH (b:Q)-[:E]->(r) WHERE id(b) + '' IN $ids AND b.n > 'q1' RETURN r.n AS n",
+            ],
+        ),
+        (
+            "id IN on an expand source with an inline property",
+            [
+                "MATCH (b:Q {n: 'q1'})-[:E]->(r) WHERE id(b) IN $ids RETURN r.n AS n",
+                "MATCH (b:Q {n: 'q1'})-[:E]->(r) WHERE id(b) + '' IN $ids RETURN r.n AS n",
             ],
         ),
         (
