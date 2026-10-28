@@ -25,9 +25,10 @@
 //! - `back_reference: false`, `shortest: None`, no `path_binding`.
 //! - An id equality or `IN` on the target (`WHERE id(c) = $id`) anchors
 //!   through `NodeById` instead, always: each id is at most one row.
-//! - The source must be a bare `NodeScan` (no pushed predicates, no
-//!   projection): if the source is filtered too, choosing sides needs real
-//!   cost comparison, which stays with the join-reorder work.
+//! - The source must be a bare `NodeScan` (no pushed predicates; a pushed
+//!   projection is fine, it only narrows decoding): if the source is
+//!   filtered too, choosing sides needs real cost comparison, which stays
+//!   with the join-reorder work.
 //! - A `multi: true` (posting list) target anchor is only taken when label
 //!   statistics say the target label is no larger than the source label;
 //!   `multi: false` (unique) is always at most one row and always wins.
@@ -311,7 +312,11 @@ fn try_invert(
         RelationshipDirection::Both => RelationshipDirection::Both,
     };
     // Source side must be a completely unselective scan; anything filtered
-    // would need a real cost comparison to pick a side. One exception sees
+    // would need a real cost comparison to pick a side. A projection is not a
+    // filter: it only narrows decoding, and the inverted Expand loads the old
+    // source as its target anyway. Projection pushdown runs at the end of
+    // every round, so refusing it would block every inversion that only
+    // becomes possible in round two (a pin pushed onto an inner hop). One exception sees
     // through the veil: a label DISJUNCTION source `(o:A|B)` lowers to an
     // unlabeled scan behind a pure `__label_eq OR __label_eq` filter — its
     // selectivity is exactly as knowable as a labeled scan's (the sum of
@@ -330,8 +335,8 @@ fn try_invert(
                 label,
                 alias,
                 predicates,
-                projection,
-            } if predicates.is_empty() && projection.is_none() => (alias, label.clone(), None),
+                ..
+            } if predicates.is_empty() => (alias, label.clone(), None),
             LogicalPlan::Filter {
                 predicate: label_pred,
                 input: scan,
@@ -340,12 +345,12 @@ fn try_invert(
                     label: None,
                     alias,
                     predicates,
-                    projection,
+                    ..
                 } = scan.as_ref()
                 else {
                     return None;
                 };
-                if !predicates.is_empty() || projection.is_some() {
+                if !predicates.is_empty() {
                     return None;
                 }
                 let labels = crate::optimize::extract_label_disjunction(label_pred, alias)?;

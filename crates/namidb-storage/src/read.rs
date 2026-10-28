@@ -109,6 +109,8 @@ use crate::sst::nodes::{
 };
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
 
+#[path = "overlap_prefix_read.rs"]
+mod overlap_prefix_read;
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
 #[path = "search_lsm_read.rs"]
 mod search_lsm_read;
@@ -6377,6 +6379,16 @@ impl<'mt> Snapshot<'mt> {
                     }
                     return Ok(rows);
                 }
+            }
+            if let Some(rows) = self
+                .try_scan_overlapping_nodes_limited(label, predicates, projection, limit)
+                .await?
+            {
+                if let Some(cache) = &self.cache {
+                    cache.record_limited_node_scan_fast_path();
+                    cache.record_limited_node_scan_work(0, 0, rows.len(), 0, 0);
+                }
+                return Ok(rows);
             }
             if let Some(cache) = &self.cache {
                 cache.record_limited_node_scan_fallback();
@@ -15780,7 +15792,9 @@ mod tests {
             vec![sorted_node_id(4), sorted_node_id(5), sorted_node_id(6)]
         );
         // Every node is a Doc, so a filter could reject every candidate and
-        // the filtered LIMIT scans instead. A bare LIMIT uses the postings.
+        // the filtered LIMIT scans instead: point-reading candidates one by
+        // one until the filter passes would cost more than one projected
+        // pass. A bare LIMIT uses the postings.
         assert_eq!(cache.limited_node_scan_fast_paths(), 0);
         assert_eq!(cache.limited_node_scan_fallbacks(), 1);
         let bare = snap
@@ -16376,8 +16390,9 @@ mod tests {
             "{} locator probes",
             cache.node_locator_probes()
         );
-        assert_eq!(cache.limited_node_scan_fast_paths(), 0);
-        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
+        // The structural merge then finds no Device without a full scan.
+        assert_eq!(cache.limited_node_scan_fast_paths(), 1);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 0);
     }
 
     fn spread_node_id(i: u16) -> NodeId {

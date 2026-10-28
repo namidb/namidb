@@ -141,6 +141,14 @@ pub(crate) fn resolve_row_count(
 /// before the first candidate exists.
 const MAX_EAGER_QUERY_CAPACITY: usize = 64;
 
+/// Largest seed round an Expand pulls from a node scan over overlapping SSTs.
+/// Every round restarts the merge and point-reads its whole prefix, so when
+/// the seeds rarely expand the rounds would add up to more point reads than
+/// the store has nodes. Past this the remaining round is one full scan.
+// ponytail: fixed cut (64 + 256 + 1024 + 4096 point reads at most); resume
+// the merge from the last seed id if selective seed pulls get common.
+const OVERLAP_SEED_PULL_MAX: usize = 4096;
+
 #[inline]
 fn query_initial_capacity(requested: usize, available: usize) -> usize {
     requested.min(available).min(MAX_EAGER_QUERY_CAPACITY)
@@ -1221,19 +1229,25 @@ fn execute_capped<'a>(
                 // millions of nodes must not materialise every node first.
                 // Each round expands only the seeds the previous one did not
                 // see, so `out` stays the same prefix as the uncapped result
-                // and edgeless seeds cannot starve the budget. Any other
-                // input, or a snapshot whose node scan cannot stop early
-                // (memtable nodes or overlapping SSTs), runs uncapped once,
-                // as before.
+                // and edgeless seeds cannot starve the budget. Memtable nodes
+                // and overlapping SSTs are merged in id order by an unfiltered
+                // limited scan, so they stop early too. Any other input, a
+                // filtered scan over overlapping SSTs, or the full-body
+                // diagnostic read mode, runs uncapped once.
                 // NOTE: when few seeds match, the rounds rescan the prefix
                 // (about 1.33x a full scan) and end up holding every seed;
-                // only the row cap bounds that case.
+                // only the row cap bounds that case. Over overlapping SSTs
+                // each seed is a point read, so past OVERLAP_SEED_PULL_MAX
+                // seeds the next round is the uncapped scan.
                 let mut want = match input.as_ref() {
-                    LogicalPlan::NodeScan { .. } if snapshot.node_scan_is_disjoint() => {
+                    LogicalPlan::NodeScan { predicates, .. }
+                        if snapshot.node_scan_stops_early(predicates) =>
+                    {
                         Some(cap.max(64))
                     }
                     _ => None,
                 };
+                let overlapping = want.is_some() && !snapshot.node_scan_is_disjoint();
                 let row_cap = crate::exec::limits::scoped_row_cap();
                 let mut out: Vec<Row> = Vec::new();
                 let mut seen = 0usize;
@@ -1289,7 +1303,9 @@ fn execute_capped<'a>(
                     // The budget is still open and more seeds remain, so
                     // the next round would hold more than this one.
                     crate::exec::limits::check_row_cap(total)?;
-                    want = want.map(|w| w.saturating_mul(4));
+                    want = want
+                        .map(|w| w.saturating_mul(4))
+                        .filter(|w| !overlapping || *w <= OVERLAP_SEED_PULL_MAX);
                 }
             }
 
@@ -7116,7 +7132,7 @@ fn should_skip_target_materialize(
         // 2.2s against 0.55s for the labelled spelling at degree 160k.
         && (!routing.referenced_aliases.contains(target_alias)
             || routing.identity_only_aliases.contains(target_alias))
-        && !routing.zero_hop_sources.contains(target_alias)
+        && !routing.row_label_aliases.contains(target_alias)
         && length.as_ref().is_none_or(|length| length.max == 1)
 }
 
@@ -7225,15 +7241,28 @@ fn collect_identity_count_args(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Collect the source alias of every `*0..n` Expand in the plan.
-fn collect_zero_hop_expand_sources(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
-    if let LogicalPlan::Expand { source, length, .. } = plan {
+/// Collect every alias whose labels a later Expand reads off the bound row:
+/// the source of a `*0..n` Expand, and the target of a labelled
+/// back-reference Expand (`MATCH (m)-->(p) MATCH (c)-->(p:Person)`).
+fn collect_row_label_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    if let LogicalPlan::Expand {
+        source,
+        length,
+        target_alias,
+        target_labels,
+        back_reference,
+        ..
+    } = plan
+    {
         if length.as_ref().is_some_and(|l| l.min == 0) {
             out.insert(source.clone());
         }
+        if *back_reference && !target_labels.is_empty() {
+            out.insert(target_alias.clone());
+        }
     }
     for child in plan.children() {
-        collect_zero_hop_expand_sources(child, out);
+        collect_row_label_aliases(child, out);
     }
 }
 
@@ -10313,14 +10342,16 @@ pub(crate) struct PlanRouting {
     /// IDENTITY, never a property, a label or the whole value. Such a target
     /// can be bound as an id-only stub even though it IS referenced.
     identity_only_aliases: BTreeSet<String>,
-    /// Aliases a later Expand consumes as the SOURCE of a zero-length
-    /// variable-length pattern (`*0..n`). Such an Expand decides whether the
-    /// source itself is a result by reading the labels off the ROW, and an
-    /// id-only stub carries only the labels its own Expand asked for — not
-    /// the node's real set. A node labelled `:T:U` bound by `->(t:T)` would
-    /// therefore fail `-[:S*0..2]->(u:U)` at zero hops and silently lose the
-    /// row. These aliases must be materialised.
-    zero_hop_sources: BTreeSet<String>,
+    /// Aliases whose labels a later Expand reads off the ROW: the SOURCE of
+    /// a zero-length variable-length pattern (`*0..n`), which decides whether
+    /// the source itself is a result, and the TARGET of a labelled
+    /// back-reference, which checks the bound node against its labels. An
+    /// id-only stub carries only the labels its own Expand asked for, not the
+    /// node's real set. A node labelled `:T:U` bound by `->(t:T)` would
+    /// therefore fail `-[:S*0..2]->(u:U)` at zero hops, and `->(p)` followed
+    /// by `MATCH (c)-->(p:Person)` would fail the label check, silently losing
+    /// the row. These aliases must be materialised.
+    row_label_aliases: BTreeSet<String>,
     /// A node-mutating write invalidates the committed property cache at
     /// commit. Correlated indexed reads in such a statement must therefore
     /// use the writer-private transactional postings map so a sequence of
@@ -10336,14 +10367,14 @@ impl PlanRouting {
         collect_plan_referenced_variables(plan, &mut refs);
         let mut value_refs: BTreeSet<String> = BTreeSet::new();
         collect_plan_value_referenced_variables(plan, &mut value_refs);
-        let mut zero_hop_sources: BTreeSet<String> = BTreeSet::new();
-        collect_zero_hop_expand_sources(plan, &mut zero_hop_sources);
+        let mut row_label_aliases: BTreeSet<String> = BTreeSet::new();
+        collect_row_label_aliases(plan, &mut row_label_aliases);
         let identity_only_aliases = collect_identity_only_aliases(plan, &refs);
         Self {
             identity_only_aliases,
             referenced_aliases: refs,
             value_referenced_aliases: value_refs,
-            zero_hop_sources,
+            row_label_aliases,
             transactional_property_reads: plan_requires_transactional_property_reads(plan),
         }
     }

@@ -533,3 +533,39 @@ async fn id_anchored_target_matches_reversed_spelling() {
         }
     }
 }
+
+/// The id pin sits on the MIDDLE node of a two-hop chain and only ids are
+/// returned. Pushdown moves the pin onto the first hop in round one, while
+/// projection pushdown narrows the head scan to its id in the same round; the
+/// inversion in round two used to refuse a projected head scan and kept the
+/// whole `Person` scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn id_pin_on_a_middle_node_anchors_past_a_projected_scan() {
+    let (writer, companies) = corpus("anchor-inv-id-two-hop", true).await;
+    let per_company = (PEOPLE / COMPANIES) as usize;
+    let query = format!(
+        "MATCH (p:Person)-[:WORKS_AT]->(c:Company)<-[:WORKS_AT]-(q:Person) \
+         WHERE id(c) = '{}' RETURN id(p) AS p, id(q) AS q",
+        companies[2]
+    );
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let plan = optimize(lower(&parse(&query).unwrap()).unwrap(), &catalog);
+    assert!(
+        !plan_has_node_scan_of(&plan, "Person"),
+        "the id-pinned middle node must anchor the chain: {plan:?}"
+    );
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let plain = lower(&parse(&query).unwrap()).unwrap();
+    let unoptimized = execute(&plain, &snapshot, &Params::new()).await.unwrap();
+    let ids = |rows: &[namidb_query::Row]| {
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{:?}|{:?}", r.get("p"), r.get("q")))
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(ids(&rows), ids(&unoptimized));
+    assert!(rows.len() >= per_company * (per_company - 1));
+}
