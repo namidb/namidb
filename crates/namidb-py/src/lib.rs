@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use object_store::ObjectStore;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use tokio::runtime::Runtime;
@@ -275,7 +275,7 @@ impl Client {
 
     /// Flush the memtable into L0 SSTs, then run a compaction pass when a
     /// bucket has reached `compaction_l0_trigger` L0 SSTs.
-    fn flush(&self) -> PyResult<()> {
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let l0 = self.runtime.block_on(async {
             let mut session = self.session.lock().await;
             let schema = session.snapshot().manifest().manifest.schema.clone();
@@ -284,12 +284,21 @@ impl Client {
         })?;
         // Embedded mode has no maintenance loop, so without this L0 grows
         // until someone calls compact() and every read fans out across it.
+        // The flush is already durable, so a failed pass is only a warning:
+        // raising would read as "data not persisted" to a retrying caller.
         if self.compaction_l0_trigger > 0 && l0 >= self.compaction_l0_trigger {
-            self.runtime.block_on(run_compaction_inner(
+            if let Err(e) = self.runtime.block_on(run_compaction_inner(
                 self.session.clone(),
                 self.compaction_lock.clone(),
                 self.auto_sweep(),
-            ))?;
+            )) {
+                PyErr::warn_bound(
+                    py,
+                    &py.get_type_bound::<PyRuntimeWarning>(),
+                    &format!("flush succeeded, but the compaction it triggered failed: {e}"),
+                    1,
+                )?;
+            }
         }
         Ok(())
     }
@@ -724,6 +733,7 @@ impl Client {
         let count = parsed.len();
         let label = label.to_string();
         let session = self.session.clone();
+        let cache = self.cache.clone();
         self.runtime.block_on(async move {
             let mut guard = session.lock().await;
             // Unique property names declared for this label (empty if none).
@@ -744,7 +754,16 @@ impl Client {
                 // Read-modify-write against the RYOW overlay, so nodes staged
                 // by earlier calls count too. Rows repeating an id fold into
                 // one node here instead of re-reading the overlay per row.
-                let snap = guard.overlay_snapshot();
+                let snap = guard.overlay_snapshot().with_cache(cache);
+                // One batched read warms the decoded row groups, so the
+                // per-id lookups below (label-agnostic, to union labels)
+                // stay in memory instead of decoding an SST per row.
+                let mut distinct: Vec<NodeId> = parsed.iter().map(|(id, _)| *id).collect();
+                distinct.sort_unstable();
+                distinct.dedup();
+                snap.batch_lookup_nodes(&label, &distinct)
+                    .await
+                    .map_err(map_storage_err)?;
                 let mut slot: std::collections::HashMap<NodeId, usize> =
                     std::collections::HashMap::new();
                 for (id, props) in parsed {
@@ -922,6 +941,8 @@ async fn sweep_locked(
 /// graph volume instead of `/var/tmp`. The leading dot keeps it from ever
 /// parsing as a namespace. A default that cannot be created (a read-only
 /// root) keeps the platform fallback; an explicit `spool_dir` must work.
+/// The setting is process-wide and every client resets it, so a later
+/// `memory://` or `s3://` client does not inherit a `file://` graph's dir.
 fn configure_spool_dir(uri: &str, spool_dir: Option<String>) -> PyResult<()> {
     let explicit = spool_dir.is_some();
     let dir = spool_dir
@@ -936,19 +957,20 @@ fn configure_spool_dir(uri: &str, spool_dir: Option<String>) -> PyResult<()> {
             let root = rest.split_once('?').map_or(rest, |(path, _)| path);
             Some(std::path::Path::new(root).join(".namidb-spool"))
         });
-    let Some(dir) = dir else {
-        return Ok(());
+    let dir = match dir {
+        Some(dir) => match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir),
+            Err(e) if explicit => {
+                return Err(PyValueError::new_err(format!(
+                    "spool_dir {}: {e}",
+                    dir.display()
+                )))
+            }
+            Err(_) => None,
+        },
+        None => None,
     };
-    match std::fs::create_dir_all(&dir) {
-        Ok(()) => namidb_storage::set_default_spool_dir(Some(dir)),
-        Err(e) if explicit => {
-            return Err(PyValueError::new_err(format!(
-                "spool_dir {}: {e}",
-                dir.display()
-            )))
-        }
-        Err(_) => {}
-    }
+    namidb_storage::set_default_spool_dir(dir);
     Ok(())
 }
 
@@ -1649,7 +1671,25 @@ fn build_node_views_table(
         "lsn".to_string(),
         "schema_version".to_string(),
     ];
-    all_names.extend(prop_keys.iter().cloned());
+    // A property named like a metadata column (`id` kept from a legacy row
+    // keyed by `id`, or a business key) would make the schema ambiguous.
+    // Drop it when it only echoes the node id, else rename it `property.<key>`.
+    let prop_columns: Vec<(String, &String)> = prop_keys
+        .iter()
+        .filter_map(|key| {
+            if !all_names.contains(key) {
+                return Some((key.clone(), key));
+            }
+            let echoes_id = key == "id"
+                && views.iter().all(|v| match v.properties.get(key) {
+                    None => true,
+                    Some(Value::Str(s)) => *s == v.id.to_string(),
+                    Some(_) => false,
+                });
+            (!echoes_id).then(|| (format!("property.{key}"), key))
+        })
+        .collect();
+    all_names.extend(prop_columns.iter().map(|(name, _)| name.clone()));
 
     let ids = PyList::empty_bound(py);
     for v in views {
@@ -1687,10 +1727,10 @@ fn build_node_views_table(
     }
     arrays.append(pyarrow.call_method1("array", (svs,))?)?;
 
-    for key in prop_keys {
+    for (_, key) in &prop_columns {
         let pylist = PyList::empty_bound(py);
         for v in views {
-            let pyval = match v.properties.get(key) {
+            let pyval = match v.properties.get(*key) {
                 Some(val) => value_to_py(py, val)?,
                 None => py.None(),
             };

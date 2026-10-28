@@ -45,7 +45,19 @@ crates.io release will establish and document that API explicitly.
   `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless
   `NAMIDB_SPOOL_DIR` was set, which filled the system disk on large graphs.
   Pass `spool_dir=` to put it elsewhere. Text and vector index builds now
-  honour the same directory instead of `/var/tmp` or `$TMPDIR`.
+  honour the same directory instead of `/var/tmp` or `$TMPDIR`. The setting
+  is process-wide and each new client resets it, and a spool dir that was
+  deleted falls back to the default instead of failing every flush.
+
+- **A compaction triggered by `flush()` that fails is a `RuntimeWarning`.**
+  The flush is already durable at that point, so raising would tell a
+  retrying caller its data was lost.
+
+- **`scan_label_arrow` no longer emits two `id` columns.** A node loaded
+  with the legacy `id` key keeps `id` as a property, which clashed with the
+  metadata `id` column and made `table["id"]` raise. A property that only
+  repeats the node id is dropped from the table, and any other property
+  named like a metadata column comes back as `property.<key>`.
 
 ### Added
 

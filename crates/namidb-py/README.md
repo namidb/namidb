@@ -253,14 +253,22 @@ it inline:
   `auto_sweep_min_age_secs` (default 60) go, so a reader in another
   process gets a grace period. `None` turns the auto sweep off.
 - `client.sweep(min_age_secs=60, dry_run=False)` runs the same sweep on
-  demand and returns counts of what it removed (or would remove).
+  demand and returns counts of what it removed (or would remove). The
+  auto sweep runs right after the pass, so that pass's own leftovers are
+  usually still too young. Call `sweep()` once more at the end of a bulk
+  load, or `sweep(min_age_secs=0)` if no other process reads the graph.
+- If the compaction a `flush()` triggered fails, the flush still counts
+  (it is already durable) and you get a `RuntimeWarning` instead of an
+  exception.
 
 Compaction writes scratch files while it merges. For a `file://` URI they
 go under `<root>/.namidb-spool`, next to the graph, unless you pass
-`spool_dir=` or set `NAMIDB_SPOOL_DIR`. Other backends keep the
-`NAMIDB_SPOOL_DIR` / `/var/tmp` default. Plan for roughly three times
-the compacted bytes on that volume while a big pass runs. The spool dir
-is per process, so the last client opened decides it.
+`spool_dir=` or set `NAMIDB_SPOOL_DIR`. Other backends use
+`NAMIDB_SPOOL_DIR`, else `/var/tmp`. Plan for roughly three times the
+compacted bytes on that volume while a big pass runs. The spool dir is
+per process, so the last client opened decides it for every client in
+the process, and a spool dir that has been deleted falls back to the
+default.
 
 ```python
 client = namidb.Client(

@@ -103,6 +103,18 @@ def test_merge_nodes_reupsert_same_unique_value_ok(client: tg.Client) -> None:
         client.merge_nodes("Person", [{"_id": str(uuid.uuid4()), "email": "a@x.io"}])
 
 
+def test_upsert_node_reupsert_same_unique_value_ok(client: tg.Client) -> None:
+    client.cypher("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE")
+    node_id = str(uuid.uuid4())
+    client.upsert_node("Person", node_id, {"email": "a@x.io"})
+    client.commit()
+    client.upsert_node("Person", node_id, {"email": "a@x.io", "n": 1})
+    client.upsert_node_with_labels(["Person", "Admin"], node_id, {"email": "a@x.io"})
+    client.commit()
+    with pytest.raises(ValueError, match="unique"):
+        client.upsert_node("Person", str(uuid.uuid4()), {"email": "a@x.io"})
+
+
 def test_merge_nodes_id_visible_as_property(client: tg.Client) -> None:
     node_id = str(uuid.uuid4())
     client.merge_nodes("Person", [{"id": node_id, "name": "Alice"}])
@@ -294,6 +306,30 @@ def test_scan_label_arrow_basic(client: tg.Client) -> None:
     assert rows_by_name["Bob"]["age"] is None
     assert rows_by_name["Bob"]["city"] is None
     assert rows_by_name["Carol"]["city"] == "NYC"
+
+
+def test_scan_label_arrow_legacy_id_key(client: tg.Client) -> None:
+    # A legacy row keeps `id` as a property; it repeats the node id, so the
+    # table still has exactly one `id` column.
+    ids = [str(uuid.uuid4()) for _ in range(2)]
+    client.merge_nodes("Person", [{"id": ids[0], "name": "Alice"}])
+    client.merge_nodes("Person", [{"_id": ids[1], "name": "Bob"}])
+    client.commit()
+    table = client.scan_label_arrow("Person")
+    assert table.column_names == ["id", "label", "labels", "lsn", "schema_version", "name"]
+    assert sorted(table["id"].to_pylist()) == sorted(ids)
+
+
+def test_scan_label_arrow_business_id_is_renamed(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "id": "case-42", "lsn": 7}])
+    client.commit()
+    table = client.scan_label_arrow("Person")
+    assert table.column_names[5:] == ["property.id", "property.lsn"]
+    row = table.to_pylist()[0]
+    assert row["id"] == node_id
+    assert row["property.id"] == "case-42"
+    assert row["property.lsn"] == 7
 
 
 def test_scan_label_arrow_empty(client: tg.Client) -> None:

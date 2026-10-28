@@ -150,7 +150,8 @@ class Client:
 
     def flush(self) -> None:
         """Flush the memtable to L0 SSTs, then run a compaction pass if
-        a bucket reached `compaction_l0_trigger` L0 SSTs."""
+        a bucket reached `compaction_l0_trigger` L0 SSTs. A failed pass
+        only emits a `RuntimeWarning`: the flush itself is durable."""
 
     def compact(self) -> _CompactionReport:
         """Run one leveled compaction pass. Expensive preparation runs
@@ -166,7 +167,9 @@ class Client:
         """Delete objects no manifest version references any more and
         that are at least `min_age_secs` old: SSTs a compaction merged
         away, WAL segments a flush retired, superseded manifests. With
-        `dry_run=True` nothing is deleted."""
+        `dry_run=True` nothing is deleted. The auto sweep after a
+        compaction skips that pass's own young leftovers, so call this
+        once more at the end of a bulk load."""
 
     # ── Bulk APIs (batched under one runtime + lock hop) ────────────
 
@@ -251,7 +254,9 @@ class Client:
         """Like [`Client.scan_label`] but returns a `pyarrow.Table`
         directly. Columns: `id`, `label` (representative), `labels`
         (full set, list<string>), `lsn`, `schema_version`, then the
-        union of property keys (missing keys -> null)."""
+        union of property keys (missing keys are null). A property named
+        like one of those columns is renamed `property.<key>`, or dropped
+        when it is an `id` that only repeats the node id."""
 
     # ── Cypher ─────────────────────────────────────────────────────
 

@@ -8,6 +8,7 @@ surface (which covers the same primitives indirectly).
 
 from __future__ import annotations
 
+import shutil
 import uuid
 
 import pytest
@@ -258,6 +259,24 @@ def test_spool_dir_defaults_inside_graph_root(tmp_path, monkeypatch) -> None:
     assert (tmp_path / ".namidb-spool").is_dir()
 
 
+def test_deleted_graph_spool_does_not_break_later_clients(tmp_path, monkeypatch) -> None:
+    # The spool dir is process-wide. A file:// graph that is gone must not
+    # take the flushes of every client opened after it down with it.
+    monkeypatch.delenv("NAMIDB_SPOOL_DIR", raising=False)
+    graph = tmp_path / "graph"
+    tg.Client(f"file://{graph}?ns=a")
+    shutil.rmtree(graph)
+    other = tg.Client(f"memory://spool-{uuid.uuid4().hex[:8]}", compaction_l0_trigger=0)
+    _flush_rounds(other, 2)
+    assert other.compact()["applied"] is True
+    # Same when the gone graph's client is still the last one opened.
+    graph.mkdir()
+    tg.Client(f"file://{graph}?ns=a")
+    shutil.rmtree(graph)
+    _flush_rounds(other, 1)
+    assert len(other.scan_label("Person")) == 3
+
+
 def test_spool_dir_kwarg_wins(tmp_path) -> None:
     spool = tmp_path / "scratch"
     tg.Client(f"file://{tmp_path / 'graph'}?ns=spool", spool_dir=str(spool))
@@ -315,3 +334,24 @@ def test_flush_trigger_zero_disables() -> None:
     client = tg.Client(f"memory://trig-{uuid.uuid4().hex[:8]}", compaction_l0_trigger=0)
     _flush_rounds(client, 3)
     assert client.compact()["l0_before"] == 3
+
+
+def test_failed_triggered_compaction_only_warns(tmp_path) -> None:
+    client = tg.Client(
+        f"file://{tmp_path}?ns=warn",
+        auto_sweep_min_age_secs=None,
+        compaction_l0_trigger=2,
+    )
+    _flush_rounds(client, 1)
+    # Compaction output goes to level1; make it unwritable so the pass the
+    # next flush triggers fails after the flush itself has landed.
+    level1 = tmp_path / "warn" / "sst" / "level1"
+    level1.mkdir(parents=True)
+    level1.chmod(0o500)
+    try:
+        with pytest.warns(RuntimeWarning, match="compaction it triggered failed"):
+            _flush_rounds(client, 1)
+    finally:
+        level1.chmod(0o700)
+    assert len(client.scan_label("Person")) == 2
+    assert client.compact()["applied"] is True
