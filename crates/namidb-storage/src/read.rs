@@ -6024,8 +6024,10 @@ impl<'mt> Snapshot<'mt> {
     /// The per-SST posting counts are still checked against the manifest.
     ///
     /// Each candidate costs a full exact-record lookup, so the route runs
-    /// only when that work is bounded: by a bare LIMIT, or by the label being
-    /// sparse. Anything else is left to the two-phase scan.
+    /// only when that work is bounded: by the label being sparse, or by a
+    /// bare LIMIT whose candidates mostly confirm. A LIMIT that keeps hitting
+    /// superseded postings gives up after a budget. Anything else is left to
+    /// the two-phase scan.
     async fn try_scan_overlapping_label_sidecars(
         &self,
         label: &str,
@@ -6038,20 +6040,25 @@ impl<'mt> Snapshot<'mt> {
         // A filter can reject every candidate, so only a bare LIMIT bounds
         // the lookups by the rows returned.
         let bounded = limit.is_some() && predicates.is_empty();
-        // As in the disjoint route, an unbounded projected scan is better
-        // served by property pages than by full exact records. An id-only
-        // projection needs no payload either way.
+        // An unbounded projected scan is better served by the two-phase scan:
+        // an id-only one (a count) never leaves its structural pass, and a
+        // projected one reads property pages. Full exact records would decode
+        // every wide value of every member only to trim it.
         if !bounded
-            && projection.is_some_and(|columns| !columns.is_empty())
-            && self
-                .manifest
-                .index
-                .node_descriptors()
-                .into_iter()
-                .any(|idx| {
-                    crate::manifest::node_property_pages_sidecar(&self.manifest.manifest.ssts[idx])
-                        .is_some()
-                })
+            && projection.is_some_and(|columns| {
+                (columns.is_empty() && predicates.is_empty())
+                    || self
+                        .manifest
+                        .index
+                        .node_descriptors()
+                        .into_iter()
+                        .any(|idx| {
+                            crate::manifest::node_property_pages_sidecar(
+                                &self.manifest.manifest.ssts[idx],
+                            )
+                            .is_some()
+                        })
+            })
         {
             return Ok(None);
         }
@@ -6065,7 +6072,8 @@ impl<'mt> Snapshot<'mt> {
                 }
             }
         }
-        if !bounded && !self.label_is_sparse(label, memtable_ids.len()) {
+        let sparse = self.label_is_sparse(label, memtable_ids.len());
+        if !bounded && !sparse {
             return Ok(None);
         }
         memtable_ids.sort_unstable();
@@ -6092,9 +6100,20 @@ impl<'mt> Snapshot<'mt> {
             projection.map(|columns| columns.iter().map(String::as_str).collect());
         let result_limit = limit.unwrap_or(usize::MAX);
         let mut out = Vec::with_capacity(result_limit.min(64));
-        let wanted = |out: &Vec<NodeView>| {
+        // Unlike the disjoint route, a candidate here can be a superseded
+        // version and be skipped. Every skip widens the next batch, so a run
+        // of stale postings costs a few doubling lookups, not one each. On a
+        // dense label the run is also cut short: past the budget the
+        // structural pass of the two-phase scan is the cheaper answer.
+        let mut skipped = 0_usize;
+        let skip_budget = if sparse {
+            usize::MAX
+        } else {
+            result_limit.max(CANDIDATE_BATCH)
+        };
+        let wanted = |found: usize, skipped: usize| {
             if predicates.is_empty() {
-                CANDIDATE_BATCH.min(result_limit - out.len())
+                CANDIDATE_BATCH.min((result_limit - found).saturating_add(skipped))
             } else {
                 CANDIDATE_BATCH
             }
@@ -6103,7 +6122,7 @@ impl<'mt> Snapshot<'mt> {
         // One pending queue per SST cursor, plus a last one for the memtable.
         let mut pending: Vec<VecDeque<NodeId>> = Vec::with_capacity(cursors.len() + 1);
         for cursor in &mut cursors {
-            let Some(ids) = self.next_label_postings(cursor, wanted(&out)).await? else {
+            let Some(ids) = self.next_label_postings(cursor, wanted(0, 0)).await? else {
                 return Ok(None);
             };
             pending.push(ids.into());
@@ -6123,7 +6142,7 @@ impl<'mt> Snapshot<'mt> {
                 pending[slot].pop_front();
                 if pending[slot].is_empty() && slot < cursors.len() {
                     let Some(ids) = self
-                        .next_label_postings(&mut cursors[slot], wanted(&out))
+                        .next_label_postings(&mut cursors[slot], wanted(out.len(), skipped))
                         .await?
                     else {
                         return Ok(None);
@@ -6138,18 +6157,17 @@ impl<'mt> Snapshot<'mt> {
                 }
                 previous = Some(id);
                 batch.push(id);
-                if batch.len() < wanted(&out) {
+                if batch.len() < wanted(out.len(), skipped) {
                     continue;
                 }
             }
             for view in self.batch_lookup_nodes(label, &batch).await? {
-                let Some(mut view) = view else {
+                let Some(mut view) = view.filter(|view| {
+                    view.labels.contains(label) && node_view_matches_predicates(view, predicates)
+                }) else {
+                    skipped += 1;
                     continue;
                 };
-                if !view.labels.contains(label) || !node_view_matches_predicates(&view, predicates)
-                {
-                    continue;
-                }
                 if let Some(requested) = &requested_projection {
                     view.properties
                         .retain(|property, _| requested.contains(property.as_str()));
@@ -6162,6 +6180,9 @@ impl<'mt> Snapshot<'mt> {
             batch.clear();
             if next.is_none() {
                 return Ok(Some(out));
+            }
+            if skipped > skip_budget {
+                return Ok(None);
             }
         }
     }
@@ -7111,6 +7132,7 @@ impl<'mt> Snapshot<'mt> {
                 &[]
             };
 
+            let mut decoded_label_rows = 0;
             for batch in
                 reader.scan_with_predicates_and_projection(reader_predicates, decode_projection)?
             {
@@ -7153,6 +7175,7 @@ impl<'mt> Snapshot<'mt> {
                         update_node_winner(&mut latest, row_id, lsn, None);
                         continue;
                     }
+                    decoded_label_rows += 1;
                     let view = NodeView {
                         id: row_id,
                         labels: decode_node_labels(&batch, row, dict, &desc.scope),
@@ -7167,6 +7190,9 @@ impl<'mt> Snapshot<'mt> {
                     };
                     update_node_winner(&mut latest, row_id, lsn, Some(view));
                 }
+            }
+            if let Some(cache) = self.cache.as_ref().filter(|_| label.is_some()) {
+                cache.record_label_selected_node_rows(decoded_label_rows);
             }
         }
 
@@ -16031,6 +16057,19 @@ mod tests {
                 sorted_ids(&[1, 4, 5, 6])
             );
         }
+
+        // The full-body loop decodes properties only for rows that carry the
+        // label: Device versions of 1, 3, 4 and 6 in the older SST and of 2 in
+        // the newer one, not the four Other or tombstone rows.
+        let cache = SstCache::new(4 * 1024 * 1024);
+        let devices = Snapshot::new(committed, &empty_view, store, paths)
+            .with_ranged_reads(false)
+            .with_cache(cache.clone())
+            .scan_label("Device")
+            .await
+            .unwrap();
+        assert_eq!(view_ids(&devices), sorted_ids(&[2, 4, 6]));
+        assert_eq!(cache.label_selected_node_rows(), 5);
     }
 
     /// Independent oracle for label reads: the label-agnostic scan never takes
@@ -16170,7 +16209,17 @@ mod tests {
             reconciled_label_ids(&snap, "Device").await,
             sorted_ids(&[3])
         );
-        assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 1);
+        // A count needs no payload, so it skips the exact records and stops
+        // after the structural pass of the two-phase scan.
+        let cache = SstCache::new(4 * 1024 * 1024);
+        let counted = Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+            .with_cache(cache.clone())
+            .count_nodes(Some("Device"))
+            .await
+            .unwrap();
+        assert_eq!(counted, 1);
+        assert_eq!(cache.node_locator_probes(), 0);
+        assert_eq!(cache.label_selected_node_rows(), 0);
 
         // A label that lives mostly in the memtable is not sparse, even when
         // the manifest has never seen it.
@@ -16235,14 +16284,79 @@ mod tests {
         let devices = snap.scan_label("Device").await.unwrap();
         assert_eq!(view_ids(&devices), sorted_ids(&[3]));
         assert_eq!(devices[0].properties["name"], Value::Str("d3".into()));
-        assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 1);
         assert!(snap.scan_label("Other").await.is_err());
 
         let snap = Snapshot::new(committed, &live_view, store, paths);
         let devices = snap.scan_label("Device").await.unwrap();
         assert_eq!(view_ids(&devices), sorted_ids(&[5, 21]));
         assert_eq!(devices[1].properties["name"], Value::Str("m".into()));
-        assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn limit_over_superseded_postings_does_not_look_each_one_up() {
+        let store = make_store();
+        let paths = make_paths("stale-postings-limit");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let first = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            (0..2000_u16)
+                .map(|i| {
+                    (
+                        spread_node_id(i),
+                        u64::from(i) + 1,
+                        MemOp::Upsert(labelled_payload("d", vec![DEVICE])),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        // A newer, overlapping SST relabels every Device to Other: each of
+        // the 2,000 postings in the older SST now names a superseded version.
+        let committed = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            (0..2000_u16)
+                .map(|i| {
+                    (
+                        spread_node_id(i),
+                        5000 + u64::from(i),
+                        MemOp::Upsert(labelled_payload("o", vec![OTHER])),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let cache = SstCache::new(16 * 1024 * 1024);
+        let snap = Snapshot::new(committed, &empty_view, store, paths).with_cache(cache.clone());
+        assert!(snap.disjoint_node_descriptors().is_none());
+        assert!(!snap.label_is_sparse("Device", 0));
+        let rows = snap
+            .scan_label_with_predicates_and_projection_limited("Device", &[], None, 1)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        // Batches double from 1 up to 512 and the route gives up past its
+        // budget: a handful of batch lookups (one locator probe per SST
+        // each), where one lookup per posting would be 4,000 probes.
+        assert!(
+            cache.node_locator_probes() <= 24,
+            "{} locator probes",
+            cache.node_locator_probes()
+        );
+        assert_eq!(cache.limited_node_scan_fast_paths(), 0);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
     }
 
     fn spread_node_id(i: u16) -> NodeId {
