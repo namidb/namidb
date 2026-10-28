@@ -43,7 +43,8 @@
 //! relevant for selective predicate push-down rather than
 //! correctness.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::hash::Hash;
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
 use std::ops::Range;
@@ -5964,75 +5965,23 @@ impl<'mt> Snapshot<'mt> {
             if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
                 continue;
             }
-            let desc = &self.manifest.manifest.ssts[idx];
-            let Some(index) = &desc.label_index else {
+            let Some(mut cursor) = self.label_posting_cursor(idx, label_id).await? else {
                 return Ok(None);
             };
-            if index.format != PropertyIndexFormat::PagedV1
-                || index.per_label_counts.is_empty()
-                || self.validated_node_descriptor_live_count(desc).is_none()
-            {
-                return Ok(None);
-            }
-            let Some(expected_candidates) = index
-                .per_label_counts
-                .iter()
-                .find(|(candidate, _)| *candidate == label_id.get())
-                .map(|(_, count)| *count)
-            else {
-                // `node_sst_can_contain_label` admitted this descriptor, so a
-                // missing positive count contradicts its completeness proof.
-                return Ok(None);
-            };
-            if expected_candidates == 0 {
-                continue;
-            }
-
-            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), index.path);
-            let source = match self
-                .pinned_sidecar_source(&absolute, Some(index.size_bytes))
-                .await
-            {
-                Ok(source) => source,
-                Err(error) if optional_accelerator_fallback(&error) => return Ok(None),
-                Err(error) => return Err(error),
-            };
-
-            let mut cursor = None;
-            let mut observed_candidates = 0_u64;
             loop {
-                let page_limit = CANDIDATE_BATCH;
-                let (page, stats) = match crate::sst::paged_index::page_label_ids_from_source(
-                    &source,
-                    label_id.get(),
-                    cursor,
-                    page_limit,
-                    *desc.id.as_bytes(),
-                    &index.per_label_counts,
-                )
-                .await
-                {
-                    Ok(page) => page,
-                    Err(error) if optional_accelerator_fallback(&error) => return Ok(None),
-                    Err(error) => return Err(error),
+                // A bare LIMIT never needs more candidates than rows it still
+                // owes: in this layout every candidate confirms or bails.
+                let page_limit = if predicates.is_empty() {
+                    CANDIDATE_BATCH.min(result_limit - out.len())
+                } else {
+                    CANDIDATE_BATCH
                 };
-                if stats.index_entries != index.posting_count {
+                let Some(ids) = self.next_label_postings(&mut cursor, page_limit).await? else {
                     return Ok(None);
+                };
+                if ids.is_empty() {
+                    break;
                 }
-                observed_candidates = observed_candidates
-                    .checked_add(page.ids.len() as u64)
-                    .ok_or_else(|| Error::invariant("label candidate count overflows"))?;
-                if observed_candidates > expected_candidates
-                    || (page.ids.is_empty() && page.next_after.is_some())
-                {
-                    return Ok(None);
-                }
-
-                let ids = page
-                    .ids
-                    .iter()
-                    .map(|id| NodeId::from_uuid(Uuid::from_bytes(*id)))
-                    .collect::<Vec<_>>();
                 let resolved = self.batch_lookup_nodes(label, &ids).await?;
                 if resolved.len() != ids.len() {
                     return Ok(None);
@@ -6056,20 +6005,278 @@ impl<'mt> Snapshot<'mt> {
                         return Ok(Some(out));
                     }
                 }
-
-                let Some(next) = page.next_after else {
-                    break;
-                };
-                if cursor.is_some_and(|previous| previous >= next) {
-                    return Ok(None);
-                }
-                cursor = Some(next);
-            }
-            if observed_candidates != expected_candidates {
-                return Ok(None);
             }
         }
         Ok(Some(out))
+    }
+
+    /// Overlap-tolerant twin of [`Self::try_scan_disjoint_label_sidecars`],
+    /// used when node SSTs overlap or the memtable holds nodes.
+    ///
+    /// A posting now only says that SOME version of the id carried `label`.
+    /// The union of every SST's postings plus the memtable ids that carry it
+    /// is still complete, because the winning version of a live member is one
+    /// of those rows. Candidates are k-way merged into id order, deduplicated,
+    /// and resolved through the ordinary batch point reader, which reconciles
+    /// every source. A winner that is gone or lost the label is an older
+    /// version rather than corruption, so it is skipped, not a reason to bail.
+    /// The per-SST posting counts are still checked against the manifest.
+    async fn try_scan_overlapping_label_sidecars(
+        &self,
+        label: &str,
+        predicates: &[ScanPredicate],
+        projection: Option<&[String]>,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<NodeView>>> {
+        const CANDIDATE_BATCH: usize = 512;
+
+        // As in the disjoint route, an unlimited projected scan is better
+        // served by property pages than by full exact records. An id-only
+        // projection or a LIMIT bounds the payloads to the rows returned.
+        if limit.is_none()
+            && projection.is_some_and(|columns| !columns.is_empty())
+            && self
+                .manifest
+                .index
+                .node_descriptors()
+                .into_iter()
+                .any(|idx| {
+                    crate::manifest::node_property_pages_sidecar(&self.manifest.manifest.ssts[idx])
+                        .is_some()
+                })
+        {
+            return Ok(None);
+        }
+
+        let dict = &self.manifest.manifest.label_dict;
+        let label_id = dict.id(label);
+        let mut cursors = Vec::new();
+        for idx in self.manifest.index.node_descriptors() {
+            if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
+                continue;
+            }
+            let Some(label_id) = label_id else {
+                return Ok(None);
+            };
+            let Some(cursor) = self.label_posting_cursor(idx, label_id).await? else {
+                return Ok(None);
+            };
+            cursors.push(cursor);
+        }
+        if label_id.is_none() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut memtable_ids = Vec::new();
+        for (key, entry) in self.node_entries() {
+            if let (MemKey::Node { id }, MemOp::Upsert(payload)) = (key, &entry.op) {
+                if record_carries_label(&NodeWriteRecord::decode(payload)?, label, dict) {
+                    memtable_ids.push(*id);
+                }
+            }
+        }
+        memtable_ids.sort_unstable();
+
+        let requested_projection: Option<BTreeSet<&str>> =
+            projection.map(|columns| columns.iter().map(String::as_str).collect());
+        let result_limit = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(result_limit.min(64));
+        let wanted = |out: &Vec<NodeView>| {
+            if predicates.is_empty() {
+                CANDIDATE_BATCH.min(result_limit - out.len())
+            } else {
+                CANDIDATE_BATCH
+            }
+        };
+
+        // One pending queue per SST cursor, plus a last one for the memtable.
+        let mut pending: Vec<VecDeque<NodeId>> = Vec::with_capacity(cursors.len() + 1);
+        for cursor in &mut cursors {
+            let Some(ids) = self.next_label_postings(cursor, wanted(&out)).await? else {
+                return Ok(None);
+            };
+            pending.push(ids.into());
+        }
+        pending.push(memtable_ids.into());
+        let mut heap: BinaryHeap<Reverse<(NodeId, usize)>> = pending
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, ids)| ids.front().map(|id| Reverse((*id, slot))))
+            .collect();
+
+        let mut previous = None;
+        let mut batch = Vec::new();
+        loop {
+            let next = heap.pop();
+            if let Some(Reverse((id, slot))) = next {
+                pending[slot].pop_front();
+                if pending[slot].is_empty() && slot < cursors.len() {
+                    let Some(ids) = self
+                        .next_label_postings(&mut cursors[slot], wanted(&out))
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    pending[slot] = ids.into();
+                }
+                if let Some(following) = pending[slot].front() {
+                    heap.push(Reverse((*following, slot)));
+                }
+                if previous == Some(id) {
+                    continue;
+                }
+                previous = Some(id);
+                batch.push(id);
+                if batch.len() < wanted(&out) {
+                    continue;
+                }
+            }
+            for view in self.batch_lookup_nodes(label, &batch).await? {
+                let Some(mut view) = view else {
+                    continue;
+                };
+                if !view.labels.contains(label) || !node_view_matches_predicates(&view, predicates)
+                {
+                    continue;
+                }
+                if let Some(requested) = &requested_projection {
+                    view.properties
+                        .retain(|property, _| requested.contains(property.as_str()));
+                }
+                out.push(view);
+                if out.len() == result_limit {
+                    return Ok(Some(out));
+                }
+            }
+            batch.clear();
+            if next.is_none() {
+                return Ok(Some(out));
+            }
+        }
+    }
+
+    /// Open the paged label postings of node SST `idx`. `None` means the
+    /// sidecar cannot prove completeness and the caller must keep its Parquet
+    /// scan.
+    async fn label_posting_cursor(
+        &self,
+        idx: usize,
+        label_id: LabelId,
+    ) -> Result<Option<LabelPostingCursor>> {
+        let desc = &self.manifest.manifest.ssts[idx];
+        let Some(index) = &desc.label_index else {
+            return Ok(None);
+        };
+        if index.format != PropertyIndexFormat::PagedV1
+            || index.per_label_counts.is_empty()
+            || self.validated_node_descriptor_live_count(desc).is_none()
+        {
+            return Ok(None);
+        }
+        // Callers only open SSTs `node_sst_can_contain_label` admitted, so a
+        // missing positive count contradicts its completeness proof.
+        let Some(expected) = index
+            .per_label_counts
+            .iter()
+            .find(|(candidate, _)| *candidate == label_id.get())
+            .map(|(_, count)| *count)
+            .filter(|count| *count > 0)
+        else {
+            return Ok(None);
+        };
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), index.path);
+        let source = match self
+            .pinned_sidecar_source(&absolute, Some(index.size_bytes))
+            .await
+        {
+            Ok(source) => source,
+            Err(error) if optional_accelerator_fallback(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(LabelPostingCursor {
+            idx,
+            label_id,
+            source,
+            expected,
+            observed: 0,
+            after: None,
+            done: false,
+        }))
+    }
+
+    /// Next page of at most `page_limit` ids of the cursor's label, in id
+    /// order. Empty once the SST is exhausted, which also checks that exactly
+    /// the manifest's count was seen. `None` selects the caller's fallback.
+    async fn next_label_postings(
+        &self,
+        cursor: &mut LabelPostingCursor,
+        page_limit: usize,
+    ) -> Result<Option<Vec<NodeId>>> {
+        if cursor.done {
+            return Ok(Some(Vec::new()));
+        }
+        let desc = &self.manifest.manifest.ssts[cursor.idx];
+        let Some(index) = &desc.label_index else {
+            return Ok(None);
+        };
+        let (page, stats) = match crate::sst::paged_index::page_label_ids_from_source(
+            &cursor.source,
+            cursor.label_id.get(),
+            cursor.after,
+            page_limit,
+            *desc.id.as_bytes(),
+            &index.per_label_counts,
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) if optional_accelerator_fallback(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if stats.index_entries != index.posting_count {
+            return Ok(None);
+        }
+        cursor.observed = cursor
+            .observed
+            .checked_add(page.ids.len() as u64)
+            .ok_or_else(|| Error::invariant("label candidate count overflows"))?;
+        if cursor.observed > cursor.expected || (page.ids.is_empty() && page.next_after.is_some()) {
+            return Ok(None);
+        }
+        match page.next_after {
+            Some(next) => {
+                if cursor.after.is_some_and(|previous| previous >= next) {
+                    return Ok(None);
+                }
+                cursor.after = Some(next);
+            }
+            None => {
+                if cursor.observed != cursor.expected {
+                    return Ok(None);
+                }
+                cursor.done = true;
+            }
+        }
+        Ok(Some(
+            page.ids
+                .iter()
+                .map(|id| NodeId::from_uuid(Uuid::from_bytes(*id)))
+                .collect(),
+        ))
+    }
+
+    /// Whether `label` is a small enough share of the stored node rows for
+    /// one point lookup per member to beat a pass over every row.
+    fn label_is_sparse(&self, label: &str) -> bool {
+        // ponytail: fixed 25% cut on manifest counts; measure the crossover
+        // if dense labels start choosing the wrong route.
+        let rows: u64 = self
+            .manifest
+            .index
+            .node_descriptors()
+            .into_iter()
+            .map(|idx| self.manifest.manifest.ssts[idx].row_count)
+            .sum();
+        self.live_row_estimate(label).saturating_mul(4) <= rows
     }
 
     /// Shared exact implementation for the two public limited node scans.
@@ -6115,6 +6322,17 @@ impl<'mt> Snapshot<'mt> {
             projection.map(|columns| columns.iter().map(String::as_str).collect());
 
         let Some(descriptors) = self.disjoint_node_descriptors() else {
+            if let Some(label) = label {
+                if let Some(rows) = self
+                    .try_scan_overlapping_label_sidecars(label, predicates, projection, Some(limit))
+                    .await?
+                {
+                    if let Some(cache) = &self.cache {
+                        cache.record_limited_node_scan_fast_path();
+                    }
+                    return Ok(rows);
+                }
+            }
             if let Some(cache) = &self.cache {
                 cache.record_limited_node_scan_fallback();
             }
@@ -6506,9 +6724,9 @@ impl<'mt> Snapshot<'mt> {
             projection.map(|columns| columns.iter().map(String::as_str).collect());
 
         if let Some(label) = label {
-            if let Some(descriptors) = self.disjoint_node_descriptors() {
-                if let Some(rows) = self
-                    .try_scan_disjoint_label_sidecars(
+            let rows = match self.disjoint_node_descriptors() {
+                Some(descriptors) => {
+                    self.try_scan_disjoint_label_sidecars(
                         &descriptors,
                         label,
                         predicates,
@@ -6516,9 +6734,15 @@ impl<'mt> Snapshot<'mt> {
                         None,
                     )
                     .await?
-                {
-                    return Ok(rows);
                 }
+                None if self.label_is_sparse(label) => {
+                    self.try_scan_overlapping_label_sidecars(label, predicates, projection, None)
+                        .await?
+                }
+                None => None,
+            };
+            if let Some(rows) = rows {
+                return Ok(rows);
             }
         }
 
@@ -9557,6 +9781,18 @@ struct LimitedNodeBatchContext<'a> {
 }
 
 type ProjectedNodeCandidate = (NodeId, u64, Option<NodeView>);
+
+/// Paged walk of one node SST's label postings; see
+/// [`Snapshot::next_label_postings`].
+struct LabelPostingCursor {
+    idx: usize,
+    label_id: LabelId,
+    source: crate::range_cache::PinnedObjectRangeSource,
+    expected: u64,
+    observed: u64,
+    after: Option<[u8; 16]>,
+    done: bool,
+}
 
 /// Consume lazy Parquet batches only until `out` contains `limit` exact live
 /// matches. The iterator itself remains unconsumed after that point, which is
@@ -15109,13 +15345,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn limited_scan_falls_back_for_memtable_and_overlapping_ssts() {
+    async fn limited_scan_uses_label_sidecars_for_memtable_and_overlapping_ssts() {
         let store = make_store();
         let paths = make_paths("limited-fallbacks");
         let (ms, fence, schema, first) = limited_doc_fixture(&store, &paths, 20, 8, false).await;
         let predicate = vigente_predicate();
 
-        // A live node memtable delta makes the immutable prefix non-authoritative.
+        // A live node memtable delta makes the immutable prefix non-authoritative,
+        // but the label postings plus the memtable still give a complete,
+        // ordered candidate set: id 2 is deleted and the persisted tombstone
+        // of id 5 comes back as a matching Doc.
         let mut live = Memtable::new();
         live.apply(
             MemKey::Node {
@@ -15123,6 +15362,13 @@ mod tests {
             },
             100,
             MemOp::Tombstone,
+        );
+        live.apply(
+            MemKey::Node {
+                id: sorted_node_id(5),
+            },
+            101,
+            MemOp::Upsert(limited_doc_payload(5, true, false)),
         );
         let live_view = live.snapshot_view();
         let cache = SstCache::new(4 * 1024 * 1024);
@@ -15145,10 +15391,16 @@ mod tests {
             limited.iter().map(|node| node.id).collect::<Vec<_>>(),
             full.iter().take(3).map(|node| node.id).collect::<Vec<_>>()
         );
-        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
+        assert_eq!(
+            limited.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![sorted_node_id(4), sorted_node_id(5), sorted_node_id(6)]
+        );
+        assert_eq!(cache.limited_node_scan_fast_paths(), 1);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 0);
 
-        // A second L0 range updates existing ids. Even with an empty memtable,
-        // global range overlap must retain full LWW/tombstone reconciliation.
+        // A second L0 range updates existing ids. With overlapping ranges a
+        // posting may name a superseded version; it must be skipped, not
+        // returned and not treated as corruption.
         let second = flush_batch(
             &ms,
             &fence,
@@ -15186,8 +15438,12 @@ mod tests {
             limited.iter().map(|node| node.id).collect::<Vec<_>>(),
             full.iter().take(3).map(|node| node.id).collect::<Vec<_>>()
         );
-        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 0);
-        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 1);
+        assert_eq!(
+            limited.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![sorted_node_id(6), sorted_node_id(8), sorted_node_id(10)]
+        );
+        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 1);
+        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 0);
     }
 
     #[tokio::test]
@@ -15414,6 +15670,156 @@ mod tests {
                 view_ids(&shadowed.scan_label("Other").await.unwrap()),
                 sorted_ids(&[1, 4, 5, 6])
             );
+        }
+    }
+
+    /// Independent oracle for label reads: the label-agnostic scan never takes
+    /// a label route, so filtering its winners is an answer built another way.
+    async fn reconciled_label_ids(snap: &Snapshot<'_>, label: &str) -> Vec<NodeId> {
+        snap.scan_all_nodes_with_predicates_and_projection(&[], None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.labels.contains(label))
+            .map(|row| row.id)
+            .collect()
+    }
+
+    fn device_relabels_in_memtable() -> Memtable {
+        let mut live = Memtable::new();
+        for (id, lsn, name, labels) in [
+            (6, 30, "f2", vec![OTHER]),
+            (3, 31, "c2", vec![DEVICE]),
+            (7, 32, "g", vec![DEVICE]),
+        ] {
+            live.apply(
+                MemKey::Node {
+                    id: sorted_node_id(id),
+                },
+                lsn,
+                MemOp::Upsert(labelled_payload(name, labels)),
+            );
+        }
+        live
+    }
+
+    #[tokio::test]
+    async fn overlapping_label_sidecar_scan_matches_full_scan_prefix_for_every_limit() {
+        let store = make_store();
+        let paths = make_paths("label-sidecar-prefix");
+        let committed = relabel_overlap_fixture(&store, &paths).await;
+        let empty = Memtable::new();
+        let live = device_relabels_in_memtable();
+        for memtable in [empty.snapshot_view(), live.snapshot_view()] {
+            for label in ["Device", "Other"] {
+                let cache = SstCache::new(4 * 1024 * 1024);
+                let snap =
+                    Snapshot::new(committed.clone(), &memtable, store.clone(), paths.clone())
+                        .with_cache(cache.clone());
+                let full = snap.scan_label(label).await.unwrap();
+                assert_eq!(view_ids(&full), reconciled_label_ids(&snap, label).await);
+                for limit in 0..=full.len() + 1 {
+                    let limited = snap
+                        .scan_label_with_predicates_and_projection_limited(label, &[], None, limit)
+                        .await
+                        .unwrap();
+                    let prefix = full.iter().take(limit).cloned().collect::<Vec<_>>();
+                    assert_eq!(limited, prefix, "{label} LIMIT {limit}");
+                }
+                // `LIMIT 0` returns before choosing a route.
+                assert_eq!(
+                    cache.limited_node_scan_fast_paths(),
+                    full.len() as u64 + 1,
+                    "{label}"
+                );
+                assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_label_scan_under_overlap_reads_postings_not_rows() {
+        let store = make_store();
+        let paths = make_paths("sparse-label-overlap");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+        let mut rows: Vec<_> = (1..=20)
+            .map(|id| (sorted_node_id(id), id as u64, upsert("o", vec![OTHER])))
+            .collect();
+        rows.push((sorted_node_id(21), 21, upsert("d21", vec![DEVICE])));
+        rows.push((sorted_node_id(22), 22, upsert("d22", vec![DEVICE])));
+        let first = flush_batch(&ms, &fence, &base, &schema, rows).await;
+        let committed = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (sorted_node_id(3), 40, upsert("d3", vec![DEVICE])),
+                (sorted_node_id(10), 41, upsert("o10", vec![OTHER])),
+                (sorted_node_id(21), 42, upsert("o21", vec![OTHER])),
+                (sorted_node_id(22), 43, MemOp::Tombstone),
+            ],
+        )
+        .await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone());
+        assert!(snap.disjoint_node_descriptors().is_none());
+        assert!(snap.label_is_sparse("Device"));
+        assert!(!snap.label_is_sparse("Other"));
+        assert_eq!(
+            view_ids(&snap.scan_label("Device").await.unwrap()),
+            sorted_ids(&[3])
+        );
+        assert_eq!(
+            reconciled_label_ids(&snap, "Device").await,
+            sorted_ids(&[3])
+        );
+        assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 1);
+
+        // The Device answer comes from label postings and exact node records
+        // alone: it still holds with every node Parquet body gone, while the
+        // dense label, which has to read rows, cannot.
+        for desc in committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), desc.path);
+            store.delete(&Path::from(absolute)).await.unwrap();
+        }
+        let snap = Snapshot::new(committed, &empty_view, store, paths);
+        let devices = snap.scan_label("Device").await.unwrap();
+        assert_eq!(view_ids(&devices), sorted_ids(&[3]));
+        assert_eq!(devices[0].properties["name"], Value::Str("d3".into()));
+        assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 1);
+        assert!(snap.scan_label("Other").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn count_nodes_label_matches_reconcile_on_overlapping_levels() {
+        let store = make_store();
+        let paths = make_paths("count-overlap");
+        let committed = relabel_overlap_fixture(&store, &paths).await;
+        let empty = Memtable::new();
+        let live = device_relabels_in_memtable();
+        for memtable in [empty.snapshot_view(), live.snapshot_view()] {
+            let snap = Snapshot::new(committed.clone(), &memtable, store.clone(), paths.clone());
+            assert!(snap.metadata_node_count(Some("Device")).is_none());
+            for label in ["Device", "Other", "Missing"] {
+                assert_eq!(
+                    snap.count_nodes(Some(label)).await.unwrap(),
+                    reconciled_label_ids(&snap, label).await.len() as u64,
+                    "{label}"
+                );
+            }
         }
     }
 

@@ -29,6 +29,17 @@ crates.io release will establish and document that API explicitly.
   label still hides the older one, and its properties are never decoded.
   The same applies to property-page projections.
 
+- **`MATCH (n:L) RETURN n LIMIT k` and `count` read the whole store once
+  there was more than one node SST.** The LIMIT prefix scan and the label
+  index both required node SSTs with disjoint key ranges and an empty
+  memtable, which a store with more than one level never has. They now work
+  with overlap too: the label postings of every SST and the memtable ids
+  that carry the label are merged in id order, each candidate resolves to
+  its newest version, and versions that lost the label or were deleted are
+  skipped. A LIMIT stops as soon as it has its rows and no longer fetches a
+  full page of candidates first. Scans and counts without a LIMIT take this
+  route when the label is at most a quarter of the stored node rows.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed
