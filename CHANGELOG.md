@@ -191,8 +191,9 @@ crates.io release will establish and document that API explicitly.
   `Neo.ClientError.Statement.AccessMode`. Write mode transactions are
   unchanged. In `--multi-tenant` mode a namespace with an open read
   transaction is never evicted as idle, so a reopened copy of it cannot
-  compact and sweep files that the transaction's snapshot still reads. Embedders get a new `Backend::begin_tx_on_mode` method whose
-  default ignores the mode, so other backends keep working as before.
+  compact and sweep files that the transaction's snapshot still reads.
+  Embedders get a new `Backend::begin_tx_on_mode` method whose default
+  ignores the mode, so other backends keep working as before.
 
 ### Fixed
 
@@ -223,11 +224,12 @@ crates.io release will establish and document that API explicitly.
   in scope (`NAMIDB_QUERY_ROW_CAP` on the server), `MATCH (n) RETURN n`
   loaded every node and only then reported the cap. The scan now stops one
   row past the cap and fails with the same error, in the flat and factorized
-  executors. A scan with a pushed down filter only stops early on node SSTs
-  that do not overlap. When the manifest shows the scan cannot reach the cap, it keeps
-  the plain read, so the SST body is still cached across queries. A `LIMIT`
-  that the first seeds of an expand already fill no longer trips a row cap
-  smaller than the seed batch.
+  executors. On node SSTs that overlap, a scan with a pushed down filter or a
+  label still reads in full first (a labelled one through the two-pass scan,
+  which is cheaper there than one point read per member). When the manifest
+  shows the scan cannot reach the cap, it keeps the plain read, so the SST
+  body is still cached across queries. A `LIMIT` that the first seeds of an
+  expand already fill no longer trips a row cap smaller than the seed batch.
 
 - **`OPTIONAL MATCH p = ...` did not give a NULL `p` when nothing matched.**
   A variable-length or `shortestPath` path was left unbound, so `RETURN p`
