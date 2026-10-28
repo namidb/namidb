@@ -1161,12 +1161,43 @@ fn lower_node_pattern_head(
     ctx: &mut LowerCtx,
 ) -> Result<LogicalPlan, LowerError> {
     // Back-reference path: if `(a)` re-uses an already bound `a`, no new
-    // scan is emitted and a label is not required.
+    // scan is emitted and a label is not required. Labels and inline
+    // properties written on it still filter the bound node, the same way
+    // they do on a back-referenced Expand target. Under OPTIONAL MATCH a
+    // filter would drop the outer row, so they are left out there, as the
+    // target's property filters are.
     if let Some(binding) = &head.binding {
         if ctx.bindings.contains(&binding.name) {
-            return Ok(input.unwrap_or_else(|| LogicalPlan::Argument {
-                bindings: vec![binding.name.clone()],
-            }));
+            let alias = &binding.name;
+            let mut plan = input.unwrap_or_else(|| LogicalPlan::Argument {
+                bindings: vec![alias.clone()],
+            });
+            if optional {
+                return Ok(plan);
+            }
+            match &head.properties {
+                None => {}
+                Some(PatternProperties::Literal(map)) => {
+                    for (key, val) in map.entries.iter() {
+                        plan = LogicalPlan::Filter {
+                            input: Box::new(plan),
+                            predicate: build_eq(alias, &key.name, val.clone(), head.span),
+                        };
+                    }
+                }
+                Some(PatternProperties::Parameter { span, .. }) => {
+                    return Err(LowerError::new(
+                        LowerErrorKind::UnsupportedFeature,
+                        "$params spread in a MATCH pattern is not supported yet; list the keys explicitly in WHERE",
+                        *span,
+                    ));
+                }
+            }
+            if head.label_disjunction && head.labels.len() > 1 {
+                return Ok(wrap_label_filters(plan, alias, head, head.span));
+            }
+            let labels: Vec<String> = head.labels.iter().map(|l| l.name.clone()).collect();
+            return Ok(wrap_extra_label_filters(plan, alias, &labels, head.span));
         }
     }
     let label = optional_primary_label(head);

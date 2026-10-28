@@ -252,7 +252,10 @@ crates.io release will establish and document that API explicitly.
   matches again with a label (`MATCH (m)-->(p) MATCH (c)-->(p:Person)`) is
   still loaded, since that label check needs the node's real labels; the
   id-only route used to drop every such row, which `count(p)` and
-  `count(*)` already did before this release.
+  `count(*)` already did before this release. When the later pattern starts
+  at that alias (`MATCH (m)-->(p) MATCH (p:Person)`), its labels and inline
+  properties used to be ignored, so rows for nodes that are not a Person
+  came back. Outside `OPTIONAL MATCH` they now filter the bound node.
 
 - **A pattern pinned by `id()` on its last node started from the first.**
   `MATCH (i:Identifier)-[:R]->(d:Device) WHERE id(d) = $id` scanned every
