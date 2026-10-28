@@ -23,7 +23,7 @@ use namidb_storage::{
     sweep_orphans, Manifest, ManifestStore, NamespacePaths, SnapshotCell, WriterSession,
 };
 use object_store::ObjectStore;
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{watch, Mutex, OnceCell, RwLock};
 use tokio::task::JoinHandle;
 use tracing::error;
 
@@ -34,6 +34,11 @@ use crate::recovery::{self, WriterHealth};
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
 /// cloned [`NamespaceState`]s. `None` until the first read query builds it.
 type CatalogCache = Arc<std::sync::Mutex<Option<(u64, Arc<StatsCatalog>)>>>;
+
+/// One namespace's place in the registry. The first request for the
+/// namespace initializes it; concurrent requests for the same namespace wait
+/// on the cell instead of on the registry map.
+type Slot = Arc<OnceCell<Arc<NamespaceState>>>;
 
 /// Per-namespace background-maintenance configuration. Mirrors the
 /// single-tenant `Config` fields that drive flush/compaction/orphan-sweep,
@@ -80,8 +85,13 @@ pub struct NamespaceRegistry {
     store: Arc<dyn ObjectStore>,
     /// Root prefix for all namespaces (e.g. "tenants" or "" for flat layout).
     root: String,
-    /// Active namespace sessions, keyed by namespace string.
-    sessions: RwLock<HashMap<String, Arc<NamespaceState>>>,
+    /// Active namespace sessions, keyed by namespace string. A slot that is
+    /// not initialized yet is an open in progress (or one whose opener was
+    /// cancelled); it counts against the cap.
+    sessions: RwLock<HashMap<String, Slot>>,
+    /// Evicted incarnations that are not quiesced yet. A reopen of the same
+    /// namespace drains its previous incarnation before claiming the epoch.
+    draining: std::sync::Mutex<HashMap<String, Arc<NamespaceState>>>,
     /// Maximum number of concurrent namespaces. `0` means unlimited (no cap,
     /// no eviction). Otherwise, when the cap is reached, idle sessions are
     /// evicted oldest-first.
@@ -121,6 +131,7 @@ impl NamespaceRegistry {
             store,
             root,
             sessions: RwLock::new(HashMap::new()),
+            draining: std::sync::Mutex::new(HashMap::new()),
             max_namespaces,
             idle_timeout,
             anchor: Instant::now(),
@@ -161,7 +172,12 @@ impl NamespaceRegistry {
     /// flushing a live memtable can free memory, while opening a cold
     /// namespace cannot and may make the pressure episode worse.
     pub async fn get_if_open(&self, namespace: &str) -> Option<Arc<NamespaceState>> {
-        let state = self.sessions.read().await.get(namespace).cloned();
+        let state = self
+            .sessions
+            .read()
+            .await
+            .get(namespace)
+            .and_then(|slot| slot.get().cloned());
         if let Some(state) = &state {
             state
                 .last_access
@@ -172,78 +188,113 @@ impl NamespaceRegistry {
 
     /// Get or create a `NamespaceState` for `namespace`. Returns an error
     /// if the namespace ID is invalid.
+    ///
+    /// The map lock is only held to find or insert the namespace's slot.
+    /// The open itself (pointer resolve, segment listing, WAL replay) runs
+    /// on the slot, so a slow cold open only makes requests for that same
+    /// namespace wait, never the other tenants.
     pub async fn get_or_open(&self, namespace: &str) -> Result<Arc<NamespaceState>, RegistryError> {
         let now = self.now_secs();
-        // Fast path: read lock check
-        {
-            let sessions = self.sessions.read().await;
-            if let Some(state) = sessions.get(namespace) {
-                state
-                    .last_access
-                    .store(now, std::sync::atomic::Ordering::Relaxed);
-                return Ok(Arc::clone(state));
-            }
-        }
+        let existing = self.sessions.read().await.get(namespace).cloned();
+        let slot = match existing {
+            Some(slot) => slot,
+            None => self.insert_slot(namespace).await?,
+        };
+        let state = slot
+            .get_or_try_init(|| self.open_namespace(namespace, now))
+            .await?;
+        state
+            .last_access
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+        Ok(Arc::clone(state))
+    }
 
-        // Slow path: write lock, double-check, then create
-        let mut sessions = self.sessions.write().await;
-        if let Some(state) = sessions.get(namespace) {
-            state
-                .last_access
-                .store(now, std::sync::atomic::Ordering::Relaxed);
-            return Ok(Arc::clone(state));
-        }
-
-        // Evict if at capacity (0 = unlimited, never evicts).
-        while self.at_capacity(sessions.len()) {
-            if let Some(to_evict) = self.find_idle_oldest(&sessions) {
-                tracing::info!("evicting idle namespace: {}", to_evict);
-                if let Some(evicted) = sessions.get(&to_evict).cloned() {
-                    // Close this incarnation to new foreground writes BEFORE
-                    // removing it from the map. Requests that already cloned
-                    // the Arc may still be queued on `writer`; every
-                    // multi-tenant write path re-validates this flag after it
-                    // acquires that mutex.
-                    evicted.mark_retired();
-                    sessions.remove(&to_evict);
-                    // Stop the namespace's flush/compaction loops so the
-                    // evicted state (writer, memtable, caches) is actually
-                    // released instead of living on as a zombie second
-                    // writer. Dropping the memtable loses nothing: acked
-                    // writes are WAL-committed before the ack, and reopen
-                    // replays the WAL.
-                    // Stop and JOIN every task before a replacement writer can
-                    // claim this namespace. A stale compaction/flush task must
-                    // never recover itself after the new writer opens: doing
-                    // so would bump the epoch again and fence the replacement.
-                    evicted.cancel_and_abort_maintenance().await;
-                    // Quiesce the old writer before opening any replacement
-                    // WriterSession while the registry write lock still
-                    // excludes concurrent opens. A write that already held
-                    // the mutex is allowed to finish; queued stale requests
-                    // observe `retired` after acquiring it and leave without
-                    // touching storage. Once this guard has been acquired,
-                    // no operation through the old Arc can recover/reopen and
-                    // fence the next incarnation.
-                    let old_writer = evicted.writer.lock().await;
-                    drop(old_writer);
-                    // The read caches are process-wide and shared across
-                    // namespaces (their budgets are global); dropping the
-                    // state does not release the evicted namespace's
-                    // entries, so reclaim them eagerly. The name came out
-                    // of the sessions map, so it always re-validates.
-                    if let Ok(ns_id) = NamespaceId::new(&to_evict) {
-                        namidb_storage::prune_shared_caches(&NamespacePaths::new(
-                            &self.root, ns_id,
-                        ));
+    /// Insert an empty slot for `namespace`, evicting idle namespaces first
+    /// when the registry is at capacity. Victims leave the map before the
+    /// new slot goes in, and are quiesced after the map lock is released.
+    async fn insert_slot(&self, namespace: &str) -> Result<Slot, RegistryError> {
+        NamespaceId::new(namespace).map_err(|e| RegistryError::InvalidNamespace(e.to_string()))?;
+        let mut victims = Vec::new();
+        let inserted = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get(namespace) {
+                Some(slot) => Ok(Arc::clone(slot)),
+                None => {
+                    let mut inserted = Ok(());
+                    // Evict if at capacity (0 = unlimited, never evicts).
+                    while self.at_capacity(sessions.len()) {
+                        let Some(to_evict) = self.find_idle_oldest(&sessions) else {
+                            inserted = Err(RegistryError::AtCapacity);
+                            break;
+                        };
+                        let slot = sessions.remove(&to_evict).expect("victim is in the map");
+                        // A slot whose opener was cancelled holds no state.
+                        let Some(evicted) = slot.get() else {
+                            continue;
+                        };
+                        tracing::info!("evicting idle namespace: {}", to_evict);
+                        // Close this incarnation to new foreground writes
+                        // BEFORE it leaves the map. Requests that already
+                        // cloned the Arc may still be queued on `writer`;
+                        // every multi-tenant write path re-validates this
+                        // flag after it acquires that mutex.
+                        evicted.mark_retired();
+                        // Until it is quiesced, a reopen of the same
+                        // namespace must wait for it (see `open_namespace`).
+                        self.draining
+                            .lock()
+                            .expect("draining map poisoned")
+                            .insert(to_evict, Arc::clone(evicted));
+                        victims.push(Arc::clone(evicted));
                     }
+                    inserted.map(|()| {
+                        let slot = Slot::default();
+                        sessions.insert(namespace.to_string(), Arc::clone(&slot));
+                        slot
+                    })
                 }
-            } else {
-                return Err(RegistryError::AtCapacity);
             }
+        };
+        for evicted in victims {
+            self.drain(&evicted).await;
+        }
+        inserted
+    }
+
+    /// Quiesce an evicted incarnation and forget it. Run by the evictor and
+    /// by a replacement opener of the same namespace, whichever comes first;
+    /// the other waits for it.
+    async fn drain(&self, evicted: &Arc<NamespaceState>) {
+        evicted.quiesce(&self.root).await;
+        let mut draining = self.draining.lock().expect("draining map poisoned");
+        if draining
+            .get(&evicted.namespace)
+            .is_some_and(|d| Arc::ptr_eq(d, evicted))
+        {
+            draining.remove(&evicted.namespace);
+        }
+    }
+
+    /// Open the writer for `namespace` and start its maintenance. Runs once
+    /// per slot, outside the map lock.
+    async fn open_namespace(
+        &self,
+        namespace: &str,
+        now: u64,
+    ) -> Result<Arc<NamespaceState>, RegistryError> {
+        // A previous incarnation evicted moments ago may still be draining.
+        // Its stale tasks must never recover after the new writer opens:
+        // doing so would bump the epoch again and fence the replacement.
+        let previous = self
+            .draining
+            .lock()
+            .expect("draining map poisoned")
+            .get(namespace)
+            .cloned();
+        if let Some(previous) = previous {
+            self.drain(&previous).await;
         }
 
-        // Create new session
         let ns_id = NamespaceId::new(namespace)
             .map_err(|e| RegistryError::InvalidNamespace(e.to_string()))?;
         let paths = NamespacePaths::new(&self.root, ns_id);
@@ -274,6 +325,7 @@ impl NamespaceRegistry {
             cancel_tx: watch::channel(false).0,
             maintenance_tasks: std::sync::Mutex::new(Vec::new()),
             retired: std::sync::atomic::AtomicBool::new(false),
+            quiesced: tokio::sync::OnceCell::new(),
             writer_health: WriterHealth::with_fence_policy(self.maintenance.fence_policy),
             flush_notify: Arc::new(tokio::sync::Notify::new()),
             group_commit: (!self.maintenance.group_commit_window.is_zero()).then(|| {
@@ -289,12 +341,7 @@ impl NamespaceRegistry {
         // hold their own Arc clones and run until eviction cancels them.
         self.spawn_maintenance(Arc::clone(&state), paths);
 
-        sessions.insert(namespace.to_string(), Arc::clone(&state));
-        tracing::info!(
-            "opened namespace: {} (total: {})",
-            namespace,
-            sessions.len()
-        );
+        tracing::info!("opened namespace: {}", namespace);
         Ok(state)
     }
 
@@ -515,12 +562,20 @@ impl NamespaceRegistry {
     /// Find the oldest idle namespace (unused for > idle_timeout). Returns
     /// `None` if no namespace is idle. Idle duration is the plain arithmetic
     /// diff `now_secs - last_access_secs` (both measured from the same anchor).
-    fn find_idle_oldest(&self, sessions: &HashMap<String, Arc<NamespaceState>>) -> Option<String> {
+    /// A slot nobody is opening any more (its opener was cancelled, so the
+    /// map holds the only reference) is picked first.
+    fn find_idle_oldest(&self, sessions: &HashMap<String, Slot>) -> Option<String> {
         let now_secs = self.now_secs();
         let idle_timeout_secs = self.idle_timeout.as_secs();
         let mut oldest: Option<(&str, u64)> = None;
 
-        for (ns, state) in sessions.iter() {
+        for (ns, slot) in sessions.iter() {
+            let Some(state) = slot.get() else {
+                if Arc::strong_count(slot) == 1 {
+                    return Some(ns.clone());
+                }
+                continue;
+            };
             let last_secs = state.last_access.load(std::sync::atomic::Ordering::Relaxed);
             let idle_secs = now_secs.saturating_sub(last_secs);
             if idle_secs > idle_timeout_secs && oldest.is_none_or(|(_, t)| idle_secs > t) {
@@ -530,14 +585,19 @@ impl NamespaceRegistry {
         oldest.map(|(ns, _)| ns.to_string())
     }
 
-    /// Total number of active namespaces.
+    /// Total number of open namespaces.
     pub async fn len(&self) -> usize {
-        self.sessions.read().await.len()
+        self.sessions
+            .read()
+            .await
+            .values()
+            .filter(|slot| slot.initialized())
+            .count()
     }
 
-    /// `true` when no namespaces are active.
+    /// `true` when no namespaces are open.
     pub async fn is_empty(&self) -> bool {
-        self.sessions.read().await.is_empty()
+        self.len().await == 0
     }
 }
 
@@ -575,6 +635,9 @@ pub struct NamespaceState {
     /// the writer mutex, so a stale `Arc<NamespaceState>` cannot recover the
     /// old WriterSession after a replacement has claimed the namespace epoch.
     retired: std::sync::atomic::AtomicBool,
+    /// Set once eviction has stopped the maintenance tasks and drained the
+    /// writer mutex. See [`Self::quiesce`].
+    quiesced: OnceCell<()>,
     /// Writer status for this namespace's readiness probe: degraded from a
     /// terminal commit/flush failure until the automatic reopen succeeds.
     pub writer_health: Arc<WriterHealth>,
@@ -627,6 +690,27 @@ impl NamespaceState {
         for handle in handles {
             let _ = handle.await;
         }
+    }
+
+    /// Stop and join every maintenance task, then wait out any write that
+    /// already holds the writer mutex, so nothing through this incarnation
+    /// can recover/reopen and fence the next one. Queued stale requests
+    /// observe `retired` after acquiring the mutex and leave without
+    /// touching storage. Idempotent: later callers wait for the first.
+    async fn quiesce(&self, root: &str) {
+        self.quiesced
+            .get_or_init(|| async {
+                self.cancel_and_abort_maintenance().await;
+                drop(self.writer.lock().await);
+                // The read caches are process-wide and shared across
+                // namespaces (their budgets are global); dropping the state
+                // does not release this namespace's entries, so reclaim
+                // them eagerly.
+                if let Ok(ns_id) = NamespaceId::new(&self.namespace) {
+                    namidb_storage::prune_shared_caches(&NamespacePaths::new(root, ns_id));
+                }
+            })
+            .await;
     }
 
     /// Register a dynamically spawned reactive-compaction task. Completed
@@ -1019,5 +1103,141 @@ mod tests {
                 "{what} entries of a sibling namespace were evicted"
             );
         }
+    }
+
+    /// Holds every PUT under `prefix` until released, so a cold open of that
+    /// namespace (its epoch claim writes a manifest) hangs mid-open.
+    #[derive(Debug)]
+    struct HoldPutsUnder {
+        inner: Arc<dyn ObjectStore>,
+        prefix: String,
+        held: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl std::fmt::Display for HoldPutsUnder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HoldPutsUnder({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for HoldPutsUnder {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location.as_ref().starts_with(&self.prefix) {
+                self.held.notify_one();
+                let _permit = self.release.acquire().await.expect("semaphore closed");
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    /// A cold open stuck on the object store must not block other tenants:
+    /// open namespaces keep resolving and other cold namespaces still open.
+    /// Concurrent requests for the stuck namespace share its one open.
+    #[tokio::test]
+    async fn slow_open_does_not_block_other_namespaces() {
+        let store = Arc::new(HoldPutsUnder {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            prefix: "slow/".to_string(),
+            held: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let reg = Arc::new(NamespaceRegistry::new(
+            store.clone(),
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics,
+            MaintenanceConfig::default(),
+        ));
+        let warm = reg.get_or_open("warm").await.expect("open warm");
+
+        let first = tokio::spawn({
+            let reg = Arc::clone(&reg);
+            async move { reg.get_or_open("slow").await }
+        });
+        store.held.notified().await;
+        let second = tokio::spawn({
+            let reg = Arc::clone(&reg);
+            async move { reg.get_or_open("slow").await }
+        });
+
+        let again = tokio::time::timeout(Duration::from_secs(2), reg.get_or_open("warm"))
+            .await
+            .expect("an open namespace waited on another namespace's cold open")
+            .expect("warm");
+        assert!(Arc::ptr_eq(&warm, &again));
+        tokio::time::timeout(Duration::from_secs(5), reg.get_or_open("other"))
+            .await
+            .expect("a cold open waited on another namespace's cold open")
+            .expect("other");
+        assert!(!first.is_finished() && !second.is_finished());
+
+        store.release.add_permits(1_000);
+        let first = first.await.unwrap().expect("slow");
+        let second = second.await.unwrap().expect("slow");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "one namespace must get exactly one writer"
+        );
+        assert_eq!(reg.len().await, 3);
     }
 }

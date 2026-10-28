@@ -36,6 +36,15 @@ crates.io release will establish and document that API explicitly.
   `AuthzHook::check` and `check_schema` take the namespace as a new
   argument.
 
+- **A slow cold open no longer stalls every other tenant.** In
+  `--multi-tenant` mode the registry held its map lock for the whole open of
+  a new namespace (pointer resolve, segment listing, WAL replay) and for the
+  wait on an evicted writer. Every request to every other namespace queued
+  behind it, including ones that were already open. Each namespace now opens
+  on its own slot, so only requests for the namespace being opened wait, and
+  concurrent first requests for it still share one writer. An evicted
+  namespace is still fully quiesced before anything reopens it.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed
