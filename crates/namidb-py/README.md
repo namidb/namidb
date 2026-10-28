@@ -82,6 +82,62 @@ then to push the memtable into L0 SSTs. That's different from the
 `upsert_node` / `upsert_edge` / `tombstone_*` API, which stages mutations
 and waits for an explicit `client.commit()`.
 
+### Timeouts and row limits
+
+`cypher` and `acypher` take two keyword-only limits:
+
+```python
+from namidb import QueryRowCapError, QueryTimeoutError
+
+try:
+    client.cypher("MATCH (n)-[]->(m) RETURN n, m", timeout_ms=5_000, max_rows=100_000)
+except QueryTimeoutError:   # a TimeoutError subclass
+    ...
+except QueryRowCapError:    # a RuntimeError subclass
+    ...
+```
+
+`timeout_ms` counts from the call, including time spent waiting for the
+writer lock. A write that times out is thrown away, not committed.
+`max_rows` fails a read once any step of the plan produces more rows than
+that. Writes ignore it.
+
+### Threads
+
+Every blocking call releases the GIL while it waits on storage, so other
+Python threads keep running. Reads (`cypher` reads, `lookup_node`,
+`scan_*`, edge lookups) run on the latest committed snapshot without
+holding the writer lock, so several threads can query one `Client` at the
+same time and a long read does not hold up writes. Writes still go one at
+a time.
+
+## Reading from another process
+
+A namespace has one writer. Opening a plain `Client` claims the namespace
+and fences whatever process was writing before, so a second process that
+only wants to read should open it read-only:
+
+```python
+reader = namidb.Client("s3://bucket/data?ns=prod", read_only=True)
+reader.cypher("MATCH (p:Person) RETURN count(p) AS n")
+
+# Later, pick up whatever the writer committed since:
+if reader.refresh():
+    print("new data")
+```
+
+A read-only client never claims the writer epoch. It sees every commit up
+to the moment it was opened (or last refreshed), including commits the
+writer has not flushed yet, and stays on that version until `refresh()`.
+Every mutating call (`upsert_*`, `tombstone_*`, `merge_*`, `load_*`,
+`commit`, `flush`, `compact`, write or DDL Cypher) raises
+`PermissionError`. The namespace must already exist.
+
+It keeps a small retention lease under `manifest/pins/` so the writer's
+cleanup does not delete files it still reads; the lease expires on its own
+if the process dies. `refresh()` replays the writer's unflushed WAL, so it
+costs more the longer the writer goes without a flush.
+
 ## Vector and full-text indexes
 
 Published wheels include the same persistent Vamana ANN and BM25 index
@@ -264,6 +320,12 @@ table = client.scan_label_arrow("Person")
 # keys across the scanned views (missing keys filled with None).
 ```
 
+On a large label, pass `limit=` to `scan_label`, `scan_label_arrow` or
+`scan_edge_type` to look at a sample, or walk the scan with
+`iter_label(label)` / `iter_edge_type(edge_type)`. The iterators build one
+dict per step instead of a list of every row, so Python memory stays flat.
+The scan itself is still read in full before the first row comes back.
+
 ## Storage backends
 
 | URI scheme | Backend | Status |
@@ -370,7 +432,10 @@ default.
 - A synchronous Python API plus async coroutine APIs (`acypher`,
   `acompact`).
   Under the hood every call drives a tokio runtime owned by the
-  `Client`; the first call per process pays the bootstrap cost.
+  `Client` with the GIL released; the first call per process pays the
+  bootstrap cost.
+- One writer per namespace, any number of `read_only=True` readers in
+  other processes.
 - Persistent Vamana vector and BM25 full-text indexes, including their
   Cypher DDL and off-writer-lock compaction lifecycle.
 - The same SST plus bloom cache the Rust read path uses

@@ -7,7 +7,7 @@ surface so IDEs / Pylance / mypy can type-check user code.
 
 from __future__ import annotations
 
-from typing import Any, Coroutine, Optional, TypedDict
+from typing import Any, Coroutine, Iterator, Optional, TypedDict
 
 __version__: str
 
@@ -28,6 +28,28 @@ class _CompactionReport(TypedDict):
     source_ssts_removed: int
     new_ssts_written: int
     bloom_sidecars_written: int
+
+
+class QueryTimeoutError(TimeoutError):
+    """A Cypher query ran past its `timeout_ms`."""
+
+
+class QueryRowCapError(RuntimeError):
+    """A Cypher read produced more rows than its `max_rows`."""
+
+
+class NodeIter(Iterator[dict[str, Any]]):
+    """Returned by [`Client.iter_label`]: one node dict per step."""
+
+    def __iter__(self) -> NodeIter: ...
+    def __next__(self) -> dict[str, Any]: ...
+
+
+class EdgeIter(Iterator[dict[str, Any]]):
+    """Returned by [`Client.iter_edge_type`]: one edge dict per step."""
+
+    def __iter__(self) -> EdgeIter: ...
+    def __next__(self) -> dict[str, Any]: ...
 
 
 class QueryResult:
@@ -70,7 +92,7 @@ class QueryResult:
 class Client:
     """A namespace handle: object store + writer session + a tokio
     runtime that drives every async storage call from synchronous
-    Python.
+    Python. Blocking calls release the GIL.
 
     Open with::
 
@@ -79,13 +101,24 @@ class Client:
             "s3://my-bucket/data?ns=prod"
             "&region=us-west-2"
         )
+
+    With `read_only=True` the client never claims the namespace, so a
+    writer in another process keeps running. It reads the newest commit
+    as of open (or the last `refresh()`), and every mutator raises
+    `PermissionError`.
     """
 
     def __init__(
         self,
         uri: str,
         cache_bytes: Optional[int] = ...,
+        read_only: bool = ...,
     ) -> None: ...
+
+    def refresh(self) -> bool:
+        """Move a `read_only` client to the newest committed version.
+        Returns `True` when it advanced. A no-op returning `False` on a
+        writer client, which always reads its own latest commit."""
 
     # ── Storage CRUD (stages into the current batch) ────────────────
 
@@ -190,15 +223,29 @@ class Client:
     ) -> list[dict[str, Any]]:
         """All incoming edges of `(edge_type, dst)`."""
 
-    def scan_label(self, label: str) -> list[dict[str, Any]]:
+    def scan_label(
+        self, label: str, limit: Optional[int] = ...
+    ) -> list[dict[str, Any]]:
         """Every node under `label` (memtable + SSTs,
-        last-write-wins)."""
+        last-write-wins), or the first `limit` of them."""
 
-    def scan_edge_type(self, edge_type: str) -> list[dict[str, Any]]:
+    def scan_edge_type(
+        self, edge_type: str, limit: Optional[int] = ...
+    ) -> list[dict[str, Any]]:
         """Every edge of `edge_type` (memtable + SSTs,
-        last-write-wins)."""
+        last-write-wins), or the first `limit` of them."""
 
-    def scan_label_arrow(self, label: str) -> _Table:
+    def iter_label(self, label: str, limit: Optional[int] = ...) -> NodeIter:
+        """Like [`Client.scan_label`], but yields one dict at a time
+        instead of building the whole list."""
+
+    def iter_edge_type(
+        self, edge_type: str, limit: Optional[int] = ...
+    ) -> EdgeIter:
+        """Like [`Client.scan_edge_type`], but yields one dict at a
+        time."""
+
+    def scan_label_arrow(self, label: str, limit: Optional[int] = ...) -> _Table:
         """Like [`Client.scan_label`] but returns a `pyarrow.Table`
         directly. Columns: `id`, `label` (representative), `labels`
         (full set, list<string>), `lsn`, `schema_version`, then the
@@ -210,18 +257,30 @@ class Client:
         self,
         query: str,
         params: Optional[dict[str, Any]] = ...,
+        *,
+        timeout_ms: Optional[int] = ...,
+        max_rows: Optional[int] = ...,
     ) -> QueryResult:
         """Run a Cypher query synchronously.
 
         Write plans (CREATE / SET / DELETE / MERGE / REMOVE) are
         durably committed before this returns — `commit_batch()`
         runs inside `execute_write`. Call `flush()` periodically to
-        push the memtable into L0 SSTs."""
+        push the memtable into L0 SSTs.
+
+        Reads run on the latest committed snapshot without the writer
+        lock. `timeout_ms` raises `QueryTimeoutError` once that much
+        time has passed since the call (a timed-out write is discarded).
+        `max_rows` raises `QueryRowCapError` when a read produces more
+        rows than that; writes ignore it."""
 
     def acypher(
         self,
         query: str,
         params: Optional[dict[str, Any]] = ...,
+        *,
+        timeout_ms: Optional[int] = ...,
+        max_rows: Optional[int] = ...,
     ) -> Coroutine[Any, Any, QueryResult]:
         """Async sibling of [`Client.cypher`]. Returns a Python
         coroutine. Backed by the `pyo3-async-runtimes` tokio

@@ -15,6 +15,41 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Python: `Client(uri, read_only=True)` reads a namespace without taking
+  it from its writer.** Opening any `Client` used to claim the writer
+  epoch, so a notebook that only wanted to look at the data fenced the
+  process loading it. A read-only client loads the current manifest,
+  replays the unflushed WAL so it sees every commit, and holds a retention
+  lease so the writer's cleanup keeps its files. `refresh()` moves it to
+  the newest commit. Every mutator raises `PermissionError`. The storage
+  side is `namidb_storage::ReaderSession`.
+
+- **Python: `timeout_ms` and `max_rows` on `cypher` / `acypher`.** Both
+  are keyword-only and off by default. They raise the new
+  `namidb.QueryTimeoutError` (a `TimeoutError`) and
+  `namidb.QueryRowCapError` (a `RuntimeError`). A timed-out write is
+  discarded, not committed.
+
+- **Python: `limit=` on `scan_label`, `scan_label_arrow` and
+  `scan_edge_type`, plus `iter_label` / `iter_edge_type`.** The iterators
+  build one dict per step, so walking a 2M-node label no longer needs 2M
+  dicts alive at once. Edge scans still read the whole type before
+  applying the limit.
+
+### Fixed
+
+- **Python calls held the GIL for their whole duration.** A long query or
+  WAL replay froze every other Python thread. Every blocking call now
+  releases the GIL while it waits.
+
+- **Python reads were serialised behind the writer lock.** `cypher` reads,
+  `lookup_node`, `scan_*` and edge lookups held the writer mutex for the
+  whole query, so two threads could not read at once and a long read
+  stalled every write. Reads now run on the latest committed snapshot
+  without the lock. Write statements are planned again under the lock.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

@@ -184,6 +184,105 @@ def test_scan_edge_type_returns_every_edge(client: tg.Client) -> None:
     assert seen == set(pairs)
 
 
+def test_scan_limit_caps_the_result(client: tg.Client) -> None:
+    for _ in range(10):
+        client.upsert_node("Person", _new_uuid(), {})
+        client.upsert_edge("KNOWS", _new_uuid(), _new_uuid(), {})
+    client.commit()
+    assert len(client.scan_label("Person", limit=3)) == 3
+    assert len(client.scan_label("Person", limit=100)) == 10
+    assert client.scan_label_arrow("Person", limit=4).num_rows == 4
+    assert len(client.scan_edge_type("KNOWS", limit=3)) == 3
+    assert client.scan_label("Person", limit=0) == []
+
+
+def test_iter_label_and_edge_type_yield_the_scan(client: tg.Client) -> None:
+    ids = {_new_uuid() for _ in range(5)}
+    for nid in ids:
+        client.upsert_node("Person", nid, {})
+    client.upsert_edge("KNOWS", *sorted(ids)[:2], {})
+    client.commit()
+
+    it = client.iter_label("Person")
+    assert iter(it) is it
+    first = next(it)
+    assert first["label"] == "Person"
+    assert {first["id"]} | {n["id"] for n in it} == ids
+    with pytest.raises(StopIteration):
+        next(it)
+
+    assert len(list(client.iter_label("Person", limit=2))) == 2
+    edges = list(client.iter_edge_type("KNOWS"))
+    assert [(e["src"], e["dst"]) for e in edges] == [tuple(sorted(ids)[:2])]
+
+
+# ── read_only clients ──────────────────────────────────────────────────
+
+
+def _file_uri(tmp_path) -> str:
+    return f"file://{tmp_path}?ns=ns{uuid.uuid4().hex[:8]}"
+
+
+def test_read_only_client_does_not_fence_the_writer(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    writer = tg.Client(uri)
+    alice = _new_uuid()
+    writer.upsert_node("Person", alice, {"name": "Alice"})
+    writer.commit()
+
+    # The commit is only in the WAL; the reader replays it.
+    reader = tg.Client(uri, read_only=True)
+    assert reader.lookup_node("Person", alice)["properties"] == {"name": "Alice"}
+
+    # Opening the reader did not take the namespace from the writer.
+    bob = _new_uuid()
+    writer.upsert_node("Person", bob, {"name": "Bob"})
+    assert writer.commit() is not None
+    writer.flush()
+
+
+def test_read_only_client_rejects_writes(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    tg.Client(uri).commit()
+    reader = tg.Client(uri, read_only=True)
+    node_id = _new_uuid()
+    for call in (
+        lambda: reader.upsert_node("Person", node_id, {}),
+        lambda: reader.upsert_edge("KNOWS", node_id, node_id, {}),
+        lambda: reader.tombstone_node("Person", node_id),
+        lambda: reader.merge_nodes("Person", [{"id": node_id}]),
+        reader.commit,
+        reader.flush,
+        reader.compact,
+        lambda: reader.cypher("CREATE (:Person {name: 'x'})"),
+        lambda: reader.cypher("CREATE INDEX FOR (p:Person) ON (p.name)"),
+    ):
+        with pytest.raises(PermissionError):
+            call()
+    # Reads still work.
+    assert reader.cypher("MATCH (p:Person) RETURN count(p) AS n").first() == {"n": 0}
+
+
+def test_read_only_refresh_sees_new_commits(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    writer = tg.Client(uri)
+    writer.commit()
+    reader = tg.Client(uri, read_only=True)
+    assert reader.refresh() is False
+
+    writer.cypher("CREATE (:Person {name: 'Alice'})")
+    query = "MATCH (p:Person) RETURN p.name AS name"
+    assert len(reader.cypher(query)) == 0
+    assert reader.refresh() is True
+    assert reader.cypher(query).first() == {"name": "Alice"}
+    assert writer.refresh() is False
+
+
+def test_read_only_requires_an_existing_namespace(tmp_path) -> None:
+    with pytest.raises(RuntimeError):
+        tg.Client(_file_uri(tmp_path), read_only=True)
+
+
 # ── property type round-trip (storage Value coverage) ──────────────────
 
 

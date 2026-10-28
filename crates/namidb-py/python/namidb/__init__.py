@@ -8,6 +8,22 @@ alongside the extension.
 
 from __future__ import annotations
 
-from ._lib import Client, QueryResult, __version__
+from ._lib import (
+    Client,
+    EdgeIter,
+    NodeIter,
+    QueryResult,
+    QueryRowCapError,
+    QueryTimeoutError,
+    __version__,
+)
 
-__all__ = ["Client", "QueryResult", "__version__"]
+__all__ = [
+    "Client",
+    "EdgeIter",
+    "NodeIter",
+    "QueryResult",
+    "QueryRowCapError",
+    "QueryTimeoutError",
+    "__version__",
+]
