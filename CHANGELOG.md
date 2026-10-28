@@ -41,9 +41,9 @@ crates.io release will establish and document that API explicitly.
   as an invalid namespace. The first character still has to be `[a-z0-9]`.
 
 - **`memory://` takes `?ns=` like the other schemes.** `memory://?ns=acme`
-  and `memory://acme?ns=acme` both open `acme`; a URI whose host and `?ns=`
-  disagree is rejected instead of being read as a namespace called
-  `acme?ns=other`.
+  and `memory://acme?ns=acme` both open `acme`. A URI whose host and `?ns=`
+  disagree now fails with a clear conflict error instead of an
+  invalid-character one.
 
 ## [2.6.19] - 2026-09-16
 

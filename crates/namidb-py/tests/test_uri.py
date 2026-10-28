@@ -40,7 +40,7 @@ def test_memory_uri_with_ns_query() -> None:
         result = client.cypher("MATCH (p:Person) RETURN p.name AS name")
         assert result.first() == {"name": "Alice"}
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="conflicts"):
         tg.Client(f"memory://{ns}?ns=other")
 
 
