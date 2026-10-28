@@ -494,7 +494,7 @@ mod tests {
             Err(UriError::BadNamespace { .. })
         ));
         for uri in ["memory://?foo=bar", "memory://acme?nss=prod"] {
-            let err = parse_uri(uri).err().expect(uri);
+            let err = parse_uri(uri).expect_err(uri);
             assert!(
                 err.to_string().contains("unknown memory:// parameter"),
                 "{uri}: {err}"
