@@ -24,8 +24,11 @@ crates.io release will establish and document that API explicitly.
   to each other, failing in-flight writes and replaying the WAL on every
   round. `steal` (the default) keeps the old behavior. `yield` leaves the
   namespace to the new owner and reports the writer degraded, so readiness
-  goes 503 and the orchestrator stops routing writes there. A poisoned
-  session or a plain CAS loss still reopens under both policies.
+  goes 503 and the orchestrator stops routing writes there. A yielded writer
+  stays down for the life of the process (or of the open namespace in
+  `--multi-tenant` mode), even when a later flush or write on it fails with
+  a different error. Before that fence, a poisoned session or a plain CAS
+  loss still reopens under both policies.
 
 - **`NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` caps reads per
   namespace.** The read admission gate is process-wide, so in
