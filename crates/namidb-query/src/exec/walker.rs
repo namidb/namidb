@@ -7116,7 +7116,7 @@ fn should_skip_target_materialize(
         // 2.2s against 0.55s for the labelled spelling at degree 160k.
         && (!routing.referenced_aliases.contains(target_alias)
             || routing.identity_only_aliases.contains(target_alias))
-        && !routing.zero_hop_sources.contains(target_alias)
+        && !routing.row_label_aliases.contains(target_alias)
         && length.as_ref().is_none_or(|length| length.max == 1)
 }
 
@@ -7225,15 +7225,28 @@ fn collect_identity_count_args(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Collect the source alias of every `*0..n` Expand in the plan.
-fn collect_zero_hop_expand_sources(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
-    if let LogicalPlan::Expand { source, length, .. } = plan {
+/// Collect every alias whose labels a later Expand reads off the bound row:
+/// the source of a `*0..n` Expand, and the target of a labelled
+/// back-reference Expand (`MATCH (m)-->(p) MATCH (c)-->(p:Person)`).
+fn collect_row_label_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    if let LogicalPlan::Expand {
+        source,
+        length,
+        target_alias,
+        target_labels,
+        back_reference,
+        ..
+    } = plan
+    {
         if length.as_ref().is_some_and(|l| l.min == 0) {
             out.insert(source.clone());
         }
+        if *back_reference && !target_labels.is_empty() {
+            out.insert(target_alias.clone());
+        }
     }
     for child in plan.children() {
-        collect_zero_hop_expand_sources(child, out);
+        collect_row_label_aliases(child, out);
     }
 }
 
@@ -10313,14 +10326,16 @@ pub(crate) struct PlanRouting {
     /// IDENTITY, never a property, a label or the whole value. Such a target
     /// can be bound as an id-only stub even though it IS referenced.
     identity_only_aliases: BTreeSet<String>,
-    /// Aliases a later Expand consumes as the SOURCE of a zero-length
-    /// variable-length pattern (`*0..n`). Such an Expand decides whether the
-    /// source itself is a result by reading the labels off the ROW, and an
-    /// id-only stub carries only the labels its own Expand asked for — not
-    /// the node's real set. A node labelled `:T:U` bound by `->(t:T)` would
-    /// therefore fail `-[:S*0..2]->(u:U)` at zero hops and silently lose the
-    /// row. These aliases must be materialised.
-    zero_hop_sources: BTreeSet<String>,
+    /// Aliases whose labels a later Expand reads off the ROW: the SOURCE of
+    /// a zero-length variable-length pattern (`*0..n`), which decides whether
+    /// the source itself is a result, and the TARGET of a labelled
+    /// back-reference, which checks the bound node against its labels. An
+    /// id-only stub carries only the labels its own Expand asked for, not the
+    /// node's real set. A node labelled `:T:U` bound by `->(t:T)` would
+    /// therefore fail `-[:S*0..2]->(u:U)` at zero hops, and `->(p)` followed
+    /// by `MATCH (c)-->(p:Person)` would fail the label check, silently losing
+    /// the row. These aliases must be materialised.
+    row_label_aliases: BTreeSet<String>,
     /// A node-mutating write invalidates the committed property cache at
     /// commit. Correlated indexed reads in such a statement must therefore
     /// use the writer-private transactional postings map so a sequence of
@@ -10336,14 +10351,14 @@ impl PlanRouting {
         collect_plan_referenced_variables(plan, &mut refs);
         let mut value_refs: BTreeSet<String> = BTreeSet::new();
         collect_plan_value_referenced_variables(plan, &mut value_refs);
-        let mut zero_hop_sources: BTreeSet<String> = BTreeSet::new();
-        collect_zero_hop_expand_sources(plan, &mut zero_hop_sources);
+        let mut row_label_aliases: BTreeSet<String> = BTreeSet::new();
+        collect_row_label_aliases(plan, &mut row_label_aliases);
         let identity_only_aliases = collect_identity_only_aliases(plan, &refs);
         Self {
             identity_only_aliases,
             referenced_aliases: refs,
             value_referenced_aliases: value_refs,
-            zero_hop_sources,
+            row_label_aliases,
             transactional_property_reads: plan_requires_transactional_property_reads(plan),
         }
     }

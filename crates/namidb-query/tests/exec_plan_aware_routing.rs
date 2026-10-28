@@ -658,3 +658,80 @@ async fn zero_hop_source_sees_its_full_label_set() {
         vec!["far".to_string()]
     );
 }
+
+/// A labelled back-reference must see the bound node's real label set.
+///
+/// `RETURN id(m), id(p)` reads `p` only for its identity, and the plain
+/// reference walk does not count a back-reference Expand as a use of its
+/// target. So the first Expand bound `p` as an id-only stub carrying only
+/// the labels THAT Expand asked for (none), and the second MATCH's
+/// `(p:Person)` check failed on the stub: every row vanished. `count(p)` and
+/// `count(*)` lost their rows the same way. An alias a labelled
+/// back-reference re-matches is now excluded from the stub optimisation.
+#[tokio::test]
+async fn labelled_back_reference_sees_its_full_label_set() {
+    std::env::set_var("NAMIDB_ADJACENCY", "1");
+    std::env::set_var("NAMIDB_NODE_CACHE", "1");
+    let mut writer = WriterSession::open(store(), paths("back-ref-labels"))
+        .await
+        .unwrap();
+    let schema = SchemaBuilder::new()
+        .label(person_label())
+        .unwrap()
+        .build();
+
+    let m = NodeId::new();
+    let p = NodeId::new();
+    let c = NodeId::new();
+    writer.upsert_node("Message", m, &person("m")).unwrap();
+    writer.upsert_node("Person", p, &person("p")).unwrap();
+    writer.upsert_node("Call", c, &person("c")).unwrap();
+    for (ty, src) in [("SENT_BY", m), ("CC", m), ("CALLER", c)] {
+        writer
+            .upsert_edge(ty, src, p, &weighted_edge(1.0))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    let run = |q: &'static str| {
+        let snapshot = &snapshot;
+        async move {
+            let plan = lower(&parse(q).unwrap()).unwrap();
+            execute(&plan, snapshot, &Params::new()).await.unwrap()
+        }
+    };
+    let want_pid = run("MATCH (p:Person) RETURN id(p) AS pid").await[0]
+        .bindings
+        .get("pid")
+        .cloned();
+    assert!(want_pid.is_some());
+
+    for q in [
+        // The reported shape: two MATCHes, identity-only RETURN.
+        "MATCH (m:Message)-[:SENT_BY]->(p) MATCH (c:Call)-[:CALLER]->(p:Person) \
+         RETURN id(m) AS mid, id(p) AS pid",
+        // A single-MATCH cycle closing on a labelled back-reference.
+        "MATCH (c:Call)-[:CALLER]->(p)<-[:SENT_BY]-(m:Message)-[:CC]->(p:Person) \
+         RETURN id(p) AS pid",
+    ] {
+        let got = run(q).await;
+        assert_eq!(got.len(), 1, "the labelled back-reference dropped the row: {q}");
+        assert_eq!(got[0].bindings.get("pid").cloned(), want_pid, "{q}");
+    }
+
+    for q in [
+        "MATCH (m:Message)-[:SENT_BY]->(p) MATCH (c:Call)-[:CALLER]->(p:Person) \
+         RETURN count(p) AS c",
+        "MATCH (m:Message)-[:SENT_BY]->(p) MATCH (c:Call)-[:CALLER]->(p:Person) \
+         RETURN count(*) AS c",
+    ] {
+        let got = run(q).await;
+        assert_eq!(
+            got[0].bindings.get("c"),
+            Some(&RuntimeValue::Integer(1)),
+            "{q}"
+        );
+    }
+}

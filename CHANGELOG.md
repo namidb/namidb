@@ -247,7 +247,11 @@ crates.io release will establish and document that API explicitly.
   through `count(t)` or `count(id(t))` already skipped loading its row, but
   projecting `id(t)` or `elementId(t)` counted as reading the whole node, so
   listing the ids around a hub decoded the properties of every neighbour.
-  It now takes the same id-only route.
+  It now takes the same id-only route. A target that a later pattern
+  matches again with a label (`MATCH (m)-->(p) MATCH (c)-->(p:Person)`) is
+  still loaded, since that label check needs the node's real labels; the
+  id-only route used to drop every such row, which `count(p)` and
+  `count(*)` already did before this release.
 
 - **A pattern pinned by `id()` on its last node started from the first.**
   `MATCH (i:Identifier)-[:R]->(d:Device) WHERE id(d) = $id` scanned every
