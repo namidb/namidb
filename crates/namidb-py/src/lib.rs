@@ -11,7 +11,7 @@
 #![allow(clippy::useless_conversion)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -59,13 +59,9 @@ use query_errors::{QueryRowCapError, QueryTimeoutError};
 
 /// What a [`Client`] holds: the namespace's writer, or a reader that never
 /// claims the writer epoch (`read_only=True`).
-///
-/// A writer also carries a [`SnapshotCell`]: reads run on their snapshot
-/// outside the writer lock, so `sweep()` needs the cell's registry to know
-/// which older versions a read in another thread still holds.
 #[derive(Clone)]
 enum Session {
-    Writer(Arc<Mutex<WriterSession>>, Arc<SnapshotCell>),
+    Writer(Arc<Writer>),
     Reader(Arc<Mutex<ReaderSession>>),
 }
 
@@ -89,22 +85,23 @@ impl std::ops::Deref for ReadSnapshot {
 }
 
 impl Session {
-    /// The committed snapshot reads run on. The lock is held only to clone
-    /// it, so a long read never blocks writers or other reads. Waiting for
-    /// the lock gives up at `deadline`.
+    /// The committed snapshot reads run on. A writer's is taken without its
+    /// lock, so reads never wait for a write. A reader's lock is held only to
+    /// clone it; waiting for that lock, or for a refresh it is due, gives up
+    /// at `deadline`.
     async fn snapshot(&self, deadline: Option<Instant>) -> PyResult<ReadSnapshot> {
         Ok(match self {
-            Session::Writer(w, reads) => {
-                // Publish and register under the writer lock, which a sweep
-                // also holds while it reads the horizon: a read either
-                // registered before the sweep or sees its result.
-                let w = lock_until(w, deadline).await?;
-                reads.store(w.owned_snapshot());
-                ReadSnapshot::Pinned(reads.load())
-            }
+            Session::Writer(w) => ReadSnapshot::Pinned(w.reads.load()),
             Session::Reader(r) => {
                 let mut r = lock_until(r, deadline).await?;
-                r.keep_alive().await;
+                match deadline {
+                    // A refresh cut short leaves the version already loaded
+                    // in place; a later read finishes it.
+                    Some(d) => {
+                        let _ = tokio::time::timeout_at(d.into(), r.keep_alive()).await;
+                    }
+                    None => r.keep_alive().await,
+                }
                 ReadSnapshot::Shared(r.snapshot())
             }
         })
@@ -112,22 +109,103 @@ impl Session {
 
     async fn close(&self) -> PyResult<()> {
         match self {
-            Session::Writer(..) => Ok(()),
+            Session::Writer(_) => Ok(()),
             Session::Reader(r) => r.lock().await.release().await.map_err(map_storage_err),
         }
     }
 
-    fn writer(&self) -> PyResult<&Arc<Mutex<WriterSession>>> {
-        Ok(self.writer_and_reads()?.0)
-    }
-
-    fn writer_and_reads(&self) -> PyResult<(&Arc<Mutex<WriterSession>>, &Arc<SnapshotCell>)> {
+    fn writer(&self) -> PyResult<&Arc<Writer>> {
         match self {
-            Session::Writer(w, reads) => Ok((w, reads)),
+            Session::Writer(w) => Ok(w),
             Session::Reader(_) => Err(PyPermissionError::new_err(
                 "this Client was opened with read_only=True",
             )),
         }
+    }
+}
+
+/// The namespace's writer and the snapshot of its last commit. Every lock
+/// guard publishes the writer's snapshot when it drops, if the call moved
+/// the manifest, so reads pick up a commit as soon as the call returns
+/// without waiting for whatever write holds the lock next.
+///
+/// `reads` is also the sweep's view of in-process reads: `load()` picks the
+/// published snapshot and registers its version in one step under the
+/// cell's own mutex, and the published version only changes under the
+/// writer lock, which a sweep holds while it computes its horizon.
+struct Writer {
+    session: Mutex<WriterSession>,
+    reads: SnapshotCell,
+}
+
+impl Writer {
+    fn new(session: WriterSession) -> Self {
+        Self {
+            reads: SnapshotCell::new(session.owned_snapshot()),
+            session: Mutex::new(session),
+        }
+    }
+
+    async fn lock(&self) -> WriterGuard<'_> {
+        WriterGuard {
+            guard: self.session.lock().await,
+            reads: &self.reads,
+        }
+    }
+
+    async fn lock_until(&self, deadline: Option<Instant>) -> PyResult<WriterGuard<'_>> {
+        Ok(WriterGuard {
+            guard: lock_until(&self.session, deadline).await?,
+            reads: &self.reads,
+        })
+    }
+}
+
+struct WriterGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, WriterSession>,
+    reads: &'a SnapshotCell,
+}
+
+impl WriterGuard<'_> {
+    /// Make the writer's current version the one reads pick up.
+    fn publish(&self) {
+        if self.reads.manifest_version() != self.guard.manifest_version() {
+            self.reads.store(self.guard.owned_snapshot());
+        }
+    }
+}
+
+impl std::ops::Deref for WriterGuard<'_> {
+    type Target = WriterSession;
+    fn deref(&self) -> &WriterSession {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WriterSession {
+        &mut self.guard
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        // Staging alone does not move the manifest, so per-row upserts skip
+        // the snapshot rebuild.
+        self.publish();
+    }
+}
+
+/// Renew a `read_only` client's leases between reads, so a read that
+/// outlasts the lease TTL keeps its files. Ends once the client is gone.
+async fn renew_reader_pins(reader: Weak<Mutex<ReaderSession>>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let Some(reader) = reader.upgrade() else {
+            return;
+        };
+        reader.lock().await.renew_pins().await;
     }
 }
 
@@ -227,11 +305,12 @@ impl Client {
                         let reader =
                             ReaderSession::open(store.clone(), paths.clone(), Some(cache.clone()))
                                 .await?;
-                        Session::Reader(Arc::new(Mutex::new(reader)))
+                        let reader = Arc::new(Mutex::new(reader));
+                        tokio::spawn(renew_reader_pins(Arc::downgrade(&reader)));
+                        Session::Reader(reader)
                     } else {
                         let writer = WriterSession::open(store.clone(), paths.clone()).await?;
-                        let reads = Arc::new(SnapshotCell::new(writer.owned_snapshot()));
-                        Session::Writer(Arc::new(Mutex::new(writer)), reads)
+                        Session::Writer(Arc::new(Writer::new(writer)))
                     })
                 })
             })
@@ -530,7 +609,7 @@ impl Client {
     /// nothing is deleted and the dict reports what would be.
     #[pyo3(signature = (min_age_secs=60, dry_run=false))]
     fn sweep(&self, py: Python<'_>, min_age_secs: u64, dry_run: bool) -> PyResult<Py<PyDict>> {
-        let (session, reads) = self.session.writer_and_reads()?;
+        let session = self.session.writer()?;
         let manifest_store = ManifestStore::new(self.store.clone(), self.paths.clone());
         let report = py.allow_threads(|| {
             self.runtime.block_on(async {
@@ -538,7 +617,6 @@ impl Client {
                 let guard = session.lock().await;
                 sweep_locked(
                     &guard,
-                    reads,
                     &manifest_store,
                     Duration::from_secs(min_age_secs),
                     !dry_run,
@@ -918,8 +996,9 @@ impl Client {
     /// the end of every write plan. Call `client.flush()` to push the
     /// memtable into L0 SSTs once enough writes have accumulated.
     ///
-    /// Reads run on the latest committed snapshot without holding the
-    /// writer lock, so several threads can query one client at once.
+    /// Reads run on the latest committed snapshot without waiting for the
+    /// writer lock, so several threads can query one client at once and a
+    /// long write does not hold them up.
     ///
     /// `timeout_ms` aborts the query with `QueryTimeoutError` once that much
     /// wall time has passed since the call, waiting for the client's lock
@@ -1001,12 +1080,10 @@ impl Client {
 
 impl Client {
     /// What an applied compaction should sweep afterwards, if anything.
-    fn auto_sweep(&self) -> Option<AutoSweep> {
-        let (_, reads) = self.session.writer_and_reads().ok()?;
+    fn auto_sweep(&self) -> Option<(ManifestStore, Duration)> {
         self.auto_sweep_min_age.map(|age| {
             (
                 ManifestStore::new(self.store.clone(), self.paths.clone()),
-                reads.clone(),
                 age,
             )
         })
@@ -1287,9 +1364,9 @@ struct CompactionReport {
 /// free to acquire `session` throughout the expensive prepare phase. Storage's
 /// install step folds those newer writes/flushes into the current manifest.
 async fn run_compaction_inner(
-    session: Arc<Mutex<WriterSession>>,
+    session: Arc<Writer>,
     compaction_lock: Arc<Mutex<()>>,
-    auto_sweep: Option<AutoSweep>,
+    auto_sweep: Option<(ManifestStore, Duration)>,
 ) -> PyResult<CompactionReport> {
     let _compaction_guard = compaction_lock.lock().await;
     let basis = {
@@ -1330,11 +1407,11 @@ async fn run_compaction_inner(
         .map_err(map_storage_err)?;
     let l0_after = guard.max_l0_bucket_len();
     let applied = outcome.source_ssts_removed > 0;
-    if let Some((manifest_store, reads, min_age)) = auto_sweep.filter(|_| applied) {
+    if let Some((manifest_store, min_age)) = auto_sweep.filter(|_| applied) {
         // The merged-away inputs and the WAL earlier flushes retired stay on
         // disk until a sweep. The pass is already installed, so a failed sweep
         // only leaves them for the next one.
-        let _ = sweep_locked(&guard, &reads, &manifest_store, min_age, true).await;
+        let _ = sweep_locked(&guard, &manifest_store, min_age, true).await;
     }
 
     Ok(CompactionReport {
@@ -1349,27 +1426,26 @@ async fn run_compaction_inner(
     })
 }
 
-/// What an applied compaction sweeps with: the store, the writer's read
-/// registry and the orphan age.
-type AutoSweep = (ManifestStore, Arc<SnapshotCell>, Duration);
-
 /// Sweep orphaned objects. The caller holds both the compaction lock and the
 /// writer guard, so no prepared compaction output is waiting to be installed
 /// and no flush or commit sits between its object PUT and the manifest CAS.
-/// Reads run on snapshots outside the writer guard, so the horizon is the
-/// oldest version a read in this process still holds (`reads` registers each
-/// one under the guard), or the current version when none is running.
+/// Reads run on snapshots taken without the writer lock, so the horizon is
+/// the oldest version a read in this process still holds, or the current
+/// version when none is running. It is safe without that lock: publishing
+/// here first means a read that has not registered yet will load the current
+/// version, and a read that loaded an older one registered it in the same
+/// step (see [`Writer`]). The published version cannot move again until the
+/// guard drops.
 /// Readers in other processes are covered only by pin leases: `min_age`
 /// counts from an object's write, not from when it stopped being referenced.
 async fn sweep_locked(
-    guard: &WriterSession,
-    reads: &SnapshotCell,
+    guard: &WriterGuard<'_>,
     manifest_store: &ManifestStore,
     min_age: Duration,
     delete: bool,
 ) -> PyResult<JanitorReport> {
-    reads.store(guard.owned_snapshot());
-    let horizon = reads.retention_horizon();
+    guard.publish();
+    let horizon = guard.reads.retention_horizon();
     sweep_orphans(manifest_store, horizon, min_age, 1, delete)
         .await
         .map_err(map_storage_err)
@@ -1485,8 +1561,7 @@ async fn run_cypher(
             return Ok(result);
         }
     }
-    let writer = session.writer()?;
-    let mut guard = lock_until(writer, deadline).await?;
+    let mut guard = session.writer()?.lock_until(deadline).await?;
     run_write(&mut guard, &parsed, params, deadline).await
 }
 
@@ -2118,18 +2193,22 @@ fn lower_err_to_pyerr(e: LowerError) -> PyErr {
 
 fn exec_err_to_pyerr(e: ExecError) -> PyErr {
     match e {
-        // Python has no admin cancel path, so a cancel can only come from
-        // the same deadline machinery.
-        // A deadline that fires in a write's commit tail arrives as a storage
-        // error.
-        ExecError::Timeout
-        | ExecError::Cancelled
-        | ExecError::Storage(namidb_storage::Error::Timeout | namidb_storage::Error::Cancelled) => {
-            QueryTimeoutError::new_err(e.to_string())
-        }
+        _ if is_deadline(&e) => QueryTimeoutError::new_err(e.to_string()),
         ExecError::RowCap(_) => QueryRowCapError::new_err(e.to_string()),
         _ => PyRuntimeError::new_err(format!("Cypher execution error: {e}")),
     }
+}
+
+/// Whether `e` is the query's own `timeout_ms` firing. Python has no admin
+/// cancel path, so a cancel can only come from the same deadline machinery.
+/// A deadline that fires in a write's commit tail arrives as a storage error.
+fn is_deadline(e: &ExecError) -> bool {
+    matches!(
+        e,
+        ExecError::Timeout
+            | ExecError::Cancelled
+            | ExecError::Storage(namidb_storage::Error::Timeout | namidb_storage::Error::Cancelled)
+    )
 }
 
 // ── pyarrow helpers ───────────────────────────────────────────────────
@@ -2253,4 +2332,23 @@ fn _lib(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("QueryRowCapError", py.get_type_bound::<QueryRowCapError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The commit tail cannot be hit on purpose from Python: a deadline that
+    // short fires while staging.
+    #[test]
+    fn a_deadline_in_the_commit_is_a_timeout() {
+        assert!(is_deadline(&ExecError::Timeout));
+        assert!(is_deadline(&ExecError::Storage(
+            namidb_storage::Error::Timeout
+        )));
+        assert!(is_deadline(&ExecError::Storage(
+            namidb_storage::Error::Cancelled
+        )));
+        assert!(!is_deadline(&ExecError::RowCap(1)));
+    }
 }

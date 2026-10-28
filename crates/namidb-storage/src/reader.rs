@@ -11,10 +11,14 @@
 //! the session holds a [`RetentionPin`] lease on the version it serves. The
 //! pin is best effort: a reader on read-only credentials cannot write the
 //! lease, and then only the sweep's `min_age` window protects its objects.
-//! A refresh keeps the old version's pin until no read holds its snapshot,
-//! and a session that is never refreshed moves itself to the newest version
-//! once its own is [`MAX_VERSION_AGE`] old, so an idle reader cannot hold
-//! back the writer's cleanup indefinitely.
+//! The lease expires unless something renews it: [`ReaderSession::keep_alive`]
+//! does on every read, and a host whose reads can outlast the TTL calls
+//! [`ReaderSession::renew_pins`] on a timer. A refresh keeps the old
+//! version's pin until no read holds its snapshot. A session that is never
+//! refreshed moves itself to the newest version once its own is
+//! [`MAX_VERSION_AGE`] old, or once its lease may have lapsed (the files of a
+//! version nobody pinned can be gone), so an idle reader cannot hold back the
+//! writer's cleanup indefinitely.
 //!
 //! Writer-local caches (node views, adjacency, property-index generations,
 //! exact counts) are left off. They are keyed by the writer's own
@@ -113,22 +117,24 @@ impl ReaderSession {
             }
         }
         self.checked_at = Instant::now();
-        self.keep_pins().await;
+        self.renew_pins().await;
         Ok(advanced)
     }
 
     /// Call once per read. Renews the leases that are due and releases the
     /// ones no read needs any more. Once the served version is
-    /// [`MAX_VERSION_AGE`] old it refreshes instead; a failed refresh is
-    /// logged and the session keeps serving the version it has.
+    /// [`MAX_VERSION_AGE`] old, or its lease may have lapsed, it refreshes
+    /// instead; a failed refresh is logged and the session keeps serving the
+    /// version it has.
     pub async fn keep_alive(&mut self) {
-        if self.checked_at.elapsed() >= MAX_VERSION_AGE {
+        let lapsed = self.pin.as_ref().is_some_and(RetentionPin::lapsed);
+        if lapsed || self.checked_at.elapsed() >= MAX_VERSION_AGE {
             match self.refresh().await {
                 Ok(_) => return,
                 Err(e) => warn!(error = %e, "reader could not refresh a stale version"),
             }
         }
-        self.keep_pins().await;
+        self.renew_pins().await;
     }
 
     /// Delete every retention lease this session holds, including those of
@@ -149,9 +155,17 @@ impl ReaderSession {
         result
     }
 
-    async fn keep_pins(&mut self) {
+    /// Renew the leases that are due without refreshing, for a timer that
+    /// keeps a long read covered between reads. Once the served version is
+    /// [`MAX_VERSION_AGE`] old and no read holds it, its lease is left to
+    /// lapse: an idle session then stops holding back cleanup, and the next
+    /// [`Self::keep_alive`] refreshes.
+    pub async fn renew_pins(&mut self) {
+        let in_use = Arc::strong_count(&self.current) > 1;
         if let Some(pin) = &mut self.pin {
-            renew_pin(pin).await;
+            if in_use || self.checked_at.elapsed() < MAX_VERSION_AGE {
+                renew_pin(pin).await;
+            }
         }
         for (snapshot, mut pin) in std::mem::take(&mut self.retired) {
             // This session holds one reference; any other is a read in flight.
@@ -517,6 +531,142 @@ mod tests {
         reader.keep_alive().await;
         assert_eq!(reader.manifest_version(), writer.manifest_version());
         assert_eq!(pins(&store, &paths).await, 1);
+    }
+
+    /// A writer with two flushed L0 SSTs, and the paths of those SSTs.
+    async fn writer_with_two_l0_ssts(
+        store: &Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+    ) -> (WriterSession, Vec<Path>) {
+        let mut writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        for name in ["a", "b"] {
+            writer
+                .upsert_node("Person", NodeId::from_uuid(Uuid::now_v7()), &node(name))
+                .unwrap();
+            writer.commit_batch().await.unwrap();
+            let schema = writer.snapshot().manifest().manifest.schema.clone();
+            writer.flush(schema).await.unwrap();
+        }
+        let l0 = writer
+            .snapshot()
+            .manifest()
+            .manifest
+            .ssts
+            .iter()
+            .map(|s| Path::from(format!("{}/{}", paths.namespace_prefix().as_ref(), s.path)))
+            .collect::<Vec<_>>();
+        assert_eq!(l0.len(), 2);
+        (writer, l0)
+    }
+
+    async fn compact(writer: &mut WriterSession) {
+        let schema = writer.snapshot().manifest().manifest.schema.clone();
+        let out = writer.compact_l0(&schema).await.unwrap();
+        assert_eq!(out.source_ssts_removed, 2);
+    }
+
+    /// Sweep with no age margin, as a writer's janitor would once `min_age`
+    /// has passed.
+    async fn sweep(store: &Arc<dyn ObjectStore>, paths: &NamespacePaths) {
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        crate::sweep_orphans(&ms, u64::MAX, Duration::ZERO, 4, true)
+            .await
+            .unwrap();
+    }
+
+    async fn scan_people(reader: &ReaderSession) -> Result<usize> {
+        Ok(reader.snapshot().borrow().scan_label("Person").await?.len())
+    }
+
+    #[tokio::test]
+    async fn reader_pin_holds_the_sweep_horizon() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-horizon");
+        let (mut writer, l0) = writer_with_two_l0_ssts(&store, &paths).await;
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+
+        compact(&mut writer).await;
+        sweep(&store, &paths).await;
+        assert_eq!(scan_people(&reader).await.unwrap(), 2);
+
+        reader.release().await.unwrap();
+        sweep(&store, &paths).await;
+        for path in &l0 {
+            assert!(store.head(path).await.is_err(), "{path} outlived the lease");
+        }
+    }
+
+    #[tokio::test]
+    async fn keep_alive_refreshes_once_the_lease_may_have_lapsed() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-lapsed");
+        let (mut writer, _) = writer_with_two_l0_ssts(&store, &paths).await;
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+
+        // Nothing renewed the lease for a TTL, and a sweep dropped it and
+        // the files only the reader's version needed.
+        let pin = reader.pin.as_mut().unwrap();
+        pin.renew_due_at = Instant::now().checked_sub(DEFAULT_PIN_TTL).unwrap();
+        let expired = crate::PinLease {
+            version: pin.version(),
+            expires_at_unix: 0,
+        };
+        store
+            .put(pin.path(), serde_json::to_vec(&expired).unwrap().into())
+            .await
+            .unwrap();
+        compact(&mut writer).await;
+        sweep(&store, &paths).await;
+        assert!(
+            scan_people(&reader).await.is_err(),
+            "the sweep kept the files"
+        );
+
+        reader.keep_alive().await;
+        assert_eq!(reader.manifest_version(), writer.manifest_version());
+        assert_eq!(scan_people(&reader).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn renew_pins_lets_an_idle_stale_version_lapse() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-renew");
+        WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        let expiry = |store: Arc<dyn ObjectStore>, path: Path| async move {
+            let body = store.get(&path).await.unwrap().bytes().await.unwrap();
+            serde_json::from_slice::<crate::PinLease>(&body)
+                .unwrap()
+                .expires_at_unix
+        };
+        let pin_path = reader.pin.as_ref().unwrap().path().clone();
+        let written = expiry(store.clone(), pin_path.clone()).await;
+
+        // A read still holds the stale version: its lease is renewed.
+        reader.checked_at = Instant::now().checked_sub(MAX_VERSION_AGE).unwrap();
+        let in_flight = reader.snapshot();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        reader.pin.as_mut().unwrap().renew_due_at = Instant::now();
+        reader.renew_pins().await;
+        let renewed = expiry(store.clone(), pin_path.clone()).await;
+        assert!(renewed > written);
+
+        // Nothing holds it any more: the lease is left to expire.
+        drop(in_flight);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        reader.pin.as_mut().unwrap().renew_due_at = Instant::now();
+        reader.renew_pins().await;
+        assert_eq!(expiry(store.clone(), pin_path).await, renewed);
     }
 
     #[tokio::test]

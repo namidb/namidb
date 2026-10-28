@@ -97,8 +97,10 @@ except QueryRowCapError:    # a RuntimeError subclass
     ...
 ```
 
-`timeout_ms` counts from the call, including time spent waiting for the
-client's lock behind a long write or `refresh()`. A write that times out is thrown away, not committed.
+`timeout_ms` counts from the call, including time a write spends waiting
+for the client's lock behind another write, or a read-only client's read
+waits behind a `refresh()`. A write that times out is thrown away, not
+committed.
 `max_rows` fails a read once any step of the plan produces more rows than
 that. Writes ignore it.
 
@@ -107,10 +109,12 @@ that. Writes ignore it.
 Every blocking call releases the GIL while it waits on storage, so other
 Python threads keep running. Reads (`cypher` reads, `lookup_node`,
 `scan_*`, edge lookups) run on the latest committed snapshot without
-holding the writer lock, so several threads can query one `Client` at the
-same time and a long read does not hold up writes. Writes still go one at
-a time. A `sweep()`, explicit or after a compaction, keeps every file a
-read still running in another thread needs.
+waiting for the writer lock, so several threads can query one `Client` at
+the same time, a long read does not hold up writes, and a long write (a
+bulk load, say) does not hold up reads. A read sees each write once the
+call that made it returns. Writes still go one at a time. A `sweep()`,
+explicit or after a compaction, keeps every file a read still running in
+another thread needs.
 
 ## Reading from another process
 
@@ -138,13 +142,20 @@ compacts or sweeps, so `spool_dir`, `auto_sweep_min_age_secs` and
 `compaction_l0_trigger` do nothing there.
 
 It keeps a small retention lease under `manifest/pins/` so the writer's
-cleanup does not delete files it still reads. While the lease lives, the
-writer cannot reclaim anything from that version on, which is why an old
-version is refreshed on the next read. `close()`, or leaving a
+cleanup does not delete files it still reads. The client renews the lease
+in the background, so a read that runs for a long time keeps its files.
+While the lease lives, the writer cannot reclaim anything from that
+version on, so once the version is an hour old and no read is using it the
+lease is left to expire, and the next read refreshes first. A read also
+refreshes first when the lease may have expired anyway (the process was
+suspended, say). `close()`, or leaving a
 `with namidb.Client(uri, read_only=True) as reader:` block, drops the
-lease right away; otherwise it expires about 15 minutes after the last
-read, or when the process dies. `refresh()` replays the writer's unflushed WAL, so it
-costs more the longer the writer goes without a flush.
+lease right away; otherwise it expires about 15 minutes after it was last
+renewed, or after the process dies. Credentials that cannot write under
+`manifest/pins/` get no lease, and then only the writer's sweep age
+margin protects the reader's files. `refresh()` replays the writer's
+unflushed WAL, so it costs more the longer the writer goes without a
+flush.
 
 ## Vector and full-text indexes
 
