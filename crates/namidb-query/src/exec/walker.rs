@@ -2002,6 +2002,10 @@ pub(crate) async fn execute_expand(
                                     None => continue,
                                 },
                             }
+                        } else if matches!(&target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
+                        {
+                            // Proven not to carry the label (single hop, over budget).
+                            continue;
                         } else if let Some(label) = target_labels.first() {
                             if max > 1 {
                                 // Multi-hop: traverse through any existing node; the
@@ -6581,8 +6585,9 @@ pub(crate) enum ExpandTargets {
     /// endpoint a single hop proved lacks the target label, so its edge is
     /// skipped without reading the node.
     Views(HashMap<NodeId, Option<namidb_storage::NodeView>>),
-    /// Nothing prepared: each edge resolves its own endpoint.
-    Cold,
+    /// Nothing prepared: each edge resolves its own endpoint, except the
+    /// endpoints a single hop already proved lack the target label.
+    Cold(std::collections::HashSet<NodeId>),
 }
 
 /// Upper bound on endpoint views held for one hop. Beyond it the batch is
@@ -6608,7 +6613,7 @@ async fn prepare_expand_targets(
         return Ok(if skip_target_materialize {
             ExpandTargets::Membership(HashMap::new())
         } else {
-            ExpandTargets::Cold
+            ExpandTargets::Cold(Default::default())
         });
     }
     if skip_target_materialize {
@@ -6726,7 +6731,7 @@ async fn prepare_expand_targets(
     }
     if !views_usable || candidates.len() > expand_target_view_budget() {
         let _ = snapshot.batch_lookup_nodes(label, candidates).await?;
-        return Ok(ExpandTargets::Cold);
+        return Ok(ExpandTargets::Cold(views.into_keys().collect()));
     }
     let fetched = snapshot.batch_lookup_nodes(label, candidates).await?;
     views.extend(
@@ -9128,6 +9133,10 @@ async fn execute_expand_factor(
                                 None => continue,
                             },
                         }
+                    } else if matches!(&target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
+                    {
+                        // Proven not to carry the label (single hop, over budget).
+                        continue;
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
                             match scan_node_for_id(snapshot, target_id).await? {
