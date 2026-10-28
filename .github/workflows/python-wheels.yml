@@ -279,16 +279,19 @@ jobs:
           print("ok:", tg.__version__)
           PY
       - name: Pytest the package against the installed wheel
-        # Rosetta on macos-14 has no AVX, which the x86_64 polars wheel
-        # needs, so the x64 entry stops at the smoke roundtrip.
-        if: runner.os != 'Windows' && matrix.arch != 'x64'
+        if: runner.os != 'Windows'
         shell: bash
         run: |
+          python -m pip install pytest pytest-asyncio pandas
           # polars 1.41.x SIGABRTs on the macos-14 / py3.12 runner during the
           # async cypher test (1.40.1 was fine on 2026-05-27); cap below 1.41
           # until the upstream regression clears. pip still picks the best
-          # 1.40.x per (OS, python) in the matrix.
-          python -m pip install pytest pytest-asyncio pandas 'polars<1.41'
+          # 1.40.x per (OS, python) in the matrix. Rosetta on macos-14 has no
+          # AVX, which the x86_64 polars wheel needs, so the x64 entry skips
+          # it and the polars test skips itself.
+          if [ "${{ matrix.arch }}" != "x64" ]; then
+            python -m pip install 'polars<1.41'
+          fi
           python -m pytest crates/namidb-py/tests -v
 
   # ── PyPI publish (only on tag push, OIDC trusted publisher) ────────────
