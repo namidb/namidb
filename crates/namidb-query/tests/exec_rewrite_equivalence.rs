@@ -178,6 +178,15 @@ fn render(v: &RuntimeValue) -> String {
 /// Assert every spelling in `family` returns the same multiset of rows.
 /// Runs through the FULL optimizer, as the server does.
 async fn assert_equivalent(writer: &WriterSession, name: &str, family: &[&str]) {
+    assert_equivalent_with(writer, name, family, &Params::new()).await;
+}
+
+async fn assert_equivalent_with(
+    writer: &WriterSession,
+    name: &str,
+    family: &[&str],
+    params: &Params,
+) {
     let snapshot = writer.snapshot();
     let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
     let mut baseline: Option<(String, Vec<String>)> = None;
@@ -187,7 +196,7 @@ async fn assert_equivalent(writer: &WriterSession, name: &str, family: &[&str]) 
             lower(&parsed).unwrap_or_else(|e| panic!("{name}: lower `{query}`: {e:?}")),
             &catalog,
         );
-        let rows = execute(&plan, &snapshot, &Params::new())
+        let rows = execute(&plan, &snapshot, params)
             .await
             .unwrap_or_else(|e| panic!("{name}: execute `{query}`: {e:?}"));
         let got = multiset(&rows);
@@ -447,4 +456,137 @@ async fn meaning_preserving_rewrites_agree() {
         ],
     )
     .await;
+}
+
+fn plan_has_node_by_id(plan: &namidb_query::LogicalPlan) -> bool {
+    matches!(plan, namidb_query::LogicalPlan::NodeById { .. })
+        || plan.children().into_iter().any(plan_has_node_by_id)
+}
+
+/// `WHERE id(n) IN $ids` is served by a seek. It must return what the
+/// filter it replaces returns (spelled `id(b) + ''` here so it stays a scan)
+/// for duplicate, null, malformed, upper-case, unknown and wrong-label ids.
+#[tokio::test]
+async fn id_seek_agrees_with_the_filter_it_replaces() {
+    let w = fixture().await;
+    let snapshot = w.snapshot();
+    let all = execute(
+        &lower(&parse("MATCH (b) RETURN b").unwrap()).unwrap(),
+        &snapshot,
+        &Params::new(),
+    )
+    .await
+    .unwrap();
+    let id_of = |name: &str| {
+        all.iter()
+            .find_map(|row| match row.get("b") {
+                Some(RuntimeValue::Node(n))
+                    if n.properties.get("n") == Some(&RuntimeValue::String(name.into())) =>
+                {
+                    Some(n.id.to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("fixture node {name}"))
+    };
+    let ids = RuntimeValue::List(vec![
+        RuntimeValue::String(id_of("q1")),
+        RuntimeValue::String(id_of("q1")),
+        RuntimeValue::String(id_of("q2")),
+        RuntimeValue::String(id_of("q3").to_uppercase()),
+        RuntimeValue::String(id_of("p1")),
+        RuntimeValue::String(NodeId::new().to_string()),
+        RuntimeValue::String("junk".into()),
+        RuntimeValue::Null,
+        RuntimeValue::Integer(7),
+    ]);
+    let mut params = Params::new();
+    params.insert("ids".into(), ids);
+    params.insert("none".into(), RuntimeValue::List(vec![]));
+    params.insert("one".into(), RuntimeValue::String(id_of("q2")));
+    params.insert(
+        "upper".into(),
+        RuntimeValue::String(id_of("q2").to_uppercase()),
+    );
+    params.insert("nothing".into(), RuntimeValue::Null);
+
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    for query in [
+        "MATCH (b:Q) WHERE id(b) IN $ids RETURN b.n AS n",
+        "MATCH (b) WHERE elementId(b) IN $ids RETURN b.n AS n",
+        "MATCH (b:Q) WHERE id(b) IN $ids RETURN *",
+        "MATCH (b:Q) WHERE id(b) = $nothing RETURN b.n AS n",
+        "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) = x RETURN b.n AS n",
+    ] {
+        let plan = optimize(lower(&parse(query).unwrap()).unwrap(), &catalog);
+        assert!(plan_has_node_by_id(&plan), "`{query}` must seek: {plan:?}");
+    }
+
+    for (name, family) in [
+        (
+            "labelled id IN",
+            [
+                "MATCH (b:Q) WHERE id(b) IN $ids RETURN b.n AS n",
+                "MATCH (b:Q) WHERE id(b) + '' IN $ids RETURN b.n AS n",
+            ],
+        ),
+        (
+            "unlabelled elementId IN",
+            [
+                "MATCH (b) WHERE elementId(b) IN $ids RETURN b.n AS n",
+                "MATCH (b) WHERE elementId(b) + '' IN $ids RETURN b.n AS n",
+            ],
+        ),
+        (
+            "the seek binding stays out of RETURN *",
+            [
+                "MATCH (b:Q) WHERE id(b) IN $ids RETURN *",
+                "MATCH (b:Q) WHERE id(b) + '' IN $ids RETURN *",
+            ],
+        ),
+        (
+            "empty id list",
+            [
+                "MATCH (b) WHERE id(b) IN $none RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' IN $none RETURN b.n AS n",
+            ],
+        ),
+        (
+            "id IN with a residual conjunct",
+            [
+                "MATCH (b:Q) WHERE id(b) IN $ids AND b.n <> 'q2' RETURN b.n AS n",
+                "MATCH (b:Q) WHERE id(b) + '' IN $ids AND b.n <> 'q2' RETURN b.n AS n",
+            ],
+        ),
+        (
+            "id equality",
+            [
+                "MATCH (b) WHERE id(b) = $one RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' = $one RETURN b.n AS n",
+            ],
+        ),
+        (
+            "upper-case id equality",
+            [
+                "MATCH (b) WHERE id(b) = $upper RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' = $upper RETURN b.n AS n",
+            ],
+        ),
+        (
+            "null id equality",
+            [
+                "MATCH (b) WHERE id(b) = $nothing RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' = $nothing RETURN b.n AS n",
+            ],
+        ),
+        (
+            "correlated id equality",
+            [
+                "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) = x RETURN b.n AS n",
+                "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) + '' = x RETURN b.n AS n",
+            ],
+        ),
+    ] {
+        assert_equivalent_with(&w, name, &family, &params).await;
+    }
 }

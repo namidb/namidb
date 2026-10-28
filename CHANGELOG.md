@@ -15,6 +15,21 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`WHERE id(n) IN $ids` scanned the whole label.** Only `id(n) = $x` was
+  turned into a point lookup, and only when it was the entire `WHERE`. An
+  `IN` list, an id equality next to another condition, and the
+  `UNWIND $ids AS x MATCH (n) WHERE id(n) = x` workaround all fell back to
+  a full scan plus filter. They now seek each id, and the ids of one lookup
+  are resolved in a single batched read instead of one cold read per id.
+
+  An id seek now behaves exactly like the filter it replaces: a null, a
+  non-string or a malformed id matches no node instead of failing the
+  query, and only the lowercase id string that `id()` returns matches. An
+  upper-case or braced UUID used to find the node through `id(n) = $x`
+  while the same value found nothing in any other spelling of the query.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

@@ -1614,6 +1614,50 @@ async fn element_id_filter_lowers_to_point_lookup() {
 }
 
 #[tokio::test]
+async fn match_with_id_in_list_uses_node_by_id() {
+    use namidb_query::{parse_lower_optimize, StatsCatalog};
+
+    let mut writer = WriterSession::open(store(), paths("exec-id-in"))
+        .await
+        .unwrap();
+    let ids = build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let mut params = Params::new();
+    params.insert(
+        "ids".into(),
+        RuntimeValue::List(vec![
+            RuntimeValue::String(ids[2].to_string()),
+            RuntimeValue::String(ids[0].to_string()),
+            RuntimeValue::String(ids[2].to_string()),
+            RuntimeValue::Null,
+            RuntimeValue::String("not-a-uuid".into()),
+        ]),
+    );
+    for query in [
+        "MATCH (a:Person) WHERE id(a) IN $ids RETURN a.name AS name",
+        "MATCH (a) WHERE elementId(a) IN $ids RETURN a.name AS name",
+    ] {
+        let plan = parse_lower_optimize(query, &StatsCatalog::empty()).unwrap();
+        assert!(
+            has_node_by_id(&plan) && !explain(&plan).contains("NodeScan"),
+            "`{query}` must seek each id instead of scanning:\n{}",
+            explain(&plan)
+        );
+        let rows = execute(&plan, &snapshot, &params).await.unwrap();
+        let mut names: Vec<_> = rows
+            .iter()
+            .map(|row| match row.get("name") {
+                Some(RuntimeValue::String(s)) => s.clone(),
+                other => panic!("unexpected: {other:?}"),
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Alice", "Carol"], "`{query}`");
+    }
+}
+
+#[tokio::test]
 async fn indexed_property_match_uses_index_and_returns_all_matches() {
     // End-to-end: an equality MATCH on a non-unique `indexed` property is
     // rewritten by the optimizer into the index lookup and the executor

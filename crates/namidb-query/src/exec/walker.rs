@@ -424,21 +424,24 @@ pub(crate) fn execute_inner_with_routing<'a>(
             } => {
                 let input_rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                let mut out = Vec::with_capacity(input_rows.len());
+                let mut keyed = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
-                    let id_value = evaluate(id, &row, params)?;
-                    let node_id = node_id_from_value(&id_value, id.span)?;
-                    let found = match label {
-                        Some(l) => snapshot.lookup_node(l, node_id).await?,
-                        None => scan_node_for_id(snapshot, node_id).await?,
-                    };
-                    if let Some(view) = found {
-                        let mut new_row = row;
-                        new_row.set(
+                    if let Some(node_id) = seek_node_id(&evaluate(id, &row, params)?) {
+                        keyed.push((row, node_id));
+                    }
+                }
+                let ids: Vec<NodeId> = keyed.iter().map(|(_, node_id)| *node_id).collect();
+                let found = snapshot
+                    .batch_lookup_nodes(label.as_deref().unwrap_or(""), &ids)
+                    .await?;
+                let mut out = Vec::with_capacity(keyed.len());
+                for ((mut row, _), view) in keyed.into_iter().zip(found) {
+                    if let Some(view) = view {
+                        row.set(
                             alias.clone(),
                             RuntimeValue::Node(Box::new(NodeValue::from(view))),
                         );
-                        out.push(new_row);
+                        out.push(row);
                     }
                 }
                 Ok(out)
@@ -7565,6 +7568,21 @@ fn sum_values(vals: &[RuntimeValue]) -> Result<RuntimeValue, ExecError> {
 
 // ───────────────────────── NodeId conversion ─────────────────────────
 
+/// The id a `NodeById` seek looks up for `value`, with the semantics of the
+/// `id(n) = value` filter it replaces: a null, a non-string, or a string that
+/// is not exactly the id string `id()` returns matches no node instead of
+/// failing the query. A Node value still seeks that node.
+fn seek_node_id(value: &RuntimeValue) -> Option<NodeId> {
+    match value {
+        RuntimeValue::String(s) => uuid::Uuid::parse_str(s)
+            .ok()
+            .map(NodeId::from_uuid)
+            .filter(|id| id.to_string() == *s),
+        RuntimeValue::Node(n) => Some(n.id),
+        _ => None,
+    }
+}
+
 pub(crate) fn node_id_from_value(v: &RuntimeValue, span: SourceSpan) -> Result<NodeId, ExecError> {
     match v {
         RuntimeValue::String(s) => match uuid::Uuid::parse_str(s) {
@@ -8045,15 +8063,19 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 // materialising the whole chain is correct now.
                 let arena_view = input_set.arena.clone();
                 let mut next_arena = input_set.arena;
+                let mut keyed = Vec::with_capacity(input_set.leaves.len());
                 for leaf in input_set.leaves {
                     let row = arena_view.materialize(leaf, None);
-                    let id_value = evaluate(id, &row, params)?;
-                    let node_id = node_id_from_value(&id_value, id.span)?;
-                    let found = match label {
-                        Some(l) => snapshot.lookup_node(l, node_id).await?,
-                        None => scan_node_for_id(snapshot, node_id).await?,
-                    };
-                    if let Some(view) = found {
+                    if let Some(node_id) = seek_node_id(&evaluate(id, &row, params)?) {
+                        keyed.push((leaf, node_id));
+                    }
+                }
+                let ids: Vec<NodeId> = keyed.iter().map(|(_, node_id)| *node_id).collect();
+                let found = snapshot
+                    .batch_lookup_nodes(label.as_deref().unwrap_or(""), &ids)
+                    .await?;
+                for ((leaf, _), view) in keyed.into_iter().zip(found) {
+                    if let Some(view) = view {
                         let slot = Slot {
                             name: alias_arc.clone(),
                             value: RuntimeValue::Node(Box::new(NodeValue::from(view))),

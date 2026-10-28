@@ -11,7 +11,8 @@
 //! - `elementId(a) == <expr>` / `id(a) == <expr>` → `NodeById` (a UUID
 //!   point lookup), with or without a label on the scan. This is what
 //!   turns a GUI's `MATCH (n) WHERE elementId(n) = $id` node fetch and
-//!   expand from a full scan into a direct lookup.
+//!   expand from a full scan into a direct lookup. `id(a) IN <list>` seeks
+//!   every listed id through `NodeById(Distinct(Unwind(<list>)))`.
 //!
 //! Triggers a point lookup in place of a full label scan + filter for
 //! the LDBC SNB anchor pattern `MATCH (p:Person {id: 'literal'})`,
@@ -141,6 +142,38 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
                 },
                 _ => None,
             };
+            // Same correlated shape keyed by id: `UNWIND $ids AS x MATCH (n)
+            // WHERE id(n) = x` binds `n` per outer row by point lookup. Only
+            // equality: an `IN` seek dedupes its ids, which would also
+            // collapse duplicate outer rows here.
+            let correlated_id = match input.as_ref() {
+                LogicalPlan::CrossProduct { left, right } if correlated.is_none() => {
+                    match right.as_ref() {
+                        LogicalPlan::NodeScan {
+                            label,
+                            alias,
+                            predicates,
+                            projection,
+                        } if predicates.is_empty() && projection.is_none() => {
+                            extract_node_id_conjunct(
+                                &predicate,
+                                alias,
+                                Some(&produced_aliases(left)),
+                            )
+                            .filter(|seek| !seek.many)
+                            .map(|seek| (label.clone(), alias.clone(), seek))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((label, alias, seek)) = correlated_id {
+                let LogicalPlan::CrossProduct { left, .. } = *input else {
+                    unreachable!("correlated id seek was matched as CrossProduct")
+                };
+                return id_seek(label, &alias, seek, rewrite(*left, catalog));
+            }
             if let Some((alias, indexed)) = correlated {
                 let LogicalPlan::CrossProduct { left, .. } = *input else {
                     unreachable!("correlated lookup was matched as CrossProduct")
@@ -166,7 +199,8 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             // scan becomes a NodeById point lookup by UUID — scoped to the
             // scan's label when it has one, or fanned across observed labels
             // when it doesn't (the unlabelled `MATCH (n) WHERE elementId(n)
-            // = $id` shape a GUI fetch/expand uses). Avoids a full scan.
+            // = $id` shape a GUI fetch/expand uses). `id(n) IN <list>` seeks
+            // each listed id the same way. Avoids a full scan.
             if let LogicalPlan::NodeScan {
                 label,
                 alias,
@@ -175,13 +209,8 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             } = input.as_ref()
             {
                 if predicates.is_empty() && projection.is_none() {
-                    if let Some(value_expr) = extract_eq_on_node_id(&predicate, alias) {
-                        return LogicalPlan::NodeById {
-                            input: Box::new(LogicalPlan::Empty),
-                            label: label.clone(),
-                            alias: alias.clone(),
-                            id: value_expr,
-                        };
+                    if let Some(seek) = extract_node_id_conjunct(&predicate, alias, None) {
+                        return id_seek(label.clone(), alias, seek, LogicalPlan::Empty);
                     }
                 }
             }
@@ -742,25 +771,104 @@ fn property_on_alias(expr: &Expression, alias: &str) -> Option<String> {
     }
 }
 
-/// Match `elementId(<alias>) == <value>` or `id(<alias>) == <value>`
-/// (either argument order) and return the value expression. Both
-/// functions yield a node's UUID string, which `node_id_from_value`
-/// parses back into a `NodeId` at execution time.
-fn extract_eq_on_node_id(expr: &Expression, scan_alias: &str) -> Option<Expression> {
+/// A `WHERE` conjunct that pins a scan's node by id: `id(a) = <value>` or
+/// `id(a) IN <value>` (`elementId` likewise, either side of `=`).
+pub(super) struct IdSeek {
+    pub(super) value: Expression,
+    /// `IN`: `value` is a list of ids rather than one id.
+    pub(super) many: bool,
+    pub(super) residual: Option<Expression>,
+}
+
+/// Find the first top-level conjunct of `predicate` that seeks `scan_alias`
+/// by id. Both functions yield a node's UUID string, which the `NodeById`
+/// executor parses back into a `NodeId`. `outer_aliases` follows
+/// [`extract_indexed_conjunct`]: `None` means the value may not reference
+/// any binding, `Some` that the outer input must produce every one it does.
+pub(super) fn extract_node_id_conjunct(
+    predicate: &Expression,
+    scan_alias: &str,
+    outer_aliases: Option<&BTreeSet<String>>,
+) -> Option<IdSeek> {
     use crate::parser::ast::BinaryOp;
-    let ExpressionKind::Binary { op, left, right } = &expr.kind else {
-        return None;
+    let mut conjuncts = Vec::new();
+    collect_top_level_conjuncts(predicate, &mut conjuncts);
+    let (index, value, many) = conjuncts.iter().enumerate().find_map(|(index, conjunct)| {
+        let (value, many) = match &conjunct.kind {
+            ExpressionKind::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } if is_node_id_call(left, scan_alias) => (right, false),
+            ExpressionKind::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+            } if is_node_id_call(right, scan_alias) => (left, false),
+            ExpressionKind::In { item, list } if is_node_id_call(item, scan_alias) => (list, true),
+            _ => return None,
+        };
+        let aliases = expression_aliases(value);
+        let available = match outer_aliases {
+            Some(outer) => aliases.is_subset(outer),
+            None => aliases.is_empty(),
+        };
+        available.then(|| (index, (**value).clone(), many))
+    })?;
+    let mut leaf_index = 0usize;
+    let residual = remove_top_level_conjunct(predicate, index, &mut leaf_index);
+    Some(IdSeek {
+        value,
+        many,
+        residual,
+    })
+}
+
+/// Build the `NodeById` for `seek` over `input`, plus its residual filter.
+/// An `IN` seek unwinds the list into a hidden binding first; the `Distinct`
+/// keeps a repeated id to one row, as the filter it replaces would.
+pub(super) fn id_seek(
+    label: Option<String>,
+    alias: &str,
+    seek: IdSeek,
+    input: LogicalPlan,
+) -> LogicalPlan {
+    let (input, id) = if seek.many {
+        let slot = format!("__idseek_{alias}");
+        let id = Expression {
+            span: seek.value.span,
+            kind: ExpressionKind::Variable(crate::parser::ast::Identifier::new(
+                slot.clone(),
+                seek.value.span,
+            )),
+        };
+        let unwind = LogicalPlan::Unwind {
+            input: Box::new(input),
+            list: seek.value,
+            alias: slot,
+        };
+        (
+            LogicalPlan::Distinct {
+                input: Box::new(unwind),
+            },
+            id,
+        )
+    } else {
+        (input, seek.value)
     };
-    if !matches!(op, BinaryOp::Eq) {
-        return None;
+    let lookup = LogicalPlan::NodeById {
+        input: Box::new(input),
+        label,
+        alias: alias.to_owned(),
+        id,
+    };
+    match seek.residual {
+        Some(residual) => LogicalPlan::Filter {
+            input: Box::new(lookup),
+            predicate: residual,
+        },
+        None => lookup,
     }
-    if is_node_id_call(left, scan_alias) {
-        return Some((**right).clone());
-    }
-    if is_node_id_call(right, scan_alias) {
-        return Some((**left).clone());
-    }
-    None
 }
 
 /// `elementId(<alias>)` or `id(<alias>)` — a single-argument call of
@@ -1023,6 +1131,88 @@ mod tests {
             Some(true),
             "the label-agnostic anchor uses a global posting lookup, never a guessed unique scope"
         );
+    }
+
+    /// `(input, id)` of the first `NodeById` in the plan, if any.
+    fn find_node_by_id(plan: &LogicalPlan) -> Option<(&LogicalPlan, &Expression)> {
+        if let LogicalPlan::NodeById { input, id, .. } = plan {
+            return Some((input, id));
+        }
+        plan.children().into_iter().find_map(find_node_by_id)
+    }
+
+    fn plan_contains_node_scan(plan: &LogicalPlan) -> bool {
+        matches!(plan, LogicalPlan::NodeScan { .. })
+            || plan.children().into_iter().any(plan_contains_node_scan)
+    }
+
+    /// The `Distinct(Unwind(Empty))` an `IN` seek reads its ids from.
+    fn assert_in_seek(plan: &LogicalPlan) {
+        let (input, id) = find_node_by_id(plan).unwrap_or_else(|| panic!("no seek: {plan:?}"));
+        let LogicalPlan::Distinct { input } = input else {
+            panic!("an IN seek must dedupe its ids: {plan:?}");
+        };
+        let LogicalPlan::Unwind { input, alias, .. } = input.as_ref() else {
+            panic!("an IN seek must unwind its list: {plan:?}");
+        };
+        assert!(matches!(input.as_ref(), LogicalPlan::Empty));
+        assert!(matches!(&id.kind, ExpressionKind::Variable(v) if v.name == *alias));
+        assert!(!plan_contains_node_scan(plan), "{plan:?}");
+    }
+
+    #[test]
+    fn id_in_param_lowers_to_node_by_id_over_distinct_unwind() {
+        let cat = StatsCatalog::empty();
+        assert_in_seek(&rewrite_query(
+            "MATCH (n:Person) WHERE id(n) IN $ids RETURN n",
+            &cat,
+        ));
+        assert_in_seek(&rewrite_query(
+            "MATCH (n) WHERE elementId(n) IN ['a', 'b'] RETURN n",
+            &cat,
+        ));
+    }
+
+    #[test]
+    fn id_eq_with_residual_conjunct_still_seeks() {
+        let cat = StatsCatalog::empty();
+        let plan = rewrite_query(
+            "MATCH (n:Person) WHERE n.age > 1 AND id(n) = $id RETURN n",
+            &cat,
+        );
+        assert!(find_node_by_id(&plan).is_some(), "{plan:?}");
+        assert!(!plan_contains_node_scan(&plan), "{plan:?}");
+        assert!(
+            plan_contains_filter(&plan),
+            "the other conjunct must remain as a residual Filter: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_unwind_id_eq_seeks() {
+        let cat = StatsCatalog::empty();
+        let plan = rewrite_query("UNWIND $ids AS x MATCH (n) WHERE id(n) = x RETURN n", &cat);
+        let (input, _) = find_node_by_id(&plan).unwrap_or_else(|| panic!("{plan:?}"));
+        assert!(
+            matches!(input, LogicalPlan::Unwind { .. }),
+            "the outer UNWIND must drive the seek: {plan:?}"
+        );
+        assert!(!plan_contains_node_scan(&plan), "{plan:?}");
+    }
+
+    #[test]
+    fn id_seek_on_other_alias_or_self_reference_does_not_fire() {
+        let cat = StatsCatalog::empty();
+        for q in [
+            "MATCH (n:Person) WHERE id(n) = n.ref RETURN n",
+            "MATCH (n:Person) WHERE id(n) IN n.refs RETURN n",
+            "MATCH (n:Person) WHERE id(n) = $a OR n.age > 1 RETURN n",
+            // An IN seek dedupes its ids, so it cannot sit under outer rows.
+            "UNWIND $lists AS xs MATCH (n) WHERE id(n) IN xs RETURN n",
+        ] {
+            let plan = rewrite_query(q, &cat);
+            assert!(find_node_by_id(&plan).is_none(), "{q}: {plan:?}");
+        }
     }
 
     #[test]
