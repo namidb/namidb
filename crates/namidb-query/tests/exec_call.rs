@@ -509,6 +509,142 @@ async fn call_shortest_path_to_target_returns_the_path() {
     assert_eq!(int_col(&rows[0], "hops"), 1);
 }
 
+fn path_col(r: &namidb_query::Row) -> Vec<[u8; 16]> {
+    match r.get("path") {
+        Some(RuntimeValue::List(items)) => items
+            .iter()
+            .map(|v| match v {
+                RuntimeValue::Node(n) => *n.id.as_bytes(),
+                other => panic!("path entry not a node: {other:?}"),
+            })
+            .collect(),
+        other => panic!("path not a list: {other:?}"),
+    }
+}
+
+async fn run_with(
+    snapshot: &namidb_storage::Snapshot<'_>,
+    cypher: &str,
+    params: &Params,
+) -> Result<Vec<namidb_query::Row>, namidb_query::ExecError> {
+    let plan = optimize(
+        lower(&parse(cypher).unwrap()).unwrap(),
+        &StatsCatalog::empty(),
+    );
+    execute(&plan, snapshot, params).await
+}
+
+/// The targeted search reads edges straight from the snapshot, so cover the
+/// cases the unweighted string-target test does not: Dijkstra with weights
+/// that live in an SST, a node value as target, source == target, a null
+/// target, a target outside the label projection and a negative weight.
+#[tokio::test]
+async fn call_shortest_path_to_target_weighted_and_edge_cases() {
+    let mut writer = WriterSession::open(store(), paths("call-sp-target-w"))
+        .await
+        .unwrap();
+    // a ->(10) d and a ->(1) b ->(1) c ->(1) d; x is labelled Other.
+    let [a, b, c, d, x] = std::array::from_fn(|_| NodeId::new());
+    for id in [a, b, c, d] {
+        writer.upsert_node("N", id, &node()).unwrap();
+    }
+    writer.upsert_node("Other", x, &node()).unwrap();
+    let weighted = |w: f64| EdgeWriteRecord {
+        properties: BTreeMap::from([("weight".to_string(), namidb_core::Value::F64(w))]),
+        schema_version: 1,
+    };
+    writer.upsert_edge("E", a, d, &weighted(10.0)).unwrap();
+    writer.upsert_edge("E", a, b, &weighted(1.0)).unwrap();
+    writer.upsert_edge("E", b, c, &weighted(1.0)).unwrap();
+    writer.upsert_edge("E", c, d, &weighted(1.0)).unwrap();
+    writer.upsert_edge("E", a, x, &weighted(1.0)).unwrap();
+    writer.commit_batch().await.unwrap();
+    writer
+        .flush(namidb_core::schema::SchemaBuilder::new().build())
+        .await
+        .unwrap();
+    let snapshot = writer.snapshot();
+
+    // Weighted: the cheaper three-hop route wins over the direct edge.
+    let rows = run(
+        &snapshot,
+        &format!(
+            "CALL algo.shortest_path({{source: \"{a}\", target: \"{d}\", weighted: true}}) \
+             YIELD distance, hops, path"
+        ),
+    )
+    .await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("distance"), Some(&RuntimeValue::Float(3.0)));
+    assert_eq!(int_col(&rows[0], "hops"), 3);
+    let ids = |ns: &[NodeId]| ns.iter().map(|n| *n.as_bytes()).collect::<Vec<_>>();
+    assert_eq!(path_col(&rows[0]), ids(&[a, b, c, d]));
+    // Unweighted: the direct edge is one hop.
+    let rows = run(
+        &snapshot,
+        &format!("CALL algo.shortest_path({{source: \"{a}\", target: \"{d}\"}}) YIELD path"),
+    )
+    .await;
+    assert_eq!(path_col(&rows[0]), ids(&[a, d]));
+
+    // Source == target: zero hops, the path is just the node.
+    let rows = run(
+        &snapshot,
+        &format!("CALL algo.shortest_path({{source: \"{a}\", target: \"{a}\"}}) YIELD hops, path"),
+    )
+    .await;
+    assert_eq!(int_col(&rows[0], "hops"), 0);
+    assert_eq!(path_col(&rows[0]), ids(&[a]));
+
+    // A node value works as target; a null target means no target.
+    let lookup = format!("MATCH (n:N) WHERE id(n) = \"{c}\" RETURN n");
+    let target_node = run(&snapshot, &lookup).await[0].get("n").cloned().unwrap();
+    let q = format!("CALL algo.shortest_path({{source: \"{a}\", target: $t}}) YIELD node_id, path");
+    let rows = run_with(
+        &snapshot,
+        &q,
+        &Params::from([("t".to_string(), target_node)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(path_col(&rows[0]), ids(&[a, b, c]));
+    let rows = run_with(
+        &snapshot,
+        &q,
+        &Params::from([("t".to_string(), RuntimeValue::Null)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 5, "null target lists every reachable node");
+
+    // x is outside a labels:['N'] projection, so it is unreachable there.
+    let rows = run(
+        &snapshot,
+        &format!(
+            "CALL algo.shortest_path({{source: \"{a}\", target: \"{x}\", labels: ['N']}}) \
+             YIELD node_id"
+        ),
+    )
+    .await;
+    assert!(rows.is_empty());
+
+    // A negative weight on the way is rejected, not skipped.
+    writer.upsert_edge("E", b, c, &weighted(-1.0)).unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+    let err = run_with(
+        &snapshot,
+        &format!(
+            "CALL algo.shortest_path({{source: \"{a}\", target: \"{d}\", weighted: true}}) \
+             YIELD node_id"
+        ),
+        &Params::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("negative"), "got {err}");
+}
+
 fn node_with_body(text: &str) -> NodeWriteRecord {
     let mut props = BTreeMap::new();
     props.insert(
