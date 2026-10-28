@@ -328,6 +328,7 @@ impl NamespaceRegistry {
             quiesced: tokio::sync::OnceCell::new(),
             writer_health: WriterHealth::with_fence_policy(self.maintenance.fence_policy),
             flush_notify: Arc::new(tokio::sync::Notify::new()),
+            query_gate: crate::namespace_query_gate(),
             group_commit: (!self.maintenance.group_commit_window.is_zero()).then(|| {
                 Arc::new(crate::GroupCommit::new(
                     self.maintenance.group_commit_window,
@@ -648,6 +649,8 @@ pub struct NamespaceState {
     /// inline commits; `Some` pairs with a committer task spawned by
     /// `spawn_maintenance` and cancelled on eviction.
     pub(crate) group_commit: Option<Arc<crate::GroupCommit>>,
+    /// Per-namespace read concurrency cap. `None` = off, the default.
+    pub(crate) query_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl NamespaceState {

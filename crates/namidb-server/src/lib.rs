@@ -351,6 +351,9 @@ pub struct AppState {
     /// token exfiltrate the namespace anywhere the server's ambient cloud
     /// credentials can write.
     pub(crate) backup: Option<Arc<BackupHandles>>,
+    /// Per-namespace read concurrency cap ([`namespace_query_gate`]).
+    /// `None` = off, the default.
+    pub(crate) query_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// See [`AppState::backup`].
@@ -401,6 +404,7 @@ impl AppState {
             writer_health: WriterHealth::new(),
             group_commit: None,
             backup: None,
+            query_gate: namespace_query_gate(),
         }
     }
 
@@ -475,6 +479,7 @@ impl AppState {
             // Bolt multi-tenant path groups too.
             group_commit: ns.group_commit.clone(),
             backup: None,
+            query_gate: ns.query_gate.clone(),
         }
     }
 
@@ -2006,6 +2011,18 @@ fn read_admission_gate() -> Option<&'static tokio::sync::Semaphore> {
     .as_ref()
 }
 
+/// Optional per-namespace cap on concurrent reads, so one busy tenant
+/// cannot take every permit of the process-wide gate above.
+/// `NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE`, default `0` (off). Each
+/// namespace gets its own semaphore when it opens.
+pub(crate) fn namespace_query_gate() -> Option<Arc<tokio::sync::Semaphore>> {
+    let permits = std::env::var("NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0);
+    (permits > 0).then(|| Arc::new(tokio::sync::Semaphore::new(permits)))
+}
+
 /// How long a read may queue for admission before the retryable 503
 /// (`NAMIDB_QUERY_ADMISSION_WAIT_MS`, default 5000). Bounded chiefly for
 /// Bolt, which has no outer request-timeout layer.
@@ -2022,24 +2039,38 @@ fn read_admission_wait() -> Duration {
 /// when the plan scans, the nested scan permit.
 #[doc(hidden)]
 pub struct ReadAdmission {
+    _namespace: Option<tokio::sync::OwnedSemaphorePermit>,
     _admission: Option<tokio::sync::SemaphorePermit<'static>>,
     _scan: Option<tokio::sync::SemaphorePermit<'static>>,
 }
 
-/// Admit one read: bounded wait on the concurrency gate, then the scan
+/// Admit one read: bounded wait on the namespace's own gate (when one is
+/// configured) and then the process-wide concurrency gate, then the scan
 /// gate when the plan needs it. `None` = the admission window elapsed —
 /// the caller returns the retryable too-many-queries rejection.
 #[doc(hidden)]
-pub async fn acquire_read_admission(plan: &namidb_query::LogicalPlan) -> Option<ReadAdmission> {
+pub async fn acquire_read_admission(
+    plan: &namidb_query::LogicalPlan,
+    namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Option<ReadAdmission> {
+    let deadline = tokio::time::Instant::now() + read_admission_wait();
+    let namespace = match namespace_gate {
+        None => None,
+        Some(gate) => match tokio::time::timeout_at(deadline, gate.clone().acquire_owned()).await {
+            Ok(permit) => Some(permit.expect("namespace query gate is never closed")),
+            Err(_) => return None,
+        },
+    };
     let admission = match read_admission_gate() {
         None => None,
-        Some(gate) => match tokio::time::timeout(read_admission_wait(), gate.acquire()).await {
+        Some(gate) => match tokio::time::timeout_at(deadline, gate.acquire()).await {
             Ok(permit) => Some(permit.expect("read admission gate is never closed")),
             Err(_) => return None,
         },
     };
     let scan = acquire_scan_permit(plan).await;
     Some(ReadAdmission {
+        _namespace: namespace,
         _admission: admission,
         _scan: scan,
     })
@@ -3864,7 +3895,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
-        let Some(_admission) = acquire_read_admission(&plan).await else {
+        let Some(_admission) = acquire_read_admission(&plan, state.query_gate.as_ref()).await
+        else {
             return admission_exhausted_observation(started);
         };
         let snap = owned.borrow();
@@ -5134,7 +5166,8 @@ async fn run_cypher_multi(
         }
     } else {
         // Read path.
-        let Some(_admission) = acquire_read_admission(&plan).await else {
+        let Some(_admission) = acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await
+        else {
             return admission_exhausted_observation(started);
         };
         let snap = owned.borrow();
@@ -8090,6 +8123,30 @@ mod tests {
         let (status, health) = get_health(&app).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(health["writer"], "ok");
+    }
+
+    /// A namespace at its own read cap is rejected after the admission
+    /// window, while another namespace is still admitted.
+    #[tokio::test(start_paused = true)]
+    async fn namespace_query_gate_caps_one_namespace_only() {
+        let plan = build_plan(
+            &cypher_parse("RETURN 1 AS one").unwrap(),
+            &StatsCatalog::empty(),
+        )
+        .unwrap();
+        let busy = Arc::new(tokio::sync::Semaphore::new(1));
+        let quiet = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = acquire_read_admission(&plan, Some(&busy))
+            .await
+            .expect("first read on the busy namespace");
+        assert!(
+            acquire_read_admission(&plan, Some(&busy)).await.is_none(),
+            "a namespace over its cap must be turned away"
+        );
+        assert!(
+            acquire_read_admission(&plan, Some(&quiet)).await.is_some(),
+            "another namespace must not wait on the busy one"
+        );
     }
 
     /// `--fence-policy=yield`: once another writer claims the namespace the

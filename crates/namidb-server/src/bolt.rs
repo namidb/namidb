@@ -1014,7 +1014,7 @@ impl ServerBackend {
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
             let admission = tokio::select! {
-                admission = crate::acquire_read_admission(&plan) => admission,
+                admission = crate::acquire_read_admission(&plan, self.state.query_gate.as_ref()) => admission,
                 _ = cancellation.cancelled() => {
                     return disconnected_observation(started, Some(QueryKind::Read));
                 }
@@ -1274,7 +1274,7 @@ impl ServerBackend {
                 }
             };
             let admission = tokio::select! {
-                admission = crate::acquire_read_admission(&plan) => admission,
+                admission = crate::acquire_read_admission(&plan, self.state.query_gate.as_ref()) => admission,
                 _ = cancellation.cancelled() => {
                     return disconnected_observation(started, Some(QueryKind::Read));
                 }

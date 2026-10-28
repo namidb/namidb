@@ -27,6 +27,13 @@ crates.io release will establish and document that API explicitly.
   goes 503 and the orchestrator stops routing writes there. A poisoned
   session or a plain CAS loss still reopens under both policies.
 
+- **`NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` caps reads per
+  namespace.** The read admission gate is process-wide, so in
+  `--multi-tenant` mode one busy tenant could hold every permit and make the
+  others queue into the retryable "too many concurrent queries" error. With
+  this set, each namespace also gets its own cap, taken before the global
+  one and inside the same admission window. Off (`0`) by default.
+
 ### Changed
 
 - **Bolt read transactions no longer take the writer lock.** Neo4j drivers
