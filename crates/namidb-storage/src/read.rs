@@ -6032,9 +6032,9 @@ impl<'mt> Snapshot<'mt> {
     ///
     /// Each candidate costs a full exact-record lookup, so the route runs
     /// only when that work is bounded: by the label being sparse, or by a
-    /// bare LIMIT whose candidates mostly confirm. A LIMIT that keeps hitting
-    /// superseded postings gives up after a budget. Anything else is left to
-    /// the two-phase scan.
+    /// small bare LIMIT whose candidates mostly confirm. A LIMIT that keeps
+    /// hitting superseded postings gives up after a budget. Anything else,
+    /// including the row cap's guard limit, is left to the two-phase scan.
     async fn try_scan_overlapping_label_sidecars(
         &self,
         label: &str,
@@ -6043,10 +6043,15 @@ impl<'mt> Snapshot<'mt> {
         limit: Option<usize>,
     ) -> Result<Option<Vec<NodeView>>> {
         const CANDIDATE_BATCH: usize = 512;
+        // ponytail: fixed cut; the row cap's guard (cap + 1, a million by
+        // default) is far past it, so a capped scan of a dense label is not
+        // mistaken for a LIMIT and does not get a million-row skip budget.
+        const BOUNDED_LIMIT: usize = 8 * CANDIDATE_BATCH;
 
         // A filter can reject every candidate, so only a bare LIMIT bounds
-        // the lookups by the rows returned.
-        let bounded = limit.is_some() && predicates.is_empty();
+        // the lookups by the rows returned, and only a small one bounds them
+        // by much.
+        let bounded = predicates.is_empty() && limit.is_some_and(|limit| limit <= BOUNDED_LIMIT);
         // An unbounded projected scan is better served by the two-phase scan:
         // an id-only one (a count) never leaves its structural pass, and a
         // projected one reads property pages. Full exact records would decode
@@ -16376,6 +16381,21 @@ mod tests {
             "{} locator probes",
             cache.node_locator_probes()
         );
+        assert_eq!(cache.limited_node_scan_fast_paths(), 0);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
+
+        // The row cap's guard limit (cap + 1) is not a LIMIT: a capped scan
+        // of a dense label goes to the two-phase scan without walking the
+        // postings, instead of looking up every stale one under a skip
+        // budget as large as the cap.
+        let cache = SstCache::new(16 * 1024 * 1024);
+        let snap = snap.with_cache(cache.clone());
+        let rows = snap
+            .scan_label_with_predicates_and_projection_limited("Device", &[], None, 1_000_001)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(cache.node_locator_probes(), 0);
         assert_eq!(cache.limited_node_scan_fast_paths(), 0);
         assert_eq!(cache.limited_node_scan_fallbacks(), 1);
     }

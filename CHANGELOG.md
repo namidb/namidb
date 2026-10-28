@@ -299,9 +299,12 @@ crates.io release will establish and document that API explicitly.
   full page of candidates first. Each skipped candidate makes the next batch
   of lookups larger, and on a dense label a LIMIT that keeps hitting stale
   postings (say after a bulk relabel) gives up and uses the two-pass scan
-  below. Scans and filtered LIMITs take this route only when the label is at
-  most a quarter of the node rows, memtable included, since each candidate
-  is a full record lookup and a filter may reject them all. Counts and
+  below. Scans, filtered LIMITs and LIMITs above 4,096 rows take this route
+  only when the label is at most a quarter of the node rows, memtable
+  included, since each candidate is a full record lookup and a filter may
+  reject them all. That includes the hidden limit a row cap adds to a node
+  scan, so a capped query over a dense label is not looked up one record at
+  a time. Counts and
   other unbounded id-only scans never take it: the first pass of the two-pass scan answers
   them without reading any property.
 
