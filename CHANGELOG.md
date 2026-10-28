@@ -42,9 +42,10 @@ crates.io release will establish and document that API explicitly.
   fails with the same error. A `LIMIT` that the first seeds of an expand
   already fill no longer trips a row cap smaller than the seed batch.
 
-- **`OPTIONAL MATCH p = ...` left `p` unbound when nothing matched.** The
-  path variable is now NULL, so `RETURN p` no longer fails with "binding
-  `p` not bound".
+- **`OPTIONAL MATCH p = ...` did not give a NULL `p` when nothing matched.**
+  A variable-length or `shortestPath` path was left unbound, so `RETURN p`
+  failed with "binding `p` not bound", and a fixed-length path came back as
+  a path holding NULL elements. Both are now NULL.
 
 ## [2.6.19] - 2026-09-16
 

@@ -655,6 +655,41 @@ async fn optional_shortest_path_without_match_binds_null_path() {
 }
 
 #[tokio::test]
+async fn optional_fixed_length_path_without_match_is_null() {
+    // A fixed-length path is assembled from its elements; an unmatched
+    // element makes the whole path NULL, not a path holding NULLs.
+    for (name, query) in [
+        (
+            "exec-opt-fixed-path-nomatch",
+            "MATCH (a:Person) OPTIONAL MATCH p = (a)-[:LIKES]->(b) RETURN p",
+        ),
+        (
+            "exec-opt-fixed-path-null-src",
+            "MATCH (a:Person) \
+             OPTIONAL MATCH (a)-[:LIKES]->(b) \
+             OPTIONAL MATCH p = (b)-[:KNOWS]->(c) \
+             RETURN p",
+        ),
+    ] {
+        let rows = run_on_friend_graph(name, query).await;
+        assert_eq!(rows.len(), 5, "{query}");
+        for row in &rows {
+            assert!(matches!(row.get("p"), Some(RuntimeValue::Null)), "{query}");
+        }
+    }
+
+    // A matched fixed-length path is still a path.
+    let rows = run_on_friend_graph(
+        "exec-opt-fixed-path-match",
+        "MATCH (a:Person) OPTIONAL MATCH p = (a)-[:KNOWS]->(b) RETURN p",
+    )
+    .await;
+    assert!(rows
+        .iter()
+        .any(|row| matches!(row.get("p"), Some(RuntimeValue::Path(_)))));
+}
+
+#[tokio::test]
 async fn not_exists_from_null_source_is_true() {
     let rows = run_on_friend_graph(
         "exec-exists-null-src",
