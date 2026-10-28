@@ -51,6 +51,8 @@ pub struct MaintenanceConfig {
     /// RFC-034 group-commit coalescing window per namespace. Zero (the
     /// default) keeps inline per-request commits.
     pub group_commit_window: Duration,
+    /// What a fenced namespace writer does. See [`recovery::FencePolicy`].
+    pub fence_policy: recovery::FencePolicy,
 }
 
 impl Default for MaintenanceConfig {
@@ -62,6 +64,7 @@ impl Default for MaintenanceConfig {
             sweep_delete: false,
             compaction_l0_trigger: 0,
             group_commit_window: Duration::ZERO,
+            fence_policy: recovery::FencePolicy::Steal,
         }
     }
 }
@@ -271,7 +274,7 @@ impl NamespaceRegistry {
             cancel_tx: watch::channel(false).0,
             maintenance_tasks: std::sync::Mutex::new(Vec::new()),
             retired: std::sync::atomic::AtomicBool::new(false),
-            writer_health: WriterHealth::new(),
+            writer_health: WriterHealth::with_fence_policy(self.maintenance.fence_policy),
             flush_notify: Arc::new(tokio::sync::Notify::new()),
             group_commit: (!self.maintenance.group_commit_window.is_zero()).then(|| {
                 Arc::new(crate::GroupCommit::new(

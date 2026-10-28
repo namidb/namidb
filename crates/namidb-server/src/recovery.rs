@@ -28,6 +28,36 @@ const REOPEN_ATTEMPTS: u32 = 3;
 /// Base backoff between reopen attempts, scaled linearly per attempt.
 const REOPEN_BACKOFF: Duration = Duration::from_millis(50);
 
+/// What a writer does after a peer claims its namespace and fences it
+/// (`Error::Fenced`). Parsed from `--fence-policy`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FencePolicy {
+    /// Reopen the session, which claims the epoch back. Right for a single
+    /// server that should keep writing no matter what touched its bucket.
+    #[default]
+    Steal,
+    /// Stay fenced and report the writer degraded (readiness 503). Right
+    /// when something outside this process (a control plane, an
+    /// orchestrator) decides which node owns a namespace: the new owner
+    /// claims the epoch and the old one steps aside instead of fencing it
+    /// back. A poisoned session or a plain CAS loss still reopens.
+    Yield,
+}
+
+impl std::str::FromStr for FencePolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "steal" => Ok(Self::Steal),
+            "yield" => Ok(Self::Yield),
+            other => Err(format!(
+                "unknown fence policy `{other}` (expected `steal` or `yield`)"
+            )),
+        }
+    }
+}
+
 /// Writer status for the readiness probe. `Some(reason)` while the writer
 /// session is broken — a terminal commit/flush failure happened and the
 /// automatic reopen has not yet succeeded. Read lock-free by `/v0/health`
@@ -44,11 +74,20 @@ pub struct WriterHealth {
     /// turns into "writer is busy" confusion); reads keep serving the last
     /// committed snapshot. It self-clears on the first successful flush.
     persistence: std::sync::Mutex<Option<String>>,
+    /// Whether a fenced writer reopens or steps aside. See [`FencePolicy`].
+    fence_policy: FencePolicy,
 }
 
 impl WriterHealth {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn with_fence_policy(fence_policy: FencePolicy) -> Arc<Self> {
+        Arc::new(Self {
+            fence_policy,
+            ..Self::default()
+        })
     }
 
     /// The failure keeping the writer degraded, or `None` when healthy.
@@ -170,7 +209,9 @@ pub(crate) async fn probe_read_fence(
 /// with backoff, republishing the snapshot on success so readers observe
 /// the recovered session. `health` is degraded for the duration and ok
 /// again once the reopen lands; if every attempt fails it stays degraded
-/// and the next failed write triggers another pass.
+/// and the next failed write triggers another pass. Under
+/// [`FencePolicy::Yield`] a fence does not reopen: the writer stays degraded
+/// and the peer that claimed the namespace keeps it.
 ///
 /// Holding the lock across the backoff is deliberate: the writer is broken,
 /// so a queued write could only fail — better to have it wait for a
@@ -186,6 +227,18 @@ pub(crate) async fn recover_writer_if_needed(
         return;
     }
     health.mark_degraded(err.to_string());
+    if health.fence_policy == FencePolicy::Yield
+        && matches!(err, namidb_storage::Error::Fenced { .. })
+    {
+        // A peer owns the namespace now. Reopening would fence it right
+        // back, so stay degraded and leave ownership to whoever placed it.
+        warn!(
+            namespace,
+            error = %err,
+            "writer session is fenced; yielding the namespace (fence policy: yield)"
+        );
+        return;
+    }
     warn!(
         namespace,
         error = %err,
@@ -295,5 +348,53 @@ mod tests {
         cell.store(a.owned_snapshot());
         probe_read_fence(&ms, &cell, &health, "fence-probe").await;
         assert!(!health.is_degraded(), "{:?}", health.degraded_reason());
+    }
+
+    /// Under `FencePolicy::Yield` a fenced writer stays degraded and leaves
+    /// the namespace to the peer that claimed it; `Steal` reopens and takes
+    /// the epoch back.
+    #[tokio::test]
+    async fn fenced_writer_yields_when_policy_is_yield() {
+        use namidb_core::NamespaceId;
+        use namidb_storage::{ManifestStore, NamespacePaths, WriterSession};
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn object_store::ObjectStore> =
+            StdArc::new(object_store::memory::InMemory::new());
+        let paths = NamespacePaths::new("tenants", NamespaceId::new("fence-yield").unwrap());
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let current_epoch = || async { ms.load_current().await.unwrap().manifest.epoch.as_u64() };
+
+        let mut a = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let cell = SnapshotCell::new(a.owned_snapshot());
+        let mine = current_epoch().await;
+        let _b = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let peer = current_epoch().await;
+        assert!(peer > mine);
+        let fenced = namidb_storage::Error::Fenced {
+            mine,
+            current: peer,
+        };
+
+        let health = WriterHealth::with_fence_policy(FencePolicy::Yield);
+        recover_writer_if_needed(&mut a, &cell, &health, "fence-yield", &fenced).await;
+        assert!(health.is_degraded(), "a yielded writer must report degraded");
+        assert_eq!(current_epoch().await, peer, "yield must not reclaim the epoch");
+
+        let health = WriterHealth::new();
+        recover_writer_if_needed(&mut a, &cell, &health, "fence-yield", &fenced).await;
+        assert!(!health.is_degraded(), "{:?}", health.degraded_reason());
+        assert!(current_epoch().await > peer, "steal reopens and reclaims");
+    }
+
+    #[test]
+    fn fence_policy_parses_both_spellings() {
+        assert_eq!("steal".parse::<FencePolicy>(), Ok(FencePolicy::Steal));
+        assert_eq!("Yield".parse::<FencePolicy>(), Ok(FencePolicy::Yield));
+        assert!("maybe".parse::<FencePolicy>().is_err());
     }
 }

@@ -256,6 +256,11 @@ pub struct Config {
     /// Idle eviction timeout for namespaces in multi-tenant mode. A namespace
     /// unused for this long is eligible for eviction when at capacity.
     pub namespace_idle_timeout: Duration,
+    /// What a fenced writer does: reopen and take the epoch back (`Steal`,
+    /// the default) or stay degraded and leave the namespace to the peer
+    /// that claimed it (`Yield`). Applies to every namespace this process
+    /// serves.
+    pub fence_policy: recovery::FencePolicy,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -525,6 +530,14 @@ impl AppState {
     /// Attach the process-wide total-memory admission governor.
     pub fn with_memory_governor(mut self, memory: Arc<memory::MemoryGovernor>) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// Set what a fenced writer does (builder style). Call it before
+    /// [`AppState::spawn_group_committer`]: it replaces the writer health
+    /// handle that the committer clones.
+    pub fn with_fence_policy(mut self, policy: recovery::FencePolicy) -> Self {
+        self.writer_health = WriterHealth::with_fence_policy(policy);
         self
     }
 
@@ -1160,6 +1173,7 @@ pub async fn run_with_memory_max_bytes(
             sweep_delete: config.sweep_delete,
             compaction_l0_trigger: config.compaction_l0_trigger,
             group_commit_window: config.group_commit_window,
+            fence_policy: config.fence_policy,
         };
         let registry = NamespaceRegistry::new(
             store,
@@ -1264,6 +1278,7 @@ pub async fn run_with_memory_max_bytes(
         .with_memory_governor(memory)
         .with_writer_lock_timeout(config.writer_lock_timeout)
         .with_slow_query_threshold(config.slow_query_threshold)
+        .with_fence_policy(config.fence_policy)
         .with_group_commit(config.group_commit_window);
     if state.group_commit.is_some() {
         info!(
@@ -5542,6 +5557,7 @@ mod tests {
             default_namespace: ns.to_string(),
             max_namespaces: 100,
             namespace_idle_timeout: Duration::from_secs(3600),
+            fence_policy: Default::default(),
         }
     }
 
@@ -8067,6 +8083,44 @@ mod tests {
         let (status, health) = get_health(&app).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(health["writer"], "ok");
+    }
+
+    /// `--fence-policy=yield`: once another writer claims the namespace the
+    /// server stops writing and reports degraded instead of reopening, so
+    /// the new owner is not fenced back.
+    #[tokio::test]
+    async fn write_path_yields_when_fence_policy_is_yield() {
+        let (store, paths) = namidb_storage::parse_uri("memory://fence-yield").unwrap();
+        let writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "fence-yield".into())
+            .with_fence_policy(recovery::FencePolicy::Yield);
+        let app = build_router(state);
+        let seed = post_cypher(&app, None, "CREATE (:Person {name: 'Alice'}) RETURN 1").await;
+        assert_eq!(seed.status(), StatusCode::OK);
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let _owner = WriterSession::open(store, paths).await.unwrap();
+        let owner_epoch = ms.load_current().await.unwrap().manifest.epoch;
+
+        for name in ["Bob", "Cara"] {
+            let resp = post_cypher(
+                &app,
+                None,
+                &format!("CREATE (:Person {{name: '{name}'}}) RETURN 1"),
+            )
+            .await;
+            assert_ne!(resp.status(), StatusCode::OK, "a yielded writer must not commit");
+        }
+        assert_eq!(
+            ms.load_current().await.unwrap().manifest.epoch,
+            owner_epoch,
+            "the yielded writer must not fence the new owner"
+        );
+        let (status, health) = get_health(&app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health["writer"], "degraded");
     }
 
     /// `ObjectStore` wrapper that, while enabled, fails any PUT of a manifest

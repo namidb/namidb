@@ -15,6 +15,18 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **`--fence-policy` (`NAMIDB_FENCE_POLICY`) decides what a fenced writer
+  does.** Until now a server whose namespace was claimed by another process
+  always reopened, which takes the epoch back and fences the other process
+  in turn. Two pods on one namespace during a rolling deploy kept doing that
+  to each other, failing in-flight writes and replaying the WAL on every
+  round. `steal` (the default) keeps the old behavior. `yield` leaves the
+  namespace to the new owner and reports the writer degraded, so readiness
+  goes 503 and the orchestrator stops routing writes there. A poisoned
+  session or a plain CAS loss still reopens under both policies.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed
