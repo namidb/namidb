@@ -15,6 +15,20 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A label scan on a store with more than one node SST decoded every node
+  in the store.** Node ids are random, so two node SSTs always overlap in key
+  range, and every label accelerator turned itself off. The fallback then
+  parsed the overflow JSON of every row of every label and kept a full view
+  of each one in memory before filtering by label. Reading 9 `:Device` nodes
+  out of 2.8M took 23 s and 12.5 GB.
+
+  The fallback now checks the label first. A row outside the label is kept
+  only as a marker for last-writer-wins, so a newer version that dropped the
+  label still hides the older one, and its properties are never decoded.
+  The same applies to property-page projections.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

@@ -5523,6 +5523,7 @@ impl<'mt> Snapshot<'mt> {
                                         projection,
                                         &batch,
                                         next_ordinal,
+                                        Some(label),
                                     )
                                     .await
                                     .map_err(E::from)?
@@ -6223,6 +6224,7 @@ impl<'mt> Snapshot<'mt> {
                                     projected_properties,
                                     &batch,
                                     next_ordinal,
+                                    label,
                                 )
                                 .await?
                             else {
@@ -6525,9 +6527,12 @@ impl<'mt> Snapshot<'mt> {
         // memtable + node SSTs and keep only those whose decoded label set
         // contains `label` (filtered at the end).
         let mut latest: BTreeMap<NodeId, (u64, Option<NodeView>)> = BTreeMap::new();
+        let label_id = label.and_then(|label| dict.id(label));
 
         // 1. Memtable rows. Keep the complete winner candidate until every
         // source has been reconciled; predicate evaluation belongs after LWW.
+        // A version outside `label` is kept only as a shadow: it still hides
+        // an older version that carried the label.
         for (mk, entry) in self.node_entries() {
             let MemKey::Node { id } = mk else {
                 continue;
@@ -6536,6 +6541,7 @@ impl<'mt> Snapshot<'mt> {
                 MemOp::Tombstone => None,
                 MemOp::Upsert(payload) => {
                     Some(node_view_from_payload(*id, entry.lsn, payload, dict, "")?)
+                        .filter(|view| label.is_none_or(|label| view.labels.contains(label)))
                 }
             };
             update_node_winner(&mut latest, *id, entry.lsn, view);
@@ -6549,7 +6555,7 @@ impl<'mt> Snapshot<'mt> {
             let sst_label_def = self.label_def_for_node_sst(desc);
             if let Some(projected_properties) = decode_projection {
                 if let Some(candidates) = self
-                    .try_read_projected_node_sst(desc, &sst_label_def, projected_properties)
+                    .try_read_projected_node_sst(desc, &sst_label_def, projected_properties, label)
                     .await?
                 {
                     for (row_id, lsn, view) in candidates {
@@ -6604,6 +6610,15 @@ impl<'mt> Snapshot<'mt> {
                     let row_id = NodeId::from_uuid(Uuid::from_bytes(row_id_bytes));
                     let lsn = lsn_col.value(row);
                     if tomb_col.value(row) {
+                        update_node_winner(&mut latest, row_id, lsn, None);
+                        continue;
+                    }
+                    // Check the label before decoding anything else: a row
+                    // outside it never reaches the output, so its properties
+                    // and overflow JSON are dead weight. It stays a shadow.
+                    if label.is_some_and(|label| {
+                        !row_carries_label(&batch, row, label, label_id, dict, &desc.scope)
+                    }) {
                         update_node_winner(&mut latest, row_id, lsn, None);
                         continue;
                     }
@@ -9243,7 +9258,10 @@ impl<'mt> Snapshot<'mt> {
         projection: &[String],
         batch: &RecordBatch,
         first_ordinal: u64,
+        label: Option<&str>,
     ) -> Result<Option<Vec<ProjectedNodeCandidate>>> {
+        let dict = &self.manifest.manifest.label_dict;
+        let label_id = label.and_then(|label| dict.id(label));
         let id_col = batch
             .column_by_name(COL_NODE_ID)
             .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
@@ -9268,7 +9286,23 @@ impl<'mt> Snapshot<'mt> {
                     .map_err(|_| Error::invariant("node_id row length != 16"))
             })
             .collect::<Result<Vec<[u8; 16]>>>()?;
-        let projected = match reader.project_node_ids(projection, &ids).await {
+        // Only live rows that carry `label` need property pages. The rest are
+        // returned as shadows so last-writer-wins stays exact.
+        let wanted = (0..batch.num_rows())
+            .map(|row| {
+                !tomb_col.value(row)
+                    && label.is_none_or(|label| {
+                        row_carries_label(batch, row, label, label_id, dict, &desc.scope)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let wanted_ids = ids
+            .iter()
+            .zip(&wanted)
+            .filter(|(_, wanted)| **wanted)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let projected = match reader.project_node_ids(projection, &wanted_ids).await {
             Ok((projected, _)) => projected,
             Err(error) if optional_accelerator_fallback(&error) => {
                 tracing::warn!(
@@ -9280,16 +9314,25 @@ impl<'mt> Snapshot<'mt> {
             }
             Err(error) => return Err(error),
         };
-        if projected.len() != ids.len() {
+        if projected.len() != wanted_ids.len() {
             return Ok(None);
         }
+        let mut projected = projected.iter();
         let mut candidates = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             let id = ids[row];
+            let node_id = NodeId::from_uuid(Uuid::from_bytes(id));
+            let lsn = lsn_col.value(row);
+            if !wanted[row] {
+                candidates.push((node_id, lsn, None));
+                continue;
+            }
             let ordinal = first_ordinal
                 .checked_add(row as u64)
                 .ok_or_else(|| Error::invariant("node property ordinal exceeds u64"))?;
-            let property_row = &projected[row];
+            let Some(property_row) = projected.next() else {
+                return Ok(None);
+            };
             if property_row.node_id != id
                 || property_row.ordinal.is_some_and(|found| found != ordinal)
             {
@@ -9298,12 +9341,6 @@ impl<'mt> Snapshot<'mt> {
                     "node property row binding mismatch; using exact Parquet fallback"
                 );
                 return Ok(None);
-            }
-            let node_id = NodeId::from_uuid(Uuid::from_bytes(id));
-            let lsn = lsn_col.value(row);
-            if tomb_col.value(row) {
-                candidates.push((node_id, lsn, None));
-                continue;
             }
             let mut properties = BTreeMap::new();
             for (name, cell) in &property_row.properties {
@@ -9322,12 +9359,7 @@ impl<'mt> Snapshot<'mt> {
                 lsn,
                 Some(NodeView {
                     id: node_id,
-                    labels: decode_node_labels(
-                        batch,
-                        row,
-                        &self.manifest.manifest.label_dict,
-                        &desc.scope,
-                    ),
+                    labels: decode_node_labels(batch, row, dict, &desc.scope),
                     properties,
                     lsn,
                     schema_version: schema_version_col.value(row),
@@ -9347,6 +9379,7 @@ impl<'mt> Snapshot<'mt> {
         desc: &SstDescriptor,
         sst_label_def: &LabelDef,
         projection: &[String],
+        label: Option<&str>,
     ) -> Result<Option<Vec<ProjectedNodeCandidate>>> {
         let Some(reader) = self.node_property_reader(desc).await? else {
             return Ok(None);
@@ -9392,6 +9425,7 @@ impl<'mt> Snapshot<'mt> {
                         projection,
                         &batch,
                         next_ordinal,
+                        label,
                     )
                     .await?
                 else {
@@ -10353,6 +10387,36 @@ fn decode_node_labels(
         None => Vec::new(),
     };
     labels_from_ids(&ids, dict, scope_fallback)
+}
+
+/// Whether node SST row `row` carries `label`, without building its label
+/// set. Same answer as `decode_node_labels(..).contains(label)`; `label_id`
+/// is `dict.id(label)`, resolved once by the caller.
+fn row_carries_label(
+    batch: &RecordBatch,
+    row: usize,
+    label: &str,
+    label_id: Option<LabelId>,
+    dict: &LabelDictionary,
+    scope_fallback: &str,
+) -> bool {
+    let list = batch
+        .column_by_name(COL_LABELS)
+        .and_then(|c| c.as_any().downcast_ref::<ListArray>());
+    if let (Some(label_id), Some(list)) = (label_id, list) {
+        if let Some(ids) = list.values().as_any().downcast_ref::<UInt32Array>() {
+            let offsets = list.value_offsets();
+            let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
+            if !list.is_null(row)
+                && (start..end).any(|i| !ids.is_null(i) && ids.value(i) == label_id.get())
+            {
+                return true;
+            }
+        }
+    }
+    // Only a legacy single-label row can still resolve to `label`, through
+    // the scope fallback.
+    scope_fallback == label && decode_node_labels(batch, row, dict, scope_fallback).contains(label)
 }
 
 /// 3VL evaluation of a conjunctive predicate list against a single
@@ -15209,6 +15273,148 @@ mod tests {
                 .is_empty(),
             "newer non-matching memtable version must hide the old matching SST version"
         );
+    }
+
+    const DEVICE: u32 = 0;
+    const OTHER: u32 = 1;
+
+    fn device_label() -> LabelDef {
+        LabelDef {
+            name: "Device".into(),
+            properties: vec![PropertyDef::new("name", DataType::Utf8, true).unwrap()],
+        }
+    }
+
+    fn labelled_payload(name: &str, labels: Vec<u32>) -> Bytes {
+        NodeWriteRecord {
+            properties: BTreeMap::from([("name".into(), Value::Str(name.into()))]),
+            schema_version: 1,
+            labels,
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// Two overlapping node SSTs. The older one holds ids 1..=6; the newer
+    /// one relabels 1 (Device to Other) and 2 (Other to Device) and
+    /// tombstones 3. Live Devices are 2, 4 and 6; live Others 1, 5 and 6.
+    async fn relabel_overlap_fixture(
+        store: &Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+    ) -> LoadedManifest {
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+        let first = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            vec![
+                (sorted_node_id(1), 1, upsert("a", vec![DEVICE])),
+                (sorted_node_id(2), 2, upsert("b", vec![OTHER])),
+                (sorted_node_id(3), 3, upsert("c", vec![DEVICE])),
+                (sorted_node_id(4), 4, upsert("d", vec![DEVICE])),
+                (sorted_node_id(5), 5, upsert("e", vec![OTHER])),
+                (sorted_node_id(6), 6, upsert("f", vec![DEVICE, OTHER])),
+            ],
+        )
+        .await;
+        flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (sorted_node_id(1), 20, upsert("a2", vec![OTHER])),
+                (sorted_node_id(2), 21, upsert("b2", vec![DEVICE])),
+                (sorted_node_id(3), 22, MemOp::Tombstone),
+            ],
+        )
+        .await
+    }
+
+    fn view_ids(rows: &[NodeView]) -> Vec<NodeId> {
+        rows.iter().map(|row| row.id).collect()
+    }
+
+    fn sorted_ids(ids: &[u8]) -> Vec<NodeId> {
+        ids.iter().map(|id| sorted_node_id(*id)).collect()
+    }
+
+    #[tokio::test]
+    async fn overlapping_label_scan_is_lww_exact_with_label_first_skip() {
+        let store = make_store();
+        let paths = make_paths("label-first-overlap");
+        let committed = relabel_overlap_fixture(&store, &paths).await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let mut live = Memtable::new();
+        live.apply(
+            MemKey::Node {
+                id: sorted_node_id(4),
+            },
+            30,
+            MemOp::Upsert(labelled_payload("d2", vec![OTHER])),
+        );
+        let live_view = live.snapshot_view();
+        let name_is_d = ScanPredicate::Eq {
+            column: "name".into(),
+            value: crate::sst::stats::StatScalar::Utf8("d".into()),
+        };
+
+        // `with_ranged_reads(false)` pins the full-body reconciliation loop;
+        // the default mode may answer through a faster route. Both must agree.
+        for legacy in [false, true] {
+            let snapshot = |memtable| {
+                let snap = Snapshot::new(committed.clone(), memtable, store.clone(), paths.clone());
+                if legacy {
+                    snap.with_ranged_reads(false)
+                } else {
+                    snap
+                }
+            };
+            let snap = snapshot(&empty_view);
+            assert!(snap.disjoint_node_descriptors().is_none());
+
+            let devices = snap.scan_label("Device").await.unwrap();
+            assert_eq!(
+                view_ids(&devices),
+                sorted_ids(&[2, 4, 6]),
+                "legacy={legacy}"
+            );
+            assert_eq!(devices[0].properties["name"], Value::Str("b2".into()));
+            assert_eq!(devices[0].lsn, 21);
+            let projected = snap
+                .scan_label_with_predicates_and_projection("Device", &[], Some(&["name".into()]))
+                .await
+                .unwrap();
+            assert_eq!(view_ids(&projected), sorted_ids(&[2, 4, 6]));
+            assert_eq!(projected, devices);
+            let filtered = snap
+                .scan_label_with_predicates("Device", std::slice::from_ref(&name_is_d))
+                .await
+                .unwrap();
+            assert_eq!(view_ids(&filtered), sorted_ids(&[4]));
+            let others = snap.scan_label("Other").await.unwrap();
+            assert_eq!(view_ids(&others), sorted_ids(&[1, 5, 6]));
+            assert!(snap.scan_label("Missing").await.unwrap().is_empty());
+
+            // A memtable relabel shadows the persisted Device version too.
+            let shadowed = snapshot(&live_view);
+            assert_eq!(
+                view_ids(&shadowed.scan_label("Device").await.unwrap()),
+                sorted_ids(&[2, 6])
+            );
+            assert_eq!(
+                view_ids(&shadowed.scan_label("Other").await.unwrap()),
+                sorted_ids(&[1, 4, 5, 6])
+            );
+        }
     }
 
     #[tokio::test]
