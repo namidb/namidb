@@ -185,6 +185,127 @@ def test_scan_edge_type_returns_every_edge(client: tg.Client) -> None:
     assert seen == set(pairs)
 
 
+def test_scan_limit_caps_the_result(client: tg.Client) -> None:
+    for _ in range(10):
+        client.upsert_node("Person", _new_uuid(), {})
+        client.upsert_edge("KNOWS", _new_uuid(), _new_uuid(), {})
+    client.commit()
+    assert len(client.scan_label("Person", limit=3)) == 3
+    assert len(client.scan_label("Person", limit=100)) == 10
+    assert client.scan_label_arrow("Person", limit=4).num_rows == 4
+    assert len(client.scan_edge_type("KNOWS", limit=3)) == 3
+    assert client.scan_label("Person", limit=0) == []
+
+
+def test_iter_label_and_edge_type_yield_the_scan(client: tg.Client) -> None:
+    ids = {_new_uuid() for _ in range(5)}
+    for nid in ids:
+        client.upsert_node("Person", nid, {})
+    client.upsert_edge("KNOWS", *sorted(ids)[:2], {})
+    client.commit()
+
+    it = client.iter_label("Person")
+    assert iter(it) is it
+    first = next(it)
+    assert first["label"] == "Person"
+    assert {first["id"]} | {n["id"] for n in it} == ids
+    with pytest.raises(StopIteration):
+        next(it)
+
+    assert len(list(client.iter_label("Person", limit=2))) == 2
+    edges = list(client.iter_edge_type("KNOWS"))
+    assert [(e["src"], e["dst"]) for e in edges] == [tuple(sorted(ids)[:2])]
+
+
+# ── read_only clients ──────────────────────────────────────────────────
+
+
+def _file_uri(tmp_path) -> str:
+    return f"file://{tmp_path}?ns=ns{uuid.uuid4().hex[:8]}"
+
+
+def test_read_only_client_does_not_fence_the_writer(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    writer = tg.Client(uri)
+    alice = _new_uuid()
+    writer.upsert_node("Person", alice, {"name": "Alice"})
+    writer.commit()
+
+    # The commit is only in the WAL; the reader replays it.
+    reader = tg.Client(uri, read_only=True)
+    assert reader.lookup_node("Person", alice)["properties"] == {"name": "Alice"}
+
+    # Opening the reader did not take the namespace from the writer.
+    bob = _new_uuid()
+    writer.upsert_node("Person", bob, {"name": "Bob"})
+    assert writer.commit() is not None
+    writer.flush()
+
+
+def test_read_only_client_rejects_writes(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    tg.Client(uri).commit()
+    reader = tg.Client(uri, read_only=True)
+    node_id = _new_uuid()
+    for call in (
+        lambda: reader.upsert_node("Person", node_id, {}),
+        lambda: reader.upsert_edge("KNOWS", node_id, node_id, {}),
+        lambda: reader.tombstone_node("Person", node_id),
+        lambda: reader.merge_nodes("Person", [{"id": node_id}]),
+        lambda: reader.put_nodes("Person", [{"_id": node_id}]),
+        reader.commit,
+        reader.flush,
+        reader.compact,
+        reader.sweep,
+        lambda: reader.cypher("CREATE (:Person {name: 'x'})"),
+        lambda: reader.cypher("CREATE INDEX FOR (p:Person) ON (p.name)"),
+    ):
+        with pytest.raises(PermissionError):
+            call()
+    # Reads still work.
+    assert reader.cypher("MATCH (p:Person) RETURN count(p) AS n").first() == {"n": 0}
+
+
+def test_read_only_refresh_sees_new_commits(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    writer = tg.Client(uri)
+    writer.commit()
+    reader = tg.Client(uri, read_only=True)
+    assert reader.refresh() is False
+
+    writer.cypher("CREATE (:Person {name: 'Alice'})")
+    query = "MATCH (p:Person) RETURN p.name AS name"
+    assert len(reader.cypher(query)) == 0
+    assert reader.refresh() is True
+    assert reader.cypher(query).first() == {"name": "Alice"}
+    assert writer.refresh() is False
+
+
+def test_read_only_close_drops_its_retention_lease(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    tg.Client(uri).commit()
+    with tg.Client(uri, read_only=True) as reader:
+        assert len(list(tmp_path.rglob("pins/*.json"))) == 1
+        assert reader.cypher("RETURN 1 AS x").first() == {"x": 1}
+    assert list(tmp_path.rglob("pins/*.json")) == []
+    # Still usable, just without a lease; close() on a writer is a no-op.
+    assert reader.cypher("RETURN 1 AS x").first() == {"x": 1}
+    tg.Client(uri).close()
+
+
+def test_read_only_ignores_maintenance_options(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    tg.Client(uri, spool_dir=str(tmp_path / "writer-spool")).commit()
+    spool = tmp_path / "reader-spool"
+    tg.Client(uri, read_only=True, spool_dir=str(spool), compaction_l0_trigger=1)
+    assert not spool.exists()
+
+
+def test_read_only_requires_an_existing_namespace(tmp_path) -> None:
+    with pytest.raises(RuntimeError):
+        tg.Client(_file_uri(tmp_path), read_only=True)
+
+
 # ── property type round-trip (storage Value coverage) ──────────────────
 
 
@@ -355,3 +476,50 @@ def test_failed_triggered_compaction_only_warns(tmp_path) -> None:
         level1.chmod(0o700)
     assert len(client.scan_label("Person")) == 2
     assert client.compact()["applied"] is True
+
+
+def test_sweep_keeps_what_a_concurrent_read_holds(tmp_path) -> None:
+    # Reads run on a snapshot outside the writer lock, so a sweep in another
+    # thread must not delete the SSTs an older in-flight read still needs.
+    import threading
+
+    client = tg.Client(
+        f"file://{tmp_path}?ns=race",
+        cache_bytes=0,
+        auto_sweep_min_age_secs=0,
+        compaction_l0_trigger=0,
+    )
+    batch = [{"_id": _new_uuid(), "n": i, "pad": "x" * 200} for i in range(4000)]
+    for _ in range(3):
+        client.put_nodes("Person", batch)
+        client.commit()
+        client.flush()
+
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def read() -> None:
+        while not stop.is_set():
+            try:
+                assert len(client.scan_label("Person")) == 4000
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+                return
+
+    readers = [threading.Thread(target=read) for _ in range(8)]
+    for t in readers:
+        t.start()
+    try:
+        for _ in range(10):
+            if errors:
+                break
+            client.put_nodes("Person", batch)
+            client.commit()
+            client.flush()
+            client.compact()
+            client.sweep(min_age_secs=0)
+    finally:
+        stop.set()
+        for t in readers:
+            t.join()
+    assert errors == []

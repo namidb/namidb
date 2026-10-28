@@ -1,0 +1,593 @@
+//! Read-only access to a namespace that another process writes.
+//!
+//! [`crate::WriterSession::open`] always claims the writer epoch, which fences
+//! whatever process was writing before. A [`ReaderSession`] never claims: it
+//! loads the current manifest, replays the WAL segments that manifest
+//! references (so commits that were never flushed are visible), and hands out
+//! an [`OwnedSnapshot`] of that version. [`ReaderSession::refresh`] moves it
+//! to the newest committed version.
+//!
+//! Another process's janitor cannot see this reader's in-process snapshot, so
+//! the session holds a [`RetentionPin`] lease on the version it serves. The
+//! pin is best effort: a reader on read-only credentials cannot write the
+//! lease, and then only the sweep's `min_age` window protects its objects.
+//! A refresh keeps the old version's pin until no read holds its snapshot,
+//! and a session that is never refreshed moves itself to the newest version
+//! once its own is [`MAX_VERSION_AGE`] old, so an idle reader cannot hold
+//! back the writer's cleanup indefinitely.
+//!
+//! Writer-local caches (node views, adjacency, property-index generations,
+//! exact counts) are left off. They are keyed by the writer's own
+//! generations, and a reader that refreshes would serve stale rows from
+//! them. The SST body cache is keyed by immutable object path and is safe to
+//! share.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use object_store::{ObjectStore, ObjectStoreExt};
+use tracing::{debug, warn};
+
+use crate::cache::SstCache;
+use crate::error::{Error, Result};
+use crate::manifest::{LoadedManifest, ManifestStore};
+use crate::paths::NamespacePaths;
+use crate::pin::{RetentionPin, DEFAULT_PIN_TTL};
+use crate::read::{OwnedSnapshot, RangedMode, DEFAULT_RANGED_THRESHOLD_BYTES};
+use crate::recovery::recover_memtable_with_snapshot;
+use crate::wal::WalStore;
+
+/// How many times a load re-reads the manifest when an object it references
+/// vanished mid-load (a concurrent janitor reclaimed a version that was
+/// already superseded). Each retry starts from the newer current version.
+const LOAD_ATTEMPTS: usize = 3;
+
+/// How long a session serves one version before [`ReaderSession::keep_alive`]
+/// refreshes on its own. Bounds how far a forgotten reader's pin holds back
+/// the writer's cleanup.
+pub const MAX_VERSION_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// A non-claiming, refreshable view of a namespace. See the module docs.
+#[derive(Debug)]
+pub struct ReaderSession {
+    manifest_store: ManifestStore,
+    wal_store: WalStore,
+    cache: Option<SstCache>,
+    current: Arc<OwnedSnapshot>,
+    pin: Option<RetentionPin>,
+    /// Versions a refresh moved past while a read still held their snapshot.
+    /// Each pin is released once its snapshot has no other holder.
+    retired: Vec<(Arc<OwnedSnapshot>, RetentionPin)>,
+    /// When `current` was last confirmed to be the newest version.
+    checked_at: Instant,
+}
+
+impl ReaderSession {
+    /// Open the namespace for reading. Fails with the object store's
+    /// `NotFound` when the namespace was never bootstrapped: a reader never
+    /// creates one.
+    pub async fn open(
+        store: Arc<dyn ObjectStore>,
+        paths: NamespacePaths,
+        cache: Option<SstCache>,
+    ) -> Result<Self> {
+        let manifest_store = ManifestStore::new(store.clone(), paths.clone());
+        let wal_store = WalStore::new(store, paths);
+        // A missing pointer means the namespace does not exist; that is not a
+        // race, so it is never retried.
+        let head = manifest_store.load_current().await?;
+        let (current, pin) = load(&manifest_store, &wal_store, &cache, head).await?;
+        Ok(Self {
+            manifest_store,
+            wal_store,
+            cache,
+            current,
+            pin,
+            retired: Vec::new(),
+            checked_at: Instant::now(),
+        })
+    }
+
+    /// The snapshot this session currently serves. Cheap: an `Arc` clone.
+    pub fn snapshot(&self) -> Arc<OwnedSnapshot> {
+        Arc::clone(&self.current)
+    }
+
+    pub fn manifest_version(&self) -> u64 {
+        self.current.manifest_version()
+    }
+
+    /// Move to the newest committed version. Returns `false` when the
+    /// namespace has not advanced since the last load; the retention pins
+    /// are renewed either way. Replays the WAL tail the new manifest
+    /// references, so the cost is proportional to the unflushed writes.
+    pub async fn refresh(&mut self) -> Result<bool> {
+        let head = self.manifest_store.load_current().await?;
+        let advanced = head.manifest.version != self.manifest_version();
+        if advanced {
+            let (current, pin) =
+                load(&self.manifest_store, &self.wal_store, &self.cache, head).await?;
+            let old = std::mem::replace(&mut self.current, current);
+            if let Some(old_pin) = std::mem::replace(&mut self.pin, pin) {
+                self.retired.push((old, old_pin));
+            }
+        }
+        self.checked_at = Instant::now();
+        self.keep_pins().await;
+        Ok(advanced)
+    }
+
+    /// Call once per read. Renews the leases that are due and releases the
+    /// ones no read needs any more. Once the served version is
+    /// [`MAX_VERSION_AGE`] old it refreshes instead; a failed refresh is
+    /// logged and the session keeps serving the version it has.
+    pub async fn keep_alive(&mut self) {
+        if self.checked_at.elapsed() >= MAX_VERSION_AGE {
+            match self.refresh().await {
+                Ok(_) => return,
+                Err(e) => warn!(error = %e, "reader could not refresh a stale version"),
+            }
+        }
+        self.keep_pins().await;
+    }
+
+    /// Delete every retention lease this session holds, including those of
+    /// snapshots a read may still be using. The session keeps serving reads
+    /// without a lease; the next refresh that advances pins again. Dropping
+    /// the session without calling this leaves the leases to expire on
+    /// their own.
+    pub async fn release(&mut self) -> Result<()> {
+        let retired = std::mem::take(&mut self.retired)
+            .into_iter()
+            .map(|(_, pin)| pin);
+        let mut result = Ok(());
+        for pin in self.pin.take().into_iter().chain(retired) {
+            if let Err(e) = pin.release().await {
+                result = Err(e);
+            }
+        }
+        result
+    }
+
+    async fn keep_pins(&mut self) {
+        if let Some(pin) = &mut self.pin {
+            renew_pin(pin).await;
+        }
+        for (snapshot, mut pin) in std::mem::take(&mut self.retired) {
+            // This session holds one reference; any other is a read in flight.
+            if Arc::strong_count(&snapshot) == 1 {
+                release_pin(pin).await;
+            } else {
+                renew_pin(&mut pin).await;
+                self.retired.push((snapshot, pin));
+            }
+        }
+    }
+}
+
+async fn load(
+    manifest_store: &ManifestStore,
+    wal_store: &WalStore,
+    cache: &Option<SstCache>,
+    mut current: LoadedManifest,
+) -> Result<(Arc<OwnedSnapshot>, Option<RetentionPin>)> {
+    let mut attempt = 1;
+    loop {
+        let version = current.manifest.version;
+        match load_version(manifest_store, wal_store, cache, current).await {
+            Err(Error::ObjectStore(object_store::Error::NotFound { .. }))
+                if attempt < LOAD_ATTEMPTS =>
+            {
+                debug!(version, attempt, "reader load raced a sweep; reloading");
+                attempt += 1;
+                current = manifest_store.load_current().await?;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn load_version(
+    manifest_store: &ManifestStore,
+    wal_store: &WalStore,
+    cache: &Option<SstCache>,
+    current: LoadedManifest,
+) -> Result<(Arc<OwnedSnapshot>, Option<RetentionPin>)> {
+    let store = manifest_store.store().clone();
+    let paths = manifest_store.paths();
+    let version = current.manifest.version;
+    let pin = match RetentionPin::acquire(store.clone(), paths, version, DEFAULT_PIN_TTL).await {
+        Ok(pin) => Some(pin),
+        Err(e) => {
+            warn!(error = %e, version, "reader could not write a retention pin");
+            None
+        }
+    };
+    // Close the load-then-pin race the same way a backup does: once the body
+    // is confirmed present after the lease exists, every later sweep keeps
+    // this version's closure.
+    let recovered = async {
+        store.head(&paths.manifest_version(version)).await?;
+        recover_memtable_with_snapshot(&current.manifest, wal_store, Some(&store)).await
+    }
+    .await;
+    let recovered = match recovered {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(pin) = pin {
+                release_pin(pin).await;
+            }
+            return Err(e);
+        }
+    };
+    let snapshot = OwnedSnapshot {
+        manifest: current,
+        memtable: Arc::new(recovered.memtable.snapshot_view()),
+        store,
+        paths: paths.clone(),
+        cache: cache.clone(),
+        ranged_mode: RangedMode::Auto,
+        ranged_threshold_bytes: DEFAULT_RANGED_THRESHOLD_BYTES,
+        adjacency_cache: None,
+        shared_node_cache: None,
+        property_index_cache: None,
+        property_index_generation: None,
+        exact_node_counts: None,
+        memtable_claimant_cell: None,
+    };
+    Ok((Arc::new(snapshot), pin))
+}
+
+async fn renew_pin(pin: &mut RetentionPin) {
+    if let Err(e) = pin.renew_if_due().await {
+        warn!(error = %e, "failed to renew the reader retention pin");
+    }
+}
+
+async fn release_pin(pin: RetentionPin) {
+    if let Err(e) = pin.release().await {
+        // Benign: the lease expires on its own and the sweep reclaims it.
+        debug!(error = %e, "failed to release the reader retention pin");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use futures::TryStreamExt;
+    use namidb_core::{NamespaceId, NodeId, Value};
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::flush::NodeWriteRecord;
+    use crate::ingest::WriterSession;
+
+    fn paths(name: &str) -> NamespacePaths {
+        NamespacePaths::new("tenants", NamespaceId::new(name).unwrap())
+    }
+
+    fn node(name: &str) -> NodeWriteRecord {
+        let mut properties = BTreeMap::new();
+        properties.insert("name".to_string(), Value::Str(name.to_string()));
+        NodeWriteRecord {
+            properties,
+            schema_version: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn pins(store: &Arc<dyn ObjectStore>, paths: &NamespacePaths) -> usize {
+        store
+            .list(Some(&paths.pins_dir()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Delegating store that can fail one `head` of a chosen path with
+    /// `NotFound` (a sweep racing the load) and refuse every pin lease PUT
+    /// (read-only credentials).
+    #[derive(Debug)]
+    struct FaultyStore {
+        inner: Arc<dyn ObjectStore>,
+        vanish_once: Mutex<Option<Path>>,
+        deny_pins: bool,
+    }
+
+    impl std::fmt::Display for FaultyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FaultyStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FaultyStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            if self.deny_pins && location.as_ref().contains("/pins/") {
+                return Err(object_store::Error::PermissionDenied {
+                    path: location.to_string(),
+                    source: "read-only credentials".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let vanished = {
+                let mut vanish = self.vanish_once.lock().unwrap();
+                options.head && vanish.take_if(|p| p == location).is_some()
+            };
+            if vanished {
+                return Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: "swept".into(),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_sees_wal_resident_commits_without_fencing_the_writer() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-open");
+        let mut writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let alice = NodeId::from_uuid(Uuid::now_v7());
+        writer.upsert_node("Person", alice, &node("alice")).unwrap();
+        writer.commit_batch().await.unwrap();
+        let epoch_before = writer.snapshot().manifest().manifest.epoch;
+
+        // The commit lives only in the WAL: nothing was flushed.
+        let reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        let snap = reader.snapshot();
+        let view = snap.borrow().lookup_node("Person", alice).await.unwrap();
+        assert_eq!(
+            view.unwrap().properties.get("name"),
+            Some(&Value::Str("alice".into()))
+        );
+
+        // The writer still owns the namespace and can keep committing.
+        let bob = NodeId::from_uuid(Uuid::now_v7());
+        writer.upsert_node("Person", bob, &node("bob")).unwrap();
+        writer.commit_batch().await.unwrap();
+        assert_eq!(writer.snapshot().manifest().manifest.epoch, epoch_before);
+        assert_eq!(
+            ManifestStore::new(store.clone(), paths.clone())
+                .load_current()
+                .await
+                .unwrap()
+                .manifest
+                .epoch,
+            epoch_before,
+            "opening a reader must not claim the epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_moves_to_the_newest_commit_and_its_pin() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-refresh");
+        let mut writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(pins(&store, &paths).await, 1);
+        assert!(!reader.refresh().await.unwrap(), "nothing new to load");
+
+        let alice = NodeId::from_uuid(Uuid::now_v7());
+        writer.upsert_node("Person", alice, &node("alice")).unwrap();
+        writer.commit_batch().await.unwrap();
+
+        let before = reader.snapshot();
+        assert!(before
+            .borrow()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(reader.refresh().await.unwrap());
+        assert_eq!(reader.manifest_version(), writer.manifest_version());
+        assert!(reader
+            .snapshot()
+            .borrow()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .is_some());
+        // The old snapshot is still a consistent view of its own version.
+        assert!(before
+            .borrow()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .is_none());
+
+        // The pin moves with the version once no read holds the old one.
+        drop(before);
+        reader.keep_alive().await;
+        assert_eq!(pins(&store, &paths).await, 1);
+        reader.release().await.unwrap();
+        assert_eq!(pins(&store, &paths).await, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_the_old_pin_while_a_read_holds_its_snapshot() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-retired");
+        let mut writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        let in_flight = reader.snapshot();
+
+        writer
+            .upsert_node("Person", NodeId::from_uuid(Uuid::now_v7()), &node("a"))
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        assert!(reader.refresh().await.unwrap());
+        assert_eq!(
+            pins(&store, &paths).await,
+            2,
+            "the old version stays pinned while a read uses it"
+        );
+
+        drop(in_flight);
+        reader.keep_alive().await;
+        assert_eq!(pins(&store, &paths).await, 1);
+        reader.release().await.unwrap();
+        assert_eq!(pins(&store, &paths).await, 0);
+    }
+
+    #[tokio::test]
+    async fn keep_alive_refreshes_a_version_past_its_max_age() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-stale");
+        let mut writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        writer
+            .upsert_node("Person", NodeId::from_uuid(Uuid::now_v7()), &node("a"))
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+
+        reader.keep_alive().await;
+        assert_ne!(reader.manifest_version(), writer.manifest_version());
+        reader.checked_at = Instant::now().checked_sub(MAX_VERSION_AGE).unwrap();
+        reader.keep_alive().await;
+        assert_eq!(reader.manifest_version(), writer.manifest_version());
+        assert_eq!(pins(&store, &paths).await, 1);
+    }
+
+    #[tokio::test]
+    async fn open_retries_when_the_loaded_version_vanishes() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-race");
+        let writer = WriterSession::open(inner.clone(), paths.clone())
+            .await
+            .unwrap();
+        let faulty = Arc::new(FaultyStore {
+            inner,
+            vanish_once: Mutex::new(Some(paths.manifest_version(writer.manifest_version()))),
+            deny_pins: false,
+        });
+        let store: Arc<dyn ObjectStore> = faulty.clone();
+        let reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        assert!(
+            faulty.vanish_once.lock().unwrap().is_none(),
+            "fault never fired"
+        );
+        assert_eq!(reader.manifest_version(), writer.manifest_version());
+        // The failed attempt released its pin; only the retry's is left.
+        assert_eq!(pins(&store, &paths).await, 1);
+    }
+
+    #[tokio::test]
+    async fn open_without_permission_to_pin_still_serves_reads() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-no-pin");
+        let mut writer = WriterSession::open(inner.clone(), paths.clone())
+            .await
+            .unwrap();
+        let alice = NodeId::from_uuid(Uuid::now_v7());
+        writer.upsert_node("Person", alice, &node("alice")).unwrap();
+        writer.commit_batch().await.unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FaultyStore {
+            inner,
+            vanish_once: Mutex::new(None),
+            deny_pins: true,
+        });
+        let mut reader = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap();
+        assert!(reader.pin.is_none());
+        assert!(reader
+            .snapshot()
+            .borrow()
+            .lookup_node("Person", alice)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(pins(&store, &paths).await, 0);
+        reader.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reader_never_bootstraps_a_missing_namespace() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("reader-missing");
+        let err = ReaderSession::open(store.clone(), paths.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ObjectStore(object_store::Error::NotFound { .. })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(pins(&store, &paths).await, 0);
+    }
+}
