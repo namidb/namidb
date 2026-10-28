@@ -58,7 +58,7 @@ pub struct RetentionPin {
     /// When the next [`RetentionPin::renew_if_due`] should actually rewrite
     /// the lease: half the TTL after the last write, so a healthy holder
     /// always renews long before expiry.
-    renew_due_at: Instant,
+    pub(crate) renew_due_at: Instant,
 }
 
 impl RetentionPin {
@@ -100,6 +100,14 @@ impl RetentionPin {
             self.write_lease().await?;
         }
         Ok(())
+    }
+
+    /// Whether the lease may already have expired: renewal is overdue by
+    /// more than a quarter of the TTL, the clock skew budget left before the
+    /// written expiry. A sweep may have ignored a lapsed lease, so renewing
+    /// it does not show that the pinned objects still exist.
+    pub fn lapsed(&self) -> bool {
+        Instant::now() >= self.renew_due_at + self.ttl / 4
     }
 
     /// Delete the lease. Failing here is benign — the lease expires on its
