@@ -23,14 +23,18 @@ crates.io release will establish and document that API explicitly.
   process loading it. A read-only client loads the current manifest,
   replays the unflushed WAL so it sees every commit, and holds a retention
   lease so the writer's cleanup keeps its files. `refresh()` moves it to
-  the newest commit. Every mutator raises `PermissionError`. The storage
-  side is `namidb_storage::ReaderSession`.
+  the newest commit, and a read on a version more than an hour old
+  refreshes on its own so a forgotten reader cannot hold back cleanup
+  forever. `close()` (or a `with` block) drops the lease. Every mutator
+  raises `PermissionError`. The storage side is
+  `namidb_storage::ReaderSession`.
 
 - **Python: `timeout_ms` and `max_rows` on `cypher` / `acypher`.** Both
   are keyword-only and off by default. They raise the new
   `namidb.QueryTimeoutError` (a `TimeoutError`) and
-  `namidb.QueryRowCapError` (a `RuntimeError`). A timed-out write is
-  discarded, not committed.
+  `namidb.QueryRowCapError` (a `RuntimeError`). The timeout also bounds
+  the wait for the client's lock behind a long write, and covers a
+  write's commit. A timed-out write is discarded, not committed.
 
 - **Python: `limit=` on `scan_label`, `scan_label_arrow` and
   `scan_edge_type`, plus `iter_label` / `iter_edge_type`.** The iterators

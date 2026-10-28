@@ -464,6 +464,44 @@ def test_reads_do_not_hold_the_writer_lock(client: tg.Client) -> None:
     assert committed < run["end"], "the commit waited for the read to finish"
 
 
+def test_reads_on_one_client_run_concurrently(client: tg.Client) -> None:
+    run = _run_in_thread(client, SLOW_READ)
+    while "start" not in run:
+        time.sleep(0.001)
+    time.sleep(0.05)
+    # Would time out if the slow read held the client's lock.
+    assert client.cypher("RETURN 1 AS x", timeout_ms=500).first() == {"x": 1}
+    assert run["thread"].is_alive(), "the slow read finished too early to tell"
+    run["thread"].join()
+
+
+def test_timeout_bounds_the_wait_behind_a_long_write(client: tg.Client) -> None:
+    slow_write = (
+        "UNWIND range(1, 1200) AS a UNWIND range(1, 1200) AS b "
+        "WITH count(*) AS n CREATE (:Big {n: n})"
+    )
+    run = _run_in_thread(client, slow_write)
+    while "start" not in run:
+        time.sleep(0.001)
+    time.sleep(0.05)
+    with pytest.raises(tg.QueryTimeoutError):
+        client.cypher("RETURN 1 AS x", timeout_ms=50)
+    gave_up = time.monotonic()
+    run["thread"].join()
+    assert gave_up < run["end"], "the read waited for the write instead of timing out"
+
+
+def test_write_deadline_in_the_commit_is_a_query_timeout_error() -> None:
+    # Short deadlines land in staging or in the commit, depending on timing.
+    # The commit path used to surface as a plain RuntimeError.
+    for timeout_ms in (1, 2, 3, 5, 1, 2, 3, 5):
+        client = tg.Client(f"memory://t{uuid.uuid4().hex[:8]}")
+        try:
+            client.cypher("CREATE (:Person {name: 'x'})", timeout_ms=timeout_ms)
+        except TimeoutError:
+            pass
+
+
 def test_cypher_timeout_raises_query_timeout_error(client: tg.Client) -> None:
     with pytest.raises(tg.QueryTimeoutError) as exc_info:
         client.cypher(SLOW_READ, timeout_ms=1)

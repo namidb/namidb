@@ -278,6 +278,18 @@ def test_read_only_refresh_sees_new_commits(tmp_path) -> None:
     assert writer.refresh() is False
 
 
+def test_read_only_close_drops_its_retention_lease(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    tg.Client(uri).commit()
+    with tg.Client(uri, read_only=True) as reader:
+        assert len(list(tmp_path.rglob("pins/*.json"))) == 1
+        assert reader.cypher("RETURN 1 AS x").first() == {"x": 1}
+    assert list(tmp_path.rglob("pins/*.json")) == []
+    # Still usable, just without a lease; close() on a writer is a no-op.
+    assert reader.cypher("RETURN 1 AS x").first() == {"x": 1}
+    tg.Client(uri).close()
+
+
 def test_read_only_requires_an_existing_namespace(tmp_path) -> None:
     with pytest.raises(RuntimeError):
         tg.Client(_file_uri(tmp_path), read_only=True)

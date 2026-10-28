@@ -104,8 +104,9 @@ class Client:
 
     With `read_only=True` the client never claims the namespace, so a
     writer in another process keeps running. It reads the newest commit
-    as of open (or the last `refresh()`), and every mutator raises
-    `PermissionError`.
+    as of open (or the last `refresh()`, at most an hour back), and
+    every mutator raises `PermissionError`. Use it as a context manager,
+    or call `close()`, to drop its retention lease when done.
     """
 
     def __init__(
@@ -119,6 +120,14 @@ class Client:
         """Move a `read_only` client to the newest committed version.
         Returns `True` when it advanced. A no-op returning `False` on a
         writer client, which always reads its own latest commit."""
+
+    def close(self) -> None:
+        """Release a `read_only` client's retention lease so the writer
+        can reclaim the version it was serving. The client keeps working.
+        A no-op on a writer client."""
+
+    def __enter__(self) -> "Client": ...
+    def __exit__(self, *args: object) -> bool: ...
 
     # ── Storage CRUD (stages into the current batch) ────────────────
 
@@ -270,7 +279,8 @@ class Client:
 
         Reads run on the latest committed snapshot without the writer
         lock. `timeout_ms` raises `QueryTimeoutError` once that much
-        time has passed since the call (a timed-out write is discarded).
+        time has passed since the call, waiting for the client's lock
+        included (a timed-out write is discarded).
         `max_rows` raises `QueryRowCapError` when a read produces more
         rows than that; writes ignore it."""
 

@@ -98,7 +98,7 @@ except QueryRowCapError:    # a RuntimeError subclass
 ```
 
 `timeout_ms` counts from the call, including time spent waiting for the
-writer lock. A write that times out is thrown away, not committed.
+client's lock behind a long write or `refresh()`. A write that times out is thrown away, not committed.
 `max_rows` fails a read once any step of the plan produces more rows than
 that. Writes ignore it.
 
@@ -128,14 +128,19 @@ if reader.refresh():
 
 A read-only client never claims the writer epoch. It sees every commit up
 to the moment it was opened (or last refreshed), including commits the
-writer has not flushed yet, and stays on that version until `refresh()`.
+writer has not flushed yet, and stays on that version until `refresh()`,
+or for at most an hour: a read on an older version refreshes first.
 Every mutating call (`upsert_*`, `tombstone_*`, `merge_*`, `load_*`,
 `commit`, `flush`, `compact`, write or DDL Cypher) raises
 `PermissionError`. The namespace must already exist.
 
 It keeps a small retention lease under `manifest/pins/` so the writer's
-cleanup does not delete files it still reads; the lease expires on its own
-if the process dies. `refresh()` replays the writer's unflushed WAL, so it
+cleanup does not delete files it still reads. While the lease lives, the
+writer cannot reclaim anything from that version on, which is why an old
+version is refreshed on the next read. `close()`, or leaving a
+`with namidb.Client(uri, read_only=True) as reader:` block, drops the
+lease right away; otherwise it expires about 15 minutes after the last
+read, or when the process dies. `refresh()` replays the writer's unflushed WAL, so it
 costs more the longer the writer goes without a flush.
 
 ## Vector and full-text indexes

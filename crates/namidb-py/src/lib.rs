@@ -66,15 +66,23 @@ enum Session {
 
 impl Session {
     /// The committed snapshot reads run on. The lock is held only to clone
-    /// it, so a long read never blocks writers or other reads.
-    async fn snapshot(&self) -> Arc<OwnedSnapshot> {
-        match self {
-            Session::Writer(w) => w.lock().await.owned_snapshot(),
+    /// it, so a long read never blocks writers or other reads. Waiting for
+    /// the lock gives up at `deadline`.
+    async fn snapshot(&self, deadline: Option<Instant>) -> PyResult<Arc<OwnedSnapshot>> {
+        Ok(match self {
+            Session::Writer(w) => lock_until(w, deadline).await?.owned_snapshot(),
             Session::Reader(r) => {
-                let mut r = r.lock().await;
-                r.renew_pin().await;
+                let mut r = lock_until(r, deadline).await?;
+                r.keep_alive().await;
                 r.snapshot()
             }
+        })
+    }
+
+    async fn close(&self) -> PyResult<()> {
+        match self {
+            Session::Writer(_) => Ok(()),
+            Session::Reader(r) => r.lock().await.release().await.map_err(map_storage_err),
         }
     }
 
@@ -85,6 +93,19 @@ impl Session {
                 "this Client was opened with read_only=True",
             )),
         }
+    }
+}
+
+/// Lock `mutex`, giving up with `QueryTimeoutError` once `deadline` passes.
+async fn lock_until<T>(
+    mutex: &Mutex<T>,
+    deadline: Option<Instant>,
+) -> PyResult<tokio::sync::MutexGuard<'_, T>> {
+    match deadline {
+        None => Ok(mutex.lock().await),
+        Some(deadline) => tokio::time::timeout_at(deadline.into(), mutex.lock())
+            .await
+            .map_err(|_| QueryTimeoutError::new_err("query timed out waiting for the client lock")),
     }
 }
 
@@ -126,8 +147,9 @@ impl Client {
     ///
     /// With `read_only=True` the client never claims the namespace, so a
     /// writer in another process keeps running. It serves the newest commit
-    /// as of open (or the last [`Client::refresh`]) and every mutator
-    /// raises `PermissionError`. The namespace must already exist.
+    /// as of open (or the last [`Client::refresh`], at most an hour back)
+    /// and every mutator raises `PermissionError`. The namespace must
+    /// already exist. [`Client::close`] drops its retention lease.
     #[new]
     #[pyo3(signature = (uri, cache_bytes=None, read_only=false))]
     fn new(
@@ -424,7 +446,7 @@ impl Client {
         let id = parse_node_id(id)?;
         let view: Option<NodeView> = py.allow_threads(|| {
             self.runtime.block_on(async {
-                let owned = self.session.snapshot().await;
+                let owned = self.session.snapshot(None).await?;
                 let snap = owned.borrow().with_cache(self.cache.clone());
                 snap.lookup_node(label, id).await.map_err(map_storage_err)
             })
@@ -440,7 +462,7 @@ impl Client {
         let src = parse_node_id(src)?;
         let list: EdgeListView = py.allow_threads(|| {
             self.runtime.block_on(async {
-                let owned = self.session.snapshot().await;
+                let owned = self.session.snapshot(None).await?;
                 let snap = owned.borrow().with_cache(self.cache.clone());
                 snap.out_edges(edge_type, src)
                     .await
@@ -455,7 +477,7 @@ impl Client {
         let dst = parse_node_id(dst)?;
         let list: EdgeListView = py.allow_threads(|| {
             self.runtime.block_on(async {
-                let owned = self.session.snapshot().await;
+                let owned = self.session.snapshot(None).await?;
                 let snap = owned.borrow().with_cache(self.cache.clone());
                 snap.in_edges(edge_type, dst).await.map_err(map_storage_err)
             })
@@ -536,6 +558,25 @@ impl Client {
                 reader.refresh().await.map_err(map_storage_err)
             })
         })
+    }
+
+    /// Release the retention lease a `read_only` client holds on the
+    /// version it serves, so the writer's cleanup can reclaim it right away
+    /// instead of when the lease expires. The client keeps working; its next
+    /// `refresh()` that advances takes a new lease. A no-op on a writer.
+    /// `with Client(...) as c:` calls this on exit.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.runtime.block_on(self.session.close()))
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, pyo3::types::PyTuple>) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
     }
 
     /// Stage a batch of node upserts under a single tokio runtime + lock
@@ -810,7 +851,7 @@ impl Client {
     /// writer lock, so several threads can query one client at once.
     ///
     /// `timeout_ms` aborts the query with `QueryTimeoutError` once that much
-    /// wall time has passed since the call, waiting for the writer lock
+    /// wall time has passed since the call, waiting for the client's lock
     /// included. A write that times out is discarded, not committed.
     /// `max_rows` aborts a read with `QueryRowCapError` as soon as any step
     /// produces more rows than that; writes ignore it.
@@ -896,7 +937,7 @@ impl Client {
     ) -> PyResult<Vec<NodeView>> {
         py.allow_threads(|| {
             self.runtime.block_on(async {
-                let owned = self.session.snapshot().await;
+                let owned = self.session.snapshot(None).await?;
                 let snap = owned.borrow().with_cache(self.cache.clone());
                 match limit {
                     Some(limit) => {
@@ -923,7 +964,7 @@ impl Client {
     ) -> PyResult<Vec<EdgeView>> {
         let mut views = py.allow_threads(|| {
             self.runtime.block_on(async {
-                let owned = self.session.snapshot().await;
+                let owned = self.session.snapshot(None).await?;
                 let snap = owned.borrow().with_cache(self.cache.clone());
                 snap.scan_edge_type(edge_type)
                     .await
@@ -1121,14 +1162,14 @@ async fn run_cypher(
 ) -> PyResult<QueryResult> {
     let parsed = cypher_parse(query).map_err(parse_errs_to_pyerr)?;
     if !is_schema_ddl(&parsed) {
-        let owned = session.snapshot().await;
+        let owned = session.snapshot(deadline).await?;
         let snap = owned.borrow().with_cache(cache);
         if let Some(result) = run_read(&parsed, &snap, params, deadline, row_cap).await? {
             return Ok(result);
         }
     }
     let writer = session.writer()?;
-    let mut guard = writer.lock().await;
+    let mut guard = lock_until(writer, deadline).await?;
     run_write(&mut guard, &parsed, params, deadline).await
 }
 
@@ -1762,7 +1803,13 @@ fn exec_err_to_pyerr(e: ExecError) -> PyErr {
     match e {
         // Python has no admin cancel path, so a cancel can only come from
         // the same deadline machinery.
-        ExecError::Timeout | ExecError::Cancelled => QueryTimeoutError::new_err(e.to_string()),
+        // A deadline that fires in a write's commit tail arrives as a storage
+        // error.
+        ExecError::Timeout
+        | ExecError::Cancelled
+        | ExecError::Storage(namidb_storage::Error::Timeout | namidb_storage::Error::Cancelled) => {
+            QueryTimeoutError::new_err(e.to_string())
+        }
         ExecError::RowCap(_) => QueryRowCapError::new_err(e.to_string()),
         _ => PyRuntimeError::new_err(format!("Cypher execution error: {e}")),
     }
