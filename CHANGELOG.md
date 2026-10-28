@@ -185,7 +185,9 @@ crates.io release will establish and document that API explicitly.
   access mode transaction now reads the snapshot published at BEGIN without
   touching the writer, and a write inside it fails with
   `Neo.ClientError.Statement.AccessMode`. Write mode transactions are
-  unchanged. Embedders get a new `Backend::begin_tx_on_mode` method whose
+  unchanged. In `--multi-tenant` mode a namespace with an open read
+  transaction is never evicted as idle, so a reopened copy of it cannot
+  compact and sweep files that the transaction's snapshot still reads. Embedders get a new `Backend::begin_tx_on_mode` method whose
   default ignores the mode, so other backends keep working as before.
 
 ### Fixed

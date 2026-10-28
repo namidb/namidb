@@ -11596,6 +11596,11 @@ impl SnapshotCell {
             .map(|m| m.min(current))
             .unwrap_or(current)
     }
+
+    /// Whether any [`PinnedSnapshot`] from this cell is still alive.
+    pub fn has_live_readers(&self) -> bool {
+        self.registry.min_live().is_some()
+    }
 }
 
 #[cfg(test)]
