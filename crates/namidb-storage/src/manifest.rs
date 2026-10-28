@@ -1385,8 +1385,20 @@ impl ManifestStore {
     ///
     /// Returns the loaded manifest at the new epoch alongside a fresh fence
     /// that the caller should hold for the lifetime of its writer session.
-    #[instrument(skip(self), fields(namespace = %self.paths.namespace()))]
     pub async fn claim_writer(&self) -> Result<(LoadedManifest, WriterFence)> {
+        self.claim_writer_unless_newer(None).await
+    }
+
+    /// [`Self::claim_writer`] that steps aside for a peer: once the current
+    /// epoch is above `mine`, another writer has claimed the namespace (or
+    /// is mid-claim, which the stall repair below publishes), so this
+    /// returns [`Error::Fenced`] instead of claiming over it. `None` claims
+    /// unconditionally.
+    #[instrument(skip(self), fields(namespace = %self.paths.namespace()))]
+    pub async fn claim_writer_unless_newer(
+        &self,
+        mine: Option<Epoch>,
+    ) -> Result<(LoadedManifest, WriterFence)> {
         // A genuine concurrent claim resolves quickly: the winner advances
         // the pointer, so a reloaded base sees a higher version within a
         // couple of rounds and we make progress. A CAS loss where the
@@ -1413,6 +1425,14 @@ impl ManifestStore {
         let mut last_version: Option<u64> = None;
         loop {
             let base = self.load_current().await?;
+            if let Some(mine) = mine {
+                if base.manifest.epoch > mine {
+                    return Err(Error::Fenced {
+                        mine: mine.as_u64(),
+                        current: base.manifest.epoch.as_u64(),
+                    });
+                }
+            }
             let mut new_manifest = base.manifest.next_version(Uuid::now_v7());
             new_manifest.epoch = base.manifest.epoch.next();
             let fence = WriterFence::new(new_manifest.epoch);

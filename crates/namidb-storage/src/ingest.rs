@@ -455,17 +455,32 @@ impl WriterSession {
     /// [`Self::open`] with caller-supplied caches instead of the shared
     /// process-wide instances. `None` slots disable that cache for every
     /// snapshot this session emits.
-    #[instrument(skip(store, paths, caches), fields(namespace = %paths.namespace()))]
     pub async fn open_with_caches(
         store: Arc<dyn ObjectStore>,
         paths: NamespacePaths,
         caches: SessionCaches,
     ) -> Result<Self> {
+        Self::open_claiming(store, paths, caches, None).await
+    }
+
+    /// The open behind [`Self::open_with_caches`]; `yield_above` goes to
+    /// [`ManifestStore::claim_writer_unless_newer`].
+    #[instrument(skip(store, paths, caches), fields(namespace = %paths.namespace()))]
+    async fn open_claiming(
+        store: Arc<dyn ObjectStore>,
+        paths: NamespacePaths,
+        caches: SessionCaches,
+        yield_above: Option<crate::fence::Epoch>,
+    ) -> Result<Self> {
         let manifest_store = ManifestStore::new(store.clone(), paths.clone());
         let wal_store = WalStore::new(store.clone(), paths);
 
         let (current, fence) = match manifest_store.load_current().await {
-            Ok(_) => manifest_store.claim_writer().await?,
+            Ok(_) => {
+                manifest_store
+                    .claim_writer_unless_newer(yield_above)
+                    .await?
+            }
             Err(Error::ObjectStore(object_store::Error::NotFound { .. })) => {
                 let writer_id = Uuid::now_v7();
                 let loaded = manifest_store.bootstrap(writer_id).await?;
@@ -1305,6 +1320,18 @@ impl WriterSession {
     /// retry. Uncommitted pending records are dropped either way; they were
     /// never ACKed, so nothing durable is lost.
     pub async fn reopen(&mut self) -> Result<()> {
+        self.reopen_claiming(None).await
+    }
+
+    /// [`Self::reopen`] that leaves the namespace to a peer: if another
+    /// writer has claimed an epoch newer than this session's, it fails with
+    /// [`Error::Fenced`] (leaving `self` untouched) instead of fencing that
+    /// writer back. For hosts where something else decides ownership.
+    pub async fn reopen_unless_claimed(&mut self) -> Result<()> {
+        self.reopen_claiming(Some(self.fence.epoch)).await
+    }
+
+    async fn reopen_claiming(&mut self, yield_above: Option<crate::fence::Epoch>) -> Result<()> {
         let store = Arc::clone(&self.store);
         let paths = self.manifest_store.paths().clone();
         // Keep whatever caches this session was opened with — a session
@@ -1315,7 +1342,7 @@ impl WriterSession {
             node_cache: self.node_cache.clone(),
             adjacency_cache: self.adjacency_cache.clone(),
         };
-        *self = Self::open_with_caches(store, paths, caches).await?;
+        *self = Self::open_claiming(store, paths, caches, yield_above).await?;
         Ok(())
     }
 
