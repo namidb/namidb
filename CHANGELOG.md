@@ -15,6 +15,16 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Changed
+
+- **Namespace names can contain `_`.** `forensic_case` used to be rejected
+  as an invalid namespace. The first character still has to be `[a-z0-9]`.
+
+- **`memory://` takes `?ns=` like the other schemes.** `memory://?ns=acme`
+  and `memory://acme?ns=acme` both open `acme`; a URI whose host and `?ns=`
+  disagree is rejected instead of being read as a namespace called
+  `acme?ns=other`.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

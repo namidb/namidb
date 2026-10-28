@@ -150,8 +150,9 @@ pub struct NamespaceId(String);
 impl NamespaceId {
     /// Construct a namespace, validating the name.
     ///
-    /// Rules: `[a-z0-9][a-z0-9-]{0,62}` — DNS-label-ish so it can also
-    /// appear in URLs and S3 prefixes without escaping.
+    /// Rules: `[a-z0-9][a-z0-9_-]{0,62}`, so it can appear in URLs and S3
+    /// prefixes without escaping. The first char can't be `_`, which keeps
+    /// tenant names clear of internal `_`-prefixed directories.
     pub fn new(name: impl Into<String>) -> Result<Self> {
         let name = name.into();
         if name.is_empty() || name.len() > 63 {
@@ -166,10 +167,10 @@ impl NamespaceId {
             )));
         }
         for c in name.chars() {
-            let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+            let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_';
             if !ok {
                 return Err(Error::InvalidId(format!(
-                    "namespace '{name}' contains invalid char '{c}' (allowed: [a-z0-9-])"
+                    "namespace '{name}' contains invalid char '{c}' (allowed: [a-z0-9_-])"
                 )));
             }
         }
@@ -245,10 +246,12 @@ mod tests {
         assert!(NamespaceId::new("acme-prod").is_ok());
         assert!(NamespaceId::new("acme-prod-1").is_ok());
         assert!(NamespaceId::new("1acme").is_ok());
+        assert!(NamespaceId::new("acme_prod").is_ok());
+        assert!(NamespaceId::new("acme_").is_ok());
 
         assert!(NamespaceId::new("").is_err());
         assert!(NamespaceId::new("ACME").is_err());
-        assert!(NamespaceId::new("acme_prod").is_err());
+        assert!(NamespaceId::new("_acme").is_err());
         assert!(NamespaceId::new("-acme").is_err());
         assert!(NamespaceId::new("a".repeat(64)).is_err());
     }

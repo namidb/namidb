@@ -32,6 +32,18 @@ def test_memory_uri_still_works() -> None:
     assert result.first() == {"name": "Alice"}
 
 
+def test_memory_uri_with_ns_query() -> None:
+    ns = f"case_{uuid.uuid4().hex[:8]}"
+    for uri in (f"memory://{ns}?ns={ns}", f"memory://?ns={ns}"):
+        client = tg.Client(uri)
+        client.cypher("CREATE (p:Person {name: 'Alice'})")
+        result = client.cypher("MATCH (p:Person) RETURN p.name AS name")
+        assert result.first() == {"name": "Alice"}
+
+    with pytest.raises(ValueError):
+        tg.Client(f"memory://{ns}?ns=other")
+
+
 def test_memory_uri_missing_namespace_raises() -> None:
     with pytest.raises(ValueError) as exc_info:
         tg.Client("memory://")
