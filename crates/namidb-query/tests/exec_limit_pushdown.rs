@@ -441,6 +441,26 @@ async fn limit_fills_past_many_edgeless_seeds() {
         let snapshot = &snapshot;
         async move {
             let plan = lower(&parse(&query).unwrap()).unwrap();
+            execute_flat_path(&plan, snapshot, &Params::new())
+                .await
+                .unwrap()
+        }
+    };
+
+    let full = values(run_query("MATCH (a)-[:TO]->(h) RETURN a.v AS v".to_string()).await);
+    assert_eq!(full.len(), 200);
+    for limit in [1usize, 2, 63, 64, 65, 150, 200, 300] {
+        let got = values(
+            run_query(format!(
+                "MATCH (a)-[:TO]->(h) RETURN a.v AS v LIMIT {limit}"
+            ))
+            .await,
+        );
+        assert_eq!(got, &full[..limit.min(full.len())], "LIMIT {limit}");
+    }
+}
+
+#[tokio::test]
 async fn nodescan_limit_uses_prefix_on_multi_level_layout() {
     // Two flushes that rewrite some of the same random ids leave two node
     // SSTs whose key ranges overlap, the normal shape of a store with more
@@ -483,18 +503,6 @@ async fn nodescan_limit_uses_prefix_on_multi_level_layout() {
                 .unwrap()
         }
     };
-
-    let full = values(run_query("MATCH (a)-[:TO]->(h) RETURN a.v AS v".to_string()).await);
-    assert_eq!(full.len(), 200);
-    for limit in [1usize, 2, 63, 64, 65, 150, 200, 300] {
-        let got = values(
-            run_query(format!(
-                "MATCH (a)-[:TO]->(h) RETURN a.v AS v LIMIT {limit}"
-            ))
-            .await,
-        );
-        assert_eq!(got, &full[..limit.min(full.len())], "LIMIT {limit}");
-    }
     let full = exec("MATCH (n:L) RETURN keys(n) AS ks, n.k AS k").await;
     assert_eq!(full.len(), 40);
     let fast_paths = sst_cache.limited_node_scan_fast_paths();
