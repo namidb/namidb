@@ -27,9 +27,10 @@
 //! 2. The immediate child is either a bare `NodeScan` or a `CrossProduct`
 //!    whose right side is that scan and whose left side produces every alias
 //!    referenced by `<value>`.
-//! 3. The scan has no pushed predicates/projection and either (a) has an
-//!    explicit label whose property is unique/equality-indexed or (b) is
-//!    label-agnostic and at least one declared label indexes that property.
+//! 3. The scan either (a) has an explicit label whose property is
+//!    unique/equality-indexed or (b) is label-agnostic and at least one
+//!    declared label indexes that property. A bare scan's pushed predicates
+//!    and projection do not block it; the predicates join the residual.
 //!    The latter uses the id-primary global posting sidecar and always fans
 //!    out, preserving equal values across different labels.
 //!
@@ -52,54 +53,66 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         // The pattern we care about: `Filter(eq-on-prop, NodeScan(label))`.
         LogicalPlan::Filter { input, predicate } => {
             // Try to match the rewrite pattern.
+            //
+            // A scan projection does not block any of the lookups below: it
+            // only narrows what the scan decodes, and a lookup loads the whole
+            // node anyway. Pushed scan predicates do not block them either.
+            // On an Expand source the filter only reaches the scan a round
+            // after pushdown moved the literal conjuncts into it, so they are
+            // folded back in and stay behind as part of the residual.
             if let LogicalPlan::NodeScan {
                 label,
                 alias,
-                predicates,
-                projection,
+                predicates: scan_predicates,
+                ..
             } = input.as_ref()
             {
-                if predicates.is_empty() && projection.is_none() {
-                    // Lookup priority: a unique single-property conjunct
-                    // (at most one row) beats a declared composite index,
-                    // which beats a non-unique single-property posting (the
-                    // composite consumes MORE conjuncts, so its posting set
-                    // is a subset of any member's).
-                    let single = extract_indexed_conjunct(
-                        &predicate,
-                        alias,
-                        label.as_deref(),
-                        catalog,
-                        None,
-                    );
-                    if let Some(indexed) = &single {
-                        if !indexed.multi {
-                            return finish_single_lookup(single.expect("checked above"), alias);
-                        }
+                let predicate = with_scan_predicates(&predicate, scan_predicates, alias);
+                // Lookup priority: a unique single-property conjunct
+                // (at most one row) beats a declared composite index,
+                // which beats a non-unique single-property posting (the
+                // composite consumes MORE conjuncts, so its posting set
+                // is a subset of any member's).
+                let single =
+                    extract_indexed_conjunct(&predicate, alias, label.as_deref(), catalog, None);
+                if let Some(indexed) = &single {
+                    if !indexed.multi {
+                        return finish_single_lookup(single.expect("checked above"), alias);
                     }
-                    if let Some(label) = label.as_deref() {
-                        if let Some(composite) =
-                            extract_composite_conjuncts(&predicate, alias, label, catalog)
-                        {
-                            let lookup = LogicalPlan::NodeByPropertyTuple {
-                                input: Box::new(LogicalPlan::Empty),
-                                label: label.to_owned(),
-                                alias: alias.clone(),
-                                properties: composite.properties,
-                                values: composite.values,
-                            };
-                            return match composite.residual {
-                                Some(residual) => LogicalPlan::Filter {
-                                    input: Box::new(lookup),
-                                    predicate: residual,
-                                },
-                                None => lookup,
-                            };
-                        }
+                }
+                if let Some(label) = label.as_deref() {
+                    if let Some(composite) =
+                        extract_composite_conjuncts(&predicate, alias, label, catalog)
+                    {
+                        let lookup = LogicalPlan::NodeByPropertyTuple {
+                            input: Box::new(LogicalPlan::Empty),
+                            label: label.to_owned(),
+                            alias: alias.clone(),
+                            properties: composite.properties,
+                            values: composite.values,
+                        };
+                        return match composite.residual {
+                            Some(residual) => LogicalPlan::Filter {
+                                input: Box::new(lookup),
+                                predicate: residual,
+                            },
+                            None => lookup,
+                        };
                     }
-                    if let Some(indexed) = single {
-                        return finish_single_lookup(indexed, alias);
-                    }
+                }
+                if let Some(indexed) = single {
+                    return finish_single_lookup(indexed, alias);
+                }
+                // `WHERE elementId(n) = <v>` / `WHERE id(n) = <v>` becomes a
+                // NodeById point lookup by UUID, scoped to the scan's label
+                // when it has one, or fanned across observed labels when it
+                // doesn't (the unlabelled `MATCH (n) WHERE elementId(n) = $id`
+                // shape a GUI fetch/expand uses). `id(n) IN <list>` seeks each
+                // listed id the same way. Avoids a full scan.
+                if let Some(seek) = extract_node_id_conjunct(&predicate, alias, None) {
+                    let (lookup, residual) =
+                        id_seek(label.clone(), alias, seek, LogicalPlan::Empty);
+                    return with_residual(lookup, residual);
                 }
             }
 
@@ -126,8 +139,8 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
                         label,
                         alias,
                         predicates,
-                        projection,
-                    } if predicates.is_empty() && projection.is_none() => {
+                        ..
+                    } if predicates.is_empty() => {
                         let outer_aliases = produced_aliases(left);
                         extract_indexed_conjunct(
                             &predicate,
@@ -194,29 +207,6 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
                 };
             }
 
-            // `WHERE elementId(n) = <v>` / `WHERE id(n) = <v>` over a bare
-            // scan becomes a NodeById point lookup by UUID — scoped to the
-            // scan's label when it has one, or fanned across observed labels
-            // when it doesn't (the unlabelled `MATCH (n) WHERE elementId(n)
-            // = $id` shape a GUI fetch/expand uses). `id(n) IN <list>` seeks
-            // each listed id the same way. Avoids a full scan. A scan
-            // projection does not block it: it only narrows what the scan
-            // decodes, and the seek loads the whole node anyway.
-            if let LogicalPlan::NodeScan {
-                label,
-                alias,
-                predicates,
-                ..
-            } = input.as_ref()
-            {
-                if predicates.is_empty() {
-                    if let Some(seek) = extract_node_id_conjunct(&predicate, alias, None) {
-                        let (lookup, residual) =
-                            id_seek(label.clone(), alias, seek, LogicalPlan::Empty);
-                        return with_residual(lookup, residual);
-                    }
-                }
-            }
             // No match — recurse into the input and keep the Filter.
             LogicalPlan::Filter {
                 input: Box::new(rewrite(*input, catalog)),
@@ -893,6 +883,28 @@ pub(super) fn id_seek(
     (with_residual(lookup, Some(exact)), residual)
 }
 
+/// `predicate` with a scan's pushed predicates ANDed back on as filter
+/// conjuncts, so a lookup that replaces the scan keeps enforcing them.
+fn with_scan_predicates(
+    predicate: &Expression,
+    scan_predicates: &[namidb_storage::sst::predicates::ScanPredicate],
+    alias: &str,
+) -> Expression {
+    scan_predicates
+        .iter()
+        .fold(predicate.clone(), |acc, pushed| {
+            let pushed = crate::cost::selectivity::scan_predicate_to_expression(pushed, alias);
+            Expression {
+                span: acc.span,
+                kind: ExpressionKind::Binary {
+                    op: crate::parser::ast::BinaryOp::And,
+                    left: Box::new(acc),
+                    right: Box::new(pushed),
+                },
+            }
+        })
+}
+
 fn with_residual(plan: LogicalPlan, residual: Option<Expression>) -> LogicalPlan {
     match residual {
         Some(predicate) => LogicalPlan::Filter {
@@ -1245,6 +1257,43 @@ mod tests {
                 &StatsCatalog::empty(),
             );
             assert!(find_node_by_id(&plan).is_some(), "{q}: {plan:?}");
+            assert!(!plan_contains_node_scan(&plan), "{q}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn id_seek_on_an_expand_source_keeps_pushed_conjuncts() {
+        // By the round the id filter reaches the scan, pushdown has moved the
+        // literal conjunct (or the inline property) into the scan itself.
+        for q in [
+            "MATCH (a:Person)-[:KNOWS]->(b) WHERE id(a) = $id AND a.age > 1 RETURN b",
+            "MATCH (a:Person {age: 3})-[:KNOWS]->(b) WHERE id(a) IN $ids RETURN id(b)",
+        ] {
+            let plan = crate::optimize::optimize(
+                lower(&parse(q).unwrap()).unwrap(),
+                &StatsCatalog::empty(),
+            );
+            assert!(find_node_by_id(&plan).is_some(), "{q}: {plan:?}");
+            assert!(!plan_contains_node_scan(&plan), "{q}: {plan:?}");
+            assert!(
+                format!("{plan:?}").contains("\"age\""),
+                "the pushed conjunct must stay as a residual: {q}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unique_lookup_on_an_expand_source_read_only_by_identity() {
+        // Projection pushdown narrows a scan read only through id() or
+        // count() before the parameter filter reaches it.
+        let cat = catalog_with_city(true, false);
+        for q in [
+            "MATCH (a:Person)-[:KNOWS]->(b) WHERE a.city = $c RETURN id(a), id(b)",
+            "MATCH (a:Person)-[:KNOWS]->(b) WHERE a.city = $c RETURN count(a)",
+            "MATCH (a:Person)-[:KNOWS]->(b) WHERE a.city = $c AND a.age > 1 RETURN labels(a)",
+        ] {
+            let plan = crate::optimize::optimize(lower(&parse(q).unwrap()).unwrap(), &cat);
+            assert_eq!(find_lookup(&plan), Some(false), "{q}: {plan:?}");
             assert!(!plan_contains_node_scan(&plan), "{q}: {plan:?}");
         }
     }
