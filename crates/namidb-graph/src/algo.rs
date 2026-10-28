@@ -820,11 +820,63 @@ pub fn shortest_paths_cancellable(
     weighted: bool,
     cancel: &dyn Fn() -> bool,
 ) -> Result<ShortestPaths, Cancelled> {
+    Ok(search_from(graph, source, None, weighted, cancel)?.0)
+}
+
+/// Shortest path from `source` to `target` with the same BFS / Dijkstra rules
+/// as [`shortest_paths`], stopping as soon as `target` is settled. Returns the
+/// distance and the node sequence, both endpoints included, or `None` when
+/// `target` is unreachable or either endpoint is not in the graph.
+pub fn shortest_path_to(
+    graph: &Graph,
+    source: NodeId,
+    target: NodeId,
+    weighted: bool,
+) -> Option<(f64, Vec<NodeId>)> {
+    shortest_path_to_cancellable(graph, source, target, weighted, &|| false).expect("never cancels")
+}
+
+/// [`shortest_path_to`] that polls `cancel` periodically.
+pub fn shortest_path_to_cancellable(
+    graph: &Graph,
+    source: NodeId,
+    target: NodeId,
+    weighted: bool,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<(f64, Vec<NodeId>)>, Cancelled> {
+    if graph.out_edges(target).is_none() {
+        return Ok(None);
+    }
+    let (sp, parent) = search_from(graph, source, Some(target), weighted, cancel)?;
+    let Some(&dist) = sp.distance.get(&target) else {
+        return Ok(None);
+    };
+    let mut path = vec![target];
+    let mut at = target;
+    while let Some(&p) = parent.get(&at) {
+        path.push(p);
+        at = p;
+    }
+    path.reverse();
+    Ok(Some((dist, path)))
+}
+
+/// BFS / Dijkstra from `source`. With a `target` it also records each node's
+/// predecessor on its shortest path and stops once `target` is settled; the
+/// full single-source run skips the predecessor map to save the memory.
+fn search_from(
+    graph: &Graph,
+    source: NodeId,
+    target: Option<NodeId>,
+    weighted: bool,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(ShortestPaths, HashMap<NodeId, NodeId>), Cancelled> {
     let mut distance: HashMap<NodeId, f64> = HashMap::new();
     let mut hops: HashMap<NodeId, usize> = HashMap::new();
+    let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
     // Unknown source → no rows.
     if graph.out_edges(source).is_none() {
-        return Ok(ShortestPaths { distance, hops });
+        return Ok((ShortestPaths { distance, hops }, parent));
     }
     let mut since_check = 0usize;
 
@@ -840,6 +892,10 @@ pub fn shortest_paths_cancellable(
             if d > *distance.get(&u).unwrap_or(&f64::INFINITY) {
                 continue;
             }
+            // Popped means settled: the target's distance is final.
+            if Some(u) == target {
+                break;
+            }
             let cur_hops = hops.get(&u).copied().unwrap_or(0);
             if let Some(edges) = graph.out_edges(u) {
                 for &(v, w) in edges {
@@ -850,6 +906,9 @@ pub fn shortest_paths_cancellable(
                     if nd < *distance.get(&v).unwrap_or(&f64::INFINITY) {
                         distance.insert(v, nd);
                         hops.insert(v, cur_hops + 1);
+                        if target.is_some() {
+                            parent.insert(v, u);
+                        }
                         heap.push(Reverse((MinF64(nd), v)));
                     }
                     since_check += 1;
@@ -870,7 +929,10 @@ pub fn shortest_paths_cancellable(
         hops.insert(source, 0);
         visited.insert(source);
         queue.push_back(source);
-        while let Some(u) = queue.pop_front() {
+        'bfs: while let Some(u) = queue.pop_front() {
+            if Some(u) == target {
+                break; // source == target
+            }
             let du = distance[&u];
             let hu = hops[&u];
             if let Some(edges) = graph.out_edges(u) {
@@ -878,6 +940,12 @@ pub fn shortest_paths_cancellable(
                     if visited.insert(v) {
                         distance.insert(v, du + 1.0);
                         hops.insert(v, hu + 1);
+                        if target.is_some() {
+                            parent.insert(v, u);
+                            if Some(v) == target {
+                                break 'bfs;
+                            }
+                        }
                         queue.push_back(v);
                     }
                     since_check += 1;
@@ -892,7 +960,7 @@ pub fn shortest_paths_cancellable(
         }
     }
 
-    Ok(ShortestPaths { distance, hops })
+    Ok((ShortestPaths { distance, hops }, parent))
 }
 
 // ===========================================================================
@@ -2097,6 +2165,39 @@ mod tests {
         assert_eq!(sp.distance[&c], 2.0);
         assert_eq!(sp.distance[&d], 1.0); // via the shortcut, not 3 hops
         assert_eq!(sp.hops[&d], 1);
+    }
+
+    #[test]
+    fn shortest_path_to_returns_node_sequence() {
+        // a -> b -> c -> d and a -> d (a shortcut).
+        let [a, b, c, d] = [1, 2, 3, 4].map(|i| nid([i; 16]));
+        let mut g = Graph::new();
+        g.add_edge(a, b, None);
+        g.add_edge(b, c, None);
+        g.add_edge(c, d, None);
+        g.add_edge(a, d, None);
+        assert_eq!(
+            shortest_path_to(&g, a, c, false),
+            Some((2.0, vec![a, b, c]))
+        );
+        assert_eq!(shortest_path_to(&g, a, d, false), Some((1.0, vec![a, d])));
+        assert_eq!(shortest_path_to(&g, a, a, false), Some((0.0, vec![a])));
+        // Directed: nothing leads back to a.
+        assert_eq!(shortest_path_to(&g, d, a, false), None);
+        assert_eq!(shortest_path_to(&g, a, nid([200; 16]), false), None);
+    }
+
+    #[test]
+    fn shortest_path_to_dijkstra_prefers_cheaper_route() {
+        let [a, b, c, d] = [1, 2, 3, 4].map(|i| nid([i; 16]));
+        let mut g = Graph::new();
+        g.add_edge(a, d, Some(10.0));
+        g.add_edge(a, b, Some(1.0));
+        g.add_edge(b, c, Some(1.0));
+        g.add_edge(c, d, Some(1.0));
+        let (dist, path) = shortest_path_to(&g, a, d, true).unwrap();
+        assert!((dist - 3.0).abs() < 1e-9);
+        assert_eq!(path, vec![a, b, c, d]);
     }
 
     #[test]

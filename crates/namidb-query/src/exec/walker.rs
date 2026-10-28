@@ -2783,14 +2783,15 @@ async fn flat_call_procedure(
     }
 
     // Shared projection options ({labels, edge_types, direction}) restrict the
-    // graph build; algorithm-specific keys are parsed per procedure below.
+    // graph build. Each arm parses its own options BEFORE building the graph,
+    // so a typo or an unknown procedure fails without a full-store scan.
     let projection = algo_projection(args, params)?;
-    let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
 
     // Canonical output: column names + one RuntimeValue per column per row.
     let (cols, raw): (Vec<&'static str>, Vec<Vec<RuntimeValue>>) = match name {
         "wcc" => {
             require_projection_only("wcc", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             // Poll the query deadline mid-computation so a runaway CALL on a
             // huge graph is interruptible, not just at the operator boundary.
             let comps = namidb_graph::algo::weakly_connected_components_cancellable(
@@ -2809,6 +2810,7 @@ async fn flat_call_procedure(
         }
         "pagerank" => {
             let opts = pagerank_options(args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let pr = namidb_graph::algo::pagerank_cancellable(
                 &graph,
                 &opts,
@@ -2830,6 +2832,7 @@ async fn flat_call_procedure(
         }
         "degree" => {
             require_projection_only("degree", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let deg = namidb_graph::algo::degrees_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -2853,6 +2856,7 @@ async fn flat_call_procedure(
         }
         "scc" => {
             require_projection_only("scc", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let comps = namidb_graph::algo::strongly_connected_components_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -2868,6 +2872,7 @@ async fn flat_call_procedure(
         }
         "triangle_count" => {
             require_projection_only("triangle_count", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let tri = namidb_graph::algo::triangle_count_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -2894,6 +2899,7 @@ async fn flat_call_procedure(
         }
         "label_propagation" => {
             let max_iters = label_propagation_options(args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let comm = namidb_graph::algo::label_propagation_cancellable(
                 &graph,
                 max_iters,
@@ -2909,14 +2915,34 @@ async fn flat_call_procedure(
             (vec!["node_id", "community"], raw)
         }
         "shortest_path" => {
-            let (source, weighted) = shortest_path_options(args, params)?;
+            let (source, target, weighted) = shortest_path_options(args, params)?;
+            let cols = vec!["node_id", "distance", "hops", "path"];
+            // With a target: one row (or none when unreachable) carrying the
+            // node sequence, searched against the snapshot adjacency without
+            // building the projected graph. It returns node ids only; for
+            // relationships use `MATCH p = shortestPath(...)` instead.
+            if let Some(target) = target {
+                let found =
+                    snapshot_shortest_path(snapshot, &projection, source, target, weighted).await?;
+                let raw = found
+                    .into_iter()
+                    .map(|(dist, path)| {
+                        vec![
+                            node_runtime(target),
+                            RuntimeValue::Float(dist),
+                            RuntimeValue::Integer(path.len() as i64 - 1),
+                            RuntimeValue::List(path.into_iter().map(node_runtime).collect()),
+                        ]
+                    })
+                    .collect();
+                return project_proc_rows("algo.shortest_path", &cols, raw, yield_items);
+            }
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             // Dijkstra is unsound with negative weights; reject the query rather
             // than silently skipping those edges and returning wrong distances
             // (matches Neo4j GDS, which validates non-negative weights).
             if weighted && graph.has_negative_weight() {
-                return Err(proc_unsupported(
-                    "algo.shortest_path with weighted:true does not support negative edge weights",
-                ));
+                return Err(proc_unsupported(NEGATIVE_WEIGHT_ERROR));
             }
             let sp = namidb_graph::algo::shortest_paths_cancellable(
                 &graph,
@@ -2939,13 +2965,16 @@ async fn flat_call_procedure(
                         node_runtime(id),
                         RuntimeValue::Float(dist),
                         RuntimeValue::Integer(sp.hops.get(&id).copied().unwrap_or(0) as i64),
+                        // Paths are only built for a single `target`.
+                        RuntimeValue::Null,
                     ]
                 })
                 .collect();
-            (vec!["node_id", "distance", "hops"], raw)
+            (cols, raw)
         }
         "fastRP" | "fast_rp" | "fastrp" => {
             let opts = fastrp_options(args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let result = namidb_graph::algo::fast_rp_cancellable(
                 &graph,
                 &opts,
@@ -2964,6 +2993,7 @@ async fn flat_call_procedure(
         }
         "louvain" => {
             let opts = louvain_options(args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let res = namidb_graph::algo::louvain_cancellable(
                 &graph,
                 &opts,
@@ -2980,6 +3010,7 @@ async fn flat_call_procedure(
         }
         "betweenness" => {
             require_projection_only("betweenness", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let res = namidb_graph::algo::betweenness_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -5296,20 +5327,31 @@ fn require_projection_only(
                     )));
                 }
             };
-            for key in map.keys() {
-                if !matches!(key.as_str(), "labels" | "edge_types" | "direction") {
-                    return Err(proc_unsupported(format!(
-                        "algo.{name} accepts only projection options \
-                         (labels, edge_types, direction); unknown option `{key}`"
-                    )));
-                }
-            }
-            Ok(())
+            reject_unknown_algo_options(name, &map, &[])
         }
         _ => Err(proc_unsupported(format!(
             "algo.{name} takes at most one (map) argument"
         ))),
     }
+}
+
+/// Reject any key an `algo.*` option map neither projects on nor reads as one
+/// of the procedure's `own` options: a typo like `dampng` or `traget` must
+/// fail the call, not run silently with the default.
+fn reject_unknown_algo_options(
+    name: &str,
+    map: &std::collections::BTreeMap<String, RuntimeValue>,
+    own: &[&str],
+) -> Result<(), ExecError> {
+    const PROJECTION: [&str; 3] = ["labels", "edge_types", "direction"];
+    let allowed = || own.iter().chain(PROJECTION.iter());
+    if let Some(key) = map.keys().find(|k| !allowed().any(|a| a == k)) {
+        return Err(proc_unsupported(format!(
+            "algo.{name} does not recognise the option `{key}`; allowed options: {}",
+            allowed().copied().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Build an in-memory `algo::Graph` from the snapshot: the projected nodes
@@ -5329,18 +5371,9 @@ async fn snapshot_to_algo_graph(
                 g.add_node(id);
             }
         }
-        // Requested labels are validated against the observed set so a typo
-        // errors instead of silently projecting an empty graph (GDS parity).
+        // A label with no nodes yet projects nothing rather than failing the
+        // call: a pipeline can name labels before the data lands.
         Some(ls) => {
-            let known = snapshot.observed_labels();
-            for l in ls {
-                if !known.iter().any(|k| k == l) {
-                    return Err(proc_unsupported(format!(
-                        "unknown label `{l}` in algo projection (known: {})",
-                        known.join(", ")
-                    )));
-                }
-            }
             for label in ls {
                 // Only the node ids are needed: an EMPTY property projection
                 // skips decoding every declared property column and the
@@ -5360,19 +5393,9 @@ async fn snapshot_to_algo_graph(
         .labels
         .as_ref()
         .map(|_| g.nodes().iter().copied().collect());
+    // Same for edge types: one with no edges scans empty and adds nothing.
     let edge_types = match &projection.edge_types {
-        Some(ts) => {
-            let known = snapshot.observed_edge_types();
-            for t in ts {
-                if !known.iter().any(|k| k == t) {
-                    return Err(proc_unsupported(format!(
-                        "unknown edge type `{t}` in algo projection (known: {})",
-                        known.join(", ")
-                    )));
-                }
-            }
-            ts.clone()
-        }
+        Some(ts) => ts.clone(),
         None => snapshot.observed_edge_types(),
     };
     for et in &edge_types {
@@ -5397,6 +5420,124 @@ async fn snapshot_to_algo_graph(
         }
     }
     Ok(g)
+}
+
+const NEGATIVE_WEIGHT_ERROR: &str =
+    "algo.shortest_path with weighted:true does not support negative edge weights";
+
+/// `algo.shortest_path` to one `target`, run straight against the snapshot
+/// adjacency instead of a projected `algo::Graph`: BFS (Dijkstra when
+/// `weighted`) that reads only the neighbourhoods it settles and stops at the
+/// target, so a nearby target costs a few edge lookups, not a scan of every
+/// node and edge. Same projection as [`snapshot_to_algo_graph`]: induced on
+/// `labels`, limited to `edge_types`, oriented by `direction`, weighted by a
+/// numeric `weight` (1.0 when absent). A negative weight errors only when the
+/// search reaches that edge. Returns the distance and the node sequence, both
+/// endpoints included, or `None` when the target is unreachable or either
+/// endpoint is outside the projection.
+// Known limit: the search is one-sided, so a far or unreachable target still
+// walks the whole reachable component one lookup at a time. Go bidirectional
+// if that shows up on real graphs.
+async fn snapshot_shortest_path(
+    snapshot: &Snapshot<'_>,
+    projection: &AlgoProjection,
+    source: NodeId,
+    target: NodeId,
+    weighted: bool,
+) -> Result<Option<(f64, Vec<NodeId>)>, ExecError> {
+    async fn projected(
+        snapshot: &Snapshot<'_>,
+        labels: Option<&[String]>,
+        id: NodeId,
+    ) -> Result<bool, ExecError> {
+        let Some(view) = scan_node_for_id(snapshot, id).await? else {
+            return Ok(false);
+        };
+        Ok(labels.is_none_or(|ls| view.labels.iter().any(|l| ls.contains(l))))
+    }
+    let labels = projection.labels.as_deref();
+    if !projected(snapshot, labels, source).await? || !projected(snapshot, labels, target).await? {
+        return Ok(None);
+    }
+    let edge_types = match &projection.edge_types {
+        Some(ts) => ts.clone(),
+        None => snapshot.observed_edge_types(),
+    };
+    let direction = match projection.direction {
+        AlgoDirection::Natural => RelationshipDirection::Right,
+        AlgoDirection::Reverse => RelationshipDirection::Left,
+        AlgoDirection::Undirected => RelationshipDirection::Both,
+    };
+    let mode = if weighted {
+        EdgeReadMode::Properties
+    } else {
+        EdgeReadMode::Topology
+    };
+
+    let mut dist: HashMap<NodeId, f64> = HashMap::from([(source, 0.0)]);
+    let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut outside: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    // Min-heap on distance. Distances are never negative, so the bit pattern
+    // of the f64 orders the same as the value. With unit weights this pops
+    // in BFS order.
+    let mut heap =
+        std::collections::BinaryHeap::from([std::cmp::Reverse((0f64.to_bits(), source))]);
+    'search: while let Some(std::cmp::Reverse((bits, u))) = heap.pop() {
+        let d = f64::from_bits(bits);
+        if d > dist[&u] {
+            continue; // stale entry
+        }
+        if u == target {
+            break; // popped means settled
+        }
+        namidb_storage::cancel::check()?;
+        for et in &edge_types {
+            for e in neighbours_of(snapshot, et, direction, u, mode).await? {
+                let v = if e.src == u { e.dst } else { e.src };
+                let w = if weighted {
+                    e.properties
+                        .get("weight")
+                        .and_then(numeric_weight)
+                        .unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                if w < 0.0 {
+                    return Err(proc_unsupported(NEGATIVE_WEIGHT_ERROR));
+                }
+                let nd = d + w;
+                if nd >= dist.get(&v).copied().unwrap_or(f64::INFINITY) || outside.contains(&v) {
+                    continue;
+                }
+                if labels.is_some()
+                    && !dist.contains_key(&v)
+                    && !projected(snapshot, labels, v).await?
+                {
+                    outside.insert(v);
+                    continue;
+                }
+                dist.insert(v, nd);
+                parent.insert(v, u);
+                // Unit weights: the first time BFS reaches the target is final.
+                if v == target && !weighted {
+                    break 'search;
+                }
+                heap.push(std::cmp::Reverse((nd.to_bits(), v)));
+            }
+        }
+    }
+
+    let Some(&d) = dist.get(&target) else {
+        return Ok(None);
+    };
+    let mut path = vec![target];
+    let mut at = target;
+    while let Some(&p) = parent.get(&at) {
+        path.push(p);
+        at = p;
+    }
+    path.reverse();
+    Ok(Some((d, path)))
 }
 
 fn numeric_weight(v: &namidb_core::Value) -> Option<f64> {
@@ -5427,6 +5568,11 @@ fn pagerank_options(
                     ));
                 }
             };
+            reject_unknown_algo_options(
+                "pagerank",
+                &map,
+                &["damping", "max_iterations", "tolerance"],
+            )?;
             if let Some(d) = map.get("damping") {
                 opts.damping = as_f64(d)
                     .ok_or_else(|| proc_unsupported("algo.pagerank `damping` must be a number"))?;
@@ -5473,6 +5619,17 @@ fn fastrp_options(
                     ))
                 }
             };
+            reject_unknown_algo_options(
+                "fastRP",
+                &map,
+                &[
+                    "dimension",
+                    "normalization_strength",
+                    "seed",
+                    "iterations",
+                    "iteration_weights",
+                ],
+            )?;
             if let Some(v) = map.get("dimension") {
                 opts.dimension = as_usize(v).ok_or_else(|| {
                     proc_unsupported("algo.fastRP `dimension` must be a non-negative integer")
@@ -5550,6 +5707,7 @@ fn label_propagation_options(args: &[Expression], params: &Params) -> Result<usi
                     ));
                 }
             };
+            reject_unknown_algo_options("label_propagation", &map, &["max_iterations"])?;
             if let Some(m) = map.get("max_iterations") {
                 max_iters = as_usize(m).ok_or_else(|| {
                     proc_unsupported(
@@ -5569,7 +5727,7 @@ fn label_propagation_options(args: &[Expression], params: &Params) -> Result<usi
 
 /// Resolve `algo.louvain` options from its optional single map argument:
 /// `CALL algo.louvain({max_levels: 5, max_iterations: 10, tolerance: 1e-4})`.
-/// The shared projection keys are parsed separately and ignored here.
+/// The shared projection keys are parsed separately.
 fn louvain_options(
     args: &[Expression],
     params: &Params,
@@ -5586,6 +5744,11 @@ fn louvain_options(
                     ));
                 }
             };
+            reject_unknown_algo_options(
+                "louvain",
+                &map,
+                &["max_levels", "max_iterations", "tolerance"],
+            )?;
             if let Some(v) = map.get("max_levels") {
                 opts.max_levels = as_usize(v).ok_or_else(|| {
                     proc_unsupported("algo.louvain `max_levels` must be a non-negative integer")
@@ -5611,13 +5774,14 @@ fn louvain_options(
 }
 
 /// Resolve `algo.shortest_path` options from its required single map arg:
-/// `CALL algo.shortest_path({source: "<uuid>", weighted: true})`. `source` is
-/// required (a node-id string or a node value); `weighted` defaults to false
-/// (BFS hop count) and, when true, runs Dijkstra over non-negative `weight`s.
+/// `CALL algo.shortest_path({source: "<uuid>", target: "<uuid>", weighted: true})`.
+/// `source` is required and `target` optional (each a node-id string or a node
+/// value); `weighted` defaults to false (BFS hop count) and, when true, runs
+/// Dijkstra over non-negative `weight`s.
 fn shortest_path_options(
     args: &[Expression],
     params: &Params,
-) -> Result<(NodeId, bool), ExecError> {
+) -> Result<(NodeId, Option<NodeId>, bool), ExecError> {
     let map = match args {
         [arg] => match evaluate(arg, &Row::new(), params)? {
             RuntimeValue::Map(m) => m,
@@ -5633,24 +5797,26 @@ fn shortest_path_options(
             ));
         }
     };
-    let source = match map.get("source") {
-        Some(RuntimeValue::String(s)) => s.parse::<NodeId>().map_err(|_| {
-            proc_unsupported(format!(
-                "algo.shortest_path `source` is not a valid node id: {s}"
-            ))
-        })?,
-        Some(RuntimeValue::Node(n)) => n.id,
-        Some(_) => {
-            return Err(proc_unsupported(
-                "algo.shortest_path `source` must be a node-id string or a node",
-            ));
-        }
-        None => {
-            return Err(proc_unsupported(
-                "algo.shortest_path requires a `source` (node-id string or node)",
-            ));
+    reject_unknown_algo_options("shortest_path", &map, &["source", "target", "weighted"])?;
+    let node_arg = |key: &str| -> Result<Option<NodeId>, ExecError> {
+        match map.get(key) {
+            // A null `$target` parameter means "no target", like an omitted key.
+            None | Some(RuntimeValue::Null) => Ok(None),
+            Some(RuntimeValue::String(s)) => s.parse::<NodeId>().map(Some).map_err(|_| {
+                proc_unsupported(format!(
+                    "algo.shortest_path `{key}` is not a valid node id: {s}"
+                ))
+            }),
+            Some(RuntimeValue::Node(n)) => Ok(Some(n.id)),
+            Some(_) => Err(proc_unsupported(format!(
+                "algo.shortest_path `{key}` must be a node-id string or a node"
+            ))),
         }
     };
+    let source = node_arg("source")?.ok_or_else(|| {
+        proc_unsupported("algo.shortest_path requires a `source` (node-id string or node)")
+    })?;
+    let target = node_arg("target")?;
     let weighted = match map.get("weighted") {
         None => false,
         Some(RuntimeValue::Bool(b)) => *b,
@@ -5660,7 +5826,7 @@ fn shortest_path_options(
             ));
         }
     };
-    Ok((source, weighted))
+    Ok((source, target, weighted))
 }
 
 fn as_f64(v: &RuntimeValue) -> Option<f64> {

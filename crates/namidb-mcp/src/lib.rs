@@ -30,7 +30,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use namidb_graph::algo::{
-    betweenness, degrees, label_propagation, louvain, pagerank, shortest_paths,
+    betweenness, degrees, label_propagation, louvain, pagerank, shortest_path_to, shortest_paths,
     strongly_connected_components, triangle_count, weakly_connected_components, Graph,
     LouvainOptions, PageRankOptions, LABEL_PROPAGATION_DEFAULT_ITERS,
 };
@@ -1023,6 +1023,34 @@ impl Server {
                     .ok_or_else(|| "shortest_path requires a `source` node id".to_string())?;
                 let source = namidb_core::NodeId::from_str(source_str)
                     .map_err(|_| format!("`source` is not a valid node id: {source_str}"))?;
+                // With a target: the one route from source to target, as notes.
+                if let Some(target) = args.get("target").filter(|t| !t.is_null()) {
+                    let target_str = target
+                        .as_str()
+                        .ok_or_else(|| "`target` must be a node id string".to_string())?;
+                    let target = namidb_core::NodeId::from_str(target_str)
+                        .map_err(|_| format!("`target` is not a valid node id: {target_str}"))?;
+                    let found = shortest_path_to(&graph, source, target, false);
+                    let route: Vec<Value> = found
+                        .iter()
+                        .flat_map(|(_, path)| path)
+                        .map(|nid| {
+                            let id = nid.to_string();
+                            let (title, path) = id_meta.get(&id).cloned().unwrap_or_default();
+                            json!({ "id": id, "title": title, "path": path })
+                        })
+                        .collect();
+                    let result = json!({
+                        "algorithm": "shortest_path",
+                        "source": source_str,
+                        "target": target_str,
+                        "found": found.is_some(),
+                        "distance": found.as_ref().map(|(d, _)| *d),
+                        "hops": found.as_ref().map(|(_, p)| p.len() - 1),
+                        "route": route,
+                    });
+                    return serde_json::to_string_pretty(&result).map_err(|e| e.to_string());
+                }
                 // The induced subgraph carries no edge weights, so this is BFS
                 // (hop count); each reachable node appears once.
                 let sp = shortest_paths(&graph, source, false);
@@ -1506,7 +1534,7 @@ fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "graph_algorithm",
-            "description": "Run a native graph algorithm over the subgraph induced by a node label. Algorithms: `wcc` (Weakly Connected Components — undirected reachability clusters), `scc` (Strongly Connected Components — directed cycles), `pagerank` (structural importance via power iteration), `degree` (in/out/total degree centrality), `triangle_count` (triangles + local clustering coefficient), `label_propagation` (community detection), `louvain` (modularity community detection, also reports modularity), `betweenness` (Brandes betweenness centrality — bridge nodes), and `shortest_path` (BFS hop distances from a `source` node id). Returns algorithm-specific results joined to readable titles/paths. Read-only. The same algorithms are available in Cypher via `CALL algo.<name>()`.",
+            "description": "Run a native graph algorithm over the subgraph induced by a node label. Algorithms: `wcc` (Weakly Connected Components — undirected reachability clusters), `scc` (Strongly Connected Components — directed cycles), `pagerank` (structural importance via power iteration), `degree` (in/out/total degree centrality), `triangle_count` (triangles + local clustering coefficient), `label_propagation` (community detection), `louvain` (modularity community detection, also reports modularity), `betweenness` (Brandes betweenness centrality — bridge nodes), and `shortest_path` (BFS hop distances from a `source` node id, or the route to one `target`). Returns algorithm-specific results joined to readable titles/paths. Read-only. The same algorithms are available in Cypher via `CALL algo.<name>()`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1516,7 +1544,8 @@ fn tool_specs() -> Vec<Value> {
                     "k": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "For partitioning algos (wcc/scc/label_propagation/louvain): number of largest groups to return. For ranking algos (pagerank/degree/triangle_count/betweenness/shortest_path): number of top results to return. Default 10." },
                     "damping": { "type": "number", "description": "PageRank damping factor (default 0.85)." },
                     "max_iterations": { "type": "integer", "description": "Iteration cap for pagerank (default 100) and label_propagation (default 10)." },
-                    "source": { "type": "string", "description": "Required for shortest_path: the source node id to compute hop distances from." }
+                    "source": { "type": "string", "description": "Required for shortest_path: the source node id to compute hop distances from." },
+                    "target": { "type": "string", "description": "Optional for shortest_path: a target node id. Returns the single shortest route (as notes) from source to target instead of every distance." }
                 },
                 "required": ["algorithm"],
             },
@@ -1899,6 +1928,72 @@ mod tests {
         assert_eq!(res["isError"], json!(true));
         let text = res["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("source"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn graph_algorithm_shortest_path_to_target_returns_the_route() {
+        // A -> B -> C, D isolated.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "A.md", "links to [[B]]\n");
+        write(dir.path(), "B.md", "links to [[C]]\n");
+        write(dir.path(), "C.md", "a leaf\n");
+        write(dir.path(), "D.md", "isolated\n");
+        let server = Server::open("memory://mcp-sp-target").await.unwrap();
+        server.load_vault(dir.path(), false).await.unwrap();
+
+        let rows = call(
+            &server,
+            "cypher",
+            json!({ "query": "MATCH (n:Note) RETURN id(n) AS id, n.title AS title" }),
+        )
+        .await;
+        let id_of = |title: &str| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["title"] == title)
+                .unwrap()["id"]
+                .clone()
+        };
+
+        let res = call(
+            &server,
+            "graph_algorithm",
+            json!({ "algorithm": "shortest_path", "source": id_of("A"), "target": id_of("C") }),
+        )
+        .await;
+        assert_eq!(res["found"], true);
+        assert_eq!(res["hops"], 2);
+        let titles: Vec<&str> = res["route"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["title"].as_str())
+            .collect();
+        assert_eq!(titles, vec!["A", "B", "C"]);
+
+        let res = call(
+            &server,
+            "graph_algorithm",
+            json!({ "algorithm": "shortest_path", "source": id_of("A"), "target": id_of("D") }),
+        )
+        .await;
+        assert_eq!(res["found"], false);
+        assert_eq!(res["route"], json!([]));
+
+        // A non-string target is an error, not silently the full listing.
+        let res = server
+            .dispatch(
+                "tools/call",
+                &json!({ "name": "graph_algorithm", "arguments": {
+                    "algorithm": "shortest_path", "source": id_of("A"), "target": 123
+                } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["isError"], json!(true));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("target"), "got: {text}");
     }
 
     #[tokio::test]

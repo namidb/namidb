@@ -44,6 +44,41 @@ crates.io release will establish and document that API explicitly.
   and `memory://acme?ns=acme` both open `acme`. A URI whose host and `?ns=`
   disagree now fails with a clear conflict error instead of an
   invalid-character one.
+### Breaking
+
+- **`CALL algo.*` rejects option keys it does not read.** `algo.pagerank`,
+  `algo.louvain`, `algo.label_propagation`, `algo.fastRP` and
+  `algo.shortest_path` used to drop unknown keys, so `{dampng: 0.9}` ran
+  with the default damping. They now fail with the list of allowed options,
+  like the projection-only procedures already did. A query that passes a
+  stray key, for example `algo.louvain({seed: 1})`, now errors; drop the key.
+  The check runs before the graph is built, so it fails fast.
+- **`algo.shortest_path` returns a fourth column, `path`.** A `YIELD` that
+  names its columns is unaffected, but a call without `YIELD`, or a client
+  that reads columns by position or count, now sees `node_id`, `distance`,
+  `hops`, `path`.
+
+### Fixed
+
+- **`CALL algo.*` failed when a projected label or edge type had no data
+  yet.** An edge type that was never declared and had no edges, or a label
+  with no nodes, made the whole call error with `unknown edge type` /
+  `unknown label`, so a pipeline could not name a type before ingest reached
+  it. Such a label or type now just contributes no nodes or edges.
+
+### Added
+
+- **`algo.shortest_path` takes an optional `target`.** It used to ignore
+  `target` and return the distance to every reachable node. With a target it
+  returns one row (none when it is unreachable) with `node_id`, `distance`,
+  `hops` and `path`, the node sequence from source to target. The search
+  runs on the stored adjacency without loading the projected graph, so it
+  only reads the part of the graph it explores before reaching the target;
+  an unreachable target still explores everything reachable from the source.
+  A null `target` is treated as no target. Without a target, `path` is null
+  and the other columns are unchanged. The MCP `graph_algorithm` tool takes
+  the same `target` for `shortest_path` and returns the route; a `target`
+  that is not a string is rejected.
 
 ## [2.6.19] - 2026-09-16
 
