@@ -18,11 +18,14 @@ crates.io release will establish and document that API explicitly.
 ### Fixed
 
 - **Keywords work as property keys, map keys and aliases.** `RETURN e.by`,
-  `SET n.end = 1`, `{order: 1}` and `RETURN x AS by` used to fail with E003
-  because `by`, `end` and `order` are reserved words. A word right after `.`,
-  before `:` in a map, or after `AS` can only be a name, so it is now read as
-  one, spelled exactly as written. Variables and labels still need backticks
-  (`` MATCH (`order`) ``), and so does a later reference to a keyword alias.
+  `SET n.end = 1`, `{order: 1}`, `RETURN x AS by` and
+  `CREATE INDEX ON :Evt(order)` used to fail with E003 because `by`, `end`
+  and `order` are reserved words. A word right after `.`, before `:` in a
+  map, after `AS` or in an index property list can only be a name, so it is
+  now read as one, spelled exactly as written. Variables and labels still
+  need backticks (`` MATCH (`order`) ``), and so does a later reference to a
+  keyword alias. `` RETURN `order` `` now names the column `order`, without
+  the backticks.
 
 ### Added
 

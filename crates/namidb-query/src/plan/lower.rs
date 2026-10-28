@@ -2016,6 +2016,11 @@ fn contains_agg_variable(expr: &Expression) -> bool {
 }
 
 fn canonical_alias(expr: &Expression) -> String {
+    // A bare variable keeps its name even when written in backticks, so
+    // `RETURN \`order\`` yields a column called `order`.
+    if let ExpressionKind::Variable(id) = &expr.kind {
+        return id.name.clone();
+    }
     // Strip the canonical Display form down to a single line and use as
     // alias for anonymous projections.
     expr.to_string()

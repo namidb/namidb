@@ -209,6 +209,12 @@ async fn keyword_property_keys_round_trip() {
     );
     assert_eq!(rows[0].get("end"), Some(&RuntimeValue::Integer(2)));
     assert_eq!(rows[0].get("order"), Some(&RuntimeValue::Null));
+
+    // A keyword alias is referenced in backticks, but the column is still
+    // named without them.
+    let plan = lower(&parse("MATCH (a:Evt) WITH a.end AS order RETURN `order`").unwrap()).unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert_eq!(rows[0].get("order"), Some(&RuntimeValue::Integer(2)));
 }
 
 #[tokio::test]

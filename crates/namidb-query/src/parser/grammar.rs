@@ -647,7 +647,7 @@ impl<'src> Parser<'src> {
         let label = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
         let property = self
-            .expect_identifier()
+            .expect_name()
             .map_err(|e| e.with_help("vector-index property goes in parentheses"))?;
         self.expect(&Token::RParen)?;
         self.expect_soft_keyword("METRIC")?;
@@ -889,11 +889,11 @@ impl<'src> Parser<'src> {
         self.expect(&Token::LParen)?;
         // One or more comma-separated text properties.
         let mut properties = vec![self
-            .expect_identifier()
+            .expect_name()
             .map_err(|e| e.with_help("fulltext-index properties go in parentheses"))?];
         while matches!(self.peek(), Some(Token::Comma)) {
             self.bump();
-            properties.push(self.expect_identifier()?);
+            properties.push(self.expect_name()?);
         }
         self.expect(&Token::RParen)?;
         let end = self
@@ -1110,9 +1110,9 @@ impl<'src> Parser<'src> {
             self.expect(&Token::Colon)?;
             label = self.expect_identifier()?;
             self.expect(&Token::LParen)?;
-            let mut props = vec![self.expect_identifier()?];
+            let mut props = vec![self.expect_name()?];
             while self.eat(&Token::Comma).is_some() {
-                props.push(self.expect_identifier()?);
+                props.push(self.expect_name()?);
             }
             properties = props;
             end = self.expect_in(&Token::RParen, "index target")?.span.end;
@@ -3849,6 +3849,15 @@ mod tests {
         }
         ok("MATCH (n) WHERE n.order > 1 SET n.by = 1 REMOVE n.end RETURN n");
         ok("CREATE INDEX FOR (n:X) ON (n.by)");
+        // The `ON :Label(prop)` lists take the same keys.
+        for src in [
+            "CREATE INDEX ON :Doc(by, order)",
+            "CREATE FULLTEXT INDEX t ON :Doc(order, end)",
+            "CREATE VECTOR INDEX v ON :Doc(order) METRIC cosine DIMENSION 3",
+        ] {
+            let q = ok(src);
+            assert!(parse(&q.to_string()).is_ok(), "re-parse of {q}");
+        }
     }
 
     #[test]
