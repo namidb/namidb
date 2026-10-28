@@ -1702,9 +1702,9 @@ impl PagedIndexBuilder {
     }
 }
 
-// ponytail: one directory per process, so with several embedded clients on
-// different roots the last one opened wins. Move it into a per-session config
-// if one process ever needs separate spool volumes.
+// ponytail: one directory per process, so with several embedded clients the
+// last one opened decides. Move it into a per-session config if one process
+// ever needs separate spool volumes.
 static SPOOL_DIR_OVERRIDE: std::sync::RwLock<Option<std::path::PathBuf>> =
     std::sync::RwLock::new(None);
 
@@ -1719,7 +1719,8 @@ pub fn set_default_spool_dir(directory: Option<std::path::PathBuf>) {
 }
 
 /// The spool directory in effect: the [`set_default_spool_dir`] override,
-/// then `NAMIDB_SPOOL_DIR`, else `None` (the caller's platform fallback).
+/// then `NAMIDB_SPOOL_DIR`, else `None` (the caller's platform fallback). An
+/// override that no longer exists (its graph root was deleted) is skipped.
 pub(crate) fn default_spool_dir() -> Option<std::path::PathBuf> {
     let override_ = SPOOL_DIR_OVERRIDE
         .read()
@@ -1732,7 +1733,7 @@ fn resolve_spool_dir(
     override_: Option<std::path::PathBuf>,
     env: Option<std::ffi::OsString>,
 ) -> Option<std::path::PathBuf> {
-    override_.or_else(|| {
+    override_.filter(|dir| dir.is_dir()).or_else(|| {
         env.filter(|path| !path.is_empty())
             .map(std::path::PathBuf::from)
     })
@@ -3415,9 +3416,18 @@ mod tests {
     #[test]
     fn resolve_spool_dir_precedence() {
         use std::path::PathBuf;
-        let set = Some(PathBuf::from("/graph/.namidb-spool"));
+        let graph = tempfile::tempdir().unwrap();
+        let set = Some(graph.path().to_path_buf());
         let env = || Some(std::ffi::OsString::from("/scratch"));
         assert_eq!(resolve_spool_dir(set.clone(), env()), set);
+        // A spool dir removed with its graph root falls back instead of
+        // failing every later flush.
+        let gone = Some(PathBuf::from("/nonexistent/graph/.namidb-spool"));
+        assert_eq!(
+            resolve_spool_dir(gone.clone(), env()),
+            Some("/scratch".into())
+        );
+        assert_eq!(resolve_spool_dir(gone, None), None);
         assert_eq!(resolve_spool_dir(None, env()), Some("/scratch".into()));
         assert_eq!(resolve_spool_dir(None, Some("".into())), None);
         assert_eq!(resolve_spool_dir(None, None), None);

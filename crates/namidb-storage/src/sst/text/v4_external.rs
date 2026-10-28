@@ -45,7 +45,6 @@ const FILTER_KEY_PREFIX: &str = "\0filter:";
 const INDEX_BUILD_MEMORY_ENV: &str = "NAMIDB_INDEX_BUILD_MEMORY_BYTES";
 const INDEX_BUILD_SPOOL_DIR_ENV: &str = "NAMIDB_INDEX_BUILD_SPOOL_DIR";
 const COMPACTION_SPOOL_DIR_ENV: &str = "NAMIDB_COMPACTION_SPOOL_DIR";
-const SHARED_SPOOL_DIR_ENV: &str = "NAMIDB_SPOOL_DIR";
 
 /// Explicit memory/scratch controls for a production FT4 delta build.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,8 +86,8 @@ impl TextV4ExternalBuildConfig {
             .or_else(|| {
                 std::env::var_os(COMPACTION_SPOOL_DIR_ENV).filter(|value| !value.is_empty())
             })
-            .or_else(|| std::env::var_os(SHARED_SPOOL_DIR_ENV).filter(|value| !value.is_empty()))
-            .map(PathBuf::from);
+            .map(PathBuf::from)
+            .or_else(crate::sst::paged_index::default_spool_dir);
         let config = Self {
             memory_budget_bytes,
             spool_directory,

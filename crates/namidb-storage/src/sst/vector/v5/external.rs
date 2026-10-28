@@ -63,12 +63,12 @@ impl Default for VectorV5ExternalBuildConfig {
 impl VectorV5ExternalBuildConfig {
     /// Read `NAMIDB_INDEX_BUILD_SPOOL_DIR` (index-specific override),
     /// `NAMIDB_COMPACTION_SPOOL_DIR` (legacy/requested alias), then the engine
-    /// wide `NAMIDB_SPOOL_DIR`, plus `NAMIDB_INDEX_BUILD_MEMORY_BYTES`.
+    /// wide spool dir the default already resolved, plus
+    /// `NAMIDB_INDEX_BUILD_MEMORY_BYTES`.
     pub fn from_env() -> Result<Self, Error> {
         let mut config = Self::default();
         if let Some(path) = std::env::var_os("NAMIDB_INDEX_BUILD_SPOOL_DIR")
             .or_else(|| std::env::var_os("NAMIDB_COMPACTION_SPOOL_DIR"))
-            .or_else(|| std::env::var_os("NAMIDB_SPOOL_DIR"))
         {
             config.scratch_dir = PathBuf::from(path);
         }
