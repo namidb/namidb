@@ -15,7 +15,9 @@ use std::sync::Arc;
 use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::schema::Schema;
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSession};
+use namidb_storage::{
+    EdgeWriteRecord, NamespacePaths, NodeWriteRecord, SessionCaches, SstCache, WriterSession,
+};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -382,22 +384,42 @@ async fn cap_never_underfills_when_most_edges_are_rejected() {
     }
 }
 
+/// `MATCH (a)-->(b)` scans every node as a seed (Movies included, which
+/// have no out-edges) and expands every edge type. The flush puts the nodes
+/// in an SST so the capped runs take the seed pull, not the memtable path.
 #[tokio::test]
 async fn unlabelled_source_limit_over_untyped_expand_is_a_prefix() {
-    // `MATCH (a)-->(b)` scans every node as a seed (Movies included, which
-    // have no out-edges) and expands every edge type.
-    let full = pairs(&run("lp-untyped-full", &format!("MATCH (a)-->(b) {PAIR_RETURN}")).await);
+    let cache = SstCache::new(8 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-untyped"), caches)
+        .await
+        .unwrap();
+    build_graph(&mut writer).await;
+    writer.flush(Schema::empty()).await.unwrap();
+    let snapshot = writer.snapshot();
+    let run_query = |query: String| {
+        let snapshot = &snapshot;
+        async move {
+            let plan = lower(&parse(&query).unwrap()).unwrap();
+            pairs(
+                &execute_flat_path(&plan, snapshot, &Params::new())
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+
+    let full = run_query(format!("MATCH (a)-->(b) {PAIR_RETURN}")).await;
     assert_eq!(full.len(), 6);
     for limit in [1usize, 3, 6, 10] {
-        let capped = pairs(
-            &run(
-                &format!("lp-untyped-{limit}"),
-                &format!("MATCH (a)-->(b) {PAIR_RETURN} LIMIT {limit}"),
-            )
-            .await,
-        );
+        let capped = run_query(format!("MATCH (a)-->(b) {PAIR_RETURN} LIMIT {limit}")).await;
         assert_eq!(capped, &full[..limit.min(full.len())], "LIMIT {limit}");
     }
+    // One limited scan per capped query, each of the 9 nodes (fewer than
+    // the first round of 64 seeds), and none fell back to a full scan.
+    assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+    assert_eq!(cache.limited_node_scan_output_rows(), 4 * 9);
 }
 
 /// The seed pull grows 64, 256, 1024: 500 edgeless nodes ahead of the

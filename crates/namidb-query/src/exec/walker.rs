@@ -1226,9 +1226,9 @@ fn execute_capped<'a>(
                 // input, or a snapshot whose node scan cannot stop early
                 // (memtable nodes or overlapping SSTs), runs uncapped once,
                 // as before.
-                // ponytail: when few seeds match, the rounds rescan the
-                // prefix (about 1.33x a full scan) and end up holding every
-                // seed; only the row cap bounds that case.
+                // NOTE: when few seeds match, the rounds rescan the prefix
+                // (about 1.33x a full scan) and end up holding every seed;
+                // only the row cap bounds that case.
                 let mut want = match input.as_ref() {
                     LogicalPlan::NodeScan { .. } if snapshot.node_scan_is_disjoint() => {
                         Some(cap.max(64))
