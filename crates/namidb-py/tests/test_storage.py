@@ -288,8 +288,11 @@ def test_read_only_close_drops_its_retention_lease(tmp_path) -> None:
         assert len(list(tmp_path.rglob("pins/*.json"))) == 1
         assert reader.cypher("RETURN 1 AS x").first() == {"x": 1}
     assert list(tmp_path.rglob("pins/*.json")) == []
-    # Still usable, just without a lease; close() on a writer is a no-op.
+    # Still usable: the next read takes a new lease rather than reading
+    # files nothing protects. close() on a writer is a no-op.
     assert reader.cypher("RETURN 1 AS x").first() == {"x": 1}
+    assert len(list(tmp_path.rglob("pins/*.json"))) == 1
+    reader.close()
     tg.Client(uri).close()
 
 

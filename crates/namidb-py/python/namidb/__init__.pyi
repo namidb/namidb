@@ -156,8 +156,9 @@ class Client:
 
     def close(self) -> None:
         """Release a `read_only` client's retention lease so the writer
-        can reclaim the version it was serving. The client keeps working.
-        A no-op on a writer client."""
+        can reclaim the version it was serving. The client keeps working:
+        its next read or `refresh()` reloads the newest version under a new
+        lease. A no-op on a writer client."""
 
     def __enter__(self) -> "Client": ...
     def __exit__(self, *args: object) -> bool: ...

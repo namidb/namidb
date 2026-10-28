@@ -35,7 +35,8 @@ crates.io release will establish and document that API explicitly.
   and a node with labels `A` and `B` merged under `A` lost `B`. Each row is
   now merged into the stored node: unmentioned keys are kept, a `None`
   value removes the key, and the label is added to the node's labels. Rows
-  that repeat an id in one call merge in order. The old replace behaviour
+  that repeat an id in one call merge in order. The stored nodes are read in
+  one batch per call, not one point read per row. The old replace behaviour
   lives on as the new `put_nodes`, which skips the read and is the faster
   choice for a first load. In `put_nodes` the last row for an id wins, and
   unique constraints are checked against each id's final value only.
@@ -83,7 +84,10 @@ crates.io release will establish and document that API explicitly.
   files. `refresh()` moves it to the newest commit, and a read on a
   version more than an hour old, or whose lease may have expired,
   refreshes on its own so a forgotten reader cannot hold back cleanup
-  forever. `close()` (or a `with` block) drops the lease. Every mutator
+  forever. `close()` (or a `with` block) drops the lease, and a read after
+  that reloads the newest version under a new one. A read that times out
+  while the client renews or refreshes leaves no lease behind and drops
+  none another read still needs. Every mutator
   raises `PermissionError`. The storage side is
   `namidb_storage::ReaderSession`.
 
