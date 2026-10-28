@@ -1019,16 +1019,17 @@ impl ServerBackend {
                     return disconnected_observation(started, Some(QueryKind::Read));
                 }
             };
-            let Some(_admission) = admission else {
-                return RunObservation {
-                    kind: Some(QueryKind::Read),
-                    elapsed: started.elapsed(),
-                    result: Err(BackendError::Storage(
-                        "too many concurrent queries; the read admission queue is full — \
-                         retry (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
-                            .into(),
-                    )),
-                };
+            let _admission = match admission {
+                Ok(admission) => admission,
+                Err(gate) => {
+                    return RunObservation {
+                        kind: Some(QueryKind::Read),
+                        elapsed: started.elapsed(),
+                        result: Err(BackendError::Storage(crate::admission_exhausted_message(
+                            gate,
+                        ))),
+                    };
+                }
             };
             let snap = owned.borrow();
             let read = execute_with_limits(
@@ -1279,16 +1280,17 @@ impl ServerBackend {
                     return disconnected_observation(started, Some(QueryKind::Read));
                 }
             };
-            let Some(_admission) = admission else {
-                return RunObservation {
-                    kind: Some(QueryKind::Read),
-                    elapsed: started.elapsed(),
-                    result: Err(BackendError::Storage(
-                        "too many concurrent queries; the read admission queue is full — \
-                         retry (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
-                            .into(),
-                    )),
-                };
+            let _admission = match admission {
+                Ok(admission) => admission,
+                Err(gate) => {
+                    return RunObservation {
+                        kind: Some(QueryKind::Read),
+                        elapsed: started.elapsed(),
+                        result: Err(BackendError::Storage(crate::admission_exhausted_message(
+                            gate,
+                        ))),
+                    };
+                }
             };
             let snap = match tx {
                 TxState::Write { writer, .. } => writer.overlay_snapshot(),

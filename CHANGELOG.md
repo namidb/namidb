@@ -35,7 +35,8 @@ crates.io release will establish and document that API explicitly.
   `--multi-tenant` mode one busy tenant could hold every permit and make the
   others queue into the retryable "too many concurrent queries" error. With
   this set, each namespace also gets its own cap, taken before the global
-  one and inside the same admission window. Off (`0`) by default.
+  one and inside the same admission window. Off (`0`) by default. The
+  rejection names whichever of the two gates was full.
 
 ### Changed
 

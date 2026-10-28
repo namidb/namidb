@@ -58,6 +58,9 @@ pub struct MaintenanceConfig {
     pub group_commit_window: Duration,
     /// What a fenced namespace writer does. See [`recovery::FencePolicy`].
     pub fence_policy: recovery::FencePolicy,
+    /// Concurrent reads one namespace may run, inside the process-wide
+    /// read gate. `0` (the default) means no per-namespace cap.
+    pub max_concurrent_queries_per_namespace: usize,
 }
 
 impl Default for MaintenanceConfig {
@@ -70,6 +73,7 @@ impl Default for MaintenanceConfig {
             compaction_l0_trigger: 0,
             group_commit_window: Duration::ZERO,
             fence_policy: recovery::FencePolicy::Steal,
+            max_concurrent_queries_per_namespace: 0,
         }
     }
 }
@@ -328,7 +332,11 @@ impl NamespaceRegistry {
             quiesced: tokio::sync::OnceCell::new(),
             writer_health: WriterHealth::with_fence_policy(self.maintenance.fence_policy),
             flush_notify: Arc::new(tokio::sync::Notify::new()),
-            query_gate: crate::namespace_query_gate(),
+            query_gate: (self.maintenance.max_concurrent_queries_per_namespace > 0).then(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    self.maintenance.max_concurrent_queries_per_namespace,
+                ))
+            }),
             group_commit: (!self.maintenance.group_commit_window.is_zero()).then(|| {
                 Arc::new(crate::GroupCommit::new(
                     self.maintenance.group_commit_window,

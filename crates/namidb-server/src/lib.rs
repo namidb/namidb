@@ -404,7 +404,8 @@ impl AppState {
             writer_health: WriterHealth::new(),
             group_commit: None,
             backup: None,
-            query_gate: namespace_query_gate(),
+            // One namespace: the process-wide gate already caps it.
+            query_gate: None,
         }
     }
 
@@ -1179,6 +1180,7 @@ pub async fn run_with_memory_max_bytes(
             compaction_l0_trigger: config.compaction_l0_trigger,
             group_commit_window: config.group_commit_window,
             fence_policy: config.fence_policy,
+            max_concurrent_queries_per_namespace: max_concurrent_queries_per_namespace(),
         };
         let registry = NamespaceRegistry::new(
             store,
@@ -2011,16 +2013,17 @@ fn read_admission_gate() -> Option<&'static tokio::sync::Semaphore> {
     .as_ref()
 }
 
-/// Optional per-namespace cap on concurrent reads, so one busy tenant
-/// cannot take every permit of the process-wide gate above.
-/// `NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE`, default `0` (off). Each
+/// Env knob for the per-namespace read cap in `--multi-tenant` mode, so one
+/// busy tenant cannot take every permit of the process-wide gate above.
+/// Default `0` (off). Read into [`registry::MaintenanceConfig`]; each
 /// namespace gets its own semaphore when it opens.
-pub(crate) fn namespace_query_gate() -> Option<Arc<tokio::sync::Semaphore>> {
-    let permits = std::env::var("NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE")
+const PER_NAMESPACE_QUERIES_ENV: &str = "NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE";
+
+fn max_concurrent_queries_per_namespace() -> usize {
+    std::env::var(PER_NAMESPACE_QUERIES_ENV)
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(0);
-    (permits > 0).then(|| Arc::new(tokio::sync::Semaphore::new(permits)))
+        .unwrap_or(0)
 }
 
 /// How long a read may queue for admission before the retryable 503
@@ -2046,38 +2049,50 @@ pub struct ReadAdmission {
 
 /// Admit one read: bounded wait on the namespace's own gate (when one is
 /// configured) and then the process-wide concurrency gate, then the scan
-/// gate when the plan needs it. `None` = the admission window elapsed —
-/// the caller returns the retryable too-many-queries rejection.
+/// gate when the plan needs it. `Err` = the admission window elapsed; it
+/// carries the knob of the gate that was full, for the retryable
+/// too-many-queries rejection ([`admission_exhausted_message`]).
 #[doc(hidden)]
 pub async fn acquire_read_admission(
     plan: &namidb_query::LogicalPlan,
     namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
-) -> Option<ReadAdmission> {
+) -> Result<ReadAdmission, &'static str> {
     let deadline = tokio::time::Instant::now() + read_admission_wait();
     let namespace = match namespace_gate {
         None => None,
         Some(gate) => match tokio::time::timeout_at(deadline, gate.clone().acquire_owned()).await {
             Ok(permit) => Some(permit.expect("namespace query gate is never closed")),
-            Err(_) => return None,
+            Err(_) => return Err(PER_NAMESPACE_QUERIES_ENV),
         },
     };
     let admission = match read_admission_gate() {
         None => None,
         Some(gate) => match tokio::time::timeout_at(deadline, gate.acquire()).await {
             Ok(permit) => Some(permit.expect("read admission gate is never closed")),
-            Err(_) => return None,
+            Err(_) => return Err("NAMIDB_MAX_CONCURRENT_QUERIES"),
         },
     };
     let scan = acquire_scan_permit(plan).await;
-    Some(ReadAdmission {
+    Ok(ReadAdmission {
         _namespace: namespace,
         _admission: admission,
         _scan: scan,
     })
 }
 
+/// Message for a read turned away by the gate whose knob is `gate`.
+pub(crate) fn admission_exhausted_message(gate: &str) -> String {
+    format!(
+        "too many concurrent queries; the read admission queue is full — retry \
+         (raise {gate} to widen the gate)"
+    )
+}
+
 /// Retryable 503 for a read that could not be admitted within the window.
-pub(crate) fn admission_exhausted_observation(started: std::time::Instant) -> ObservedQuery {
+pub(crate) fn admission_exhausted_observation(
+    started: std::time::Instant,
+    gate: &str,
+) -> ObservedQuery {
     ObservedQuery {
         kind: Some(QueryKind::Read),
         ok: false,
@@ -2085,9 +2100,7 @@ pub(crate) fn admission_exhausted_observation(started: std::time::Instant) -> Ob
         response: (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
-                error: "too many concurrent queries; the read admission queue is full — retry \
-                        (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
-                    .into(),
+                error: admission_exhausted_message(gate),
             }),
         )
             .into_response(),
@@ -3895,9 +3908,9 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
-        let Some(_admission) = acquire_read_admission(&plan, state.query_gate.as_ref()).await
-        else {
-            return admission_exhausted_observation(started);
+        let _admission = match acquire_read_admission(&plan, state.query_gate.as_ref()).await {
+            Ok(admission) => admission,
+            Err(gate) => return admission_exhausted_observation(started, gate),
         };
         let snap = owned.borrow();
         let result = execute_with_limits(
@@ -5166,9 +5179,9 @@ async fn run_cypher_multi(
         }
     } else {
         // Read path.
-        let Some(_admission) = acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await
-        else {
-            return admission_exhausted_observation(started);
+        let _admission = match acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await {
+            Ok(admission) => admission,
+            Err(gate) => return admission_exhausted_observation(started, gate),
         };
         let snap = owned.borrow();
         let result = execute_with_limits(
@@ -8126,27 +8139,74 @@ mod tests {
     }
 
     /// A namespace at its own read cap is rejected after the admission
-    /// window, while another namespace is still admitted.
+    /// window with a message naming the per-namespace knob, while another
+    /// namespace on the same registry is still admitted.
     #[tokio::test(start_paused = true)]
     async fn namespace_query_gate_caps_one_namespace_only() {
-        let plan = build_plan(
-            &cypher_parse("RETURN 1 AS one").unwrap(),
-            &StatsCatalog::empty(),
-        )
-        .unwrap();
-        let busy = Arc::new(tokio::sync::Semaphore::new(1));
-        let quiet = Arc::new(tokio::sync::Semaphore::new(1));
-        let _held = acquire_read_admission(&plan, Some(&busy))
+        let (store, _) = namidb_storage::parse_uri("memory://mt-query-gate").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig {
+                max_concurrent_queries_per_namespace: 1,
+                ..Default::default()
+            },
+        ));
+        let shared = SharedAppState::new_with_memory(
+            registry.clone(),
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::new(memory::MemoryGovernor::new(0)),
+            Duration::ZERO,
+            "busy".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+        let read = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(Body::from(r#"{"query":"RETURN 1 AS one"}"#))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let busy = registry.get_or_open("busy").await.unwrap();
+        let _held = busy
+            .query_gate
+            .clone()
+            .expect("the registry must build the namespace gate")
+            .acquire_owned()
             .await
-            .expect("first read on the busy namespace");
-        assert!(
-            acquire_read_admission(&plan, Some(&busy)).await.is_none(),
-            "a namespace over its cap must be turned away"
-        );
-        assert!(
-            acquire_read_admission(&plan, Some(&quiet)).await.is_some(),
-            "another namespace must not wait on the busy one"
-        );
+            .unwrap();
+        let (status, body) = read("/busy/v0/cypher").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains(PER_NAMESPACE_QUERIES_ENV), "{body}");
+        let (status, body) = read("/quiet/v0/cypher").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// `--fence-policy=yield`: once another writer claims the namespace the
