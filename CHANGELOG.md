@@ -49,8 +49,9 @@ crates.io release will establish and document that API explicitly.
   `Identifier` and expanded forward, while the reversed spelling answered
   at once. The planner already re-anchored a pattern at a target pinned by
   an indexed property; it now does the same for `id(d) = ...` and
-  `id(d) IN ...`, with or without a label on the target. Still single hop
-  only: a longer chain pinned at its far end keeps its written order.
+  `id(d) IN ...`, with or without a label on the target, unless a literal
+  id list is longer than the label it would replace scanning. Still single
+  hop only: a longer chain pinned at its far end keeps its written order.
 
 - **A labelled hop decoded every neighbour to check its label.** When the
   query read a property of the target (`-[:R]->(t:Device) RETURN t.name`),

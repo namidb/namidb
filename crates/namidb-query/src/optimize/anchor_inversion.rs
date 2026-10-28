@@ -360,9 +360,22 @@ fn try_invert(
     if target_labels.len() > 1 {
         return None;
     }
+    let source_labels = source_disjunction
+        .as_ref()
+        .map(|(_, labels)| labels.as_slice());
+    let source_count = source_node_count(source_label.as_deref(), source_labels, catalog);
     // An id seek is at most one row per id and proves the target exists, so
-    // it always anchors, labelled or not.
-    let (anchor, residual) = match extract_node_id_conjunct(predicate, target_alias, None) {
+    // it anchors, labelled or not, unless a literal id list is longer than
+    // the source scan it would replace.
+    let id_anchor = extract_node_id_conjunct(predicate, target_alias, None).filter(|seek| {
+        match (&seek.value.kind, source_count) {
+            (crate::parser::ast::ExpressionKind::List(ids), Some(count)) if seek.many => {
+                ids.len() as u64 <= count
+            }
+            _ => true,
+        }
+    });
+    let (anchor, residual) = match id_anchor {
         Some(seek) => id_seek(
             target_labels.first().cloned(),
             target_alias,
@@ -373,10 +386,7 @@ fn try_invert(
             predicate,
             target_alias,
             target_labels.first()?,
-            source_label.as_deref(),
-            source_disjunction
-                .as_ref()
-                .map(|(_, labels)| labels.as_slice()),
+            source_count,
             catalog,
         )?,
     };
@@ -416,14 +426,32 @@ fn try_invert(
     Some(result)
 }
 
+/// Rows the source scan would produce, when the catalog knows: a
+/// disjunction source counts as the SUM of its disjunct labels.
+fn source_node_count(
+    source_label: Option<&str>,
+    source_disjunction: Option<&[String]>,
+    catalog: &StatsCatalog,
+) -> Option<u64> {
+    match source_disjunction {
+        Some(labels) => labels.iter().try_fold(0u64, |total, label| {
+            catalog
+                .label(label)
+                .map(|stats| total.saturating_add(stats.node_count))
+        }),
+        None => source_label
+            .and_then(|label| catalog.label(label))
+            .map(|stats| stats.node_count),
+    }
+}
+
 /// The `NodeByPropertyValue` anchor (plus residual) for an index-answerable
 /// equality on the target, when it is worth taking over the source scan.
 fn property_anchor(
     predicate: &crate::parser::Expression,
     target_alias: &str,
     target_label: &String,
-    source_label: Option<&str>,
-    source_disjunction: Option<&[String]>,
+    source_count: Option<u64>,
     catalog: &StatsCatalog,
 ) -> Option<(LogicalPlan, Option<crate::parser::Expression>)> {
     let indexed = extract_indexed_conjunct(
@@ -438,19 +466,8 @@ fn property_anchor(
     }
     if indexed.multi {
         // A posting-list anchor fans out; only take it when the target label
-        // is provably no larger than the label(s) we would otherwise scan —
-        // a disjunction source counts as the SUM of its disjunct labels.
+        // is provably no larger than the label(s) we would otherwise scan.
         let target_count = catalog.label(target_label).map(|stats| stats.node_count);
-        let source_count = match source_disjunction {
-            Some(labels) => labels.iter().try_fold(0u64, |total, label| {
-                catalog
-                    .label(label)
-                    .map(|stats| total.saturating_add(stats.node_count))
-            }),
-            None => source_label
-                .and_then(|label| catalog.label(label))
-                .map(|stats| stats.node_count),
-        };
         match (target_count, source_count) {
             (Some(target), Some(source)) if target <= source => {}
             _ => return None,
@@ -606,6 +623,24 @@ mod tests {
             let plan = rewrite_query(q, &StatsCatalog::empty());
             assert!(find_inverted(&plan).is_none(), "`{q}`: {plan:?}");
         }
+    }
+
+    #[test]
+    fn a_literal_id_list_longer_than_the_source_does_not_invert() {
+        // 3 Person rows: a 4-id list costs more seeks and reverse hops than
+        // scanning them; a 3-id list (or a parameter) still anchors.
+        let cat = catalog(true, false, 10, 3);
+        let ids = |n: usize| {
+            let ids: Vec<String> = (0..n).map(|i| format!("'{i}'")).collect();
+            format!(
+                "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(c) IN [{}] RETURN p",
+                ids.join(", ")
+            )
+        };
+        assert!(find_inverted(&rewrite_query(&ids(4), &cat)).is_none());
+        assert!(find_inverted(&rewrite_query(&ids(3), &cat)).is_some());
+        let q = "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(c) IN $cids RETURN p";
+        assert!(find_inverted(&rewrite_query(q, &cat)).is_some());
     }
 
     #[test]
