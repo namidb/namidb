@@ -12,10 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use object_store::ObjectStore;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use tokio::runtime::Runtime;
@@ -30,8 +31,8 @@ use namidb_query::{
     RuntimeValue, StatsCatalog,
 };
 use namidb_storage::{
-    CommitOutcome, EdgeListView, EdgeView, EdgeWriteRecord, NodeView, NodeWriteRecord, SstCache,
-    WriterSession,
+    sweep_orphans, CommitOutcome, EdgeListView, EdgeView, EdgeWriteRecord, JanitorReport,
+    ManifestStore, NodeView, NodeWriteRecord, SstCache, WriterSession,
 };
 
 /// A namespace handle: object store + writer session + a tokio runtime
@@ -47,6 +48,12 @@ pub struct Client {
     store: Arc<dyn ObjectStore>,
     paths: namidb_storage::NamespacePaths,
     cache: SstCache,
+    /// Orphan age for the sweep that follows an applied compaction; `None`
+    /// leaves reclaiming to explicit `sweep()` calls.
+    auto_sweep_min_age: Option<Duration>,
+    /// `flush()` compacts inline once a bucket holds this many L0 SSTs
+    /// (`0` disables).
+    compaction_l0_trigger: usize,
 }
 
 #[pymethods]
@@ -68,10 +75,24 @@ impl Client {
     /// - `az://<account>/<container>[/<prefix>]?ns=<ns>[&endpoint=...][&allow_http=true][&use_emulator=true]`
     /// — Azure Blob Storage. Auth from `AZURE_STORAGE_ACCOUNT_NAME`
     /// + `AZURE_STORAGE_ACCESS_KEY` (or SAS token via env).
+    ///
+    /// `spool_dir` is where compaction writes its scratch files. It defaults
+    /// to `NAMIDB_SPOOL_DIR`, then to `<root>/.namidb-spool` for `file://`
+    /// URIs. `auto_sweep_min_age_secs` reclaims objects an applied compaction
+    /// retired once they are that old (`None` disables), and `flush()`
+    /// compacts once a bucket reaches `compaction_l0_trigger` L0 SSTs (`0`
+    /// disables).
     #[new]
-    #[pyo3(signature = (uri, cache_bytes=None))]
-    fn new(uri: &str, cache_bytes: Option<usize>) -> PyResult<Self> {
+    #[pyo3(signature = (uri, cache_bytes=None, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8))]
+    fn new(
+        uri: &str,
+        cache_bytes: Option<usize>,
+        spool_dir: Option<String>,
+        auto_sweep_min_age_secs: Option<u64>,
+        compaction_l0_trigger: usize,
+    ) -> PyResult<Self> {
         let (store, paths) = parse_uri(uri)?;
+        configure_spool_dir(uri, spool_dir)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -87,6 +108,8 @@ impl Client {
             store,
             paths,
             cache,
+            auto_sweep_min_age: auto_sweep_min_age_secs.map(Duration::from_secs),
+            compaction_l0_trigger,
         })
     }
 
@@ -102,9 +125,14 @@ impl Client {
         self.runtime.block_on(async {
             let mut session = self.session.lock().await;
             let labels = [label.to_string()];
-            namidb_query::enforce_node_unique_constraints(&session, &labels, &record.properties)
-                .await
-                .map_err(PyValueError::new_err)?;
+            namidb_query::enforce_node_unique_constraints(
+                &session,
+                &labels,
+                &record.properties,
+                Some(id),
+            )
+            .await
+            .map_err(PyValueError::new_err)?;
             session
                 .upsert_node(label, id, &record)
                 .map_err(map_storage_err)
@@ -130,9 +158,14 @@ impl Client {
         };
         self.runtime.block_on(async {
             let mut session = self.session.lock().await;
-            namidb_query::enforce_node_unique_constraints(&session, &labels, &record.properties)
-                .await
-                .map_err(PyValueError::new_err)?;
+            namidb_query::enforce_node_unique_constraints(
+                &session,
+                &labels,
+                &record.properties,
+                Some(id),
+            )
+            .await
+            .map_err(PyValueError::new_err)?;
             session
                 .upsert_node_with_labels(labels, id, &record)
                 .map_err(map_storage_err)
@@ -240,13 +273,33 @@ impl Client {
         Ok(last_lsn)
     }
 
-    /// Flush the memtable into L0 SSTs.
-    fn flush(&self) -> PyResult<()> {
-        self.runtime.block_on(async {
+    /// Flush the memtable into L0 SSTs, then run a compaction pass when a
+    /// bucket has reached `compaction_l0_trigger` L0 SSTs.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let l0 = self.runtime.block_on(async {
             let mut session = self.session.lock().await;
             let schema = session.snapshot().manifest().manifest.schema.clone();
-            session.flush(schema).await.map_err(map_storage_err)
+            session.flush(schema).await.map_err(map_storage_err)?;
+            Ok::<_, PyErr>(session.max_l0_bucket_len())
         })?;
+        // Embedded mode has no maintenance loop, so without this L0 grows
+        // until someone calls compact() and every read fans out across it.
+        // The flush is already durable, so a failed pass is only a warning:
+        // raising would read as "data not persisted" to a retrying caller.
+        if self.compaction_l0_trigger > 0 && l0 >= self.compaction_l0_trigger {
+            if let Err(e) = self.runtime.block_on(run_compaction_inner(
+                self.session.clone(),
+                self.compaction_lock.clone(),
+                self.auto_sweep(),
+            )) {
+                PyErr::warn_bound(
+                    py,
+                    &py.get_type_bound::<PyRuntimeWarning>(),
+                    &format!("flush succeeded, but the compaction it triggered failed: {e}"),
+                    1,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -260,6 +313,7 @@ impl Client {
         let report = self.runtime.block_on(run_compaction_inner(
             self.session.clone(),
             self.compaction_lock.clone(),
+            self.auto_sweep(),
         ))?;
         compaction_report_to_py(py, &report)
     }
@@ -268,10 +322,46 @@ impl Client {
     fn acompact<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let session = self.session.clone();
         let compaction_lock = self.compaction_lock.clone();
+        let auto_sweep = self.auto_sweep();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let report = run_compaction_inner(session, compaction_lock).await?;
+            let report = run_compaction_inner(session, compaction_lock, auto_sweep).await?;
             Python::with_gil(|py| compaction_report_to_py(py, &report))
         })
+    }
+
+    /// Delete objects no manifest version references any more and that are
+    /// at least `min_age_secs` old: SSTs a compaction merged away, WAL
+    /// segments a flush retired, superseded manifests. With `dry_run=True`
+    /// nothing is deleted and the dict reports what would be.
+    #[pyo3(signature = (min_age_secs=60, dry_run=false))]
+    fn sweep(&self, py: Python<'_>, min_age_secs: u64, dry_run: bool) -> PyResult<Py<PyDict>> {
+        let session = self.session.clone();
+        let compaction_lock = self.compaction_lock.clone();
+        let manifest_store = ManifestStore::new(self.store.clone(), self.paths.clone());
+        let report = self.runtime.block_on(async move {
+            let _compaction_guard = compaction_lock.lock().await;
+            let guard = session.lock().await;
+            sweep_locked(
+                &guard,
+                &manifest_store,
+                Duration::from_secs(min_age_secs),
+                !dry_run,
+            )
+            .await
+        })?;
+        let d = PyDict::new_bound(py);
+        d.set_item("orphans_found", report.orphans_found)?;
+        d.set_item("orphans_deleted", report.orphans_deleted)?;
+        d.set_item("bytes_freed", report.bytes_freed)?;
+        d.set_item("skipped_too_young", report.skipped_too_young)?;
+        d.set_item("wal_segments_reclaimed", report.wal_segments_reclaimed)?;
+        d.set_item("wal_bytes_freed", report.wal_bytes_freed)?;
+        d.set_item(
+            "manifest_snapshots_reclaimed",
+            report.manifest_snapshots_reclaimed,
+        )?;
+        d.set_item("manifest_bytes_freed", report.manifest_bytes_freed)?;
+        Ok(d.into())
     }
 
     /// Look up a single node by `(label, id)`.
@@ -347,88 +437,26 @@ impl Client {
         Ok(list.into())
     }
 
-    /// Stage a batch of node upserts under a single tokio runtime + lock
-    /// hop. Each `row` is a `dict[str, Any]` that must contain a string
-    /// `"id"` (UUID); all other keys become node properties.
+    /// Stage a batch of node upserts that merge into the stored nodes. Each
+    /// `row` is a `dict[str, Any]` keyed by `"_id"` (UUID string), or by the
+    /// legacy `"id"`, which is then also kept as an `id` property. Every other
+    /// key is merged into the node's current properties: unmentioned keys are
+    /// kept, a `None` value removes the key, and `label` is added to the
+    /// node's labels. Rows repeating an id in one batch merge in order.
     ///
-    /// Returns the count of staged rows. Like [`Client::upsert_node`],
-    /// the mutations are durable only after a subsequent
-    /// [`Client::commit`].
+    /// This reads each node before writing it; use [`Client::put_nodes`] for
+    /// first loads. Returns the count of staged rows. Like
+    /// [`Client::upsert_node`], the mutations are durable only after a
+    /// subsequent [`Client::commit`].
     fn merge_nodes(&self, label: &str, rows: &Bound<'_, PyList>) -> PyResult<usize> {
-        let mut parsed: Vec<(NodeId, BTreeMap<String, Value>)> = Vec::with_capacity(rows.len());
-        for (idx, row_obj) in rows.iter().enumerate() {
-            let row = row_obj
-                .downcast::<PyDict>()
-                .map_err(|_| PyValueError::new_err(format!("row #{idx} is not a dict")))?;
-            let id_obj = row.get_item("id")?.ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "row #{idx} is missing the required 'id' key (UUID string)"
-                ))
-            })?;
-            let id_str: String = id_obj
-                .extract()
-                .map_err(|_| PyValueError::new_err(format!("row #{idx} 'id' is not a string")))?;
-            let id = parse_node_id(&id_str)?;
-            let mut props = BTreeMap::new();
-            for (k, v) in row.iter() {
-                let key: String = k.extract()?;
-                if key == "id" {
-                    continue;
-                }
-                props.insert(key, py_any_to_value(&v)?);
-            }
-            parsed.push((id, props));
-        }
-        let label = label.to_string();
-        let session = self.session.clone();
-        let count = self.runtime.block_on(async move {
-            let mut guard = session.lock().await;
-            // Unique property names declared for this label (empty if none).
-            let unique_props: Vec<String> = guard
-                .schema()
-                .label(&label)
-                .map(|d| {
-                    d.properties
-                        .iter()
-                        .filter(|p| p.unique)
-                        .map(|p| p.name.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let labels = [label.clone()];
-            let mut seen: std::collections::HashMap<(String, String), NodeId> =
-                std::collections::HashMap::new();
-            for (id, props) in &parsed {
-                let record = NodeWriteRecord {
-                    properties: props.clone(),
-                    schema_version: 0,
-                    ..Default::default()
-                };
-                // Committed + already-staged duplicates, via the RYOW overlay.
-                namidb_query::enforce_node_unique_constraints(&guard, &labels, &record.properties)
-                    .await
-                    .map_err(PyValueError::new_err)?;
-                // Two rows in THIS batch carrying the same unique value.
-                for uprop in &unique_props {
-                    if let Some(v) = props.get(uprop) {
-                        let key = (uprop.clone(), format!("{v:?}"));
-                        if let Some(prev) = seen.insert(key, *id) {
-                            if prev != *id {
-                                return Err(PyValueError::new_err(format!(
-                                    "{label}.{uprop} = {v:?} appears on two ids in the same \
-                                     merge_nodes batch (unique constraint)"
-                                )));
-                            }
-                        }
-                    }
-                }
-                guard
-                    .upsert_node(&label, *id, &record)
-                    .map_err(map_storage_err)?;
-            }
-            Ok::<_, PyErr>(parsed.len())
-        })?;
-        Ok(count)
+        self.stage_nodes(label, rows, true)
+    }
+
+    /// Stage a batch of node upserts that replace the stored nodes (no read).
+    /// Rows take the same shape as [`Client::merge_nodes`], but each row is
+    /// the node's full property set and `label` its only label.
+    fn put_nodes(&self, label: &str, rows: &Bound<'_, PyList>) -> PyResult<usize> {
+        self.stage_nodes(label, rows, false)
     }
 
     /// Stage a batch of edge upserts. Each row needs `"src"` and `"dst"`
@@ -656,6 +684,158 @@ impl Client {
     }
 }
 
+impl Client {
+    /// What an applied compaction should sweep afterwards, if anything.
+    fn auto_sweep(&self) -> Option<(ManifestStore, Duration)> {
+        self.auto_sweep_min_age.map(|age| {
+            (
+                ManifestStore::new(self.store.clone(), self.paths.clone()),
+                age,
+            )
+        })
+    }
+
+    /// Shared body of [`Client::merge_nodes`] (`merge = true`) and
+    /// [`Client::put_nodes`].
+    fn stage_nodes(&self, label: &str, rows: &Bound<'_, PyList>, merge: bool) -> PyResult<usize> {
+        let mut parsed: Vec<(NodeId, BTreeMap<String, Value>)> = Vec::with_capacity(rows.len());
+        for (idx, row_obj) in rows.iter().enumerate() {
+            let row = row_obj
+                .downcast::<PyDict>()
+                .map_err(|_| PyValueError::new_err(format!("row #{idx} is not a dict")))?;
+            // `_id` is the internal node id, as in Cypher. A legacy row keyed by
+            // `id` still works, and its `id` stays a property so `n.id` reads it.
+            let (id_key, id_obj) = match row.get_item("_id")? {
+                Some(v) => ("_id", v),
+                None => (
+                    "id",
+                    row.get_item("id")?.ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "row #{idx} is missing the required '_id' key (UUID string)"
+                        ))
+                    })?,
+                ),
+            };
+            let id_str: String = id_obj.extract().map_err(|_| {
+                PyValueError::new_err(format!("row #{idx} '{id_key}' is not a string"))
+            })?;
+            let id = parse_node_id(&id_str)?;
+            let mut props = BTreeMap::new();
+            for (k, v) in row.iter() {
+                let key: String = k.extract()?;
+                if key == "_id" {
+                    continue;
+                }
+                props.insert(key, py_any_to_value(&v)?);
+            }
+            parsed.push((id, props));
+        }
+        let count = parsed.len();
+        let label = label.to_string();
+        let session = self.session.clone();
+        let cache = self.cache.clone();
+        self.runtime.block_on(async move {
+            let mut guard = session.lock().await;
+            // Unique property names declared for this label (empty if none).
+            let unique_props: Vec<String> = guard
+                .schema()
+                .label(&label)
+                .map(|d| {
+                    d.properties
+                        .iter()
+                        .filter(|p| p.unique)
+                        .map(|p| p.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut nodes: Vec<(NodeId, Vec<String>, BTreeMap<String, Value>)> =
+                Vec::with_capacity(count);
+            if merge {
+                // Read-modify-write against the RYOW overlay, so nodes staged
+                // by earlier calls count too. Rows repeating an id fold into
+                // one node here instead of re-reading the overlay per row.
+                let snap = guard.overlay_snapshot().with_cache(cache);
+                // One batched read warms the decoded row groups, so the
+                // per-id lookups below (label-agnostic, to union labels)
+                // stay in memory instead of decoding an SST per row.
+                let mut distinct: Vec<NodeId> = parsed.iter().map(|(id, _)| *id).collect();
+                distinct.sort_unstable();
+                distinct.dedup();
+                snap.batch_lookup_nodes(&label, &distinct)
+                    .await
+                    .map_err(map_storage_err)?;
+                let mut slot: std::collections::HashMap<NodeId, usize> =
+                    std::collections::HashMap::new();
+                for (id, props) in parsed {
+                    let i = match slot.get(&id) {
+                        Some(&i) => i,
+                        None => {
+                            let (labels, base) =
+                                match snap.lookup_node_by_id(id).await.map_err(map_storage_err)? {
+                                    Some(n) => (n.labels.into_iter().collect(), n.properties),
+                                    None => (Vec::new(), BTreeMap::new()),
+                                };
+                            slot.insert(id, nodes.len());
+                            nodes.push((id, labels, base));
+                            nodes.len() - 1
+                        }
+                    };
+                    let (_, labels, current) = &mut nodes[i];
+                    if !labels.contains(&label) {
+                        labels.push(label.clone());
+                    }
+                    for (k, v) in props {
+                        if matches!(v, Value::Null) {
+                            current.remove(&k);
+                        } else {
+                            current.insert(k, v);
+                        }
+                    }
+                }
+            } else {
+                nodes.extend(
+                    parsed
+                        .into_iter()
+                        .map(|(id, props)| (id, vec![label.clone()], props)),
+                );
+            }
+            let mut seen: std::collections::HashMap<(String, String), NodeId> =
+                std::collections::HashMap::new();
+            for (id, labels, props) in nodes {
+                // Committed + already-staged duplicates, via the RYOW overlay.
+                // The node's own row is excluded: this write replaces it.
+                namidb_query::enforce_node_unique_constraints(&guard, &labels, &props, Some(id))
+                    .await
+                    .map_err(PyValueError::new_err)?;
+                // Two rows in THIS batch carrying the same unique value.
+                for uprop in &unique_props {
+                    if let Some(v) = props.get(uprop) {
+                        let key = (uprop.clone(), format!("{v:?}"));
+                        if let Some(prev) = seen.insert(key, id) {
+                            if prev != id {
+                                return Err(PyValueError::new_err(format!(
+                                    "{label}.{uprop} = {v:?} appears on two ids in the same \
+                                     batch (unique constraint)"
+                                )));
+                            }
+                        }
+                    }
+                }
+                let record = NodeWriteRecord {
+                    properties: props,
+                    schema_version: 0,
+                    ..Default::default()
+                };
+                guard
+                    .upsert_node_with_labels(labels, id, &record)
+                    .map_err(map_storage_err)?;
+            }
+            Ok::<_, PyErr>(())
+        })?;
+        Ok(count)
+    }
+}
+
 // ── Embedded maintenance ──────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -678,6 +858,7 @@ struct CompactionReport {
 async fn run_compaction_inner(
     session: Arc<Mutex<WriterSession>>,
     compaction_lock: Arc<Mutex<()>>,
+    auto_sweep: Option<(ManifestStore, Duration)>,
 ) -> PyResult<CompactionReport> {
     let _compaction_guard = compaction_lock.lock().await;
     let basis = {
@@ -717,9 +898,16 @@ async fn run_compaction_inner(
         .await
         .map_err(map_storage_err)?;
     let l0_after = guard.max_l0_bucket_len();
+    let applied = outcome.source_ssts_removed > 0;
+    if let Some((manifest_store, min_age)) = auto_sweep.filter(|_| applied) {
+        // The merged-away inputs and the WAL earlier flushes retired stay on
+        // disk until a sweep. The pass is already installed, so a failed sweep
+        // only leaves them for the next one.
+        let _ = sweep_locked(&guard, &manifest_store, min_age, true).await;
+    }
 
     Ok(CompactionReport {
-        applied: outcome.source_ssts_removed > 0,
+        applied,
         manifest_version_before,
         manifest_version_after: outcome.committed.manifest.version,
         l0_before,
@@ -728,6 +916,62 @@ async fn run_compaction_inner(
         new_ssts_written: outcome.new_ssts_written,
         bloom_sidecars_written: outcome.bloom_sidecars_written,
     })
+}
+
+/// Sweep orphaned objects with the current manifest version as the retention
+/// horizon. The caller holds both the compaction lock and the writer guard, so
+/// no prepared compaction output is waiting to be installed and no flush or
+/// commit sits between its object PUT and the manifest CAS. Embedded reads also
+/// run entirely under the writer guard, so no in-process reader holds an older
+/// version. Readers in other processes are covered by pin leases and `min_age`.
+async fn sweep_locked(
+    guard: &WriterSession,
+    manifest_store: &ManifestStore,
+    min_age: Duration,
+    delete: bool,
+) -> PyResult<JanitorReport> {
+    let horizon = guard.snapshot().manifest().manifest.version;
+    sweep_orphans(manifest_store, horizon, min_age, 1, delete)
+        .await
+        .map_err(map_storage_err)
+}
+
+/// Point compaction scratch at `spool_dir`, else `NAMIDB_SPOOL_DIR`, else
+/// `<root>/.namidb-spool` for a `file://` URI, so a big compaction fills the
+/// graph volume instead of `/var/tmp`. The leading dot keeps it from ever
+/// parsing as a namespace. A default that cannot be created (a read-only
+/// root) keeps the platform fallback; an explicit `spool_dir` must work.
+/// The setting is process-wide and every client resets it, so a later
+/// `memory://` or `s3://` client does not inherit a `file://` graph's dir.
+fn configure_spool_dir(uri: &str, spool_dir: Option<String>) -> PyResult<()> {
+    let explicit = spool_dir.is_some();
+    let dir = spool_dir
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("NAMIDB_SPOOL_DIR")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .or_else(|| {
+            let rest = uri.strip_prefix("file://")?;
+            let root = rest.split_once('?').map_or(rest, |(path, _)| path);
+            Some(std::path::Path::new(root).join(".namidb-spool"))
+        });
+    let dir = match dir {
+        Some(dir) => match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir),
+            Err(e) if explicit => {
+                return Err(PyValueError::new_err(format!(
+                    "spool_dir {}: {e}",
+                    dir.display()
+                )))
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+    namidb_storage::set_default_spool_dir(dir);
+    Ok(())
 }
 
 fn compaction_report_to_py(py: Python<'_>, report: &CompactionReport) -> PyResult<Py<PyDict>> {
@@ -1427,7 +1671,25 @@ fn build_node_views_table(
         "lsn".to_string(),
         "schema_version".to_string(),
     ];
-    all_names.extend(prop_keys.iter().cloned());
+    // A property named like a metadata column (`id` kept from a legacy row
+    // keyed by `id`, or a business key) would make the schema ambiguous.
+    // Drop it when it only echoes the node id, else rename it `property.<key>`.
+    let prop_columns: Vec<(String, &String)> = prop_keys
+        .iter()
+        .filter_map(|key| {
+            if !all_names.contains(key) {
+                return Some((key.clone(), key));
+            }
+            let echoes_id = key == "id"
+                && views.iter().all(|v| match v.properties.get(key) {
+                    None => true,
+                    Some(Value::Str(s)) => *s == v.id.to_string(),
+                    Some(_) => false,
+                });
+            (!echoes_id).then(|| (format!("property.{key}"), key))
+        })
+        .collect();
+    all_names.extend(prop_columns.iter().map(|(name, _)| name.clone()));
 
     let ids = PyList::empty_bound(py);
     for v in views {
@@ -1465,10 +1727,10 @@ fn build_node_views_table(
     }
     arrays.append(pyarrow.call_method1("array", (svs,))?)?;
 
-    for key in prop_keys {
+    for (_, key) in &prop_columns {
         let pylist = PyList::empty_bound(py);
         for v in views {
-            let pyval = match v.properties.get(key) {
+            let pyval = match v.properties.get(*key) {
                 Some(val) => value_to_py(py, val)?,
                 None => py.None(),
             };

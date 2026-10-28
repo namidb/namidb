@@ -52,7 +52,8 @@ pub struct VectorV5ExternalBuildConfig {
 impl Default for VectorV5ExternalBuildConfig {
     fn default() -> Self {
         Self {
-            scratch_dir: std::env::temp_dir(),
+            scratch_dir: crate::sst::paged_index::default_spool_dir()
+                .unwrap_or_else(std::env::temp_dir),
             memory_budget_bytes: DEFAULT_MEMORY_BYTES,
             quantile_sample_rows: DEFAULT_SAMPLE_ROWS,
         }
@@ -62,12 +63,12 @@ impl Default for VectorV5ExternalBuildConfig {
 impl VectorV5ExternalBuildConfig {
     /// Read `NAMIDB_INDEX_BUILD_SPOOL_DIR` (index-specific override),
     /// `NAMIDB_COMPACTION_SPOOL_DIR` (legacy/requested alias), then the engine
-    /// wide `NAMIDB_SPOOL_DIR`, plus `NAMIDB_INDEX_BUILD_MEMORY_BYTES`.
+    /// wide spool dir the default already resolved, plus
+    /// `NAMIDB_INDEX_BUILD_MEMORY_BYTES`.
     pub fn from_env() -> Result<Self, Error> {
         let mut config = Self::default();
         if let Some(path) = std::env::var_os("NAMIDB_INDEX_BUILD_SPOOL_DIR")
             .or_else(|| std::env::var_os("NAMIDB_COMPACTION_SPOOL_DIR"))
-            .or_else(|| std::env::var_os("NAMIDB_SPOOL_DIR"))
         {
             config.scratch_dir = PathBuf::from(path);
         }

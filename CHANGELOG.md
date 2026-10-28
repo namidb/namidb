@@ -199,6 +199,64 @@ crates.io release will establish and document that API explicitly.
   full reconciliation. This also covers the BM25 and hybrid search label
   walks. `SstCache::label_selected_node_rows()` reports how many label rows
   had their properties read, here or from property pages.
+### Changed
+
+- **Python `merge_nodes` now merges.** It used to replace the whole node,
+  so a second call carrying only some keys dropped every other property,
+  and a node with labels `A` and `B` merged under `A` lost `B`. Each row is
+  now merged into the stored node: unmentioned keys are kept, a `None`
+  value removes the key, and the label is added to the node's labels. Rows
+  that repeat an id in one call merge in order. The old replace behaviour
+  lives on as the new `put_nodes`, which skips the read and is the faster
+  choice for a first load.
+
+- **Python bulk rows take the node id from `_id`.** That matches `n._id` in
+  Cypher, and leaves `id` free to be an ordinary property. Rows keyed by
+  `id` alone still work, and the `id` value is now also stored as a
+  property, so `n.id` and `WHERE n.id = $id` find the node instead of
+  returning null.
+
+- **The embedded Python client now compacts and reclaims space on its own.**
+  It has no maintenance loop like the server, so L0 SSTs piled up until
+  someone called `compact()`, and even then nothing was deleted: merged-away
+  L0 files and flushed WAL segments stayed on disk for good. `flush()` now
+  runs a compaction pass once a bucket holds `compaction_l0_trigger` L0 SSTs
+  (default 8, `0` turns it off), and every applied pass is followed by a
+  sweep of objects older than `auto_sweep_min_age_secs` (default 60, `None`
+  turns it off).
+
+- **Compaction scratch for a `file://` Python client goes under
+  `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless
+  `NAMIDB_SPOOL_DIR` was set, which filled the system disk on large graphs.
+  Pass `spool_dir=` to put it elsewhere. Text and vector index builds now
+  honour the same directory instead of `/var/tmp` or `$TMPDIR`. The setting
+  is process-wide and each new client resets it, and a spool dir that was
+  deleted falls back to the default instead of failing every flush.
+
+- **A compaction triggered by `flush()` that fails is a `RuntimeWarning`.**
+  The flush is already durable at that point, so raising would tell a
+  retrying caller its data was lost.
+
+- **`scan_label_arrow` no longer emits two `id` columns.** A node loaded
+  with the legacy `id` key keeps `id` as a property, which clashed with the
+  metadata `id` column and made `table["id"]` raise. A property that only
+  repeats the node id is dropped from the table, and any other property
+  named like a metadata column comes back as `property.<key>`.
+
+### Added
+
+- **`Client.sweep(min_age_secs=60, dry_run=False)`** in the Python client
+  deletes objects no manifest version references any more and reports what
+  it removed.
+
+### Fixed
+
+- **Re-upserting a node with its own unique value raised a constraint
+  error.** The low-level Python writes (`upsert_node`,
+  `upsert_node_with_labels`, `merge_nodes`) checked uniqueness as if the
+  node were new, so writing a node again with an unchanged unique property,
+  or listing the same id twice in one batch, conflicted with itself. The
+  node's own row is now excluded from the check.
 
 ## [2.6.19] - 2026-09-16
 

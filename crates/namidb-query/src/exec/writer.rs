@@ -2086,11 +2086,14 @@ async fn find_unique_conflict(
 /// label's unique properties (of any type) are checked against the
 /// read-your-own-writes overlay (RFC-026), so a duplicate value staged earlier
 /// in the same uncommitted statement/transaction is caught too, not just one
-/// already committed. Returns [`ExecError::Constraint`] on the first duplicate.
+/// already committed. `exclude` skips the node's own row when the write
+/// replaces an existing node. Returns [`ExecError::Constraint`] on the first
+/// duplicate.
 async fn enforce_unique_on_create(
     writer: &WriterSession,
     labels: &[String],
     core_props: &BTreeMap<String, CoreValue>,
+    exclude: Option<NodeId>,
 ) -> Result<(), ExecError> {
     // Collect the (label, property, value) checks first so the borrow of the
     // schema is released before we take a snapshot.
@@ -2111,7 +2114,7 @@ async fn enforce_unique_on_create(
         checks
     };
     for (label, prop, value) in checks {
-        if find_unique_conflict(writer, &label, &prop, &value, None)
+        if find_unique_conflict(writer, &label, &prop, &value, exclude)
             .await?
             .is_some()
         {
@@ -2127,20 +2130,23 @@ async fn enforce_unique_on_create(
 /// caller OUTSIDE the Cypher executor (the Python low-level bulk API), against
 /// the read-your-own-writes overlay. Returns the conflict message on the first
 /// duplicate, mirroring the check `CREATE` already runs, so the low-level path
-/// cannot silently commit duplicate unique-property values.
+/// cannot silently commit duplicate unique-property values. `self_id` is the
+/// node being written: an upsert replaces that row, so the node's own current
+/// values never count as a conflict.
 pub async fn enforce_node_unique_constraints(
     writer: &WriterSession,
     labels: &[String],
     core_props: &BTreeMap<String, CoreValue>,
+    self_id: Option<NodeId>,
 ) -> Result<(), String> {
     let to_msg = |e: ExecError| match e {
         ExecError::Constraint(msg) => msg,
         other => other.to_string(),
     };
-    enforce_unique_on_create(writer, labels, core_props)
+    enforce_unique_on_create(writer, labels, core_props, self_id)
         .await
         .map_err(to_msg)?;
-    enforce_composite_unique(writer, labels, core_props, None, None)
+    enforce_composite_unique(writer, labels, core_props, self_id, None)
         .await
         .map_err(to_msg)
 }
@@ -2554,7 +2560,7 @@ async fn apply_create(
                 // read-your-own-writes overlay (RFC-026) before staging the
                 // node, so a duplicate staged earlier in the same uncommitted
                 // batch is caught as well as one already committed.
-                enforce_unique_on_create(writer, labels, &core_props).await?;
+                enforce_unique_on_create(writer, labels, &core_props, None).await?;
                 enforce_composite_unique(writer, labels, &core_props, None, None).await?;
                 enforce_notnull_on_create(writer, labels, &core_props)?;
                 // CREATE introduces every property → validate them all.
@@ -4847,17 +4853,28 @@ mod tests {
         let mut dup = BTreeMap::new();
         dup.insert("name".to_string(), CoreValue::Str("Ada".into()));
         assert!(
-            enforce_node_unique_constraints(&writer, &labels, &dup)
+            enforce_node_unique_constraints(&writer, &labels, &dup, None)
                 .await
                 .is_err(),
             "the low-level path must reject a duplicate unique value"
         );
 
+        // Re-upserting Ada with her own unchanged value is not a conflict.
+        let ada = writer.snapshot().scan_label("Person").await.unwrap()[0].id;
+        assert!(
+            enforce_node_unique_constraints(&writer, &labels, &dup, Some(ada))
+                .await
+                .is_ok(),
+            "a node must not conflict with its own row"
+        );
+
         let mut fresh = BTreeMap::new();
         fresh.insert("name".to_string(), CoreValue::Str("Bob".into()));
-        assert!(enforce_node_unique_constraints(&writer, &labels, &fresh)
-            .await
-            .is_ok());
+        assert!(
+            enforce_node_unique_constraints(&writer, &labels, &fresh, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

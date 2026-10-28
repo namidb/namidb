@@ -193,10 +193,10 @@ mapping:
 
 ## Bulk inserts
 
-`Client.merge_nodes` and `Client.merge_edges` batch a lot of writes
-behind a single tokio-runtime plus mutex round-trip. They're the right
-ingestion path once you have thousands of rows, since Cypher `CREATE`
-parses, plans and executes once per call:
+`Client.put_nodes`, `Client.merge_nodes` and `Client.merge_edges` batch
+a lot of writes behind a single tokio-runtime plus mutex round-trip.
+They're the right ingestion path once you have thousands of rows, since
+Cypher `CREATE` parses, plans and executes once per call:
 
 ```python
 import uuid
@@ -204,10 +204,10 @@ import namidb
 
 client = namidb.Client("memory://acme")
 
-# Bulk insert: each row needs an "id" UUID string + arbitrary properties.
-client.merge_nodes(
+# First load: each row needs an "_id" UUID string + arbitrary properties.
+client.put_nodes(
     "Person",
-    [{"id": str(uuid.uuid4()), "name": f"p{i}", "age": 20 + i} for i in range(10_000)],
+    [{"_id": str(uuid.uuid4()), "name": f"p{i}", "age": 20 + i} for i in range(10_000)],
 )
 # Edges: each row needs "src" + "dst" UUIDs.
 client.merge_edges(
@@ -221,9 +221,63 @@ client.commit()        # WAL + manifest CAS
 client.flush()         # memtable -> L0 SSTs
 ```
 
-`merge_nodes` / `merge_edges` stage into the current batch (same
-lifecycle as `upsert_*`), so call `client.commit()` to make the
+`put_nodes` replaces each node: the row is its full property set and
+`label` its only label. Nothing is read first, so it is the fast path for
+first loads. `merge_nodes` reads each node and merges the row into it:
+keys the row doesn't mention are kept, a `None` value removes the key,
+and `label` is added to the node's existing labels. Rows repeating an id
+in one call merge in order.
+
+`_id` is the internal node id, the same thing `n._id` returns in Cypher.
+It is not stored as a property, so a business key called `id` can sit
+next to it. Rows keyed by `id` alone (the older form) still work: `id`
+becomes the node id and is also kept as an `id` property, so
+`WHERE n.id = $id` finds the node.
+
+`put_nodes` / `merge_nodes` / `merge_edges` stage into the current batch
+(same lifecycle as `upsert_*`), so call `client.commit()` to make the
 mutations durable.
+
+## Compaction and disk space
+
+There is no background maintenance in embedded mode, so the client does
+it inline:
+
+- `flush()` runs a compaction pass once any bucket holds
+  `compaction_l0_trigger` L0 SSTs (default 8). Each extra L0 file is one
+  more file every read has to visit. Pass `compaction_l0_trigger=0` to
+  turn it off and call `compact()` yourself.
+- A compaction that applies is followed by a sweep that deletes what it
+  retired: the merged-away L0 files, WAL segments that flushes already
+  folded into SSTs, old manifest versions. Only objects older than
+  `auto_sweep_min_age_secs` (default 60) go, so a reader in another
+  process gets a grace period. `None` turns the auto sweep off.
+- `client.sweep(min_age_secs=60, dry_run=False)` runs the same sweep on
+  demand and returns counts of what it removed (or would remove). The
+  auto sweep runs right after the pass, so that pass's own leftovers are
+  usually still too young. Call `sweep()` once more at the end of a bulk
+  load, or `sweep(min_age_secs=0)` if no other process reads the graph.
+- If the compaction a `flush()` triggered fails, the flush still counts
+  (it is already durable) and you get a `RuntimeWarning` instead of an
+  exception.
+
+Compaction writes scratch files while it merges. For a `file://` URI they
+go under `<root>/.namidb-spool`, next to the graph, unless you pass
+`spool_dir=` or set `NAMIDB_SPOOL_DIR`. Other backends use
+`NAMIDB_SPOOL_DIR`, else `/var/tmp`. Plan for roughly three times the
+compacted bytes on that volume while a big pass runs. The spool dir is
+per process, so the last client opened decides it for every client in
+the process, and a spool dir that has been deleted falls back to the
+default.
+
+```python
+client = namidb.Client(
+    "file:///data/graph?ns=case",
+    spool_dir="/data/scratch",
+    compaction_l0_trigger=8,
+    auto_sweep_min_age_secs=60,
+)
+```
 
 ## Arrow / pandas / polars output
 
