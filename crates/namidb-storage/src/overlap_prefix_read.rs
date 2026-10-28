@@ -203,7 +203,12 @@ impl Snapshot<'_> {
             }
 
             if !pending.is_empty() && (exhausted || pending.len() >= remaining(&out)) {
-                for view in self.batch_lookup_nodes("", &pending).await?.into_iter().flatten() {
+                for view in self
+                    .batch_lookup_nodes("", &pending)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                {
                     if label.is_some_and(|label| !view.labels.iter().any(|l| l == label))
                         || !node_view_matches_predicates(&view, predicates)
                     {

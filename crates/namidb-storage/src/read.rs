@@ -109,11 +109,11 @@ use crate::sst::nodes::{
 };
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
 
+#[path = "overlap_prefix_read.rs"]
+mod overlap_prefix_read;
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
 #[path = "search_lsm_read.rs"]
 mod search_lsm_read;
-#[path = "overlap_prefix_read.rs"]
-mod overlap_prefix_read;
 
 const SNAPSHOT_ROW_GROUP_CACHE_MAX_BYTES_ENV: &str = "NAMIDB_SNAPSHOT_ROW_GROUP_CACHE_MAX_BYTES";
 const SNAPSHOT_EDGE_READER_CACHE_MAX_BYTES_ENV: &str =

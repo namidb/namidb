@@ -586,7 +586,9 @@ async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
         let id = NodeId::new();
         fresh.push(id);
         let label = if i % 2 == 0 { "A" } else { "B" };
-        writer.upsert_node(label, id, &node_with("v", 30_000 + i)).unwrap();
+        writer
+            .upsert_node(label, id, &node_with("v", 30_000 + i))
+            .unwrap();
         writer.upsert_edge("TO", id, ids[1], &edge()).unwrap();
     }
     writer.commit_batch().await.unwrap();
@@ -697,7 +699,11 @@ async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
                     .await
                     .unwrap(),
             };
-            assert_eq!(got, &full[..limit.min(full.len())], "{label:?} LIMIT {limit}");
+            assert_eq!(
+                got,
+                &full[..limit.min(full.len())],
+                "{label:?} LIMIT {limit}"
+            );
             assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
         }
     }

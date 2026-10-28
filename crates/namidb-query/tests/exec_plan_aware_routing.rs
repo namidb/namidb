@@ -675,10 +675,7 @@ async fn labelled_back_reference_sees_its_full_label_set() {
     let mut writer = WriterSession::open(store(), paths("back-ref-labels"))
         .await
         .unwrap();
-    let schema = SchemaBuilder::new()
-        .label(person_label())
-        .unwrap()
-        .build();
+    let schema = SchemaBuilder::new().label(person_label()).unwrap().build();
 
     let m = NodeId::new();
     let p = NodeId::new();
@@ -687,9 +684,7 @@ async fn labelled_back_reference_sees_its_full_label_set() {
     writer.upsert_node("Person", p, &person("p")).unwrap();
     writer.upsert_node("Call", c, &person("c")).unwrap();
     for (ty, src) in [("SENT_BY", m), ("CC", m), ("CALLER", c)] {
-        writer
-            .upsert_edge(ty, src, p, &weighted_edge(1.0))
-            .unwrap();
+        writer.upsert_edge(ty, src, p, &weighted_edge(1.0)).unwrap();
     }
     writer.commit_batch().await.unwrap();
     writer.flush(schema).await.unwrap();
@@ -717,7 +712,11 @@ async fn labelled_back_reference_sees_its_full_label_set() {
          RETURN id(p) AS pid",
     ] {
         let got = run(q).await;
-        assert_eq!(got.len(), 1, "the labelled back-reference dropped the row: {q}");
+        assert_eq!(
+            got.len(),
+            1,
+            "the labelled back-reference dropped the row: {q}"
+        );
         assert_eq!(got[0].bindings.get("pid").cloned(), want_pid, "{q}");
     }
 
