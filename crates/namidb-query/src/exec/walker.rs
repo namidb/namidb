@@ -1594,6 +1594,20 @@ pub(crate) async fn execute_expand(
         }
         let starting = match row.get(source) {
             Some(RuntimeValue::Node(n)) => n.id,
+            // A NULL source (padded by an earlier OPTIONAL MATCH) matches
+            // nothing: OPTIONAL pads again, a plain MATCH drops the row.
+            Some(RuntimeValue::Null) => {
+                if optional {
+                    out.push(optional_null_row(
+                        row,
+                        rel_alias,
+                        target_alias,
+                        back_reference,
+                        path_binding,
+                    ));
+                }
+                continue;
+            }
             _ => {
                 return Err(ExecError::Runtime(format!(
                     "Expand source `{}` is not a Node",
@@ -2207,17 +2221,38 @@ pub(crate) async fn execute_expand(
         if matched_any {
             out.append(&mut hop_results);
         } else if optional {
-            let mut empty = row.clone();
-            if let Some(name) = rel_alias {
-                empty.set(name, RuntimeValue::Null);
-            }
-            if !back_reference {
-                empty.set(target_alias.to_string(), RuntimeValue::Null);
-            }
-            out.push(empty);
+            out.push(optional_null_row(
+                row,
+                rel_alias,
+                target_alias,
+                back_reference,
+                path_binding,
+            ));
         }
     }
     Ok(out)
+}
+
+/// The row an OPTIONAL Expand emits for a seed with no match: the
+/// relationship, the target (unless it was already bound) and the path
+/// binding all become NULL.
+fn optional_null_row(
+    mut row: Row,
+    rel_alias: Option<&str>,
+    target_alias: &str,
+    back_reference: bool,
+    path_binding: Option<&str>,
+) -> Row {
+    if let Some(name) = rel_alias {
+        row.set(name, RuntimeValue::Null);
+    }
+    if !back_reference {
+        row.set(target_alias, RuntimeValue::Null);
+    }
+    if let Some(name) = path_binding {
+        row.set(name, RuntimeValue::Null);
+    }
+    row
 }
 
 /// Flip a pattern direction for the reverse side of a bidirectional BFS.
@@ -2448,6 +2483,19 @@ async fn execute_expand_shortest_grouped(
         crate::exec::limits::check_row_cap(out.len())?;
         let starting = match rows[i].get(source) {
             Some(RuntimeValue::Node(n)) => n.id,
+            Some(RuntimeValue::Null) => {
+                if optional {
+                    out.push(optional_null_row(
+                        rows[i].clone(),
+                        rel_alias,
+                        target_alias,
+                        true,
+                        path_binding,
+                    ));
+                }
+                i += 1;
+                continue;
+            }
             _ => {
                 return Err(ExecError::Runtime(format!(
                     "Expand source `{}` is not a Node",
@@ -2694,11 +2742,13 @@ async fn execute_expand_shortest_grouped(
                     }
                 }
                 _ if optional => {
-                    let mut empty = row.clone();
-                    if let Some(name) = rel_alias {
-                        empty.set(name, RuntimeValue::Null);
-                    }
-                    out.push(empty);
+                    out.push(optional_null_row(
+                        row.clone(),
+                        rel_alias,
+                        target_alias,
+                        true,
+                        path_binding,
+                    ));
                 }
                 _ => {}
             }
@@ -8823,6 +8873,14 @@ async fn execute_expand_factor(
         // root-ward without materialising the whole row.
         let starting = match arena.lookup_binding(parent_leaf, source) {
             Some(RuntimeValue::Node(n)) => n.id,
+            // NULL source: same rule as the flat `execute_expand`.
+            Some(RuntimeValue::Null) => {
+                if optional {
+                    let slots = optional_null_slots(&rel_arc, &target_arc, back_reference);
+                    out_leaves.push(arena.push(parent_leaf, slots));
+                }
+                continue;
+            }
             Some(_) => {
                 return Err(ExecError::Runtime(format!(
                     "Expand source `{}` is not a Node",
@@ -9132,21 +9190,7 @@ async fn execute_expand_factor(
         if matched_any {
             out_leaves.append(&mut hop_outputs_for_this_input);
         } else if optional {
-            // Emit a leaf with NULL bindings for rel and target so OPTIONAL
-            // MATCH semantics survive.
-            let mut slots: Vec<Slot> = Vec::with_capacity(2);
-            if let Some(name) = &rel_arc {
-                slots.push(Slot {
-                    name: name.clone(),
-                    value: RuntimeValue::Null,
-                });
-            }
-            if !back_reference {
-                slots.push(Slot {
-                    name: target_arc.clone(),
-                    value: RuntimeValue::Null,
-                });
-            }
+            let slots = optional_null_slots(&rel_arc, &target_arc, back_reference);
             out_leaves.push(arena.push(parent_leaf, slots));
         }
     }
@@ -9155,6 +9199,29 @@ async fn execute_expand_factor(
         arena,
         leaves: out_leaves,
     })
+}
+
+/// Factor-path twin of [`optional_null_row`]: NULL slots for the rel and
+/// (unless already bound) the target, so OPTIONAL MATCH semantics survive.
+fn optional_null_slots(
+    rel_arc: &Option<Arc<str>>,
+    target_arc: &Arc<str>,
+    back_reference: bool,
+) -> Vec<Slot> {
+    let mut slots: Vec<Slot> = Vec::with_capacity(2);
+    if let Some(name) = rel_arc {
+        slots.push(Slot {
+            name: name.clone(),
+            value: RuntimeValue::Null,
+        });
+    }
+    if !back_reference {
+        slots.push(Slot {
+            name: target_arc.clone(),
+            value: RuntimeValue::Null,
+        });
+    }
+    slots
 }
 
 // Worst-case optimal multiway join (RFC-024).

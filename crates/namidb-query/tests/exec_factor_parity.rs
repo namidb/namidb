@@ -395,6 +395,21 @@ async fn parity_optional_match_unbound_friend() {
     .await;
 }
 
+#[tokio::test]
+async fn parity_chained_optional_match_null_source() {
+    // The second OPTIONAL MATCH starts from `b`, which the first one pads
+    // with NULL for every Person without a friend.
+    assert_parity(
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:KNOWS]->(b:Person) \
+         OPTIONAL MATCH (b)-[:KNOWS]->(c:Person) \
+         RETURN a.firstName AS aName, b.firstName AS bName, c.firstName AS cName",
+        &Params::default(),
+        "chained OPTIONAL MATCH from NULL",
+    )
+    .await;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // — Parity tests for CrossProduct, HashJoin, HashSemiJoin
 // ──────────────────────────────────────────────────────────────────────

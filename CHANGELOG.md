@@ -15,6 +15,19 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A chained `OPTIONAL MATCH` failed when an earlier one found nothing.**
+  `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (b)-[:S]->(c)` raised
+  "Expand source `b` is not a Node" for every row where `b` was NULL. A NULL
+  source now pads the rest of the pattern with NULLs under `OPTIONAL MATCH`
+  and yields no rows under a plain `MATCH`, in the flat, shortest path and
+  factorized executors alike. Other non-node sources still raise the error.
+
+- **`OPTIONAL MATCH p = ...` left `p` unbound when nothing matched.** The
+  path variable is now NULL, so `RETURN p` no longer fails with "binding
+  `p` not bound".
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

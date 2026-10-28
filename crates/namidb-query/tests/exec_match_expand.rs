@@ -545,6 +545,130 @@ async fn optional_match_yields_null_when_no_neighbour() {
     assert_eq!(rows.len(), 5);
 }
 
+/// Run `query` over the friend graph (no LIKES edges, so an
+/// `OPTIONAL MATCH (a)-[:LIKES]->(b)` binds `b` to NULL on every row).
+async fn run_on_friend_graph(name: &str, query: &str) -> Vec<namidb_query::Row> {
+    let mut writer = WriterSession::open(store(), paths(name)).await.unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+    let plan = lower(&parse(query).unwrap()).unwrap();
+    execute(&plan, &snapshot, &Params::new()).await.unwrap()
+}
+
+#[tokio::test]
+async fn chained_optional_match_from_null_source_keeps_rows() {
+    let rows = run_on_friend_graph(
+        "exec-opt-null-src",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         OPTIONAL MATCH (b)-[r:KNOWS]->(c) \
+         RETURN a.name AS name, b, r, c",
+    )
+    .await;
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        for col in ["b", "r", "c"] {
+            assert!(matches!(row.get(col), Some(RuntimeValue::Null)), "{col}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn chained_optional_var_length_from_null_source_keeps_rows() {
+    // Hop 0 must not bind the NULL source as `c`.
+    let rows = run_on_friend_graph(
+        "exec-opt-null-src-varlen",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         OPTIONAL MATCH (b)-[:KNOWS*0..2]->(c) \
+         RETURN a.name AS name, c",
+    )
+    .await;
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        assert!(matches!(row.get("c"), Some(RuntimeValue::Null)));
+    }
+}
+
+#[tokio::test]
+async fn match_from_null_source_yields_no_rows() {
+    let rows = run_on_friend_graph(
+        "exec-null-src-match",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         MATCH (b)-[:KNOWS]->(c) \
+         RETURN c",
+    )
+    .await;
+    assert!(rows.is_empty());
+
+    let rows = run_on_friend_graph(
+        "exec-null-src-with",
+        "WITH null AS n MATCH (n)-[:KNOWS]->(m) RETURN m",
+    )
+    .await;
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn match_from_non_node_source_still_errors() {
+    let mut writer = WriterSession::open(store(), paths("exec-int-src"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+    let plan = lower(&parse("WITH 1 AS n MATCH (n)-[:KNOWS]->(m) RETURN m").unwrap()).unwrap();
+    let err = execute(&plan, &snapshot, &Params::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("is not a Node"), "{err}");
+}
+
+#[tokio::test]
+async fn optional_shortest_path_from_null_source_binds_null_path() {
+    let rows = run_on_friend_graph(
+        "exec-opt-null-shortest",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         OPTIONAL MATCH p = shortestPath((b)-[:KNOWS*..5]->(a)) \
+         RETURN a.name AS name, p",
+    )
+    .await;
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        assert!(matches!(row.get("p"), Some(RuntimeValue::Null)));
+    }
+}
+
+#[tokio::test]
+async fn optional_shortest_path_without_match_binds_null_path() {
+    // Non-NULL source, no path (no LIKES edges): `p` is NULL, not unbound.
+    let rows = run_on_friend_graph(
+        "exec-opt-shortest-nomatch",
+        "MATCH (a:Person), (b:Person) WHERE a <> b \
+         OPTIONAL MATCH p = shortestPath((a)-[:LIKES*..5]->(b)) \
+         RETURN p",
+    )
+    .await;
+    assert_eq!(rows.len(), 20);
+    for row in &rows {
+        assert!(matches!(row.get("p"), Some(RuntimeValue::Null)));
+    }
+}
+
+#[tokio::test]
+async fn not_exists_from_null_source_is_true() {
+    let rows = run_on_friend_graph(
+        "exec-exists-null-src",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         WITH a, b WHERE NOT EXISTS((b)-[:KNOWS]->()) \
+         RETURN a.name AS name",
+    )
+    .await;
+    assert_eq!(rows.len(), 5);
+}
+
 #[tokio::test]
 async fn exists_predicate_filters_via_semiapply() {
     let mut writer = WriterSession::open(store(), paths("exec-exists"))
