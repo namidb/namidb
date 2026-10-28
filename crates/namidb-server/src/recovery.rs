@@ -536,6 +536,10 @@ mod tests {
             "a yielded writer must report degraded"
         );
         assert!(
+            health.yielded.load(std::sync::atomic::Ordering::Acquire),
+            "the writer must yield, not reopen"
+        );
+        assert!(
             ms.load_current().await.unwrap().manifest.epoch <= mine.next(),
             "yield must not claim an epoch above the peer's"
         );
