@@ -20,7 +20,7 @@ use namidb_query::{
     execute_with_limits, execute_write_staged_with_deadline, parse as cypher_parse,
     plan as build_plan, ExecError, LowerError, Params, ParseError, Row, WriteOutcome,
 };
-use namidb_storage::WriterSession;
+use namidb_storage::{PinnedSnapshot, WriterSession};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{error, info, warn};
@@ -93,16 +93,24 @@ fn disconnected_observation(
     }
 }
 
-/// In-flight explicit transaction (BEGIN..COMMIT/ROLLBACK). Holds the
-/// global writer lock for the whole transaction so no other writer — nor
-/// the flush / compaction tasks — can commit a half-built batch in the
-/// middle of it. Staged statements live in the writer's pending batch and
-/// are made durable in one commit at COMMIT, or dropped at ROLLBACK.
-struct TxState {
-    writer: OwnedMutexGuard<WriterSession>,
-    /// Whether any statement staged a mutation, so ROLLBACK only discards
-    /// when there is something to discard.
-    staged: bool,
+/// In-flight explicit transaction (BEGIN..COMMIT/ROLLBACK).
+enum TxState {
+    /// The default access mode. Holds the global writer lock for the whole
+    /// transaction so no other writer (nor the flush / compaction tasks) can
+    /// commit a half-built batch in the middle of it. Staged statements live
+    /// in the writer's pending batch and are made durable in one commit at
+    /// COMMIT, or dropped at ROLLBACK.
+    Write {
+        writer: OwnedMutexGuard<WriterSession>,
+        /// Whether any statement staged a mutation, so ROLLBACK only
+        /// discards when there is something to discard.
+        staged: bool,
+    },
+    /// BEGIN with access mode `r`, which drivers send for every managed
+    /// read (`session.execute_read`). Statements read the snapshot published
+    /// at BEGIN, so the transaction neither waits for nor holds the writer
+    /// lock, and writes are rejected.
+    Read { snapshot: PinnedSnapshot },
 }
 
 /// Adapter that drives Bolt `RUN` requests against the shared
@@ -1178,8 +1186,17 @@ impl ServerBackend {
                     return disconnected_observation(started, Some(QueryKind::Write));
                 }
             };
-            let tx = match slot.as_mut() {
-                Some(tx) => tx,
+            let (writer, tx_staged) = match slot.as_mut() {
+                Some(TxState::Write { writer, staged }) => (writer, staged),
+                Some(TxState::Read { .. }) => {
+                    return RunObservation {
+                        kind: Some(QueryKind::Write),
+                        elapsed: started.elapsed(),
+                        result: Err(BackendError::AccessMode(
+                            "writing in a read access mode transaction is not allowed".into(),
+                        )),
+                    };
+                }
                 None => {
                     // A protocol-state error, not an executed query: keep it out
                     // of the latency histogram (kind None) like a parse/plan
@@ -1194,7 +1211,7 @@ impl ServerBackend {
             let staged = {
                 let apply = execute_write_staged_with_deadline(
                     &plan,
-                    &mut tx.writer,
+                    writer,
                     &params,
                     self.state.write_deadline(),
                 );
@@ -1206,7 +1223,7 @@ impl ServerBackend {
             };
             let result = match staged {
                 Some(Ok(outcome)) => {
-                    tx.staged = true;
+                    *tx_staged = true;
                     Ok(write_run_outcome(&plan, outcome))
                 }
                 Some(Err(e)) => {
@@ -1214,12 +1231,12 @@ impl ServerBackend {
                     // it (or an earlier statement) staged so a stray COMMIT
                     // cannot seal a partial write; the session moves to FAILED
                     // and the client must ROLLBACK / RESET.
-                    tx.writer.discard_batch();
+                    writer.discard_batch();
                     Err(map_exec_err(e))
                 }
                 None => {
-                    tx.writer.discard_batch();
-                    tx.staged = false;
+                    writer.discard_batch();
+                    *tx_staged = false;
                     Err(BackendError::Other(
                         "Bolt client disconnected while RUN was executing".into(),
                     ))
@@ -1234,7 +1251,8 @@ impl ServerBackend {
             // Read against the transaction's own writer so the staged batch
             // is visible (RFC-026). The writer pins the committed state at
             // tx-begin (no commit happens mid-tx while we hold the lock) and
-            // overlays everything statements 1..N-1 staged.
+            // overlays everything statements 1..N-1 staged. A read access
+            // mode transaction reads the snapshot it pinned at BEGIN.
             let tx_lock = self.tx.lock();
             tokio::pin!(tx_lock);
             let mut slot = tokio::select! {
@@ -1272,7 +1290,10 @@ impl ServerBackend {
                     )),
                 };
             };
-            let snap = tx.writer.overlay_snapshot();
+            let snap = match tx {
+                TxState::Write { writer, .. } => writer.overlay_snapshot(),
+                TxState::Read { snapshot } => snapshot.borrow(),
+            };
             let read = execute_with_limits(
                 &plan,
                 &snap,
@@ -1492,9 +1513,30 @@ impl Backend for ServerBackend {
             lock_started.elapsed(),
             true,
         );
-        *slot = Some(TxState {
+        *slot = Some(TxState::Write {
             writer,
             staged: false,
+        });
+        Ok(())
+    }
+
+    async fn begin_tx_on_mode(
+        &self,
+        _db: Option<&str>,
+        read_only: bool,
+    ) -> std::result::Result<(), BackendError> {
+        if !read_only {
+            return self.begin_tx().await;
+        }
+        let mut slot = self.tx.lock().await;
+        if slot.is_some() {
+            return Err(BackendError::Other("a transaction is already open".into()));
+        }
+        if let Err(pressure) = self.state.memory.admit_query().await {
+            return Err(memory_pressure_error(pressure));
+        }
+        *slot = Some(TxState::Read {
+            snapshot: self.state.snapshot.load(),
         });
         Ok(())
     }
@@ -1519,19 +1561,24 @@ impl Backend for ServerBackend {
 
     async fn commit_tx(&self) -> std::result::Result<(), BackendError> {
         let mut slot = self.tx.lock().await;
-        let mut tx = slot
+        let tx = slot
             .take()
             .ok_or_else(|| BackendError::Other("no open transaction".into()))?;
+        // A read transaction has nothing to commit; dropping it unpins the
+        // snapshot.
+        let TxState::Write { mut writer, .. } = tx else {
+            return Ok(());
+        };
         // One manifest CAS makes the whole transaction durable; then
-        // republish so reads see it. Dropping `tx` releases the writer lock.
+        // republish so reads see it. Dropping `writer` releases the lock.
         match namidb_storage::cancel::with_deadline(
             self.state.write_deadline(),
-            tx.writer.commit_batch(),
+            writer.commit_batch(),
         )
         .await
         {
             Ok(_) => {
-                self.state.snapshot.store(tx.writer.owned_snapshot());
+                self.state.snapshot.store(writer.owned_snapshot());
                 Ok(())
             }
             Err(e) => {
@@ -1542,9 +1589,9 @@ impl Backend for ServerBackend {
                 // can never be sealed by the next unrelated commit — then
                 // reopen a fenced/poisoned session in place while we still
                 // hold the writer lock.
-                tx.writer.discard_batch();
+                writer.discard_batch();
                 crate::recovery::recover_writer_if_needed(
-                    &mut tx.writer,
+                    &mut writer,
                     &self.state.snapshot,
                     &self.state.writer_health,
                     &self.state.namespace,
@@ -1558,11 +1605,11 @@ impl Backend for ServerBackend {
 
     async fn rollback_tx(&self) -> std::result::Result<(), BackendError> {
         let mut slot = self.tx.lock().await;
-        if let Some(mut tx) = slot.take() {
+        if let Some(TxState::Write { mut writer, .. }) = slot.take() {
             // Always discard: a statement that failed before `staged` was set
             // can still have left mutations in the pending batch. Discarding
-            // an empty batch is a no-op. Dropping `tx` releases the writer.
-            tx.writer.discard_batch();
+            // an empty batch is a no-op. Dropping `writer` releases the lock.
+            writer.discard_batch();
         }
         Ok(())
     }
@@ -1885,8 +1932,16 @@ impl Backend for MultiTenantBackend {
     }
 
     async fn begin_tx_on(&self, db: Option<&str>) -> std::result::Result<(), BackendError> {
+        self.begin_tx_on_mode(db, false).await
+    }
+
+    async fn begin_tx_on_mode(
+        &self,
+        db: Option<&str>,
+        read_only: bool,
+    ) -> std::result::Result<(), BackendError> {
         let delegate = self.delegate_for(db).await?;
-        delegate.begin_tx().await?;
+        delegate.begin_tx_on_mode(None, read_only).await?;
         *self.tx_delegate.lock().await = Some(delegate);
         Ok(())
     }
@@ -2639,7 +2694,7 @@ mod tests {
                 },
             )
             .unwrap();
-        *backend.tx.lock().await = Some(TxState {
+        *backend.tx.lock().await = Some(TxState::Write {
             writer: commit_writer,
             staged: true,
         });
@@ -2660,7 +2715,7 @@ mod tests {
                 },
             )
             .unwrap();
-        *backend.tx.lock().await = Some(TxState {
+        *backend.tx.lock().await = Some(TxState::Write {
             writer: rollback_writer,
             staged: true,
         });
@@ -2676,6 +2731,83 @@ mod tests {
             governor.rejected_queries(),
             0,
             "COMMIT/ROLLBACK must not run admission"
+        );
+    }
+
+    /// BEGIN with access mode `r` (every driver `execute_read`) runs on a
+    /// snapshot: it neither waits for nor holds the writer lock, and it
+    /// keeps reading the state it pinned at BEGIN.
+    #[tokio::test]
+    async fn read_mode_begin_does_not_take_writer_lock() {
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-read-tx").unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "bolt-read-tx".into())
+            .with_writer_lock_timeout(std::time::Duration::from_millis(50));
+        let backend = ServerBackend::new(state.clone(), Arc::new(std::sync::Mutex::new(None)));
+        backend
+            .run("CREATE (:T {k: 1})", Params::new())
+            .await
+            .unwrap();
+
+        let held = state.writer.clone().lock_owned().await;
+        backend
+            .begin_tx_on_mode(None, true)
+            .await
+            .expect("a read transaction must not wait for the writer");
+        let count = || async {
+            let out = backend
+                .run_in_tx("MATCH (t:T) RETURN count(t) AS c", Params::new())
+                .await
+                .unwrap();
+            out.rows[0].get("c").cloned()
+        };
+        assert_eq!(count().await, Some(namidb_query::RuntimeValue::Integer(1)));
+        drop(held);
+
+        // A commit after BEGIN stays invisible to the pinned snapshot.
+        let other = ServerBackend::new(state.clone(), Arc::new(std::sync::Mutex::new(None)));
+        other
+            .run("CREATE (:T {k: 2})", Params::new())
+            .await
+            .unwrap();
+        assert_eq!(count().await, Some(namidb_query::RuntimeValue::Integer(1)));
+        backend.commit_tx().await.unwrap();
+        assert!(state.writer.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_mode_tx_rejects_write() {
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-read-tx-write").unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "bolt-read-tx-write".into());
+        let backend = ServerBackend::new(state.clone(), Arc::new(std::sync::Mutex::new(None)));
+
+        backend.begin_tx_on_mode(None, true).await.unwrap();
+        let err = backend
+            .run_in_tx("CREATE (:T {k: 1})", Params::new())
+            .await
+            .expect_err("a read transaction must reject writes");
+        assert_eq!(err.code(), "Neo.ClientError.Statement.AccessMode");
+        backend.rollback_tx().await.unwrap();
+
+        // Write mode is unchanged.
+        backend.begin_tx_on_mode(None, false).await.unwrap();
+        backend
+            .run_in_tx("CREATE (:T {k: 1})", Params::new())
+            .await
+            .unwrap();
+        backend.commit_tx().await.unwrap();
+        let out = backend
+            .run("MATCH (t:T) RETURN count(t) AS c", Params::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            out.rows[0].get("c"),
+            Some(&namidb_query::RuntimeValue::Integer(1))
         );
     }
 

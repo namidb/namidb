@@ -27,6 +27,19 @@ crates.io release will establish and document that API explicitly.
   goes 503 and the orchestrator stops routing writes there. A poisoned
   session or a plain CAS loss still reopens under both policies.
 
+### Changed
+
+- **Bolt read transactions no longer take the writer lock.** Neo4j drivers
+  send every managed read (`session.execute_read`) as `BEGIN {mode: "r"}`,
+  but the server ignored the access mode and held the writer lock for the
+  whole transaction. Driver reads queued behind each other and behind every
+  write, and failed with a busy error after `--writer-lock-timeout`. A read
+  access mode transaction now reads the snapshot published at BEGIN without
+  touching the writer, and a write inside it fails with
+  `Neo.ClientError.Statement.AccessMode`. Write mode transactions are
+  unchanged. Embedders get a new `Backend::begin_tx_on_mode` method whose
+  default ignores the mode, so other backends keep working as before.
+
 ### Fixed
 
 - **The external policy endpoint now receives the namespace.** The PDP
