@@ -389,17 +389,13 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 predicates,
                 projection,
             } => {
-                // Under a row cap, read one row past it and stop: the guard
-                // below still reports RowCap, but the scan never holds more
-                // than cap + 1 nodes.
-                let limit = crate::exec::limits::scoped_row_cap().map(|cap| cap.saturating_add(1));
                 scan_nodes(
                     snapshot,
                     label.as_deref(),
                     alias,
                     predicates,
                     projection.as_deref(),
-                    limit,
+                    row_cap_scan_limit(snapshot, label.as_deref()),
                 )
                 .await
             }
@@ -1358,6 +1354,22 @@ fn execute_capped<'a>(
     .boxed()
 }
 
+/// Scan limit that keeps a leaf node scan under the scoped row cap: one row
+/// past the cap, so the operator guard still reports RowCap but the scan never
+/// holds more than cap + 1 nodes. `None` without a cap, or when the manifest
+/// proves the scan cannot reach it: the plain scan keeps caching the SST body,
+/// which the ranged limited read does not.
+fn row_cap_scan_limit(snapshot: &Snapshot<'_>, label: Option<&str>) -> Option<usize> {
+    let cap = crate::exec::limits::scoped_row_cap()?;
+    let count = snapshot
+        .metadata_node_count(label)
+        .or_else(|| label.and_then(|_| snapshot.metadata_node_count(None)));
+    if count.is_some_and(|count| count <= cap as u64) {
+        return None;
+    }
+    Some(cap.saturating_add(1))
+}
+
 /// Leaf `NodeScan`: one row per live node, binding `alias`. With `limit`
 /// the storage scan stops after that many rows (a scan-order prefix).
 async fn scan_nodes(
@@ -1368,7 +1380,21 @@ async fn scan_nodes(
     projection: Option<&[String]>,
     limit: Option<usize>,
 ) -> Result<Vec<Row>, ExecError> {
-    let nodes = match (label, limit) {
+    let nodes = scan_node_views(snapshot, label, predicates, projection, limit).await?;
+    Ok(nodes
+        .into_iter()
+        .map(|n| Row::new().with(alias, RuntimeValue::Node(Box::new(NodeValue::from(n)))))
+        .collect())
+}
+
+async fn scan_node_views(
+    snapshot: &Snapshot<'_>,
+    label: Option<&str>,
+    predicates: &[namidb_storage::sst::predicates::ScanPredicate],
+    projection: Option<&[String]>,
+    limit: Option<usize>,
+) -> Result<Vec<namidb_storage::NodeView>, ExecError> {
+    Ok(match (label, limit) {
         (Some(label), Some(limit)) => {
             snapshot
                 .scan_label_with_predicates_and_projection_limited(
@@ -1393,11 +1419,7 @@ async fn scan_nodes(
                 .scan_all_nodes_with_predicates_and_projection(predicates, projection)
                 .await?
         }
-    };
-    Ok(nodes
-        .into_iter()
-        .map(|n| Row::new().with(alias, RuntimeValue::Node(Box::new(NodeValue::from(n)))))
-        .collect())
+    })
 }
 
 // ───────────────────────── Expand ────────────────────────────────────
@@ -8116,25 +8138,17 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let root = set.arena.root();
                 let alias_arc: Arc<str> = Arc::from(alias.as_str());
                 let mut leaves: Vec<crate::exec::FactorIdx> = Vec::new();
-                let nodes = match label.as_deref() {
-                    Some(label_name) => {
-                        snapshot
-                            .scan_label_with_predicates_and_projection(
-                                label_name,
-                                predicates,
-                                projection.as_deref(),
-                            )
-                            .await?
-                    }
-                    None => {
-                        snapshot
-                            .scan_all_nodes_with_predicates_and_projection(
-                                predicates,
-                                projection.as_deref(),
-                            )
-                            .await?
-                    }
-                };
+                let nodes = scan_node_views(
+                    snapshot,
+                    label.as_deref(),
+                    predicates,
+                    projection.as_deref(),
+                    row_cap_scan_limit(snapshot, label.as_deref()),
+                )
+                .await?;
+                // The factor path only checks the cap on its final rows, so a
+                // truncated scan must fail here rather than drop nodes.
+                crate::exec::limits::check_row_cap(nodes.len())?;
                 for n in nodes {
                     let slot = Slot {
                         name: alias_arc.clone(),
@@ -10664,6 +10678,41 @@ mod tests {
         let v = RuntimeValue::String("not-a-uuid".into());
         let err = node_id_from_value(&v, SourceSpan::point(0)).unwrap_err();
         assert!(matches!(err, ExecError::Eval(_)));
+    }
+
+    #[tokio::test]
+    async fn factor_node_scan_stops_one_row_past_the_row_cap() {
+        let cache = namidb_storage::SstCache::new(8 * 1024 * 1024);
+        let mut caches = namidb_storage::SessionCaches::none();
+        caches.sst_cache = Some(cache.clone());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = NamespacePaths::new("tenants", NamespaceId::new("factor-row-cap").unwrap());
+        let mut writer = WriterSession::open_with_caches(store, paths, caches)
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            writer
+                .upsert_node("Item", NodeId::new(), &NodeWriteRecord::default())
+                .unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+        writer
+            .flush(namidb_core::schema::Schema::empty())
+            .await
+            .unwrap();
+        let snapshot = writer.snapshot();
+        let plan =
+            crate::plan::lower(&crate::parser::parse("MATCH (n) RETURN n").unwrap()).unwrap();
+
+        let err = crate::exec::limits::with_limits(
+            None,
+            Some(2),
+            execute_factor_path(&plan, &snapshot, &Params::new()),
+        )
+        .await
+        .expect_err("a factor scan over the row cap must abort");
+        assert!(matches!(err, ExecError::RowCap(2)), "got {err:?}");
+        assert_eq!(cache.limited_node_scan_output_rows(), 3);
     }
 
     #[tokio::test]

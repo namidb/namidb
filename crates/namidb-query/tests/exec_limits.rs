@@ -149,6 +149,23 @@ async fn row_cap_on_unlabelled_scan_reads_one_past_the_cap() {
 }
 
 #[tokio::test]
+async fn row_cap_above_the_node_count_keeps_the_plain_scan() {
+    // The manifest proves 200 nodes cannot reach a cap of 1000, so the scan
+    // stays on the plain read, which caches the SST body for the next query.
+    let (writer, cache) = seed_chain("limits-rowcap-plain", true).await;
+    let snap = writer.snapshot();
+    for query in ["MATCH (n) RETURN n", "MATCH (n:Item) RETURN n"] {
+        let plan = lower(&parse(query).unwrap()).unwrap();
+        let rows = execute_with_limits(&plan, &snap, &Params::new(), None, Some(1000))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 200, "{query}");
+    }
+    assert_eq!(cache.limited_node_scan_fast_paths(), 0);
+    assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+}
+
+#[tokio::test]
 async fn limit_over_expand_reads_one_round_of_seeds() {
     let (writer, cache) = seed_chain("limits-seed-pull-round", true).await;
     let snap = writer.snapshot();

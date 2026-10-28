@@ -39,8 +39,11 @@ crates.io release will establish and document that API explicitly.
   in scope (`NAMIDB_QUERY_ROW_CAP` on the server), `MATCH (n) RETURN n`
   loaded every node and only then reported the cap. On flushed,
   non-overlapping node SSTs the scan now stops one row past the cap and
-  fails with the same error. A `LIMIT` that the first seeds of an expand
-  already fill no longer trips a row cap smaller than the seed batch.
+  fails with the same error, in the flat and factorized executors. When the
+  manifest shows the scan cannot reach the cap, it keeps the plain read, so
+  the SST body is still cached across queries. A `LIMIT` that the first
+  seeds of an expand already fill no longer trips a row cap smaller than the
+  seed batch.
 
 - **`OPTIONAL MATCH p = ...` did not give a NULL `p` when nothing matched.**
   A variable-length or `shortestPath` path was left unbound, so `RETURN p`
