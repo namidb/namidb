@@ -105,6 +105,7 @@ pub use recovery::{
     recover_memtable, recover_memtable_with_snapshot, write_memtable_snapshot,
     MemtableSnapshotEntry, MemtableSnapshotFile, RecoveredMemtable, WalEntry, WalOp,
 };
+pub use sst::paged_index::set_default_spool_dir;
 #[cfg(feature = "vector-index")]
 pub use sst::vector::vector_filter_bitmap_searches;
 pub use sst::{

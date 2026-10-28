@@ -1702,8 +1702,44 @@ impl PagedIndexBuilder {
     }
 }
 
+// ponytail: one directory per process, so with several embedded clients on
+// different roots the last one opened wins. Move it into a per-session config
+// if one process ever needs separate spool volumes.
+static SPOOL_DIR_OVERRIDE: std::sync::RwLock<Option<std::path::PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// Set the directory every spool file falls back to when no build-specific
+/// override applies. It wins over `NAMIDB_SPOOL_DIR`; `None` restores the
+/// environment lookup. The embedded Python client uses it to keep compaction
+/// scratch on the graph volume.
+pub fn set_default_spool_dir(directory: Option<std::path::PathBuf>) {
+    *SPOOL_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
+}
+
+/// The spool directory in effect: the [`set_default_spool_dir`] override,
+/// then `NAMIDB_SPOOL_DIR`, else `None` (the caller's platform fallback).
+pub(crate) fn default_spool_dir() -> Option<std::path::PathBuf> {
+    let override_ = SPOOL_DIR_OVERRIDE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    resolve_spool_dir(override_, std::env::var_os("NAMIDB_SPOOL_DIR"))
+}
+
+fn resolve_spool_dir(
+    override_: Option<std::path::PathBuf>,
+    env: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    override_.or_else(|| {
+        env.filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+}
+
 pub(crate) fn create_spool_file() -> std::io::Result<std::fs::File> {
-    match std::env::var_os("NAMIDB_SPOOL_DIR").filter(|path| !path.is_empty()) {
+    match default_spool_dir() {
         Some(directory) => tempfile::tempfile_in(directory),
         None => {
             // `/tmp` is commonly a RAM-backed tmpfs on Linux hosts. Falling
@@ -3374,6 +3410,17 @@ mod tests {
 
     fn id(n: u128) -> [u8; 16] {
         n.to_be_bytes()
+    }
+
+    #[test]
+    fn resolve_spool_dir_precedence() {
+        use std::path::PathBuf;
+        let set = Some(PathBuf::from("/graph/.namidb-spool"));
+        let env = || Some(std::ffi::OsString::from("/scratch"));
+        assert_eq!(resolve_spool_dir(set.clone(), env()), set);
+        assert_eq!(resolve_spool_dir(None, env()), Some("/scratch".into()));
+        assert_eq!(resolve_spool_dir(None, Some("".into())), None);
+        assert_eq!(resolve_spool_dir(None, None), None);
     }
 
     #[derive(Debug, Default)]

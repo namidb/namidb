@@ -1359,7 +1359,11 @@ impl SpoolFactory {
     }
 
     fn create(&self) -> Result<File> {
-        if let Some(directory) = self.directory.as_deref() {
+        let directory = self
+            .directory
+            .clone()
+            .or_else(crate::sst::paged_index::default_spool_dir);
+        if let Some(directory) = directory {
             return tempfile::tempfile_in(directory).map_err(Error::from);
         }
         #[cfg(unix)]

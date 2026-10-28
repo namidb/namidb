@@ -52,7 +52,8 @@ pub struct VectorV5ExternalBuildConfig {
 impl Default for VectorV5ExternalBuildConfig {
     fn default() -> Self {
         Self {
-            scratch_dir: std::env::temp_dir(),
+            scratch_dir: crate::sst::paged_index::default_spool_dir()
+                .unwrap_or_else(std::env::temp_dir),
             memory_budget_bytes: DEFAULT_MEMORY_BYTES,
             quantile_sample_rows: DEFAULT_SAMPLE_ROWS,
         }
