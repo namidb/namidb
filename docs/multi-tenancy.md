@@ -3,8 +3,8 @@
 **Status:** operator guide
 **Author(s):** NamiDB team
 **Created:** 2026-06-26
-**Updated:** 2026-06-26
-**Applies to:** v1.4 + the namespace-scoping change set
+**Updated:** 2026-10-28
+**Applies to:** v2.6
 **Related:** RFC-032 (filtered ANN pre-filtering), RFC-030 (vector index),
 RFC-015 (auth / external PDP)
 
@@ -27,8 +27,9 @@ JSON shape and the JWT `namespaces` claim the server parses — with worked
 examples. A final section sketches a proposed `namidb token mint` subcommand;
 that command does not exist yet and is clearly marked *Proposed*.
 
-Everything under **Implemented** is grounded in the v1.4 code plus the
-namespace-scoping change set. Everything under **Proposed / Future** is design
+Everything under **Implemented** is grounded in the current code. Source
+references name the file and the symbol, not line numbers, so they stay
+valid as the code moves. Everything under **Proposed / Future** is design
 only.
 
 ## Motivation
@@ -75,7 +76,7 @@ Two ways to express the tenant restriction today (both **Implemented**):
 
   The optional 4th map argument carries `ef` (beam width) and/or `filter`; the
   `filter` map is compiled to a residual `post_filter` bound to the `node`
-  binding (`crates/namidb-query/src/exec/walker.rs:2329`, `walker.rs:2340-2353`).
+  binding (`crates/namidb-query/src/exec/walker.rs`).
 
 Both forms are served by **post-filtering**: the index over-fetches the global
 top candidates, the executor materializes them, applies the predicate, and falls
@@ -92,12 +93,12 @@ you must enforce on every query, not as an access control the engine guarantees.
 
 ### Namespace-per-tenant (physical isolation)
 
-Run the server with `--multi-tenant` (`crates/namidb-server/src/main.rs:229-233`).
+Run the server with `--multi-tenant` (`crates/namidb-server/src/main.rs`).
 Each tenant gets its own namespace, and a namespace is a full physical boundary:
 its own manifest pointer family, SSTs, WAL, in-memory snapshot, single writer,
 and background maintenance (flush / compaction / orphan sweep) are all spawned
-per namespace (`crates/namidb-server/src/registry.rs:135-209`,
-`registry.rs:215`). Each namespace has its **own** vector index, so ANN never
+per namespace (`NamespaceRegistry::get_or_open` in
+`crates/namidb-server/src/registry.rs`). Each namespace has its **own** vector index, so ANN never
 crosses a tenant boundary and the index only spans one tenant's corpus.
 
 Access is enforced by namespace-scoped tokens (see *Provisioning*, below): a
@@ -111,7 +112,7 @@ runs.
 | **Isolation strength** | Logical only. Enforced by a `WHERE` / `filter` predicate the application adds to every query. A missing predicate or the global ANN leaks across tenants. **Not** a security boundary. | Physical. Separate `NamespacePaths`, manifest, SSTs, WAL, and writer per tenant. A scoped token cannot reach another namespace (`role_for_in` / `principal_for_in`). |
 | **Vector index size** | One shared index per `(label, property)`; smallest aggregate footprint; one build, one writer. ANN returns global neighbours. | One index **per namespace**; aggregate index bytes scale with tenant count (no sharing), but each index spans only one tenant — better selectivity/recall. |
 | **Noisy neighbour** | High. All tenants share one writer, one SST set, one ANN graph; one tenant's data volume and read/write load affect everyone. | Low. Per-namespace writer + maintenance isolate load. Bounded by `--max-namespaces` and idle eviction. |
-| **Ops cost** | Lowest. One namespace, one token can cover everything; no per-tenant provisioning. | Higher. Per-tenant token provisioning (manual today), lazy namespace creation, Bolt needs one port per namespace, watch `--max-namespaces` / idle eviction. |
+| **Ops cost** | Lowest. One namespace, one token can cover everything; no per-tenant provisioning. | Higher. Per-tenant token provisioning (manual today), lazy namespace creation, Bolt clients must set the session database, watch `--max-namespaces` / idle eviction. |
 
 Rule of thumb: use **property mode** for many small, low-trust-boundary tenants
 where a per-query predicate is acceptable and cost dominates; use
@@ -122,21 +123,24 @@ vector indexes, or noisy-neighbour isolation.
 
 This matters because it is what makes a scoped token safe. In `--multi-tenant`
 mode the HTTP router exposes both `/:namespace/v0/...` and unprefixed `/v0/...`
-routes (`crates/namidb-server/src/lib.rs:366-393`). For each request the auth
+routes (`crates/namidb-server/src/lib.rs`). For each request the auth
 middleware resolves the target namespace **before** authenticating:
 
-- `resolve_request_namespace` (`lib.rs:418-429`) reads axum/matchit's captured
+- `resolve_request_namespace` (`lib.rs`) reads axum/matchit's captured
   `:namespace` path parameter first — the same value the handler will serve —
   and only falls back to the `X-NamiDB-Namespace` header
-  (`namespace_from_header`, `lib.rs:397-404`, lowercased lookup) and then
+  (`namespace_from_header`, `lib.rs`, lowercased lookup) and then
   `--default-namespace` when no path param was captured. Reading the captured
   param (rather than re-parsing the URI) is deliberate: it closes the
-  `/v0/v0/...` cross-tenant bypass class (`lib.rs:406-417`).
-- `require_auth_multi` (`lib.rs:809-848`) then calls
-  `auth.principal_for_in(token, &namespace)` (`lib.rs:830`). A token that is
+  `/v0/v0/...` cross-tenant bypass class (`lib.rs`).
+- `require_auth_multi` (`lib.rs`) then calls
+  `auth.principal_for_in(token, &namespace)` (`lib.rs`). A token that is
   valid overall but scoped to a *different* namespace is rejected with `401` and
   the message `"missing or invalid bearer token, or token not scoped to this
   namespace"`.
+- The resolved namespace is passed on to the authorization hook
+  (`AuthzHook::check` / `check_schema`), so an external PDP receives it as
+  `input.namespace` and a policy can gate by tenant.
 
 **Bolt routes by the `db` field (since 2.3.0).** In `--multi-tenant` mode the
 Bolt listener serves every namespace: a statement routes to the database named
@@ -161,8 +165,8 @@ is two independent steps:
 ### Namespace names
 
 A namespace name must match `[a-z0-9][a-z0-9_-]{0,62}` (length 1..=63),
-validated by `NamespaceId::new` (`crates/namidb-core/src/id.rs:153-177`). The
-registry validates the same way on open (`registry.rs:168`), and the CLI exposes
+validated by `NamespaceId::new` (`crates/namidb-core/src/id.rs`). The
+registry validates the same way on open (`registry.rs`), and the CLI exposes
 the check directly:
 
 ```bash
@@ -173,8 +177,9 @@ namidb namespace-check 'Acme!'     # error: invalid namespace
 ### Static tokens: the real `--auth-tokens-file` format
 
 The file is parsed into `TokenFile` / `TokenFileEntry`
-(`crates/namidb-server/src/auth.rs:309-326`) and loaded once at boot by
-`AuthConfig::load_file` (`auth.rs:142-176`). The exact accepted shape:
+(`crates/namidb-server/src/auth.rs`) by `AuthConfig::load_file`, at boot
+and again on every hot reload (see *Adding or rotating a static token*,
+below). The exact accepted shape:
 
 ```json
 {
@@ -190,14 +195,14 @@ The file is parsed into `TokenFile` / `TokenFileEntry`
 Field semantics, exactly as the code treats them:
 
 - **`token`** (required, non-empty). The shared secret, compared in constant
-  time. An empty secret is rejected (`auth.rs:158-163`).
+  time. An empty secret is rejected (`auth.rs`).
 - **`name`** (optional). A human label only; defaults to `token-<i>`
-  (`auth.rs:165`). Surfaces as the `Principal.subject`.
+  (`auth.rs`). Surfaces as the `Principal.subject`.
 - **`role`** (optional). `"read-write"` or `"read-only"`; defaults to
-  `"read-write"` (`RoleSpec`, `auth.rs:328-335`). A `read-only` token has every
+  `"read-write"` (`RoleSpec`, `auth.rs`). A `read-only` token has every
   write (and admin flush) rejected.
 - **`namespaces`** (optional). This is the scoping field
-  (`AuthToken.namespaces`, `auth.rs:84`):
+  (`AuthToken.namespaces`, `auth.rs`):
   - **omitted or `null`** ⇒ *unscoped* — the token reaches **every** namespace
     (the back-compat default). This is what `"platform"` above is.
   - **a list** ⇒ scoped to exactly those namespaces.
@@ -206,14 +211,15 @@ Field semantics, exactly as the code treats them:
 
 A file with an empty `tokens` array is rejected outright — that would silently
 disable auth; omit `--auth-tokens-file` to run open on purpose
-(`auth.rs:147-152`).
+(`auth.rs`).
 
 Enforcement happens in `role_for_in` / `principal_for_in` →
-`token_principal` (`auth.rs:242-260`, `auth.rs:274-301`): on the multi-tenant
+`token_principal` (`auth.rs`): on the multi-tenant
 path a scoped token grants its role only when the requested namespace is in its
-set; an unscoped token grants always. (On the single-tenant / Bolt path the
-namespace is the empty-string sentinel `""`, which bypasses the scope check —
-`role_for` / `principal_for`, `auth.rs:205-215`, `auth.rs:277`.)
+set; an unscoped token grants always. (On the single-tenant path the
+namespace is the empty-string sentinel `""`, which bypasses the scope check:
+`role_for` / `principal_for` in `auth.rs`. Multi-tenant Bolt resolves the
+token against the requested namespace per statement, like HTTP.)
 
 ### Worked example (HTTP, namespace-per-tenant)
 
@@ -267,10 +273,10 @@ curl -s -o /dev/null -w '%{http_code}\n' https://host:8080/other/v0/cypher \
 ### Materializing the namespace
 
 Namespaces are lazy: the registry opens a `WriterSession` on first access and
-there is no explicit DDL (`registry.rs:135-209`). The first authorized request
+there is no explicit DDL (`registry.rs`). The first authorized request
 above is enough to materialize `acme`. If you want to pre-create it out of band,
 issue one write through the CLI against the same store (this opens and commits a
-`WriterSession` for that namespace — `crates/namidb-cli/src/main.rs:487-516`):
+`WriterSession` for that namespace, see `crates/namidb-cli/src/main.rs`):
 
 ```bash
 namidb run --store "s3://my-bucket?ns=acme&region=us-east-1" \
@@ -287,7 +293,7 @@ external IdP's JWKS and never mints one. With `--multi-tenant` plus
 `--jwt-namespaces-claim`, a JWT is scoped the same way a static token's
 `namespaces` list scopes it.
 
-Configure it (`crates/namidb-server/src/main.rs:48-75`):
+Configure it (`crates/namidb-server/src/main.rs`):
 
 ```bash
 namidb-server \
@@ -305,18 +311,18 @@ namidb-server \
 What the validator parses (`crates/namidb-server/src/jwt.rs`):
 
 - **Signature**: only asymmetric JWKS algorithms `RS256/384/512`, `ES256/384`
-  (`ACCEPTED_ALGS`, `jwt.rs:29-35`). Symmetric `HS*` and `none` are refused
-  (`jwt.rs:165-167`).
-- **`exp`** with 30s leeway (`jwt.rs:255`); optional `iss` / `aud` enforced only
-  when configured (`jwt.rs:257-266`).
-- **`sub`** → `Principal.subject` (`jwt.rs:240-245`).
+  (`ACCEPTED_ALGS`, `jwt.rs`). Symmetric `HS*` and `none` are refused
+  (`jwt.rs`).
+- **`exp`** with 30s leeway (`jwt.rs`); optional `iss` / `aud` enforced only
+  when configured (`jwt.rs`).
+- **`sub`** becomes `Principal.subject` (`jwt.rs`).
 - **groups claim** (`--jwt-groups-claim`, default `groups`) → role:
-  `--jwt-write-group` wins over `--jwt-read-group` (`jwt.rs:218-238`).
+  `--jwt-write-group` wins over `--jwt-read-group` (`jwt.rs`).
 - **namespaces claim** (`--jwt-namespaces-claim`): the scoping check at
-  `jwt.rs:202-211`. When configured, the token must name the requested namespace
+  `jwt.rs`. When configured, the token must name the requested namespace
   in that claim; unconfigured ⇒ unscoped (any namespace). The claim value may be
   a **JSON array of strings or a single string** (`extract_group_strings`,
-  `jwt.rs:273-283`).
+  `jwt.rs`).
 
 A matching JWT payload for the config above:
 
@@ -334,7 +340,7 @@ A matching JWT payload for the config above:
 This token authenticates as read-write against namespace `acme` and is rejected
 for any namespace not in `tenants`. Mint and rotate it in your IdP — NamiDB only
 verifies it, and refreshes the JWKS hourly so key rotation needs no restart
-(`crates/namidb-server/src/lib.rs:461-465`).
+(`crates/namidb-server/src/lib.rs`).
 
 ### Adding or rotating a static token: hot reload (since 2.5.0)
 
@@ -359,6 +365,65 @@ anyone. Semantics to rely on:
 
 (JWT key rotation likewise needs no restart — the JWKS refreshes on a timer.)
 
+## Running as a hosted service
+
+The engine can serve many tenants from one process, but a hosted service
+needs a few rules around it. Some of them are flags, the rest belong in
+whatever control plane sits in front.
+
+**One owner per namespace.** A namespace has exactly one writer, fenced by an
+epoch in its manifest. Any process that opens the namespace for writing claims
+the next epoch and fences the previous holder: a second server pod, an old pod
+that overlaps a new one during a rolling deploy, or an embedded Python client
+pointed at the same bucket. Two writers on one namespace never add
+throughput, they just fence each other. Pick one node per namespace and route
+every request for it there.
+
+**Use `--fence-policy=yield` when something outside decides ownership.** The
+default, `steal`, makes a fenced server reopen and claim the namespace back,
+which is right for a single box. When a control plane moves namespaces
+between nodes, run every node with `yield` (`NAMIDB_FENCE_POLICY=yield`): the
+new owner claims the epoch and the old one stops writing and reports its
+writer degraded, so readiness goes 503. The yielded writer stays down until
+the control plane restarts or reassigns it.
+
+Yield only covers a writer that is already open. In `--multi-tenant` mode any
+request for a namespace that is not open on a node opens it there, and that
+open claims the epoch and fences the real owner, whatever policy either node
+runs. Health checks count: `/<namespace>/v0/health` opens the namespace it
+asks about, and the unprefixed `/v0/health` opens the header or default
+namespace. So the routing layer must never send a namespace's requests,
+probes included, to a node that does not own it. Use `/v0/livez` for node
+liveness, since it opens nothing. A yielded namespace that gets evicted under
+capacity pressure is no longer open either, so the next stray request for it
+would steal it the same way.
+
+**Turn on group commit.** `--group-commit-window` defaults to `0s`, which
+commits every write on its own. Many clients writing the same namespace queue
+on the writer lock and each one pays a full commit round trip. A window of
+`2ms` to `5ms` lets writes that arrive together share one WAL append and one
+manifest CAS. The cost is shared fate: if a group's commit fails, every write
+in it fails.
+
+**Reads stay off the writer.** HTTP reads, Bolt auto-commit reads and Bolt
+transactions opened in read access mode (what `session.execute_read` sends)
+all run on the published snapshot and never wait for the writer lock. Write
+transactions hold the writer lock until COMMIT or ROLLBACK, so keep them short;
+`--bolt-tx-timeout` rolls back one that goes idle.
+
+**Keep one tenant from starving the rest.** The read admission gate
+(`NAMIDB_MAX_CONCURRENT_QUERIES`) is shared by the whole process. Set
+`NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` to give each namespace its own
+cap inside it. Namespaces also open independently: a slow cold open (large
+WAL to replay, slow bucket) only delays requests for that namespace.
+
+**What the control plane owns.** Tenant-to-node placement, the routing proxy
+(the HTTP `/:namespace` path or `X-NamiDB-Namespace` header, the Bolt `db`
+field), health-driven failover, issuing JWTs with a namespaces claim, rate
+limits, connection caps, storage quotas, billing, namespace provisioning and
+deletion, and scheduled backups through the admin backup endpoint. The engine
+makes ownership safe to move. It does not decide where a namespace lives.
+
 ## Proposed / Future
 
 None of this exists yet; it is design intent.
@@ -367,7 +432,7 @@ None of this exists yet; it is design intent.
 
 The `namidb` CLI today has no token/tenant subcommand — its commands are
 `version`, `namespace-check`, `parse`, `explain`, `run`, `load-vault`, `backup`,
-`restore` (`crates/namidb-cli/src/main.rs:40-191`). A proposed subcommand would
+`restore` (`crates/namidb-cli/src/main.rs`). A proposed subcommand would
 remove the hand-edit-JSON step for static tokens:
 
 ```text
@@ -392,9 +457,9 @@ What it would do, reusing existing symbols:
   enforcement.
 - Write atomically with `0600` permissions.
 
-This is provisioning sugar only; it would still require a server restart to take
-effect (no hot-reload), and it would not create the namespace — namespaces remain
-lazy.
+This is provisioning sugar only. The running server picks up the edited file
+on its next hot reload, and the command would not create the namespace:
+namespaces remain lazy.
 
 ### Other future work
 
@@ -403,11 +468,6 @@ lazy.
   serving a JWKS — a new trust boundary, RFC-sized.
 - **Explicit namespace lifecycle.** A real create/list/delete API instead of
   lazy `get_or_open`, so provisioning and de-provisioning are first-class.
-- **PDP namespace input.** The external-PDP request document advertises an
-  `input.namespace` field (`crates/namidb-server/src/pdp.rs:19-26`) but
-  `plan_input` does not currently emit it (`pdp.rs:138-151`), so OPA policies
-  cannot gate by namespace yet. Threading the resolved namespace into
-  `AuthzHook::check` would close that gap.
 
 ## Drawbacks and operational notes
 
@@ -416,14 +476,16 @@ lazy.
   missing predicate leaks data. Do not treat it as a security boundary.
 - **`namespaces: []` is a foot-gun.** An empty array denies every namespace.
   Omit the key for an unscoped token.
-- **Boot-only static-token load.** A newly minted static token needs a server
-  restart; only JWT keys rotate live.
+- **Static tokens reload on an interval, not instantly.** A new or revoked
+  token takes effect on the next reload tick (`--auth-tokens-reload-interval`,
+  default `10s`), and a live single-tenant Bolt session keeps the principal it
+  logged on with.
 - **Bolt multidatabase needs driver `database=` support.** Since 2.3.0 Bolt
   routes per statement by the `db` field; clients that cannot set a session
   database land on `--default-namespace`.
 - **Capacity and eviction.** In `--multi-tenant` mode, `--max-namespaces`
   (default 100) caps concurrently open namespaces and idle ones are evicted
-  oldest-first (`registry.rs:128-165`); `--namespace-idle-timeout` (default 1h)
+  oldest-first (`registry.rs`); `--namespace-idle-timeout` (default 1h)
   controls idleness. Eviction drops the in-memory session, not the data.
 
 ## References

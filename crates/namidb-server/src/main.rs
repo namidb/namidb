@@ -396,6 +396,15 @@ struct Cli {
         value_parser = humantime::parse_duration,
     )]
     namespace_idle_timeout: Duration,
+
+    /// What a writer does when another process claims its namespace.
+    /// `steal` (the default) reopens and takes the namespace back, which is
+    /// right for a single server. `yield` leaves the namespace to the new
+    /// owner and reports the writer degraded (readiness 503); use it when a
+    /// control plane decides which node owns each namespace, so a rolling
+    /// deploy or a failover does not turn into two nodes fencing each other.
+    #[arg(long, env = "NAMIDB_FENCE_POLICY", default_value = "steal")]
+    fence_policy: namidb_server::recovery::FencePolicy,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -454,6 +463,7 @@ fn main() -> anyhow::Result<()> {
         default_namespace: cli.default_namespace,
         max_namespaces: cli.max_namespaces,
         namespace_idle_timeout: cli.namespace_idle_timeout,
+        fence_policy: cli.fence_policy,
     };
 
     let memory_max_bytes = namidb_server::memory::resolve_memory_max_bytes(&cli.memory_max_bytes)

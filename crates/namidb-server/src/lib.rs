@@ -256,6 +256,11 @@ pub struct Config {
     /// Idle eviction timeout for namespaces in multi-tenant mode. A namespace
     /// unused for this long is eligible for eviction when at capacity.
     pub namespace_idle_timeout: Duration,
+    /// What a fenced writer does: reopen and take the epoch back (`Steal`,
+    /// the default) or stay degraded and leave the namespace to the peer
+    /// that claimed it (`Yield`). Applies to every namespace this process
+    /// serves.
+    pub fence_policy: recovery::FencePolicy,
 }
 
 /// `(manifest_version, catalog)` memoised behind a mutex and shared across
@@ -346,6 +351,9 @@ pub struct AppState {
     /// token exfiltrate the namespace anywhere the server's ambient cloud
     /// credentials can write.
     pub(crate) backup: Option<Arc<BackupHandles>>,
+    /// Per-namespace read concurrency cap ([`namespace_query_gate`]).
+    /// `None` = off, the default.
+    pub(crate) query_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// See [`AppState::backup`].
@@ -396,6 +404,8 @@ impl AppState {
             writer_health: WriterHealth::new(),
             group_commit: None,
             backup: None,
+            // One namespace: the process-wide gate already caps it.
+            query_gate: None,
         }
     }
 
@@ -470,6 +480,7 @@ impl AppState {
             // Bolt multi-tenant path groups too.
             group_commit: ns.group_commit.clone(),
             backup: None,
+            query_gate: ns.query_gate.clone(),
         }
     }
 
@@ -525,6 +536,14 @@ impl AppState {
     /// Attach the process-wide total-memory admission governor.
     pub fn with_memory_governor(mut self, memory: Arc<memory::MemoryGovernor>) -> Self {
         self.memory = memory;
+        self
+    }
+
+    /// Set what a fenced writer does (builder style). Call it before
+    /// [`AppState::spawn_group_committer`]: it replaces the writer health
+    /// handle that the committer clones.
+    pub fn with_fence_policy(mut self, policy: recovery::FencePolicy) -> Self {
+        self.writer_health = WriterHealth::with_fence_policy(policy);
         self
     }
 
@@ -1160,6 +1179,8 @@ pub async fn run_with_memory_max_bytes(
             sweep_delete: config.sweep_delete,
             compaction_l0_trigger: config.compaction_l0_trigger,
             group_commit_window: config.group_commit_window,
+            fence_policy: config.fence_policy,
+            max_concurrent_queries_per_namespace: max_concurrent_queries_per_namespace(),
         };
         let registry = NamespaceRegistry::new(
             store,
@@ -1264,6 +1285,7 @@ pub async fn run_with_memory_max_bytes(
         .with_memory_governor(memory)
         .with_writer_lock_timeout(config.writer_lock_timeout)
         .with_slow_query_threshold(config.slow_query_threshold)
+        .with_fence_policy(config.fence_policy)
         .with_group_commit(config.group_commit_window);
     if state.group_commit.is_some() {
         info!(
@@ -1991,6 +2013,19 @@ fn read_admission_gate() -> Option<&'static tokio::sync::Semaphore> {
     .as_ref()
 }
 
+/// Env knob for the per-namespace read cap in `--multi-tenant` mode, so one
+/// busy tenant cannot take every permit of the process-wide gate above.
+/// Default `0` (off). Read into [`registry::MaintenanceConfig`]; each
+/// namespace gets its own semaphore when it opens.
+const PER_NAMESPACE_QUERIES_ENV: &str = "NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE";
+
+fn max_concurrent_queries_per_namespace() -> usize {
+    std::env::var(PER_NAMESPACE_QUERIES_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 /// How long a read may queue for admission before the retryable 503
 /// (`NAMIDB_QUERY_ADMISSION_WAIT_MS`, default 5000). Bounded chiefly for
 /// Bolt, which has no outer request-timeout layer.
@@ -2007,31 +2042,57 @@ fn read_admission_wait() -> Duration {
 /// when the plan scans, the nested scan permit.
 #[doc(hidden)]
 pub struct ReadAdmission {
+    _namespace: Option<tokio::sync::OwnedSemaphorePermit>,
     _admission: Option<tokio::sync::SemaphorePermit<'static>>,
     _scan: Option<tokio::sync::SemaphorePermit<'static>>,
 }
 
-/// Admit one read: bounded wait on the concurrency gate, then the scan
-/// gate when the plan needs it. `None` = the admission window elapsed —
-/// the caller returns the retryable too-many-queries rejection.
+/// Admit one read: bounded wait on the namespace's own gate (when one is
+/// configured) and then the process-wide concurrency gate, then the scan
+/// gate when the plan needs it. `Err` = the admission window elapsed; it
+/// carries the knob of the gate that was full, for the retryable
+/// too-many-queries rejection ([`admission_exhausted_message`]).
 #[doc(hidden)]
-pub async fn acquire_read_admission(plan: &namidb_query::LogicalPlan) -> Option<ReadAdmission> {
+pub async fn acquire_read_admission(
+    plan: &namidb_query::LogicalPlan,
+    namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Result<ReadAdmission, &'static str> {
+    let deadline = tokio::time::Instant::now() + read_admission_wait();
+    let namespace = match namespace_gate {
+        None => None,
+        Some(gate) => match tokio::time::timeout_at(deadline, gate.clone().acquire_owned()).await {
+            Ok(permit) => Some(permit.expect("namespace query gate is never closed")),
+            Err(_) => return Err(PER_NAMESPACE_QUERIES_ENV),
+        },
+    };
     let admission = match read_admission_gate() {
         None => None,
-        Some(gate) => match tokio::time::timeout(read_admission_wait(), gate.acquire()).await {
+        Some(gate) => match tokio::time::timeout_at(deadline, gate.acquire()).await {
             Ok(permit) => Some(permit.expect("read admission gate is never closed")),
-            Err(_) => return None,
+            Err(_) => return Err("NAMIDB_MAX_CONCURRENT_QUERIES"),
         },
     };
     let scan = acquire_scan_permit(plan).await;
-    Some(ReadAdmission {
+    Ok(ReadAdmission {
+        _namespace: namespace,
         _admission: admission,
         _scan: scan,
     })
 }
 
+/// Message for a read turned away by the gate whose knob is `gate`.
+pub(crate) fn admission_exhausted_message(gate: &str) -> String {
+    format!(
+        "too many concurrent queries; the read admission queue is full — retry \
+         (raise {gate} to widen the gate)"
+    )
+}
+
 /// Retryable 503 for a read that could not be admitted within the window.
-pub(crate) fn admission_exhausted_observation(started: std::time::Instant) -> ObservedQuery {
+pub(crate) fn admission_exhausted_observation(
+    started: std::time::Instant,
+    gate: &str,
+) -> ObservedQuery {
     ObservedQuery {
         kind: Some(QueryKind::Read),
         ok: false,
@@ -2039,9 +2100,7 @@ pub(crate) fn admission_exhausted_observation(started: std::time::Instant) -> Ob
         response: (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorBody {
-                error: "too many concurrent queries; the read admission queue is full — retry \
-                        (raise NAMIDB_MAX_CONCURRENT_QUERIES to widen the gate)"
-                    .into(),
+                error: admission_exhausted_message(gate),
             }),
         )
             .into_response(),
@@ -2745,7 +2804,7 @@ async fn run_create_vector_index(
         label: &cvi.label.name,
         property: &cvi.property.name,
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -2883,7 +2942,7 @@ async fn run_create_fulltext_index(
         label: &cfi.label.name,
         properties: &props,
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3006,7 +3065,7 @@ async fn run_drop_vector_index(
     let op = authz::SchemaOp::DropVectorIndex {
         name: &dvi.name.name,
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3131,7 +3190,7 @@ async fn run_drop_fulltext_index(
     let op = authz::SchemaOp::DropFulltextIndex {
         name: &dfi.name.name,
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3303,7 +3362,7 @@ async fn run_create_property_ddl(
             property: &properties[0],
         }
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3732,7 +3791,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
     // Pre-execution authorization hook (RFC-015 Wave B): a policy may deny the
     // request based on the principal + plan, before the writer lock or any
     // execution. NoOp by default (allow-all), so this is behavior-preserving.
-    if let Err(denied) = state.authz.check(principal, &plan).await {
+    if let Err(denied) = state.authz.check(principal, &state.namespace, &plan).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3849,8 +3908,9 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
-        let Some(_admission) = acquire_read_admission(&plan).await else {
-            return admission_exhausted_observation(started);
+        let _admission = match acquire_read_admission(&plan, state.query_gate.as_ref()).await {
+            Ok(admission) => admission,
+            Err(gate) => return admission_exhausted_observation(started, gate),
         };
         let snap = owned.borrow();
         let result = execute_with_limits(
@@ -5005,7 +5065,11 @@ async fn run_cypher_multi(
     };
 
     // Pre-execution authorization hook (RFC-015 Wave B); NoOp by default.
-    if let Err(denied) = shared.authz.check(principal, &plan).await {
+    if let Err(denied) = shared
+        .authz
+        .check(principal, &ns_state.namespace, &plan)
+        .await
+    {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -5115,8 +5179,9 @@ async fn run_cypher_multi(
         }
     } else {
         // Read path.
-        let Some(_admission) = acquire_read_admission(&plan).await else {
-            return admission_exhausted_observation(started);
+        let _admission = match acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await {
+            Ok(admission) => admission,
+            Err(gate) => return admission_exhausted_observation(started, gate),
         };
         let snap = owned.borrow();
         let result = execute_with_limits(
@@ -5542,6 +5607,7 @@ mod tests {
             default_namespace: ns.to_string(),
             max_namespaces: 100,
             namespace_idle_timeout: Duration::from_secs(3600),
+            fence_policy: Default::default(),
         }
     }
 
@@ -6628,6 +6694,7 @@ mod tests {
         async fn check(
             &self,
             _p: &Principal,
+            _namespace: &str,
             _plan: &namidb_query::LogicalPlan,
         ) -> Result<(), crate::authz::Denied> {
             Err(crate::authz::Denied::new("denied by test policy"))
@@ -7178,6 +7245,7 @@ mod tests {
         async fn check(
             &self,
             _p: &Principal,
+            _namespace: &str,
             _plan: &namidb_query::LogicalPlan,
         ) -> Result<(), crate::authz::Denied> {
             Ok(())
@@ -7185,6 +7253,7 @@ mod tests {
         async fn check_schema(
             &self,
             _p: &Principal,
+            _namespace: &str,
             _op: crate::authz::SchemaOp<'_>,
         ) -> Result<(), crate::authz::Denied> {
             Err(crate::authz::Denied::new("schema changes denied by policy"))
@@ -8067,6 +8136,119 @@ mod tests {
         let (status, health) = get_health(&app).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(health["writer"], "ok");
+    }
+
+    /// A namespace at its own read cap is rejected after the admission
+    /// window with a message naming the per-namespace knob, while another
+    /// namespace on the same registry is still admitted.
+    #[tokio::test(start_paused = true)]
+    async fn namespace_query_gate_caps_one_namespace_only() {
+        let (store, _) = namidb_storage::parse_uri("memory://mt-query-gate").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig {
+                max_concurrent_queries_per_namespace: 1,
+                ..Default::default()
+            },
+        ));
+        let shared = SharedAppState::new_with_memory(
+            registry.clone(),
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::new(memory::MemoryGovernor::new(0)),
+            Duration::ZERO,
+            "busy".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+        let read = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(Body::from(r#"{"query":"RETURN 1 AS one"}"#))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let busy = registry.get_or_open("busy").await.unwrap();
+        let _held = busy
+            .query_gate
+            .clone()
+            .expect("the registry must build the namespace gate")
+            .acquire_owned()
+            .await
+            .unwrap();
+        let (status, body) = read("/busy/v0/cypher").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains(PER_NAMESPACE_QUERIES_ENV), "{body}");
+        let (status, body) = read("/quiet/v0/cypher").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// `--fence-policy=yield`: once another writer claims the namespace the
+    /// server stops writing and reports degraded instead of reopening, so
+    /// the new owner is not fenced back.
+    #[tokio::test]
+    async fn write_path_yields_when_fence_policy_is_yield() {
+        let (store, paths) = namidb_storage::parse_uri("memory://fence-yield").unwrap();
+        let writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "fence-yield".into())
+            .with_fence_policy(recovery::FencePolicy::Yield);
+        let app = build_router(state);
+        let seed = post_cypher(&app, None, "CREATE (:Person {name: 'Alice'}) RETURN 1").await;
+        assert_eq!(seed.status(), StatusCode::OK);
+
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let _owner = WriterSession::open(store, paths).await.unwrap();
+        let owner_epoch = ms.load_current().await.unwrap().manifest.epoch;
+
+        for name in ["Bob", "Cara"] {
+            let resp = post_cypher(
+                &app,
+                None,
+                &format!("CREATE (:Person {{name: '{name}'}}) RETURN 1"),
+            )
+            .await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "a yielded writer must not commit"
+            );
+        }
+        assert_eq!(
+            ms.load_current().await.unwrap().manifest.epoch,
+            owner_epoch,
+            "the yielded writer must not fence the new owner"
+        );
+        let (status, health) = get_health(&app).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health["writer"], "degraded");
     }
 
     /// `ObjectStore` wrapper that, while enabled, fails any PUT of a manifest

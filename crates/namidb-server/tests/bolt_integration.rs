@@ -193,6 +193,7 @@ async fn boot_bolt_grouped(ns: &str) -> (std::net::SocketAddr, tokio::task::Join
         default_namespace: ns.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        fence_policy: Default::default(),
         http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
@@ -306,6 +307,7 @@ async fn boot_bolt_multi(
         default_namespace: format!("{ns_prefix}-default"),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        fence_policy: Default::default(),
         auth_tokens_reload_interval: std::time::Duration::ZERO,
         http_request_timeout: None,
     };
@@ -729,6 +731,7 @@ async fn boot_bolt_config(
         default_namespace: ns.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        fence_policy: Default::default(),
         http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
@@ -796,6 +799,7 @@ async fn boot_bolt_tokens(
         default_namespace: ns.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        fence_policy: Default::default(),
         auth_tokens_reload_interval: std::time::Duration::ZERO,
         http_request_timeout: None,
     };
@@ -1054,6 +1058,7 @@ async fn bolt_create_then_match_roundtrip() {
         default_namespace: "bolt-test".to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        fence_policy: Default::default(),
         http_request_timeout: None,
     };
 
@@ -1149,6 +1154,7 @@ async fn bolt_bad_token_yields_failure() {
         default_namespace: "bolt-bad-auth".to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        fence_policy: Default::default(),
         http_request_timeout: None,
     };
 
@@ -1322,6 +1328,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         default_namespace: "bolt-introspect".to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        fence_policy: Default::default(),
         http_request_timeout: None,
     };
     let server_task = tokio::spawn(async move {

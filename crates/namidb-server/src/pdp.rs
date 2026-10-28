@@ -135,7 +135,7 @@ fn extract_allow(v: &serde_json::Value) -> Option<bool> {
 }
 
 /// Build the `input` document for a query plan.
-fn plan_input(principal: &Principal, plan: &LogicalPlan) -> serde_json::Value {
+fn plan_input(principal: &Principal, namespace: &str, plan: &LogicalPlan) -> serde_json::Value {
     let action = if plan.contains_write() {
         "write"
     } else {
@@ -147,6 +147,7 @@ fn plan_input(principal: &Principal, plan: &LogicalPlan) -> serde_json::Value {
         "groups": principal.groups,
         "action": action,
         "operators": operator_names(plan),
+        "namespace": namespace,
     })
 }
 
@@ -183,12 +184,22 @@ fn collect_ops(plan: &LogicalPlan, out: &mut Vec<&'static str>) {
 
 #[async_trait]
 impl AuthzHook for OpaAuthz {
-    async fn check(&self, principal: &Principal, plan: &LogicalPlan) -> Result<(), Denied> {
-        self.evaluate(plan_input(principal, plan)).await
+    async fn check(
+        &self,
+        principal: &Principal,
+        namespace: &str,
+        plan: &LogicalPlan,
+    ) -> Result<(), Denied> {
+        self.evaluate(plan_input(principal, namespace, plan)).await
     }
 
-    async fn check_schema(&self, principal: &Principal, op: SchemaOp<'_>) -> Result<(), Denied> {
-        let input = match op {
+    async fn check_schema(
+        &self,
+        principal: &Principal,
+        namespace: &str,
+        op: SchemaOp<'_>,
+    ) -> Result<(), Denied> {
+        let mut input = match op {
             SchemaOp::CreateVectorIndex {
                 name,
                 label,
@@ -252,6 +263,7 @@ impl AuthzHook for OpaAuthz {
                 "property": property,
             }),
         };
+        input["namespace"] = namespace.into();
         self.evaluate(input).await
     }
 }
@@ -330,7 +342,7 @@ mod tests {
     async fn opa_allows_when_policy_allows() {
         let (url, _guard) = spawn_policy(r#"{"result":{"allow":true}}"#).await;
         let hook = OpaAuthz::new(url).unwrap();
-        assert!(hook.check(&principal(), &read_plan()).await.is_ok());
+        assert!(hook.check(&principal(), "acme", &read_plan()).await.is_ok());
     }
 
     #[tokio::test]
@@ -338,7 +350,10 @@ mod tests {
         let (url, _guard) = spawn_policy(r#"{"result":{"allow":false}}"#).await;
         let hook = OpaAuthz::new(url).unwrap();
         // A READ denied by policy — the role gate would allow it; the PDP denies.
-        let err = hook.check(&principal(), &read_plan()).await.unwrap_err();
+        let err = hook
+            .check(&principal(), "acme", &read_plan())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("denied by policy"));
     }
 
@@ -346,7 +361,10 @@ mod tests {
     async fn opa_fails_closed_when_endpoint_unreachable() {
         // Nothing is listening on this port → fail-closed deny, not allow.
         let hook = OpaAuthz::new("http://127.0.0.1:1/decide").unwrap();
-        let err = hook.check(&principal(), &read_plan()).await.unwrap_err();
+        let err = hook
+            .check(&principal(), "acme", &read_plan())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("unavailable"));
     }
 
@@ -359,7 +377,7 @@ mod tests {
             label: "Doc",
             property: "emb",
         };
-        assert!(hook.check_schema(&principal(), op).await.is_err());
+        assert!(hook.check_schema(&principal(), "acme", op).await.is_err());
     }
 
     #[test]
@@ -391,8 +409,8 @@ mod tests {
         let LogicalPlan::DiscardResult { input: write } = &wrapped else {
             panic!("write without RETURN must have an internal result sink: {wrapped:?}");
         };
-        let legacy_input = plan_input(&principal(), write);
-        let current_input = plan_input(&principal(), &wrapped);
+        let legacy_input = plan_input(&principal(), "acme", write);
+        let current_input = plan_input(&principal(), "acme", &wrapped);
 
         assert_eq!(
             current_input, legacy_input,
@@ -403,5 +421,6 @@ mod tests {
             serde_json::json!(["Delete", "NodeScan"])
         );
         assert_eq!(current_input["action"], "write");
+        assert_eq!(current_input["namespace"], "acme");
     }
 }

@@ -48,8 +48,14 @@ impl std::error::Error for Denied {}
 /// policy engine returns `Err(Denied)`, never `Ok`.
 #[async_trait]
 pub trait AuthzHook: Send + Sync {
-    /// Decide whether `principal` may run `plan`. `Ok(())` allows; `Err` denies.
-    async fn check(&self, principal: &Principal, plan: &LogicalPlan) -> Result<(), Denied>;
+    /// Decide whether `principal` may run `plan` against `namespace`.
+    /// `Ok(())` allows; `Err` denies.
+    async fn check(
+        &self,
+        principal: &Principal,
+        namespace: &str,
+        plan: &LogicalPlan,
+    ) -> Result<(), Denied>;
 
     /// Decide whether `principal` may run a schema (DDL) operation. DDL is
     /// intercepted before planning, so it has no `LogicalPlan`; this is the
@@ -57,7 +63,12 @@ pub trait AuthzHook: Send + Sync {
     /// `CREATE VECTOR INDEX`). The default delegates nothing and allows — a
     /// real PDP overrides it to gate schema changes. `Ok(())` allows; `Err`
     /// denies.
-    async fn check_schema(&self, _principal: &Principal, _op: SchemaOp<'_>) -> Result<(), Denied> {
+    async fn check_schema(
+        &self,
+        _principal: &Principal,
+        _namespace: &str,
+        _op: SchemaOp<'_>,
+    ) -> Result<(), Denied> {
         Ok(())
     }
 }
@@ -98,7 +109,12 @@ pub struct NoOpAuthz;
 
 #[async_trait]
 impl AuthzHook for NoOpAuthz {
-    async fn check(&self, _principal: &Principal, _plan: &LogicalPlan) -> Result<(), Denied> {
+    async fn check(
+        &self,
+        _principal: &Principal,
+        _namespace: &str,
+        _plan: &LogicalPlan,
+    ) -> Result<(), Denied> {
         Ok(())
     }
 }
@@ -121,7 +137,12 @@ mod tests {
     struct DenyAll;
     #[async_trait]
     impl AuthzHook for DenyAll {
-        async fn check(&self, _p: &Principal, _plan: &LogicalPlan) -> Result<(), Denied> {
+        async fn check(
+            &self,
+            _p: &Principal,
+            _ns: &str,
+            _plan: &LogicalPlan,
+        ) -> Result<(), Denied> {
             Err(Denied::new("denied by policy"))
         }
     }
@@ -129,13 +150,13 @@ mod tests {
     #[tokio::test]
     async fn noop_allows_everything() {
         let plan = LogicalPlan::Empty;
-        assert!(NoOpAuthz.check(&principal(), &plan).await.is_ok());
+        assert!(NoOpAuthz.check(&principal(), "ns", &plan).await.is_ok());
     }
 
     #[tokio::test]
     async fn deny_all_denies() {
         let plan = LogicalPlan::Empty;
-        let err = DenyAll.check(&principal(), &plan).await.unwrap_err();
+        let err = DenyAll.check(&principal(), "ns", &plan).await.unwrap_err();
         assert!(err.to_string().contains("denied by policy"));
     }
 }

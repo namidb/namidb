@@ -299,6 +299,59 @@ crates.io release will establish and document that API explicitly.
   `sweep()` and the sweep after a compaction take their horizon from the
   oldest snapshot a read in the same process still holds, so they never
   delete files an in-flight read in another thread needs.
+### Added
+
+- **`--fence-policy` (`NAMIDB_FENCE_POLICY`) decides what a fenced writer
+  does.** Until now a server whose namespace was claimed by another process
+  always reopened, which takes the epoch back and fences the other process
+  in turn. Two pods on one namespace during a rolling deploy kept doing that
+  to each other, failing in-flight writes and replaying the WAL on every
+  round. `steal` (the default) keeps the old behavior. `yield` leaves the
+  namespace to the new owner and reports the writer degraded, so readiness
+  goes 503 and the orchestrator stops routing writes there. A yielded writer
+  stays down for the life of the process (or of the open namespace in
+  `--multi-tenant` mode), even when a later flush or write on it fails with
+  a different error. Before that fence, a poisoned session or a plain CAS
+  loss still reopens under both policies.
+
+- **`NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` caps reads per
+  namespace.** The read admission gate is process-wide, so in
+  `--multi-tenant` mode one busy tenant could hold every permit and make the
+  others queue into the retryable "too many concurrent queries" error. With
+  this set, each namespace also gets its own cap, taken before the global
+  one and inside the same admission window. Off (`0`) by default. The
+  rejection names whichever of the two gates was full.
+
+### Changed
+
+- **Bolt read transactions no longer take the writer lock.** Neo4j drivers
+  send every managed read (`session.execute_read`) as `BEGIN {mode: "r"}`,
+  but the server ignored the access mode and held the writer lock for the
+  whole transaction. Driver reads queued behind each other and behind every
+  write, and failed with a busy error after `--writer-lock-timeout`. A read
+  access mode transaction now reads the snapshot published at BEGIN without
+  touching the writer, and a write inside it fails with
+  `Neo.ClientError.Statement.AccessMode`. Write mode transactions are
+  unchanged. Embedders get a new `Backend::begin_tx_on_mode` method whose
+  default ignores the mode, so other backends keep working as before.
+
+### Fixed
+
+- **The external policy endpoint now receives the namespace.** The PDP
+  request was documented with an `input.namespace` field, but nothing ever
+  set it, so an OPA policy could not tell tenants apart. Queries and schema
+  commands now carry the namespace they run against, over HTTP and Bolt.
+  `AuthzHook::check` and `check_schema` take the namespace as a new
+  argument.
+
+- **A slow cold open no longer stalls every other tenant.** In
+  `--multi-tenant` mode the registry held its map lock for the whole open of
+  a new namespace (pointer resolve, segment listing, WAL replay) and for the
+  wait on an evicted writer. Every request to every other namespace queued
+  behind it, including ones that were already open. Each namespace now opens
+  on its own slot, so only requests for the namespace being opened wait, and
+  concurrent first requests for it still share one writer. An evicted
+  namespace is still fully quiesced before anything reopens it.
 
 ## [2.6.19] - 2026-09-16
 
