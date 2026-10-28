@@ -23,6 +23,15 @@ crates.io release will establish and document that API explicitly.
   `unknown label`, so a pipeline could not name a type before ingest reached
   it. Such a label or type now just contributes no nodes or edges.
 
+### Changed
+
+- **`CALL algo.*` rejects option keys it does not read.** `algo.pagerank`,
+  `algo.louvain`, `algo.label_propagation`, `algo.fastRP` and
+  `algo.shortest_path` used to drop unknown keys, so `{dampng: 0.9}` ran
+  with the default damping and `{target: ...}` on `algo.shortest_path` was
+  ignored without a word. They now fail with the list of allowed options,
+  like the projection-only procedures already did.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

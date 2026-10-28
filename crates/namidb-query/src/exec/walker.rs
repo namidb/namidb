@@ -5300,20 +5300,31 @@ fn require_projection_only(
                     )));
                 }
             };
-            for key in map.keys() {
-                if !matches!(key.as_str(), "labels" | "edge_types" | "direction") {
-                    return Err(proc_unsupported(format!(
-                        "algo.{name} accepts only projection options \
-                         (labels, edge_types, direction); unknown option `{key}`"
-                    )));
-                }
-            }
-            Ok(())
+            reject_unknown_algo_options(name, &map, &[])
         }
         _ => Err(proc_unsupported(format!(
             "algo.{name} takes at most one (map) argument"
         ))),
     }
+}
+
+/// Reject any key an `algo.*` option map neither projects on nor reads as one
+/// of the procedure's `own` options: a typo like `dampng` or `traget` must
+/// fail the call, not run silently with the default.
+fn reject_unknown_algo_options(
+    name: &str,
+    map: &std::collections::BTreeMap<String, RuntimeValue>,
+    own: &[&str],
+) -> Result<(), ExecError> {
+    const PROJECTION: [&str; 3] = ["labels", "edge_types", "direction"];
+    let allowed = || own.iter().chain(PROJECTION.iter());
+    if let Some(key) = map.keys().find(|k| !allowed().any(|a| a == k)) {
+        return Err(proc_unsupported(format!(
+            "algo.{name} does not recognise the option `{key}`; allowed options: {}",
+            allowed().copied().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Build an in-memory `algo::Graph` from the snapshot: the projected nodes
@@ -5412,6 +5423,11 @@ fn pagerank_options(
                     ));
                 }
             };
+            reject_unknown_algo_options(
+                "pagerank",
+                &map,
+                &["damping", "max_iterations", "tolerance"],
+            )?;
             if let Some(d) = map.get("damping") {
                 opts.damping = as_f64(d)
                     .ok_or_else(|| proc_unsupported("algo.pagerank `damping` must be a number"))?;
@@ -5458,6 +5474,17 @@ fn fastrp_options(
                     ))
                 }
             };
+            reject_unknown_algo_options(
+                "fastRP",
+                &map,
+                &[
+                    "dimension",
+                    "normalization_strength",
+                    "seed",
+                    "iterations",
+                    "iteration_weights",
+                ],
+            )?;
             if let Some(v) = map.get("dimension") {
                 opts.dimension = as_usize(v).ok_or_else(|| {
                     proc_unsupported("algo.fastRP `dimension` must be a non-negative integer")
@@ -5535,6 +5562,7 @@ fn label_propagation_options(args: &[Expression], params: &Params) -> Result<usi
                     ));
                 }
             };
+            reject_unknown_algo_options("label_propagation", &map, &["max_iterations"])?;
             if let Some(m) = map.get("max_iterations") {
                 max_iters = as_usize(m).ok_or_else(|| {
                     proc_unsupported(
@@ -5554,7 +5582,7 @@ fn label_propagation_options(args: &[Expression], params: &Params) -> Result<usi
 
 /// Resolve `algo.louvain` options from its optional single map argument:
 /// `CALL algo.louvain({max_levels: 5, max_iterations: 10, tolerance: 1e-4})`.
-/// The shared projection keys are parsed separately and ignored here.
+/// The shared projection keys are parsed separately.
 fn louvain_options(
     args: &[Expression],
     params: &Params,
@@ -5571,6 +5599,11 @@ fn louvain_options(
                     ));
                 }
             };
+            reject_unknown_algo_options(
+                "louvain",
+                &map,
+                &["max_levels", "max_iterations", "tolerance"],
+            )?;
             if let Some(v) = map.get("max_levels") {
                 opts.max_levels = as_usize(v).ok_or_else(|| {
                     proc_unsupported("algo.louvain `max_levels` must be a non-negative integer")
@@ -5618,6 +5651,7 @@ fn shortest_path_options(
             ));
         }
     };
+    reject_unknown_algo_options("shortest_path", &map, &["source", "weighted"])?;
     let source = match map.get("source") {
         Some(RuntimeValue::String(s)) => s.parse::<NodeId>().map_err(|_| {
             proc_unsupported(format!(

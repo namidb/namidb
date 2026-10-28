@@ -263,6 +263,37 @@ async fn call_wcc_rejects_non_projection_arguments() {
     }
 }
 
+/// Every `algo.*` option map rejects keys the procedure does not read, so a
+/// typo fails loudly instead of running with the default.
+#[tokio::test]
+async fn call_algo_rejects_unknown_option_keys() {
+    let mut writer = WriterSession::open(store(), paths("call-unknown-keys"))
+        .await
+        .unwrap();
+    let ids = build(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    for bad in [
+        "CALL algo.pagerank({dampng: 0.9}) YIELD node_id, score".to_string(),
+        "CALL algo.louvain({max_level: 5}) YIELD node_id, community".to_string(),
+        "CALL algo.label_propagation({iterations: 5}) YIELD node_id, community".to_string(),
+        "CALL algo.fastRP({dim: 8}) YIELD node_id, embedding".to_string(),
+        format!(
+            "CALL algo.shortest_path({{source: \"{}\", tgt: \"{}\"}}) YIELD node_id",
+            ids[0], ids[1]
+        ),
+    ] {
+        let q = parse(&bad).unwrap();
+        let plan = lower(&q).unwrap();
+        let plan = optimize(plan, &StatsCatalog::empty());
+        let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
+        assert!(
+            err.is_unsupported() && err.to_string().contains("does not recognise the option"),
+            "{bad} should reject the key, got {err}"
+        );
+    }
+}
+
 /// A directed triangle a→b→c→a (one SCC, one undirected triangle) plus a node
 /// d→a that is its own SCC and a pendant off the triangle. Returns [a, b, c, d].
 async fn build_directed(writer: &mut WriterSession) -> [NodeId; 4] {
