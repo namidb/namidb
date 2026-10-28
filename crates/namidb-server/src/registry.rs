@@ -573,6 +573,12 @@ impl NamespaceRegistry {
     /// diff `now_secs - last_access_secs` (both measured from the same anchor).
     /// A slot nobody is opening any more (its opener was cancelled, so the
     /// map holds the only reference) is picked first.
+    ///
+    /// A namespace with a live pinned reader is never idle. A Bolt read
+    /// transaction holds its snapshot across statements without touching
+    /// `last_access` or the writer, so `quiesce` would not wait for it, and
+    /// the replacement incarnation's sweep (whose horizon only sees its own
+    /// cell) could delete files that snapshot still reads.
     fn find_idle_oldest(&self, sessions: &HashMap<String, Slot>) -> Option<String> {
         let now_secs = self.now_secs();
         let idle_timeout_secs = self.idle_timeout.as_secs();
@@ -585,6 +591,9 @@ impl NamespaceRegistry {
                 }
                 continue;
             };
+            if state.snapshot.has_live_readers() {
+                continue;
+            }
             let last_secs = state.last_access.load(std::sync::atomic::Ordering::Relaxed);
             let idle_secs = now_secs.saturating_sub(last_secs);
             if idle_secs > idle_timeout_secs && oldest.is_none_or(|(_, t)| idle_secs > t) {
@@ -917,6 +926,28 @@ mod tests {
             1,
             "evicted NamespaceState is still referenced somewhere"
         );
+    }
+
+    /// A pinned snapshot (a Bolt read transaction) keeps its namespace from
+    /// being evicted and reopened under it; once it drops, eviction resumes.
+    #[tokio::test]
+    async fn pinned_reader_keeps_its_namespace_from_eviction() {
+        let reg = evicting_registry("registry-evict-pinned", MaintenanceConfig::default());
+        let acme = reg.get_or_open("acme").await.expect("open acme");
+        let pinned = acme.snapshot.load();
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            matches!(
+                reg.get_or_open("beta").await,
+                Err(RegistryError::AtCapacity)
+            ),
+            "a namespace with a live reader must not be evicted"
+        );
+
+        drop(pinned);
+        let _beta = open_evicting(&reg, "beta").await;
+        assert!(acme.is_retired(), "acme is evicted once nobody reads it");
     }
 
     /// Acked writes survive evict + reopen. They are WAL-committed before

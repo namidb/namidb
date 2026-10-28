@@ -217,8 +217,9 @@ pub(crate) async fn probe_read_fence(
 /// the recovered session. `health` is degraded for the duration and ok
 /// again once the reopen lands; if every attempt fails it stays degraded
 /// and the next failed write triggers another pass. Under
-/// [`FencePolicy::Yield`] a fence does not reopen: the writer stays degraded
-/// and the peer that claimed the namespace keeps it.
+/// [`FencePolicy::Yield`] a fence does not reopen, and no other failure
+/// reopens over a newer epoch: the writer stays degraded and the peer that
+/// claimed the namespace keeps it.
 ///
 /// Holding the lock across the backoff is deliberate: the writer is broken,
 /// so a queued write could only fail — better to have it wait for a
@@ -233,23 +234,14 @@ pub(crate) async fn recover_writer_if_needed(
     if !(err.requires_writer_reopen() || writer.is_poisoned()) {
         return;
     }
-    if health.fence_policy == FencePolicy::Yield {
+    let yielding = health.fence_policy == FencePolicy::Yield;
+    if yielding {
         if health.yielded.load(std::sync::atomic::Ordering::Acquire) {
             // Already yielded: keep the fence reason and stay down.
             return;
         }
         if matches!(err, namidb_storage::Error::Fenced { .. }) {
-            // A peer owns the namespace now. Reopening would fence it right
-            // back, so stay degraded and leave ownership to whoever placed it.
-            health.mark_degraded(err.to_string());
-            health
-                .yielded
-                .store(true, std::sync::atomic::Ordering::Release);
-            warn!(
-                namespace,
-                error = %err,
-                "writer session is fenced; yielding the namespace (fence policy: yield)"
-            );
+            yield_namespace(health, namespace, err);
             return;
         }
     }
@@ -260,7 +252,19 @@ pub(crate) async fn recover_writer_if_needed(
         "writer session is fenced/poisoned; reopening the namespace"
     );
     for attempt in 1..=REOPEN_ATTEMPTS {
-        match writer.reopen().await {
+        // A peer claim does not always surface as `Fenced`: one caught
+        // between its body and its pointer reads as a lost CAS. Under
+        // `Yield` the reopen itself refuses to claim over a newer epoch.
+        let reopened = if yielding {
+            writer.reopen_unless_claimed().await
+        } else {
+            writer.reopen().await
+        };
+        match reopened {
+            Err(e @ namidb_storage::Error::Fenced { .. }) if yielding => {
+                yield_namespace(health, namespace, &e);
+                return;
+            }
             Ok(()) => {
                 snapshot.store(writer.owned_snapshot());
                 health.mark_ok();
@@ -282,6 +286,20 @@ pub(crate) async fn recover_writer_if_needed(
     }
     // Still broken: health stays degraded so /v0/health reports it, and the
     // next failed write re-enters this path.
+}
+
+/// A peer owns the namespace now. Reopening would fence it right back, so
+/// stay degraded and leave ownership to whoever placed it.
+fn yield_namespace(health: &WriterHealth, namespace: &str, err: &namidb_storage::Error) {
+    health.mark_degraded(err.to_string());
+    health
+        .yielded
+        .store(true, std::sync::atomic::Ordering::Release);
+    warn!(
+        namespace,
+        error = %err,
+        "writer session is fenced; yielding the namespace (fence policy: yield)"
+    );
 }
 
 /// [`recover_writer_if_needed`] for a failed write statement: the executor
@@ -461,6 +479,65 @@ mod tests {
             ms.load_current().await.unwrap().manifest.epoch,
             owner_epoch,
             "a yielded writer must not fence the owner on a later failure"
+        );
+    }
+
+    /// A peer's claim is half done: its body at `v+1` is durable but its
+    /// pointer is not. Our commit then loses the body Create and reports a
+    /// plain `ManifestCommitCas`, not `Fenced`. Under `Yield` the recovery
+    /// must still not claim over the peer.
+    #[tokio::test]
+    async fn yield_does_not_steal_from_a_half_published_peer_claim() {
+        use namidb_core::NamespaceId;
+        use namidb_storage::{ManifestStore, NamespacePaths, NodeWriteRecord, WriterFence};
+        use std::sync::Arc as StdArc;
+
+        let store: StdArc<dyn object_store::ObjectStore> =
+            StdArc::new(object_store::memory::InMemory::new());
+        let paths = NamespacePaths::new("tenants", NamespaceId::new("fence-cas").unwrap());
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+
+        let mut a = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let cell = SnapshotCell::new(a.owned_snapshot());
+
+        // The peer's claim body, as `claim_writer` writes it, without the
+        // pointer that would publish it.
+        let base = ms.load_current().await.unwrap();
+        let mine = base.manifest.epoch;
+        let mut claim = base.manifest.next_version(uuid::Uuid::now_v7());
+        claim.epoch = mine.next();
+        let pretend = WriterFence {
+            epoch: mine,
+            writer_id: claim.writer_id,
+        };
+        ms.put_body(&pretend, &base, &claim).await.unwrap();
+
+        a.upsert_node(
+            "P",
+            namidb_core::id::NodeId::new(),
+            &NodeWriteRecord {
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = a.commit_batch().await.unwrap_err();
+        assert!(
+            matches!(err, namidb_storage::Error::ManifestCommitCas { .. }),
+            "{err}"
+        );
+
+        let health = WriterHealth::with_fence_policy(FencePolicy::Yield);
+        recover_writer_if_needed(&mut a, &cell, &health, "fence-cas", &err).await;
+        assert!(
+            health.is_degraded(),
+            "a yielded writer must report degraded"
+        );
+        assert!(
+            ms.load_current().await.unwrap().manifest.epoch <= mine.next(),
+            "yield must not claim an epoch above the peer's"
         );
     }
 

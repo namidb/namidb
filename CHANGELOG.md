@@ -115,8 +115,10 @@ crates.io release will establish and document that API explicitly.
   goes 503 and the orchestrator stops routing writes there. A yielded writer
   stays down for the life of the process (or of the open namespace in
   `--multi-tenant` mode), even when a later flush or write on it fails with
-  a different error. Before that fence, a poisoned session or a plain CAS
-  loss still reopens under both policies.
+  a different error. A poisoned session or a plain CAS loss still reopens
+  under both policies, but under `yield` that reopen yields instead when
+  another process already holds a newer epoch. That includes a claim caught
+  halfway, which shows up on this side as a CAS loss rather than a fence.
 
 - **`NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` caps reads per
   namespace.** The read admission gate is process-wide, so in
@@ -187,7 +189,9 @@ crates.io release will establish and document that API explicitly.
   access mode transaction now reads the snapshot published at BEGIN without
   touching the writer, and a write inside it fails with
   `Neo.ClientError.Statement.AccessMode`. Write mode transactions are
-  unchanged. Embedders get a new `Backend::begin_tx_on_mode` method whose
+  unchanged. In `--multi-tenant` mode a namespace with an open read
+  transaction is never evicted as idle, so a reopened copy of it cannot
+  compact and sweep files that the transaction's snapshot still reads. Embedders get a new `Backend::begin_tx_on_mode` method whose
   default ignores the mode, so other backends keep working as before.
 
 ### Fixed

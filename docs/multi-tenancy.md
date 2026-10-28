@@ -486,7 +486,9 @@ namespaces remain lazy.
 - **Capacity and eviction.** In `--multi-tenant` mode, `--max-namespaces`
   (default 100) caps concurrently open namespaces and idle ones are evicted
   oldest-first (`registry.rs`); `--namespace-idle-timeout` (default 1h)
-  controls idleness. Eviction drops the in-memory session, not the data.
+  controls idleness. A namespace with a read in flight, such as an open Bolt
+  read transaction, is never idle. Eviction drops the in-memory session, not
+  the data.
 
 ## References
 
