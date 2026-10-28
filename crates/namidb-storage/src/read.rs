@@ -5637,9 +5637,10 @@ impl<'mt> Snapshot<'mt> {
     ///
     /// In a compacted/disjoint snapshot, physical node order is already the
     /// logical last-write-wins order, so the reader can stop after `limit`
-    /// live rows that carry `label` and satisfy every predicate. Any node
-    /// memtable entry or overlapping SST range falls back to the ordinary full
-    /// reconciliation before truncation.
+    /// live rows that carry `label` and satisfy every predicate. With node
+    /// memtable entries or overlapping SST ranges the label postings are
+    /// merged in id order instead; only when they cannot prove completeness
+    /// does the scan reconcile in full and truncate.
     pub async fn scan_label_with_predicates_and_projection_limited(
         &self,
         label: &str,
@@ -16190,7 +16191,9 @@ mod tests {
             column: "name".into(),
             value: crate::sst::stats::StatScalar::Utf8("d1200".into()),
         };
-        let cases: [(&[ScanPredicate], Option<&[String]>, &[u16], u64); 4] = [
+        // (predicates, projection, expected Device ids, rows read in phase 2)
+        type Case<'a> = (&'a [ScanPredicate], Option<&'a [String]>, &'a [u16], u64);
+        let cases: [Case<'_>; 4] = [
             (&[], None, &[100, 1200], 2),
             (&[], Some(&name), &[100, 1200], 2),
             // An id-only projection never reads a property.

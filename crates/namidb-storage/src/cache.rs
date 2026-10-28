@@ -1120,9 +1120,9 @@ struct CacheStats {
     /// Winning label rows whose properties a two-phase label scan read over
     /// overlapping node SSTs. Rows outside the label never count.
     node_label_selected_rows: AtomicU64,
-    /// Exact LIMIT pushdown over globally-disjoint node SSTs. These counters
-    /// distinguish a true lazy prefix scan from the legacy full scan followed
-    /// by `take(k)`.
+    /// Exact LIMIT pushdown over node SSTs (a disjoint prefix scan or merged
+    /// label postings). These counters distinguish a true lazy prefix scan
+    /// from the legacy full scan followed by `take(k)`.
     node_limited_scan_fast_paths: AtomicU64,
     node_limited_scan_fallbacks: AtomicU64,
     node_limited_scan_decoded_rows: AtomicU64,
