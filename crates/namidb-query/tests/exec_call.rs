@@ -459,6 +459,56 @@ async fn call_shortest_path_from_source() {
     );
 }
 
+#[tokio::test]
+async fn call_shortest_path_to_target_returns_the_path() {
+    let mut writer = WriterSession::open(store(), paths("call-sp-target"))
+        .await
+        .unwrap();
+    let ids = build_directed(&mut writer).await; // a→b→c→a, d→a
+    let snapshot = writer.snapshot();
+
+    let cypher = format!(
+        "CALL algo.shortest_path({{source: \"{}\", target: \"{}\"}}) \
+         YIELD node_id, distance, hops, path",
+        ids[0], ids[2]
+    );
+    let rows = run(&snapshot, &cypher).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(node_of(&rows[0]), *ids[2].as_bytes());
+    assert_eq!(int_col(&rows[0], "hops"), 2);
+    assert_eq!(rows[0].get("distance"), Some(&RuntimeValue::Float(2.0)));
+    let path: Vec<[u8; 16]> = match rows[0].get("path") {
+        Some(RuntimeValue::List(items)) => items
+            .iter()
+            .map(|v| match v {
+                RuntimeValue::Node(n) => *n.id.as_bytes(),
+                other => panic!("path entry not a node: {other:?}"),
+            })
+            .collect(),
+        other => panic!("path not a list: {other:?}"),
+    };
+    assert_eq!(
+        path,
+        vec![*ids[0].as_bytes(), *ids[1].as_bytes(), *ids[2].as_bytes()]
+    );
+
+    // d is unreachable from a (only d→a exists): no row, not an error.
+    let cypher = format!(
+        "CALL algo.shortest_path({{source: \"{}\", target: \"{}\"}}) YIELD node_id",
+        ids[0], ids[3]
+    );
+    assert!(run(&snapshot, &cypher).await.is_empty());
+
+    // Undirected projection makes d reachable through a.
+    let cypher = format!(
+        "CALL algo.shortest_path({{source: \"{}\", target: \"{}\", direction: 'undirected'}}) \
+         YIELD hops",
+        ids[0], ids[3]
+    );
+    let rows = run(&snapshot, &cypher).await;
+    assert_eq!(int_col(&rows[0], "hops"), 1);
+}
+
 fn node_with_body(text: &str) -> NodeWriteRecord {
     let mut props = BTreeMap::new();
     props.insert(

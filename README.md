@@ -171,6 +171,10 @@ CALL algo.triangle_count() YIELD node_id, triangles, coefficient RETURN *;
 
 -- Hop distance from a starting node (BFS; pass weighted: true for Dijkstra).
 CALL algo.shortest_path({source: "<node-uuid>"}) YIELD node_id, distance, hops RETURN *;
+-- Add a target to stop there and get the node sequence. Edges follow their
+-- stored direction unless you pass direction: 'undirected'.
+CALL algo.shortest_path({source: "<node-uuid>", target: "<node-uuid>"})
+YIELD distance, hops, path RETURN *;
 
 -- Modularity communities (Louvain) and bridge nodes (Brandes betweenness).
 CALL algo.louvain() YIELD node_id, community RETURN node_id, community;

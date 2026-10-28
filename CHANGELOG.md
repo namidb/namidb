@@ -28,9 +28,17 @@ crates.io release will establish and document that API explicitly.
 - **`CALL algo.*` rejects option keys it does not read.** `algo.pagerank`,
   `algo.louvain`, `algo.label_propagation`, `algo.fastRP` and
   `algo.shortest_path` used to drop unknown keys, so `{dampng: 0.9}` ran
-  with the default damping and `{target: ...}` on `algo.shortest_path` was
-  ignored without a word. They now fail with the list of allowed options,
+  with the default damping. They now fail with the list of allowed options,
   like the projection-only procedures already did.
+
+### Added
+
+- **`algo.shortest_path` takes an optional `target`.** It used to ignore
+  `target` and return the distance to every reachable node. With a target it
+  stops as soon as the target is settled and returns one row (none when it
+  is unreachable) with `node_id`, `distance`, `hops` and a new `path` column
+  holding the node sequence from source to target. Without a target, `path`
+  is null and the other columns are unchanged.
 
 ## [2.6.19] - 2026-09-16
 

@@ -2909,7 +2909,7 @@ async fn flat_call_procedure(
             (vec!["node_id", "community"], raw)
         }
         "shortest_path" => {
-            let (source, weighted) = shortest_path_options(args, params)?;
+            let (source, target, weighted) = shortest_path_options(args, params)?;
             // Dijkstra is unsound with negative weights; reject the query rather
             // than silently skipping those edges and returning wrong distances
             // (matches Neo4j GDS, which validates non-negative weights).
@@ -2917,6 +2917,33 @@ async fn flat_call_procedure(
                 return Err(proc_unsupported(
                     "algo.shortest_path with weighted:true does not support negative edge weights",
                 ));
+            }
+            let cols = vec!["node_id", "distance", "hops", "path"];
+            // With a target: one row (or none when unreachable) carrying the
+            // node sequence, found with an early-exit search. The algo graph
+            // keeps no edge types, so for relationships use
+            // `MATCH p = shortestPath(...)` instead.
+            if let Some(target) = target {
+                let found = namidb_graph::algo::shortest_path_to_cancellable(
+                    &graph,
+                    source,
+                    target,
+                    weighted,
+                    &namidb_storage::cancel::deadline_exceeded,
+                )
+                .map_err(|_| ExecError::Timeout)?;
+                let raw = found
+                    .into_iter()
+                    .map(|(dist, path)| {
+                        vec![
+                            node_runtime(target),
+                            RuntimeValue::Float(dist),
+                            RuntimeValue::Integer(path.len() as i64 - 1),
+                            RuntimeValue::List(path.into_iter().map(node_runtime).collect()),
+                        ]
+                    })
+                    .collect();
+                return project_proc_rows("algo.shortest_path", &cols, raw, yield_items);
             }
             let sp = namidb_graph::algo::shortest_paths_cancellable(
                 &graph,
@@ -2939,10 +2966,12 @@ async fn flat_call_procedure(
                         node_runtime(id),
                         RuntimeValue::Float(dist),
                         RuntimeValue::Integer(sp.hops.get(&id).copied().unwrap_or(0) as i64),
+                        // Paths are only built for a single `target`.
+                        RuntimeValue::Null,
                     ]
                 })
                 .collect();
-            (vec!["node_id", "distance", "hops"], raw)
+            (cols, raw)
         }
         "fastRP" | "fast_rp" | "fastrp" => {
             let opts = fastrp_options(args, params)?;
@@ -5629,13 +5658,14 @@ fn louvain_options(
 }
 
 /// Resolve `algo.shortest_path` options from its required single map arg:
-/// `CALL algo.shortest_path({source: "<uuid>", weighted: true})`. `source` is
-/// required (a node-id string or a node value); `weighted` defaults to false
-/// (BFS hop count) and, when true, runs Dijkstra over non-negative `weight`s.
+/// `CALL algo.shortest_path({source: "<uuid>", target: "<uuid>", weighted: true})`.
+/// `source` is required and `target` optional (each a node-id string or a node
+/// value); `weighted` defaults to false (BFS hop count) and, when true, runs
+/// Dijkstra over non-negative `weight`s.
 fn shortest_path_options(
     args: &[Expression],
     params: &Params,
-) -> Result<(NodeId, bool), ExecError> {
+) -> Result<(NodeId, Option<NodeId>, bool), ExecError> {
     let map = match args {
         [arg] => match evaluate(arg, &Row::new(), params)? {
             RuntimeValue::Map(m) => m,
@@ -5651,25 +5681,25 @@ fn shortest_path_options(
             ));
         }
     };
-    reject_unknown_algo_options("shortest_path", &map, &["source", "weighted"])?;
-    let source = match map.get("source") {
-        Some(RuntimeValue::String(s)) => s.parse::<NodeId>().map_err(|_| {
-            proc_unsupported(format!(
-                "algo.shortest_path `source` is not a valid node id: {s}"
-            ))
-        })?,
-        Some(RuntimeValue::Node(n)) => n.id,
-        Some(_) => {
-            return Err(proc_unsupported(
-                "algo.shortest_path `source` must be a node-id string or a node",
-            ));
-        }
-        None => {
-            return Err(proc_unsupported(
-                "algo.shortest_path requires a `source` (node-id string or node)",
-            ));
+    reject_unknown_algo_options("shortest_path", &map, &["source", "target", "weighted"])?;
+    let node_arg = |key: &str| -> Result<Option<NodeId>, ExecError> {
+        match map.get(key) {
+            None => Ok(None),
+            Some(RuntimeValue::String(s)) => s.parse::<NodeId>().map(Some).map_err(|_| {
+                proc_unsupported(format!(
+                    "algo.shortest_path `{key}` is not a valid node id: {s}"
+                ))
+            }),
+            Some(RuntimeValue::Node(n)) => Ok(Some(n.id)),
+            Some(_) => Err(proc_unsupported(format!(
+                "algo.shortest_path `{key}` must be a node-id string or a node"
+            ))),
         }
     };
+    let source = node_arg("source")?.ok_or_else(|| {
+        proc_unsupported("algo.shortest_path requires a `source` (node-id string or node)")
+    })?;
+    let target = node_arg("target")?;
     let weighted = match map.get("weighted") {
         None => false,
         Some(RuntimeValue::Bool(b)) => *b,
@@ -5679,7 +5709,7 @@ fn shortest_path_options(
             ));
         }
     };
-    Ok((source, weighted))
+    Ok((source, target, weighted))
 }
 
 fn as_f64(v: &RuntimeValue) -> Option<f64> {
