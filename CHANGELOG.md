@@ -15,6 +15,15 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Keywords work as property keys, map keys and aliases.** `RETURN e.by`,
+  `SET n.end = 1`, `{order: 1}` and `RETURN x AS by` used to fail with E003
+  because `by`, `end` and `order` are reserved words. A word right after `.`,
+  before `:` in a map, or after `AS` can only be a name, so it is now read as
+  one, spelled exactly as written. Variables and labels still need backticks
+  (`` MATCH (`order`) ``), and so does a later reference to a keyword alias.
+
 ### Changed
 
 - **Namespace names can contain `_`.** `forensic_case` used to be rejected
