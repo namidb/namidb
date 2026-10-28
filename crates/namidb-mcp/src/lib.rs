@@ -1024,7 +1024,10 @@ impl Server {
                 let source = namidb_core::NodeId::from_str(source_str)
                     .map_err(|_| format!("`source` is not a valid node id: {source_str}"))?;
                 // With a target: the one route from source to target, as notes.
-                if let Some(target_str) = args.get("target").and_then(Value::as_str) {
+                if let Some(target) = args.get("target").filter(|t| !t.is_null()) {
+                    let target_str = target
+                        .as_str()
+                        .ok_or_else(|| "`target` must be a node id string".to_string())?;
                     let target = namidb_core::NodeId::from_str(target_str)
                         .map_err(|_| format!("`target` is not a valid node id: {target_str}"))?;
                     let found = shortest_path_to(&graph, source, target, false);
@@ -1977,6 +1980,20 @@ mod tests {
         .await;
         assert_eq!(res["found"], false);
         assert_eq!(res["route"], json!([]));
+
+        // A non-string target is an error, not silently the full listing.
+        let res = server
+            .dispatch(
+                "tools/call",
+                &json!({ "name": "graph_algorithm", "arguments": {
+                    "algorithm": "shortest_path", "source": id_of("A"), "target": 123
+                } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["isError"], json!(true));
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("target"), "got: {text}");
     }
 
     #[tokio::test]
