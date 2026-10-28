@@ -15,37 +15,6 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
-### Fixed
-
-- **Keywords work as property keys, map keys and aliases.** `RETURN e.by`,
-  `SET n.end = 1`, `{order: 1}`, `RETURN x AS by` and
-  `CREATE INDEX ON :Evt(order)` used to fail with E003 because `by`, `end`
-  and `order` are reserved words. A word right after `.`, before `:` in a
-  map, after `AS` or in an index property list can only be a name, so it is
-  now read as one, spelled exactly as written. Variables and labels still
-  need backticks (`` MATCH (`order`) ``), and so does a later reference to a
-  keyword alias. A bare backtick-quoted variable now names its column
-  without the backticks, like Neo4j: `` RETURN `order` `` gives a column
-  `order` and `` RETURN `my node` `` a column `my node` (it used to be
-  `` `my node` ``, backticks included).
-
-### Added
-
-- **macOS x86_64 Python wheel.** Intel Macs and x86_64 Pythons on Apple
-  silicon (a Rosetta terminal, `python3-intel64`) found no matching wheel,
-  fell back to the sdist and failed without a Rust toolchain. The release
-  now ships a `macosx_*_x86_64` wheel, cross-built on the arm64 runner and
-  smoke-tested under Rosetta.
-
-### Changed
-
-- **Namespace names can contain `_`.** `forensic_case` used to be rejected
-  as an invalid namespace. The first character still has to be `[a-z0-9]`.
-
-- **`memory://` takes `?ns=` like the other schemes.** `memory://?ns=acme`
-  and `memory://acme?ns=acme` both open `acme`. A URI whose host and `?ns=`
-  disagree now fails with a clear conflict error instead of an
-  invalid-character one.
 ### Breaking
 
 - **`CALL algo.*` rejects option keys it does not read.** `algo.pagerank`,
@@ -55,20 +24,35 @@ crates.io release will establish and document that API explicitly.
   like the projection-only procedures already did. A query that passes a
   stray key, for example `algo.louvain({seed: 1})`, now errors; drop the key.
   The check runs before the graph is built, so it fails fast.
+
 - **`algo.shortest_path` returns a fourth column, `path`.** A `YIELD` that
   names its columns is unaffected, but a call without `YIELD`, or a client
   that reads columns by position or count, now sees `node_id`, `distance`,
   `hops`, `path`.
 
-### Fixed
+- **Python `merge_nodes` now merges.** It used to replace the whole node,
+  so a second call carrying only some keys dropped every other property,
+  and a node with labels `A` and `B` merged under `A` lost `B`. Each row is
+  now merged into the stored node: unmentioned keys are kept, a `None`
+  value removes the key, and the label is added to the node's labels. Rows
+  that repeat an id in one call merge in order. The old replace behaviour
+  lives on as the new `put_nodes`, which skips the read and is the faster
+  choice for a first load. In `put_nodes` the last row for an id wins, and
+  unique constraints are checked against each id's final value only.
 
-- **`CALL algo.*` failed when a projected label or edge type had no data
-  yet.** An edge type that was never declared and had no edges, or a label
-  with no nodes, made the whole call error with `unknown edge type` /
-  `unknown label`, so a pipeline could not name a type before ingest reached
-  it. Such a label or type now just contributes no nodes or edges.
+- **Python bulk rows take the node id from `_id`.** That matches `n._id` in
+  Cypher, and leaves `id` free to be an ordinary property. Rows keyed by
+  `id` alone still work, and the `id` value is now also stored as a
+  property, so `n.id` and `WHERE n.id = $id` find the node instead of
+  returning null.
 
 ### Added
+
+- **macOS x86_64 Python wheel.** Intel Macs and x86_64 Pythons on Apple
+  silicon (a Rosetta terminal, `python3-intel64`) found no matching wheel,
+  fell back to the sdist and failed without a Rust toolchain. The release
+  now ships a `macosx_*_x86_64` wheel, cross-built on the arm64 runner and
+  smoke-tested under Rosetta.
 
 - **`algo.shortest_path` takes an optional `target`.** It used to ignore
   `target` and return the distance to every reachable node. With a target it
@@ -84,6 +68,126 @@ crates.io release will establish and document that API explicitly.
   and the other columns are unchanged. The MCP `graph_algorithm` tool takes
   the same `target` for `shortest_path` and returns the route; a `target`
   that is not a string is rejected.
+
+- **`Client.sweep(min_age_secs=60, dry_run=False)`** in the Python client
+  deletes objects no manifest version references any more and reports what
+  it removed. `aborted_by_pin` in the report is true when a pin lease landed
+  mid-sweep and nothing was deleted, so the sweep should be run again.
+
+- **Python: `Client(uri, read_only=True)` reads a namespace without taking
+  it from its writer.** Opening any `Client` used to claim the writer
+  epoch, so a notebook that only wanted to look at the data fenced the
+  process loading it. A read-only client loads the current manifest,
+  replays the unflushed WAL so it sees every commit, and holds a retention
+  lease, renewed in the background, so the writer's cleanup keeps its
+  files. `refresh()` moves it to the newest commit, and a read on a
+  version more than an hour old, or whose lease may have expired,
+  refreshes on its own so a forgotten reader cannot hold back cleanup
+  forever. `close()` (or a `with` block) drops the lease. Every mutator
+  raises `PermissionError`. The storage side is
+  `namidb_storage::ReaderSession`.
+
+- **Python: `timeout_ms` and `max_rows` on `cypher` / `acypher`.** Both
+  are keyword-only and off by default. They raise the new
+  `namidb.QueryTimeoutError` (a `TimeoutError`) and
+  `namidb.QueryRowCapError` (a `RuntimeError`). The timeout also bounds
+  a write's wait for the client's lock behind another write, a read-only
+  client's refresh, and a write's commit. A timed-out write is
+  discarded, not committed.
+
+- **Python: `limit=` on `scan_label`, `scan_label_arrow` and
+  `scan_edge_type`, plus `iter_label` / `iter_edge_type`.** The iterators
+  build one dict per step, so walking a 2M-node label no longer needs 2M
+  dicts alive at once. Edge scans still read the whole type before
+  applying the limit.
+
+- **`--fence-policy` (`NAMIDB_FENCE_POLICY`) decides what a fenced writer
+  does.** Until now a server whose namespace was claimed by another process
+  always reopened, which takes the epoch back and fences the other process
+  in turn. Two pods on one namespace during a rolling deploy kept doing that
+  to each other, failing in-flight writes and replaying the WAL on every
+  round. `steal` (the default) keeps the old behavior. `yield` leaves the
+  namespace to the new owner and reports the writer degraded, so readiness
+  goes 503 and the orchestrator stops routing writes there. A yielded writer
+  stays down for the life of the process (or of the open namespace in
+  `--multi-tenant` mode), even when a later flush or write on it fails with
+  a different error. Before that fence, a poisoned session or a plain CAS
+  loss still reopens under both policies.
+
+- **`NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` caps reads per
+  namespace.** The read admission gate is process-wide, so in
+  `--multi-tenant` mode one busy tenant could hold every permit and make the
+  others queue into the retryable "too many concurrent queries" error. With
+  this set, each namespace also gets its own cap, taken before the global
+  one and inside the same admission window. Off (`0`) by default. The
+  rejection names whichever of the two gates was full.
+
+### Changed
+
+- **Namespace names can contain `_`.** `forensic_case` used to be rejected
+  as an invalid namespace. The first character still has to be `[a-z0-9]`.
+
+- **`memory://` takes `?ns=` like the other schemes.** `memory://?ns=acme`
+  and `memory://acme?ns=acme` both open `acme`. A URI whose host and `?ns=`
+  disagree now fails with a clear conflict error instead of an
+  invalid-character one.
+
+- **Label scans over overlapping node SSTs no longer load whole SST files.**
+  A denser label, or a projected scan that is better served by property
+  pages, now runs in two passes. The first reads only the id, tombstone,
+  lsn and label columns of each SST and settles which version of each id
+  wins. The second reads properties for the winning rows of the label only:
+  from property pages for a projected scan, or from Parquet with a row
+  selection that skips every other page. Counts and `RETURN id(n)` style
+  scans stop after the first pass. Any mismatch between the passes falls
+  back to the full reconciliation. This also covers the BM25 and hybrid search label
+  walks. `SstCache::label_selected_node_rows()` reports how many label rows
+  had their properties read, here or from property pages.
+
+- **The embedded Python client now compacts and reclaims space on its own.**
+  It has no maintenance loop like the server, so L0 SSTs piled up until
+  someone called `compact()`, and even then nothing was deleted: merged-away
+  L0 files and flushed WAL segments stayed on disk for good. `flush()` now
+  runs a compaction pass once a bucket holds `compaction_l0_trigger` L0 SSTs
+  (default 8, `0` turns it off), and every applied pass is followed by a
+  sweep of objects written more than `auto_sweep_min_age_secs` ago (default
+  60, `None` turns it off). The age counts from when a file was written, so
+  it does not protect a reader in another process that loaded the manifest
+  before the pass. Turn the auto sweep off while another process reads the
+  graph.
+
+- **Compaction scratch for a `file://` Python client goes under
+  `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless
+  `NAMIDB_SPOOL_DIR` was set, which filled the system disk on large graphs.
+  Pass `spool_dir=` to put it elsewhere. Text and vector index builds now
+  honour the same directory instead of `/var/tmp` or `$TMPDIR`. The setting
+  is process-wide and each new client resets it, and a spool dir that was
+  deleted falls back to the default instead of failing every flush.
+
+- **A compaction triggered by `flush()` that fails is a `RuntimeWarning`.**
+  The flush is already durable at that point, so raising would tell a
+  retrying caller its data was lost.
+
+- **`scan_label_arrow` no longer emits two `id` columns.** A node loaded
+  with the legacy `id` key keeps `id` as a property, which clashed with the
+  metadata `id` column and made `table["id"]` raise. A property that only
+  repeats the node id (in any UUID spelling, upper case included) is
+  dropped from the table, and any other property
+  named like a metadata column comes back as `property.<key>`.
+
+- **Bolt read transactions no longer take the writer lock.** Neo4j drivers
+  send every managed read (`session.execute_read`) as `BEGIN {mode: "r"}`,
+  but the server ignored the access mode and held the writer lock for the
+  whole transaction. Driver reads queued behind each other and behind every
+  write, and failed with a busy error after `--writer-lock-timeout`. A read
+  access mode transaction now reads the snapshot published at BEGIN without
+  touching the writer, and a write inside it fails with
+  `Neo.ClientError.Statement.AccessMode`. Write mode transactions are
+  unchanged. Embedders get a new `Backend::begin_tx_on_mode` method whose
+  default ignores the mode, so other backends keep working as before.
+
+### Fixed
+
 - **A chained `OPTIONAL MATCH` failed when an earlier one found nothing.**
   `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (b)-[:S]->(c)` raised
   "Expand source `b` is not a Node" for every row where `b` was NULL. A NULL
@@ -116,6 +220,7 @@ crates.io release will establish and document that API explicitly.
   A variable-length or `shortestPath` path was left unbound, so `RETURN p`
   failed with "binding `p` not bound", and a fixed-length path came back as
   a path holding NULL elements. Both are now NULL.
+
 - **`WHERE id(n) IN $ids` scanned the whole label.** Only `id(n) = $x` was
   turned into a point lookup, and only when it was the entire `WHERE`. An
   `IN` list, an id equality next to another condition (including an inline
@@ -170,6 +275,7 @@ crates.io release will establish and document that API explicitly.
   included) of every row it scanned. These calls now read only the id and
   label columns. `keys(n)`, `properties(n)` and a bare `n` still load
   everything.
+
 - **A label scan on a store with more than one node SST decoded every node
   in the store.** Node ids are random, so two node SSTs always overlap in key
   range, and every label accelerator turned itself off. The fallback then
@@ -204,76 +310,23 @@ crates.io release will establish and document that API explicitly.
   storing embeddings in a binary column would cut the remaining work, but
   both change the on-disk format and are left for later.
 
-### Changed
+- **Keywords work as property keys, map keys and aliases.** `RETURN e.by`,
+  `SET n.end = 1`, `{order: 1}`, `RETURN x AS by` and
+  `CREATE INDEX ON :Evt(order)` used to fail with E003 because `by`, `end`
+  and `order` are reserved words. A word right after `.`, before `:` in a
+  map, after `AS` or in an index property list can only be a name, so it is
+  now read as one, spelled exactly as written. Variables and labels still
+  need backticks (`` MATCH (`order`) ``), and so does a later reference to a
+  keyword alias. A bare backtick-quoted variable now names its column
+  without the backticks, like Neo4j: `` RETURN `order` `` gives a column
+  `order` and `` RETURN `my node` `` a column `my node` (it used to be
+  `` `my node` ``, backticks included).
 
-- **Label scans over overlapping node SSTs no longer load whole SST files.**
-  A denser label, or a projected scan that is better served by property
-  pages, now runs in two passes. The first reads only the id, tombstone,
-  lsn and label columns of each SST and settles which version of each id
-  wins. The second reads properties for the winning rows of the label only:
-  from property pages for a projected scan, or from Parquet with a row
-  selection that skips every other page. Counts and `RETURN id(n)` style
-  scans stop after the first pass. Any mismatch between the passes falls
-  back to the full reconciliation. This also covers the BM25 and hybrid search label
-  walks. `SstCache::label_selected_node_rows()` reports how many label rows
-  had their properties read, here or from property pages.
-### Changed
-
-- **Python `merge_nodes` now merges.** It used to replace the whole node,
-  so a second call carrying only some keys dropped every other property,
-  and a node with labels `A` and `B` merged under `A` lost `B`. Each row is
-  now merged into the stored node: unmentioned keys are kept, a `None`
-  value removes the key, and the label is added to the node's labels. Rows
-  that repeat an id in one call merge in order. The old replace behaviour
-  lives on as the new `put_nodes`, which skips the read and is the faster
-  choice for a first load. In `put_nodes` the last row for an id wins, and
-  unique constraints are checked against each id's final value only.
-
-- **Python bulk rows take the node id from `_id`.** That matches `n._id` in
-  Cypher, and leaves `id` free to be an ordinary property. Rows keyed by
-  `id` alone still work, and the `id` value is now also stored as a
-  property, so `n.id` and `WHERE n.id = $id` find the node instead of
-  returning null.
-
-- **The embedded Python client now compacts and reclaims space on its own.**
-  It has no maintenance loop like the server, so L0 SSTs piled up until
-  someone called `compact()`, and even then nothing was deleted: merged-away
-  L0 files and flushed WAL segments stayed on disk for good. `flush()` now
-  runs a compaction pass once a bucket holds `compaction_l0_trigger` L0 SSTs
-  (default 8, `0` turns it off), and every applied pass is followed by a
-  sweep of objects written more than `auto_sweep_min_age_secs` ago (default
-  60, `None` turns it off). The age counts from when a file was written, so
-  it does not protect a reader in another process that loaded the manifest
-  before the pass. Turn the auto sweep off while another process reads the
-  graph.
-
-- **Compaction scratch for a `file://` Python client goes under
-  `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless
-  `NAMIDB_SPOOL_DIR` was set, which filled the system disk on large graphs.
-  Pass `spool_dir=` to put it elsewhere. Text and vector index builds now
-  honour the same directory instead of `/var/tmp` or `$TMPDIR`. The setting
-  is process-wide and each new client resets it, and a spool dir that was
-  deleted falls back to the default instead of failing every flush.
-
-- **A compaction triggered by `flush()` that fails is a `RuntimeWarning`.**
-  The flush is already durable at that point, so raising would tell a
-  retrying caller its data was lost.
-
-- **`scan_label_arrow` no longer emits two `id` columns.** A node loaded
-  with the legacy `id` key keeps `id` as a property, which clashed with the
-  metadata `id` column and made `table["id"]` raise. A property that only
-  repeats the node id (in any UUID spelling, upper case included) is
-  dropped from the table, and any other property
-  named like a metadata column comes back as `property.<key>`.
-
-### Added
-
-- **`Client.sweep(min_age_secs=60, dry_run=False)`** in the Python client
-  deletes objects no manifest version references any more and reports what
-  it removed. `aborted_by_pin` in the report is true when a pin lease landed
-  mid-sweep and nothing was deleted, so the sweep should be run again.
-
-### Fixed
+- **`CALL algo.*` failed when a projected label or edge type had no data
+  yet.** An edge type that was never declared and had no edges, or a label
+  with no nodes, made the whole call error with `unknown edge type` /
+  `unknown label`, so a pipeline could not name a type before ingest reached
+  it. Such a label or type now just contributes no nodes or edges.
 
 - **Re-upserting a node with its own unique value raised a constraint
   error.** The low-level Python writes (`upsert_node`,
@@ -281,37 +334,6 @@ crates.io release will establish and document that API explicitly.
   node were new, so writing a node again with an unchanged unique property,
   or listing the same id twice in one batch, conflicted with itself. The
   node's own row is now excluded from the check.
-
-### Added
-
-- **Python: `Client(uri, read_only=True)` reads a namespace without taking
-  it from its writer.** Opening any `Client` used to claim the writer
-  epoch, so a notebook that only wanted to look at the data fenced the
-  process loading it. A read-only client loads the current manifest,
-  replays the unflushed WAL so it sees every commit, and holds a retention
-  lease, renewed in the background, so the writer's cleanup keeps its
-  files. `refresh()` moves it to the newest commit, and a read on a
-  version more than an hour old, or whose lease may have expired,
-  refreshes on its own so a forgotten reader cannot hold back cleanup
-  forever. `close()` (or a `with` block) drops the lease. Every mutator
-  raises `PermissionError`. The storage side is
-  `namidb_storage::ReaderSession`.
-
-- **Python: `timeout_ms` and `max_rows` on `cypher` / `acypher`.** Both
-  are keyword-only and off by default. They raise the new
-  `namidb.QueryTimeoutError` (a `TimeoutError`) and
-  `namidb.QueryRowCapError` (a `RuntimeError`). The timeout also bounds
-  a write's wait for the client's lock behind another write, a read-only
-  client's refresh, and a write's commit. A timed-out write is
-  discarded, not committed.
-
-- **Python: `limit=` on `scan_label`, `scan_label_arrow` and
-  `scan_edge_type`, plus `iter_label` / `iter_edge_type`.** The iterators
-  build one dict per step, so walking a 2M-node label no longer needs 2M
-  dicts alive at once. Edge scans still read the whole type before
-  applying the limit.
-
-### Fixed
 
 - **Python calls held the GIL for their whole duration.** A long query or
   WAL replay froze every other Python thread. Every blocking call now
@@ -325,43 +347,6 @@ crates.io release will establish and document that API explicitly.
   `sweep()` and the sweep after a compaction take their horizon from the
   oldest snapshot a read in the same process still holds, so they never
   delete files an in-flight read in another thread needs.
-### Added
-
-- **`--fence-policy` (`NAMIDB_FENCE_POLICY`) decides what a fenced writer
-  does.** Until now a server whose namespace was claimed by another process
-  always reopened, which takes the epoch back and fences the other process
-  in turn. Two pods on one namespace during a rolling deploy kept doing that
-  to each other, failing in-flight writes and replaying the WAL on every
-  round. `steal` (the default) keeps the old behavior. `yield` leaves the
-  namespace to the new owner and reports the writer degraded, so readiness
-  goes 503 and the orchestrator stops routing writes there. A yielded writer
-  stays down for the life of the process (or of the open namespace in
-  `--multi-tenant` mode), even when a later flush or write on it fails with
-  a different error. Before that fence, a poisoned session or a plain CAS
-  loss still reopens under both policies.
-
-- **`NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` caps reads per
-  namespace.** The read admission gate is process-wide, so in
-  `--multi-tenant` mode one busy tenant could hold every permit and make the
-  others queue into the retryable "too many concurrent queries" error. With
-  this set, each namespace also gets its own cap, taken before the global
-  one and inside the same admission window. Off (`0`) by default. The
-  rejection names whichever of the two gates was full.
-
-### Changed
-
-- **Bolt read transactions no longer take the writer lock.** Neo4j drivers
-  send every managed read (`session.execute_read`) as `BEGIN {mode: "r"}`,
-  but the server ignored the access mode and held the writer lock for the
-  whole transaction. Driver reads queued behind each other and behind every
-  write, and failed with a busy error after `--writer-lock-timeout`. A read
-  access mode transaction now reads the snapshot published at BEGIN without
-  touching the writer, and a write inside it fails with
-  `Neo.ClientError.Statement.AccessMode`. Write mode transactions are
-  unchanged. Embedders get a new `Backend::begin_tx_on_mode` method whose
-  default ignores the mode, so other backends keep working as before.
-
-### Fixed
 
 - **The external policy endpoint now receives the namespace.** The PDP
   request was documented with an `input.namespace` field, but nothing ever
