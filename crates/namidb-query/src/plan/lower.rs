@@ -1077,12 +1077,9 @@ fn build_path_constructor(elem: &PatternElement, span: SourceSpan) -> Expression
     let head_name = elem.head.binding.as_ref().expect("validated").name.clone();
     args.push(var_expression(&head_name, span));
     for (rel, target) in &elem.chain {
-        // For shortestPath patterns (RFC-023) the rel / target may
-        // lack an explicit binding (LDBC IC13 writes
-        // `shortestPath((a)-[:KNOWS*..15]-(b))`). Use a null literal
-        // for the missing element so `length(p)` still works; the
-        // `__path` builtin tolerates null fillers and counts only
-        // non-null relationships.
+        // The caller fills anonymous elements first (see
+        // `fill_anonymous_path_bindings`), so the null literal below is
+        // only a fallback; `__path` turns any NULL element into a NULL path.
         if let Some(b) = &rel.binding {
             args.push(var_expression(&b.name, span));
         } else {
