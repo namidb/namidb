@@ -7626,16 +7626,14 @@ fn sum_values(vals: &[RuntimeValue]) -> Result<RuntimeValue, ExecError> {
 
 // ───────────────────────── NodeId conversion ─────────────────────────
 
-/// The id a `NodeById` seek looks up for `value`, with the semantics of the
-/// `id(n) = value` filter it replaces: a null, a non-string, or a string that
-/// is not exactly the id string `id()` returns matches no node instead of
-/// failing the query. A Node value still seeks that node.
+/// The id a `NodeById` seek looks up for `value`. It reads a key the way
+/// `CREATE (n {_id: ...})` does (a Node value, any UUID spelling), so the
+/// `{_id: ...}` sigil finds what it created. A null or a value that names no
+/// node matches nothing instead of failing the query. A seek planned from
+/// `WHERE id(n) = ...` keeps that comparison on top to stay exact.
 fn seek_node_id(value: &RuntimeValue) -> Option<NodeId> {
     match value {
-        RuntimeValue::String(s) => uuid::Uuid::parse_str(s)
-            .ok()
-            .map(NodeId::from_uuid)
-            .filter(|id| id.to_string() == *s),
+        RuntimeValue::String(s) => uuid::Uuid::parse_str(s).ok().map(NodeId::from_uuid),
         RuntimeValue::Node(n) => Some(n.id),
         _ => None,
     }

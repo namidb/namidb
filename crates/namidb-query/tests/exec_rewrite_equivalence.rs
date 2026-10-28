@@ -518,10 +518,20 @@ fn plan_has_node_by_id(plan: &namidb_query::LogicalPlan) -> bool {
 
 /// `WHERE id(n) IN $ids` is served by a seek. It must return what the
 /// filter it replaces returns (spelled `id(b) + ''` here so it stays a scan)
-/// for duplicate, null, malformed, upper-case, unknown and wrong-label ids.
+/// for duplicate, null, malformed, upper-case, unknown, deleted and
+/// wrong-label ids, and for a key that is a node rather than its id.
 #[tokio::test]
 async fn id_seek_agrees_with_the_filter_it_replaces() {
-    let w = fixture().await;
+    let mut w = fixture().await;
+    // Flushed, then deleted: a memtable tombstone shadows its SST row.
+    let gone = NodeId::new();
+    w.upsert_node("Q", gone, &node(vec![("n", s("gone"))]))
+        .unwrap();
+    w.commit_batch().await.unwrap();
+    let schema = w.schema().clone();
+    w.flush(schema).await.unwrap();
+    w.tombstone_node("Q", gone).unwrap();
+    w.commit_batch().await.unwrap();
     let snapshot = w.snapshot();
     let all = execute(
         &lower(&parse("MATCH (b) RETURN b").unwrap()).unwrap(),
@@ -549,6 +559,7 @@ async fn id_seek_agrees_with_the_filter_it_replaces() {
         RuntimeValue::String(id_of("q3").to_uppercase()),
         RuntimeValue::String(id_of("p1")),
         RuntimeValue::String(NodeId::new().to_string()),
+        RuntimeValue::String(gone.to_string()),
         RuntimeValue::String("junk".into()),
         RuntimeValue::Null,
         RuntimeValue::Integer(7),
@@ -562,6 +573,7 @@ async fn id_seek_agrees_with_the_filter_it_replaces() {
         RuntimeValue::String(id_of("q2").to_uppercase()),
     );
     params.insert("nothing".into(), RuntimeValue::Null);
+    params.insert("gone".into(), RuntimeValue::String(gone.to_string()));
 
     let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
     for query in [
@@ -570,6 +582,7 @@ async fn id_seek_agrees_with_the_filter_it_replaces() {
         "MATCH (b:Q) WHERE id(b) IN $ids RETURN *",
         "MATCH (b:Q) WHERE id(b) = $nothing RETURN b.n AS n",
         "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) = x RETURN b.n AS n",
+        "MATCH (m:Q) MATCH (b:Q) WHERE id(b) = m RETURN b.n AS n",
     ] {
         let plan = optimize(lower(&parse(query).unwrap()).unwrap(), &catalog);
         assert!(plan_has_node_by_id(&plan), "`{query}` must seek: {plan:?}");
@@ -639,7 +652,42 @@ async fn id_seek_agrees_with_the_filter_it_replaces() {
                 "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) + '' = x RETURN b.n AS n",
             ],
         ),
+        (
+            "deleted id equality",
+            [
+                "MATCH (b) WHERE id(b) = $gone RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' = $gone RETURN b.n AS n",
+            ],
+        ),
+        (
+            "a node is not its id",
+            [
+                "MATCH (m:Q) MATCH (b:Q) WHERE id(b) = m RETURN b.n AS n",
+                "MATCH (m:Q) MATCH (b:Q) WHERE id(b) + '' = m RETURN b.n AS n",
+            ],
+        ),
+        (
+            "a collected node is not its id",
+            [
+                "MATCH (m:Q) WITH collect(m) AS ms UNWIND ms AS x \
+                 MATCH (b:Q) WHERE id(b) = x RETURN b.n AS n",
+                "MATCH (m:Q) WITH collect(m) AS ms UNWIND ms AS x \
+                 MATCH (b:Q) WHERE id(b) + '' = x RETURN b.n AS n",
+            ],
+        ),
     ] {
         assert_equivalent_with(&w, name, &family, &params).await;
+    }
+
+    // The `{_id: ...}` sigil reads its key the way CREATE does, so an
+    // upper-case spelling still finds the node and a null finds nothing.
+    for (query, expected) in [
+        ("MATCH (b:Q {_id: $upper}) RETURN b.n AS n", vec!["n=q2"]),
+        ("MATCH (b:Q {_id: $nothing}) RETURN b.n AS n", vec![]),
+        ("MATCH (b:Q {_id: $gone}) RETURN b.n AS n", vec![]),
+    ] {
+        let plan = optimize(lower(&parse(query).unwrap()).unwrap(), &catalog);
+        let rows = execute(&plan, &snapshot, &params).await.unwrap();
+        assert_eq!(multiset(&rows), expected, "`{query}`");
     }
 }

@@ -170,8 +170,8 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
                 let LogicalPlan::CrossProduct { left, .. } = *input else {
                     unreachable!("correlated id seek was matched as CrossProduct")
                 };
-                let lookup = id_seek(label, &alias, seek.value, false, rewrite(*left, catalog));
-                return with_residual(lookup, seek.residual);
+                let (lookup, residual) = id_seek(label, &alias, seek, rewrite(*left, catalog));
+                return with_residual(lookup, residual);
             }
             if let Some((alias, indexed)) = correlated {
                 let LogicalPlan::CrossProduct { left, .. } = *input else {
@@ -211,14 +211,9 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             {
                 if predicates.is_empty() {
                     if let Some(seek) = extract_node_id_conjunct(&predicate, alias, None) {
-                        let lookup = id_seek(
-                            label.clone(),
-                            alias,
-                            seek.value,
-                            seek.many,
-                            LogicalPlan::Empty,
-                        );
-                        return with_residual(lookup, seek.residual);
+                        let (lookup, residual) =
+                            id_seek(label.clone(), alias, seek, LogicalPlan::Empty);
+                        return with_residual(lookup, residual);
                     }
                 }
             }
@@ -782,6 +777,8 @@ fn property_on_alias(expr: &Expression, alias: &str) -> Option<String> {
 /// A `WHERE` conjunct that pins a scan's node by id: `id(a) = <value>` or
 /// `id(a) IN <value>` (`elementId` likewise, either side of `=`).
 pub(super) struct IdSeek {
+    /// The `id(a)` / `elementId(a)` call itself.
+    call: Expression,
     pub(super) value: Expression,
     /// `IN`: `value` is a list of ids rather than one id.
     pub(super) many: bool,
@@ -801,47 +798,60 @@ pub(super) fn extract_node_id_conjunct(
     use crate::parser::ast::BinaryOp;
     let mut conjuncts = Vec::new();
     collect_top_level_conjuncts(predicate, &mut conjuncts);
-    let (index, value, many) = conjuncts.iter().enumerate().find_map(|(index, conjunct)| {
-        let (value, many) = match &conjunct.kind {
-            ExpressionKind::Binary {
-                op: BinaryOp::Eq,
-                left,
-                right,
-            } if is_node_id_call(left, scan_alias) => (right, false),
-            ExpressionKind::Binary {
-                op: BinaryOp::Eq,
-                left,
-                right,
-            } if is_node_id_call(right, scan_alias) => (left, false),
-            ExpressionKind::In { item, list } if is_node_id_call(item, scan_alias) => (list, true),
-            _ => return None,
-        };
-        let aliases = expression_aliases(value);
-        let available = match outer_aliases {
-            Some(outer) => aliases.is_subset(outer),
-            None => aliases.is_empty(),
-        };
-        available.then(|| (index, (**value).clone(), many))
-    })?;
+    let (index, call, value, many) =
+        conjuncts.iter().enumerate().find_map(|(index, conjunct)| {
+            let (call, value, many) = match &conjunct.kind {
+                ExpressionKind::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } if is_node_id_call(left, scan_alias) => (left, right, false),
+                ExpressionKind::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } if is_node_id_call(right, scan_alias) => (right, left, false),
+                ExpressionKind::In { item, list } if is_node_id_call(item, scan_alias) => {
+                    (item, list, true)
+                }
+                _ => return None,
+            };
+            let aliases = expression_aliases(value);
+            let available = match outer_aliases {
+                Some(outer) => aliases.is_subset(outer),
+                None => aliases.is_empty(),
+            };
+            available.then(|| (index, (**call).clone(), (**value).clone(), many))
+        })?;
     let mut leaf_index = 0usize;
     let residual = remove_top_level_conjunct(predicate, index, &mut leaf_index);
     Some(IdSeek {
+        call,
         value,
         many,
         residual,
     })
 }
 
-/// Build the `NodeById` for `value` over `input`. An `IN` seek (`many`)
-/// unwinds the list into a hidden binding first; the `Distinct` keeps a
-/// repeated id to one row, as the filter it replaces would.
+/// Build the `NodeById` for `seek` over `input`, and hand back its residual.
+/// An `IN` seek unwinds the list into a hidden binding first; the `Distinct`
+/// keeps a repeated id to one row, as the filter it replaces would.
+///
+/// The seek resolves its key as leniently as the `{_id: ...}` sigil does (a
+/// Node value, any UUID spelling), so `call = key` stays on top of it: the
+/// filter it replaces compares the canonical id string and nothing else.
 pub(super) fn id_seek(
     label: Option<String>,
     alias: &str,
-    value: Expression,
-    many: bool,
+    seek: IdSeek,
     input: LogicalPlan,
-) -> LogicalPlan {
+) -> (LogicalPlan, Option<Expression>) {
+    let IdSeek {
+        call,
+        value,
+        many,
+        residual,
+    } = seek;
     let (input, id) = if many {
         let slot = format!("__idseek_{alias}");
         let id = Expression {
@@ -865,12 +875,22 @@ pub(super) fn id_seek(
     } else {
         (input, value)
     };
-    LogicalPlan::NodeById {
+    let span = call.span;
+    let exact = Expression {
+        span,
+        kind: ExpressionKind::Binary {
+            op: crate::parser::ast::BinaryOp::Eq,
+            left: Box::new(call),
+            right: Box::new(id.clone()),
+        },
+    };
+    let lookup = LogicalPlan::NodeById {
         input: Box::new(input),
         label,
         alias: alias.to_owned(),
         id,
-    }
+    };
+    (with_residual(lookup, Some(exact)), residual)
 }
 
 fn with_residual(plan: LogicalPlan, residual: Option<Expression>) -> LogicalPlan {

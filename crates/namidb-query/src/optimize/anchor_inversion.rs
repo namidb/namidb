@@ -363,15 +363,11 @@ fn try_invert(
     // An id seek is at most one row per id and proves the target exists, so
     // it always anchors, labelled or not.
     let (anchor, residual) = match extract_node_id_conjunct(predicate, target_alias, None) {
-        Some(seek) => (
-            id_seek(
-                target_labels.first().cloned(),
-                target_alias,
-                seek.value,
-                seek.many,
-                LogicalPlan::Empty,
-            ),
-            seek.residual,
+        Some(seek) => id_seek(
+            target_labels.first().cloned(),
+            target_alias,
+            seek,
+            LogicalPlan::Empty,
         ),
         None => property_anchor(
             predicate,
@@ -525,8 +521,13 @@ mod tests {
             ..
         } = plan
         {
+            // An id seek keeps its exact `id(c) = key` check on top.
+            let anchor = match input.as_ref() {
+                LogicalPlan::Filter { input, .. } => input.as_ref(),
+                other => other,
+            };
             if matches!(
-                input.as_ref(),
+                anchor,
                 LogicalPlan::NodeByPropertyValue { .. } | LogicalPlan::NodeById { .. }
             ) {
                 return Some((

@@ -27,8 +27,16 @@ crates.io release will establish and document that API explicitly.
   An id seek now behaves exactly like the filter it replaces: a null, a
   non-string or a malformed id matches no node instead of failing the
   query, and only the lowercase id string that `id()` returns matches. An
-  upper-case or braced UUID used to find the node through `id(n) = $x`
-  while the same value found nothing in any other spelling of the query.
+  upper-case or braced UUID, or a node passed where its id was meant
+  (`WHERE id(b) = m`), used to find the node through `id(n) = $x` while the
+  same value found nothing in any other spelling of the query. One
+  difference remains: `id(n) IN $ids` with a value that is not a list
+  fails with an UNWIND error, as Neo4j also rejects it, where the scan
+  returned no rows.
+
+  `MATCH (n:L {_id: $x})` still accepts any UUID spelling and a node, like
+  `CREATE (n:L {_id: $x})` does, but a null or malformed `_id` now matches
+  nothing instead of failing the query.
 
 - **`RETURN id(t)` decoded every expanded neighbour.** A target used only
   through `count(t)` or `count(id(t))` already skipped loading its row, but
