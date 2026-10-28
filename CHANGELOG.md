@@ -44,6 +44,14 @@ crates.io release will establish and document that API explicitly.
   `id(d) IN ...`, with or without a label on the target. Still single hop
   only: a longer chain pinned at its far end keeps its written order.
 
+- **A labelled hop decoded every neighbour to check its label.** When the
+  query read a property of the target (`-[:R]->(t:Device) RETURN t.name`),
+  each distinct neighbour was loaded first and the label was tested after,
+  so a hub with 1.7M neighbours decoded 1.7M rows even if a handful were
+  devices. A single hop now proves the label from the label index and
+  loads only the nodes that carry it. Variable-length hops still visit
+  every neighbour, since the label only decides which ones are results.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed
