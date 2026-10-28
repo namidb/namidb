@@ -2760,7 +2760,7 @@ async fn run_create_vector_index(
         label: &cvi.label.name,
         property: &cvi.property.name,
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -2898,7 +2898,7 @@ async fn run_create_fulltext_index(
         label: &cfi.label.name,
         properties: &props,
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3021,7 +3021,7 @@ async fn run_drop_vector_index(
     let op = authz::SchemaOp::DropVectorIndex {
         name: &dvi.name.name,
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3146,7 +3146,7 @@ async fn run_drop_fulltext_index(
     let op = authz::SchemaOp::DropFulltextIndex {
         name: &dfi.name.name,
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3318,7 +3318,7 @@ async fn run_create_property_ddl(
             property: &properties[0],
         }
     };
-    if let Err(denied) = authz.check_schema(principal, op).await {
+    if let Err(denied) = authz.check_schema(principal, namespace, op).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -3747,7 +3747,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
     // Pre-execution authorization hook (RFC-015 Wave B): a policy may deny the
     // request based on the principal + plan, before the writer lock or any
     // execution. NoOp by default (allow-all), so this is behavior-preserving.
-    if let Err(denied) = state.authz.check(principal, &plan).await {
+    if let Err(denied) = state.authz.check(principal, &state.namespace, &plan).await {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -5020,7 +5020,11 @@ async fn run_cypher_multi(
     };
 
     // Pre-execution authorization hook (RFC-015 Wave B); NoOp by default.
-    if let Err(denied) = shared.authz.check(principal, &plan).await {
+    if let Err(denied) = shared
+        .authz
+        .check(principal, &ns_state.namespace, &plan)
+        .await
+    {
         return ObservedQuery {
             kind: None,
             ok: false,
@@ -6644,6 +6648,7 @@ mod tests {
         async fn check(
             &self,
             _p: &Principal,
+            _namespace: &str,
             _plan: &namidb_query::LogicalPlan,
         ) -> Result<(), crate::authz::Denied> {
             Err(crate::authz::Denied::new("denied by test policy"))
@@ -7194,6 +7199,7 @@ mod tests {
         async fn check(
             &self,
             _p: &Principal,
+            _namespace: &str,
             _plan: &namidb_query::LogicalPlan,
         ) -> Result<(), crate::authz::Denied> {
             Ok(())
@@ -7201,6 +7207,7 @@ mod tests {
         async fn check_schema(
             &self,
             _p: &Principal,
+            _namespace: &str,
             _op: crate::authz::SchemaOp<'_>,
         ) -> Result<(), crate::authz::Denied> {
             Err(crate::authz::Denied::new("schema changes denied by policy"))
@@ -8111,7 +8118,11 @@ mod tests {
                 &format!("CREATE (:Person {{name: '{name}'}}) RETURN 1"),
             )
             .await;
-            assert_ne!(resp.status(), StatusCode::OK, "a yielded writer must not commit");
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "a yielded writer must not commit"
+            );
         }
         assert_eq!(
             ms.load_current().await.unwrap().manifest.epoch,

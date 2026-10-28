@@ -382,8 +382,15 @@ mod tests {
 
         let health = WriterHealth::with_fence_policy(FencePolicy::Yield);
         recover_writer_if_needed(&mut a, &cell, &health, "fence-yield", &fenced).await;
-        assert!(health.is_degraded(), "a yielded writer must report degraded");
-        assert_eq!(current_epoch().await, peer, "yield must not reclaim the epoch");
+        assert!(
+            health.is_degraded(),
+            "a yielded writer must report degraded"
+        );
+        assert_eq!(
+            current_epoch().await,
+            peer,
+            "yield must not reclaim the epoch"
+        );
 
         let health = WriterHealth::new();
         recover_writer_if_needed(&mut a, &cell, &health, "fence-yield", &fenced).await;

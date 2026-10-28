@@ -27,6 +27,15 @@ crates.io release will establish and document that API explicitly.
   goes 503 and the orchestrator stops routing writes there. A poisoned
   session or a plain CAS loss still reopens under both policies.
 
+### Fixed
+
+- **The external policy endpoint now receives the namespace.** The PDP
+  request was documented with an `input.namespace` field, but nothing ever
+  set it, so an OPA policy could not tell tenants apart. Queries and schema
+  commands now carry the namespace they run against, over HTTP and Bolt.
+  `AuthzHook::check` and `check_schema` take the namespace as a new
+  argument.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

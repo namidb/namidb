@@ -143,7 +143,12 @@ impl ServerBackend {
     /// to allow. Mirrors the HTTP `authz.check` call so the Bolt path is NOT a
     /// policy bypass (NoOp default ⇒ always allows).
     async fn authz_denied(&self, plan: &namidb_query::LogicalPlan) -> Option<BackendError> {
-        match self.state.authz.check(&self.principal(), plan).await {
+        match self
+            .state
+            .authz
+            .check(&self.principal(), &self.state.namespace, plan)
+            .await
+        {
             Ok(()) => None,
             Err(denied) => Some(BackendError::Forbidden(denied.to_string())),
         }
@@ -180,7 +185,12 @@ impl ServerBackend {
             label: &cvi.label.name,
             property: &cvi.property.name,
         };
-        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+        if let Err(denied) = self
+            .state
+            .authz
+            .check_schema(&self.principal(), &self.state.namespace, op)
+            .await
+        {
             return RunObservation {
                 kind: None,
                 elapsed: started.elapsed(),
@@ -268,7 +278,12 @@ impl ServerBackend {
             label: &cfi.label.name,
             properties: &props,
         };
-        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+        if let Err(denied) = self
+            .state
+            .authz
+            .check_schema(&self.principal(), &self.state.namespace, op)
+            .await
+        {
             return RunObservation {
                 kind: None,
                 elapsed: started.elapsed(),
@@ -341,7 +356,12 @@ impl ServerBackend {
         let op = crate::authz::SchemaOp::DropVectorIndex {
             name: &dvi.name.name,
         };
-        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+        if let Err(denied) = self
+            .state
+            .authz
+            .check_schema(&self.principal(), &self.state.namespace, op)
+            .await
+        {
             return RunObservation {
                 kind: None,
                 elapsed: started.elapsed(),
@@ -427,7 +447,12 @@ impl ServerBackend {
         let op = crate::authz::SchemaOp::DropFulltextIndex {
             name: &dfi.name.name,
         };
-        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+        if let Err(denied) = self
+            .state
+            .authz
+            .check_schema(&self.principal(), &self.state.namespace, op)
+            .await
+        {
             return RunObservation {
                 kind: None,
                 elapsed: started.elapsed(),
@@ -518,7 +543,12 @@ impl ServerBackend {
                 property: &properties[0],
             }
         };
-        if let Err(denied) = self.state.authz.check_schema(&self.principal(), op).await {
+        if let Err(denied) = self
+            .state
+            .authz
+            .check_schema(&self.principal(), &self.state.namespace, op)
+            .await
+        {
             return RunObservation {
                 kind: None,
                 elapsed: started.elapsed(),
@@ -2502,6 +2532,7 @@ mod tests {
         async fn check(
             &self,
             _p: &Principal,
+            _namespace: &str,
             _plan: &namidb_query::LogicalPlan,
         ) -> Result<(), crate::authz::Denied> {
             Err(crate::authz::Denied::new("denied by test policy"))
