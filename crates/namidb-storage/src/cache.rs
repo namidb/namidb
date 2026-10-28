@@ -1147,6 +1147,9 @@ struct CacheStats {
     label_membership_pages: AtomicU64,
     label_membership_entries_examined: AtomicU64,
     label_membership_bytes: AtomicU64,
+    /// Ids a membership proof over overlapping SSTs could not settle from
+    /// the postings and sent to the point reader.
+    label_membership_point_reads: AtomicU64,
     /// Range-readable exact-edge sidecar work. One probe may contain a whole
     /// UNWIND batch and visit each distinct B+tree page once.
     edge_point_probes: AtomicU64,
@@ -2467,6 +2470,18 @@ impl SstCache {
 
     pub fn label_membership_bytes(&self) -> u64 {
         self.stats.label_membership_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_label_membership_point_reads(&self, ids: usize) {
+        self.stats
+            .label_membership_point_reads
+            .fetch_add(ids as u64, Ordering::Relaxed);
+    }
+
+    pub fn label_membership_point_reads(&self) -> u64 {
+        self.stats
+            .label_membership_point_reads
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_edge_point_probe(&self, stats: crate::sst::paged_index::PagedProbeStats) {

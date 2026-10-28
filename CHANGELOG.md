@@ -264,9 +264,14 @@ crates.io release will establish and document that API explicitly.
   so a hub with 1.7M neighbours decoded 1.7M rows even if a handful were
   devices. A single hop now proves the label from the label index and
   loads only the nodes that carry it, and skips the others without a read
-  even when the hop is too wide to keep its neighbours in memory.
-  Variable-length hops still visit every neighbour, since the label only
-  decides which ones are results.
+  even when the hop is too wide to keep its neighbours in memory. This also
+  holds when node SSTs overlap, as they do once a store has more than one
+  level: each neighbour is checked against the label index of the newest
+  SST that can hold it, and only the ones the index cannot settle (a
+  version deleted in a newer SST, unflushed writes) are read whole. If the
+  overlapping SSTs also share a range of LSNs, every neighbour is read as
+  before. Variable-length hops still visit every neighbour, since the label
+  only decides which ones are results.
 
 - **`id(n)`, `labels(n)` and `count(n)` decoded every property of `n`.** The
   planner treated any use of a node variable inside a function or an
