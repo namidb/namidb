@@ -425,6 +425,8 @@ def test_compact_then_sweep_reclaims_wal_and_l0(tmp_path) -> None:
     assert _file_count(wal) > 0
 
     report = client.sweep(min_age_secs=0)
+    assert report["aborted_by_pin"] is False
+    assert report["pins_honoured"] == 0
     assert report["wal_segments_reclaimed"] > 0
     assert report["orphans_deleted"] > 0
     assert _file_count(wal) == 0

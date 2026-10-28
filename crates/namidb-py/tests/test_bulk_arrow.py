@@ -103,6 +103,20 @@ def test_merge_nodes_reupsert_same_unique_value_ok(client: tg.Client) -> None:
         client.merge_nodes("Person", [{"_id": str(uuid.uuid4()), "email": "a@x.io"}])
 
 
+def test_put_nodes_repeated_id_moves_unique_value(client: tg.Client) -> None:
+    # put is last-write-wins per id, so only each id's final value counts:
+    # x moves from "a" to "b" and y takes "a" in the same batch.
+    client.cypher("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE")
+    x, y = str(uuid.uuid4()), str(uuid.uuid4())
+    rows = [{"_id": x, "email": "a"}, {"_id": x, "email": "b"}, {"_id": y, "email": "a"}]
+    assert client.put_nodes("Person", rows) == 3
+    client.commit()
+    assert client.lookup_node("Person", x)["properties"] == {"email": "b"}
+    assert client.lookup_node("Person", y)["properties"] == {"email": "a"}
+    with pytest.raises(ValueError, match="unique"):
+        client.put_nodes("Person", [{"_id": str(uuid.uuid4()), "email": "b"}])
+
+
 def test_upsert_node_reupsert_same_unique_value_ok(client: tg.Client) -> None:
     client.cypher("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE")
     node_id = str(uuid.uuid4())
@@ -318,6 +332,17 @@ def test_scan_label_arrow_legacy_id_key(client: tg.Client) -> None:
     table = client.scan_label_arrow("Person")
     assert table.column_names == ["id", "label", "labels", "lsn", "schema_version", "name"]
     assert sorted(table["id"].to_pylist()) == sorted(ids)
+
+
+def test_scan_label_arrow_legacy_id_key_any_spelling(client: tg.Client) -> None:
+    # An upper-case UUID is the same node id, so the columns do not depend
+    # on how a batch spelled it.
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"id": node_id.upper(), "name": "Alice"}])
+    client.commit()
+    table = client.scan_label_arrow("Person")
+    assert table.column_names == ["id", "label", "labels", "lsn", "schema_version", "name"]
+    assert table["id"].to_pylist() == [node_id]
 
 
 def test_scan_label_arrow_business_id_is_renamed(client: tg.Client) -> None:
