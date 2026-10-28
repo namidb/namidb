@@ -276,7 +276,7 @@ Namespaces are lazy: the registry opens a `WriterSession` on first access and
 there is no explicit DDL (`registry.rs`). The first authorized request
 above is enough to materialize `acme`. If you want to pre-create it out of band,
 issue one write through the CLI against the same store (this opens and commits a
-`WriterSession` for that namespace — `crates/namidb-cli/src/main.rs`):
+`WriterSession` for that namespace, see `crates/namidb-cli/src/main.rs`):
 
 ```bash
 namidb run --store "s3://my-bucket?ns=acme&region=us-east-1" \
@@ -315,7 +315,7 @@ What the validator parses (`crates/namidb-server/src/jwt.rs`):
   (`jwt.rs`).
 - **`exp`** with 30s leeway (`jwt.rs`); optional `iss` / `aud` enforced only
   when configured (`jwt.rs`).
-- **`sub`** → `Principal.subject` (`jwt.rs`).
+- **`sub`** becomes `Principal.subject` (`jwt.rs`).
 - **groups claim** (`--jwt-groups-claim`, default `groups`) → role:
   `--jwt-write-group` wins over `--jwt-read-group` (`jwt.rs`).
 - **namespaces claim** (`--jwt-namespaces-claim`): the scoping check at
@@ -384,8 +384,19 @@ default, `steal`, makes a fenced server reopen and claim the namespace back,
 which is right for a single box. When a control plane moves namespaces
 between nodes, run every node with `yield` (`NAMIDB_FENCE_POLICY=yield`): the
 new owner claims the epoch and the old one stops writing and reports its
-writer degraded, so readiness goes 503. Nothing reclaims a yielded namespace
-by itself; the control plane restarts or reassigns it.
+writer degraded, so readiness goes 503. The yielded writer stays down until
+the control plane restarts or reassigns it.
+
+Yield only covers a writer that is already open. In `--multi-tenant` mode any
+request for a namespace that is not open on a node opens it there, and that
+open claims the epoch and fences the real owner, whatever policy either node
+runs. Health checks count: `/<namespace>/v0/health` opens the namespace it
+asks about, and the unprefixed `/v0/health` opens the header or default
+namespace. So the routing layer must never send a namespace's requests,
+probes included, to a node that does not own it. Use `/v0/livez` for node
+liveness, since it opens nothing. A yielded namespace that gets evicted under
+capacity pressure is no longer open either, so the next stray request for it
+would steal it the same way.
 
 **Turn on group commit.** `--group-commit-window` defaults to `0s`, which
 commits every write on its own. Many clients writing the same namespace queue
