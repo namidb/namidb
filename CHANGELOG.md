@@ -259,8 +259,11 @@ crates.io release will establish and document that API explicitly.
   at once. The planner already re-anchored a pattern at a target pinned by
   an indexed property; it now does the same for `id(d) = ...` and
   `id(d) IN ...`, with or without a label on the target, unless a literal
-  id list is longer than the label it would replace scanning. Still single
-  hop only: a longer chain pinned at its far end keeps its written order.
+  id list is longer than the label it would replace scanning. A longer chain
+  pinned on its second node is re-anchored there too, so
+  `MATCH (i)-[:R]->(d)-[:S]->(p) WHERE id(d) = $id` starts at `d`, also when
+  only `id(...)` or `labels(...)` are returned. A chain pinned further along
+  (`WHERE id(p) = $id` above) still keeps its written order.
 
 - **A labelled hop decoded every neighbour to check its label.** When the
   query read a property of the target (`-[:R]->(t:Device) RETURN t.name`),
