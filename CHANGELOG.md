@@ -15,6 +15,32 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Changed
+
+- **Python `merge_nodes` now merges.** It used to replace the whole node,
+  so a second call carrying only some keys dropped every other property,
+  and a node with labels `A` and `B` merged under `A` lost `B`. Each row is
+  now merged into the stored node: unmentioned keys are kept, a `None`
+  value removes the key, and the label is added to the node's labels. Rows
+  that repeat an id in one call merge in order. The old replace behaviour
+  lives on as the new `put_nodes`, which skips the read and is the faster
+  choice for a first load.
+
+- **Python bulk rows take the node id from `_id`.** That matches `n._id` in
+  Cypher, and leaves `id` free to be an ordinary property. Rows keyed by
+  `id` alone still work, and the `id` value is now also stored as a
+  property, so `n.id` and `WHERE n.id = $id` find the node instead of
+  returning null.
+
+### Fixed
+
+- **Re-upserting a node with its own unique value raised a constraint
+  error.** The low-level Python writes (`upsert_node`,
+  `upsert_node_with_labels`, `merge_nodes`) checked uniqueness as if the
+  node were new, so writing a node again with an unchanged unique property,
+  or listing the same id twice in one batch, conflicted with itself. The
+  node's own row is now excluded from the check.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

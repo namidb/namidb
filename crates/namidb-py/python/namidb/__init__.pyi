@@ -146,12 +146,32 @@ class Client:
         label: str,
         rows: list[dict[str, Any]],
     ) -> int:
-        """Stage many node upserts in one call. Each `row` is a
-        dict with an `"id"` (UUID string) and arbitrary properties.
+        """Stage many node upserts that merge into the stored nodes.
+        Each `row` is a dict with an `"_id"` (UUID string, the internal
+        node id) and arbitrary properties. A row keyed by the legacy
+        `"id"` uses it as the node id and also keeps it as an `id`
+        property.
+
+        Unmentioned keys are kept, a `None` value removes the key, and
+        `label` is added to the node's labels. Each node is read before
+        it is written; use [`Client.put_nodes`] for first loads.
 
         Returns the count of staged rows. Like
         [`Client.upsert_node`], the mutations require a subsequent
         [`Client.commit`] to become durable."""
+
+    def put_nodes(
+        self,
+        label: str,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """Stage many node upserts that replace the stored nodes. Rows
+        take the same shape as [`Client.merge_nodes`], but each row is
+        the node's full property set and `label` its only label. No
+        read happens first.
+
+        Returns the count of staged rows. Requires a subsequent
+        [`Client.commit`]."""
 
     def merge_edges(
         self,

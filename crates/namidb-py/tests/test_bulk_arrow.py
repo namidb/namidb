@@ -33,7 +33,96 @@ def test_merge_nodes_basic(client: tg.Client) -> None:
 def test_merge_nodes_missing_id_raises(client: tg.Client) -> None:
     with pytest.raises(ValueError) as exc_info:
         client.merge_nodes("Person", [{"name": "no id"}])
-    assert "'id'" in str(exc_info.value)
+    assert "'_id'" in str(exc_info.value)
+
+
+def test_merge_nodes_preserves_unmentioned_props(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "a": 1, "b": 2}])
+    client.commit()
+    client.merge_nodes("Person", [{"_id": node_id, "b": 3}])
+    client.commit()
+    assert client.lookup_node("Person", node_id)["properties"] == {"a": 1, "b": 3}
+
+
+def test_merge_nodes_none_removes_key(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "a": 1, "b": 2}])
+    client.merge_nodes("Person", [{"_id": node_id, "b": None}])
+    client.commit()
+    assert client.lookup_node("Person", node_id)["properties"] == {"a": 1}
+
+
+def test_merge_nodes_keeps_extra_labels(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.upsert_node_with_labels(["A", "B"], node_id, {"x": 1})
+    client.commit()
+    client.merge_nodes("A", [{"_id": node_id, "y": 2}])
+    client.commit()
+    node = client.lookup_node("A", node_id)
+    assert node["labels"] == ["A", "B"]
+    assert node["properties"] == {"x": 1, "y": 2}
+
+
+def test_merge_nodes_same_id_twice_in_batch(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    n = client.merge_nodes(
+        "Person",
+        [{"_id": node_id, "a": 1}, {"_id": node_id, "b": 2}, {"_id": node_id, "a": 3}],
+    )
+    assert n == 3
+    client.commit()
+    assert client.lookup_node("Person", node_id)["properties"] == {"a": 3, "b": 2}
+
+
+def test_put_nodes_replaces(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.upsert_node_with_labels(["A", "B"], node_id, {"a": 1, "b": 2})
+    client.commit()
+    assert client.put_nodes("A", [{"_id": node_id, "b": 3}]) == 1
+    client.commit()
+    node = client.lookup_node("A", node_id)
+    assert node["labels"] == ["A"]
+    assert node["properties"] == {"b": 3}
+
+
+def test_merge_nodes_reupsert_same_unique_value_ok(client: tg.Client) -> None:
+    client.cypher("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE")
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "email": "a@x.io"}])
+    client.commit()
+    # The node's own value is not a conflict, for merge, put or a repeat in
+    # one batch.
+    client.merge_nodes("Person", [{"_id": node_id, "email": "a@x.io", "n": 1}])
+    client.put_nodes(
+        "Person",
+        [{"_id": node_id, "email": "a@x.io"}, {"_id": node_id, "email": "a@x.io"}],
+    )
+    client.commit()
+    with pytest.raises(ValueError, match="unique"):
+        client.merge_nodes("Person", [{"_id": str(uuid.uuid4()), "email": "a@x.io"}])
+
+
+def test_merge_nodes_id_visible_as_property(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"id": node_id, "name": "Alice"}])
+    client.commit()
+    row = client.cypher(
+        "MATCH (p:Person) WHERE p.id = $id RETURN p.id AS id, p._id AS iid",
+        params={"id": node_id},
+    ).first()
+    assert row is not None
+    assert row["id"] == node_id
+    assert str(row["iid"]) == node_id
+
+
+def test_merge_nodes_underscore_id_keeps_business_id(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "id": "case-42"}])
+    client.commit()
+    assert client.lookup_node("Person", node_id)["properties"] == {"id": "case-42"}
+    row = client.cypher("MATCH (p:Person) RETURN p.id AS id").first()
+    assert row == {"id": "case-42"}
 
 
 def test_merge_nodes_id_must_be_string(client: tg.Client) -> None:
@@ -54,7 +143,8 @@ def test_merge_nodes_then_lookup(client: tg.Client) -> None:
     client.commit()
     looked_up = client.lookup_node("Person", node_id)
     assert looked_up is not None
-    assert looked_up["properties"] == {"name": "Alice", "age": 30}
+    # A legacy `id` key is the node id and also stays a property.
+    assert looked_up["properties"] == {"id": node_id, "name": "Alice", "age": 30}
 
 
 def test_merge_edges_basic(client: tg.Client) -> None:
@@ -186,9 +276,9 @@ def test_scan_label_arrow_basic(client: tg.Client) -> None:
     client.merge_nodes(
         "Person",
         [
-            {"id": ids[0], "name": "Alice", "age": 30},
-            {"id": ids[1], "name": "Bob"},  # no age
-            {"id": ids[2], "name": "Carol", "age": 42, "city": "NYC"},
+            {"_id": ids[0], "name": "Alice", "age": 30},
+            {"_id": ids[1], "name": "Bob"},  # no age
+            {"_id": ids[2], "name": "Carol", "age": 42, "city": "NYC"},
         ],
     )
     client.commit()

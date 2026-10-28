@@ -102,9 +102,14 @@ impl Client {
         self.runtime.block_on(async {
             let mut session = self.session.lock().await;
             let labels = [label.to_string()];
-            namidb_query::enforce_node_unique_constraints(&session, &labels, &record.properties)
-                .await
-                .map_err(PyValueError::new_err)?;
+            namidb_query::enforce_node_unique_constraints(
+                &session,
+                &labels,
+                &record.properties,
+                Some(id),
+            )
+            .await
+            .map_err(PyValueError::new_err)?;
             session
                 .upsert_node(label, id, &record)
                 .map_err(map_storage_err)
@@ -130,9 +135,14 @@ impl Client {
         };
         self.runtime.block_on(async {
             let mut session = self.session.lock().await;
-            namidb_query::enforce_node_unique_constraints(&session, &labels, &record.properties)
-                .await
-                .map_err(PyValueError::new_err)?;
+            namidb_query::enforce_node_unique_constraints(
+                &session,
+                &labels,
+                &record.properties,
+                Some(id),
+            )
+            .await
+            .map_err(PyValueError::new_err)?;
             session
                 .upsert_node_with_labels(labels, id, &record)
                 .map_err(map_storage_err)
@@ -347,88 +357,26 @@ impl Client {
         Ok(list.into())
     }
 
-    /// Stage a batch of node upserts under a single tokio runtime + lock
-    /// hop. Each `row` is a `dict[str, Any]` that must contain a string
-    /// `"id"` (UUID); all other keys become node properties.
+    /// Stage a batch of node upserts that merge into the stored nodes. Each
+    /// `row` is a `dict[str, Any]` keyed by `"_id"` (UUID string), or by the
+    /// legacy `"id"`, which is then also kept as an `id` property. Every other
+    /// key is merged into the node's current properties: unmentioned keys are
+    /// kept, a `None` value removes the key, and `label` is added to the
+    /// node's labels. Rows repeating an id in one batch merge in order.
     ///
-    /// Returns the count of staged rows. Like [`Client::upsert_node`],
-    /// the mutations are durable only after a subsequent
-    /// [`Client::commit`].
+    /// This reads each node before writing it; use [`Client::put_nodes`] for
+    /// first loads. Returns the count of staged rows. Like
+    /// [`Client::upsert_node`], the mutations are durable only after a
+    /// subsequent [`Client::commit`].
     fn merge_nodes(&self, label: &str, rows: &Bound<'_, PyList>) -> PyResult<usize> {
-        let mut parsed: Vec<(NodeId, BTreeMap<String, Value>)> = Vec::with_capacity(rows.len());
-        for (idx, row_obj) in rows.iter().enumerate() {
-            let row = row_obj
-                .downcast::<PyDict>()
-                .map_err(|_| PyValueError::new_err(format!("row #{idx} is not a dict")))?;
-            let id_obj = row.get_item("id")?.ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "row #{idx} is missing the required 'id' key (UUID string)"
-                ))
-            })?;
-            let id_str: String = id_obj
-                .extract()
-                .map_err(|_| PyValueError::new_err(format!("row #{idx} 'id' is not a string")))?;
-            let id = parse_node_id(&id_str)?;
-            let mut props = BTreeMap::new();
-            for (k, v) in row.iter() {
-                let key: String = k.extract()?;
-                if key == "id" {
-                    continue;
-                }
-                props.insert(key, py_any_to_value(&v)?);
-            }
-            parsed.push((id, props));
-        }
-        let label = label.to_string();
-        let session = self.session.clone();
-        let count = self.runtime.block_on(async move {
-            let mut guard = session.lock().await;
-            // Unique property names declared for this label (empty if none).
-            let unique_props: Vec<String> = guard
-                .schema()
-                .label(&label)
-                .map(|d| {
-                    d.properties
-                        .iter()
-                        .filter(|p| p.unique)
-                        .map(|p| p.name.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let labels = [label.clone()];
-            let mut seen: std::collections::HashMap<(String, String), NodeId> =
-                std::collections::HashMap::new();
-            for (id, props) in &parsed {
-                let record = NodeWriteRecord {
-                    properties: props.clone(),
-                    schema_version: 0,
-                    ..Default::default()
-                };
-                // Committed + already-staged duplicates, via the RYOW overlay.
-                namidb_query::enforce_node_unique_constraints(&guard, &labels, &record.properties)
-                    .await
-                    .map_err(PyValueError::new_err)?;
-                // Two rows in THIS batch carrying the same unique value.
-                for uprop in &unique_props {
-                    if let Some(v) = props.get(uprop) {
-                        let key = (uprop.clone(), format!("{v:?}"));
-                        if let Some(prev) = seen.insert(key, *id) {
-                            if prev != *id {
-                                return Err(PyValueError::new_err(format!(
-                                    "{label}.{uprop} = {v:?} appears on two ids in the same \
-                                     merge_nodes batch (unique constraint)"
-                                )));
-                            }
-                        }
-                    }
-                }
-                guard
-                    .upsert_node(&label, *id, &record)
-                    .map_err(map_storage_err)?;
-            }
-            Ok::<_, PyErr>(parsed.len())
-        })?;
-        Ok(count)
+        self.stage_nodes(label, rows, true)
+    }
+
+    /// Stage a batch of node upserts that replace the stored nodes (no read).
+    /// Rows take the same shape as [`Client::merge_nodes`], but each row is
+    /// the node's full property set and `label` its only label.
+    fn put_nodes(&self, label: &str, rows: &Bound<'_, PyList>) -> PyResult<usize> {
+        self.stage_nodes(label, rows, false)
     }
 
     /// Stage a batch of edge upserts. Each row needs `"src"` and `"dst"`
@@ -653,6 +601,138 @@ impl Client {
     /// debugging.
     fn store_repr(&self) -> String {
         format!("{:?}", self.store)
+    }
+}
+
+impl Client {
+    /// Shared body of [`Client::merge_nodes`] (`merge = true`) and
+    /// [`Client::put_nodes`].
+    fn stage_nodes(&self, label: &str, rows: &Bound<'_, PyList>, merge: bool) -> PyResult<usize> {
+        let mut parsed: Vec<(NodeId, BTreeMap<String, Value>)> = Vec::with_capacity(rows.len());
+        for (idx, row_obj) in rows.iter().enumerate() {
+            let row = row_obj
+                .downcast::<PyDict>()
+                .map_err(|_| PyValueError::new_err(format!("row #{idx} is not a dict")))?;
+            // `_id` is the internal node id, as in Cypher. A legacy row keyed by
+            // `id` still works, and its `id` stays a property so `n.id` reads it.
+            let (id_key, id_obj) = match row.get_item("_id")? {
+                Some(v) => ("_id", v),
+                None => (
+                    "id",
+                    row.get_item("id")?.ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "row #{idx} is missing the required '_id' key (UUID string)"
+                        ))
+                    })?,
+                ),
+            };
+            let id_str: String = id_obj.extract().map_err(|_| {
+                PyValueError::new_err(format!("row #{idx} '{id_key}' is not a string"))
+            })?;
+            let id = parse_node_id(&id_str)?;
+            let mut props = BTreeMap::new();
+            for (k, v) in row.iter() {
+                let key: String = k.extract()?;
+                if key == "_id" {
+                    continue;
+                }
+                props.insert(key, py_any_to_value(&v)?);
+            }
+            parsed.push((id, props));
+        }
+        let count = parsed.len();
+        let label = label.to_string();
+        let session = self.session.clone();
+        self.runtime.block_on(async move {
+            let mut guard = session.lock().await;
+            // Unique property names declared for this label (empty if none).
+            let unique_props: Vec<String> = guard
+                .schema()
+                .label(&label)
+                .map(|d| {
+                    d.properties
+                        .iter()
+                        .filter(|p| p.unique)
+                        .map(|p| p.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut nodes: Vec<(NodeId, Vec<String>, BTreeMap<String, Value>)> =
+                Vec::with_capacity(count);
+            if merge {
+                // Read-modify-write against the RYOW overlay, so nodes staged
+                // by earlier calls count too. Rows repeating an id fold into
+                // one node here instead of re-reading the overlay per row.
+                let snap = guard.overlay_snapshot();
+                let mut slot: std::collections::HashMap<NodeId, usize> =
+                    std::collections::HashMap::new();
+                for (id, props) in parsed {
+                    let i = match slot.get(&id) {
+                        Some(&i) => i,
+                        None => {
+                            let (labels, base) =
+                                match snap.lookup_node_by_id(id).await.map_err(map_storage_err)? {
+                                    Some(n) => (n.labels.into_iter().collect(), n.properties),
+                                    None => (Vec::new(), BTreeMap::new()),
+                                };
+                            slot.insert(id, nodes.len());
+                            nodes.push((id, labels, base));
+                            nodes.len() - 1
+                        }
+                    };
+                    let (_, labels, current) = &mut nodes[i];
+                    if !labels.contains(&label) {
+                        labels.push(label.clone());
+                    }
+                    for (k, v) in props {
+                        if matches!(v, Value::Null) {
+                            current.remove(&k);
+                        } else {
+                            current.insert(k, v);
+                        }
+                    }
+                }
+            } else {
+                nodes.extend(
+                    parsed
+                        .into_iter()
+                        .map(|(id, props)| (id, vec![label.clone()], props)),
+                );
+            }
+            let mut seen: std::collections::HashMap<(String, String), NodeId> =
+                std::collections::HashMap::new();
+            for (id, labels, props) in nodes {
+                // Committed + already-staged duplicates, via the RYOW overlay.
+                // The node's own row is excluded: this write replaces it.
+                namidb_query::enforce_node_unique_constraints(&guard, &labels, &props, Some(id))
+                    .await
+                    .map_err(PyValueError::new_err)?;
+                // Two rows in THIS batch carrying the same unique value.
+                for uprop in &unique_props {
+                    if let Some(v) = props.get(uprop) {
+                        let key = (uprop.clone(), format!("{v:?}"));
+                        if let Some(prev) = seen.insert(key, id) {
+                            if prev != id {
+                                return Err(PyValueError::new_err(format!(
+                                    "{label}.{uprop} = {v:?} appears on two ids in the same \
+                                     batch (unique constraint)"
+                                )));
+                            }
+                        }
+                    }
+                }
+                let record = NodeWriteRecord {
+                    properties: props,
+                    schema_version: 0,
+                    ..Default::default()
+                };
+                guard
+                    .upsert_node_with_labels(labels, id, &record)
+                    .map_err(map_storage_err)?;
+            }
+            Ok::<_, PyErr>(())
+        })?;
+        Ok(count)
     }
 }
 

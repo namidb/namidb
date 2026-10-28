@@ -193,10 +193,10 @@ mapping:
 
 ## Bulk inserts
 
-`Client.merge_nodes` and `Client.merge_edges` batch a lot of writes
-behind a single tokio-runtime plus mutex round-trip. They're the right
-ingestion path once you have thousands of rows, since Cypher `CREATE`
-parses, plans and executes once per call:
+`Client.put_nodes`, `Client.merge_nodes` and `Client.merge_edges` batch
+a lot of writes behind a single tokio-runtime plus mutex round-trip.
+They're the right ingestion path once you have thousands of rows, since
+Cypher `CREATE` parses, plans and executes once per call:
 
 ```python
 import uuid
@@ -204,10 +204,10 @@ import namidb
 
 client = namidb.Client("memory://acme")
 
-# Bulk insert: each row needs an "id" UUID string + arbitrary properties.
-client.merge_nodes(
+# First load: each row needs an "_id" UUID string + arbitrary properties.
+client.put_nodes(
     "Person",
-    [{"id": str(uuid.uuid4()), "name": f"p{i}", "age": 20 + i} for i in range(10_000)],
+    [{"_id": str(uuid.uuid4()), "name": f"p{i}", "age": 20 + i} for i in range(10_000)],
 )
 # Edges: each row needs "src" + "dst" UUIDs.
 client.merge_edges(
@@ -221,8 +221,21 @@ client.commit()        # WAL + manifest CAS
 client.flush()         # memtable -> L0 SSTs
 ```
 
-`merge_nodes` / `merge_edges` stage into the current batch (same
-lifecycle as `upsert_*`), so call `client.commit()` to make the
+`put_nodes` replaces each node: the row is its full property set and
+`label` its only label. Nothing is read first, so it is the fast path for
+first loads. `merge_nodes` reads each node and merges the row into it:
+keys the row doesn't mention are kept, a `None` value removes the key,
+and `label` is added to the node's existing labels. Rows repeating an id
+in one call merge in order.
+
+`_id` is the internal node id, the same thing `n._id` returns in Cypher.
+It is not stored as a property, so a business key called `id` can sit
+next to it. Rows keyed by `id` alone (the older form) still work: `id`
+becomes the node id and is also kept as an `id` property, so
+`WHERE n.id = $id` finds the node.
+
+`put_nodes` / `merge_nodes` / `merge_edges` stage into the current batch
+(same lifecycle as `upsert_*`), so call `client.commit()` to make the
 mutations durable.
 
 ## Arrow / pandas / polars output
