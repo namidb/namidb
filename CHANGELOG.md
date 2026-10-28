@@ -40,6 +40,20 @@ crates.io release will establish and document that API explicitly.
   full page of candidates first. Scans and counts without a LIMIT take this
   route when the label is at most a quarter of the stored node rows.
 
+### Changed
+
+- **Label scans over overlapping node SSTs no longer load whole SST files.**
+  A denser label, or a projected scan that is better served by property
+  pages, now runs in two passes. The first reads only the id, tombstone,
+  lsn and label columns of each SST and settles which version of each id
+  wins. The second reads properties for the winning rows of the label only:
+  from property pages for a projected scan, or from Parquet with a row
+  selection that skips every other page. `RETURN id(n)` style scans stop
+  after the first pass. Any mismatch between the passes falls back to the
+  full reconciliation. This also covers the BM25 and hybrid search label
+  walks. `SstCache::label_selected_node_rows()` reports how many rows
+  the second pass read.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

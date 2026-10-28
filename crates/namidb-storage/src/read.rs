@@ -95,7 +95,7 @@ use crate::sst::edges::paged_reader::PagedEdgeReader;
 use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::EdgeDirection;
 use crate::sst::nodes::property_pages::{
-    NodePropertyPageConfig, NodePropertyPageReader, PropertyCell,
+    NodePropertyPageConfig, NodePropertyPageReader, NodePropertyProjection, PropertyCell,
     NODE_PROPERTY_PAGES_FORMAT_VERSION,
 };
 use crate::sst::nodes::{
@@ -6687,6 +6687,288 @@ impl<'mt> Snapshot<'mt> {
         Ok(Some(rows))
     }
 
+    /// Label scan over overlapping node SSTs in two passes, so that no row
+    /// outside `label` and no superseded version is ever decoded.
+    ///
+    /// Phase 1 streams only the structural columns (id, tombstone, lsn,
+    /// schema version, labels) of every node SST and reconciles last-writer-
+    /// wins over them, remembering where each winning label row lives. Every
+    /// row group is read, so a running counter is the physical ordinal. Phase
+    /// 2 reads properties for those rows only: from property pages when the
+    /// scan is projected, otherwise from Parquet through a row selection that
+    /// never decompresses unselected pages. An id-only projection stops after
+    /// phase 1.
+    ///
+    /// `None` keeps the caller's reconciliation loop: the full-body
+    /// diagnostic mode, or an SST whose rows disagree with the manifest.
+    async fn try_scan_label_two_phase(
+        &self,
+        label: &str,
+        predicates: &[ScanPredicate],
+        decode_projection: Option<&[String]>,
+        requested_projection: Option<&BTreeSet<&str>>,
+    ) -> Result<Option<Vec<NodeView>>> {
+        if matches!(self.ranged_mode, RangedMode::Force(false)) {
+            return Ok(None);
+        }
+        let dict = &self.manifest.manifest.label_dict;
+        let label_id = dict.id(label);
+
+        // id -> (winning lsn, the winner's structural view and physical row
+        // when it carries `label`). Anything else is only a shadow.
+        let mut latest: BTreeMap<NodeId, (u64, Option<Box<LabelScanRow>>)> = BTreeMap::new();
+        for (key, entry) in self.node_entries() {
+            let MemKey::Node { id } = key else {
+                continue;
+            };
+            let row = match &entry.op {
+                MemOp::Tombstone => None,
+                MemOp::Upsert(payload) => {
+                    Some(node_view_from_payload(*id, entry.lsn, payload, dict, "")?)
+                        .filter(|view| view.labels.contains(label))
+                        .map(|view| {
+                            Box::new(LabelScanRow {
+                                view,
+                                sst_row: None,
+                            })
+                        })
+                }
+            };
+            update_node_winner(&mut latest, *id, entry.lsn, row);
+        }
+
+        for idx in self.manifest.index.node_descriptors() {
+            let desc = &self.manifest.manifest.ssts[idx];
+            let sst_label_def = self.label_def_for_node_sst(desc);
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+            let mut next_ordinal = 0_u64;
+            let mut collect = |batch: RecordBatch| -> Result<()> {
+                crate::cancel::check()?;
+                let id_col = batch
+                    .column_by_name(COL_NODE_ID)
+                    .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                    .ok_or_else(|| Error::invariant("node_id column missing"))?;
+                let tomb_col = batch
+                    .column_by_name(COL_TOMBSTONE)
+                    .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+                    .ok_or_else(|| Error::invariant("tombstone column missing"))?;
+                let lsn_col = batch
+                    .column_by_name(COL_LSN)
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or_else(|| Error::invariant("lsn column missing"))?;
+                let sv_col = batch
+                    .column_by_name(SCHEMA_VERSION)
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
+                for row in 0..batch.num_rows() {
+                    let id_bytes: [u8; 16] = id_col
+                        .value(row)
+                        .try_into()
+                        .map_err(|_| Error::invariant("node_id row length != 16"))?;
+                    let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
+                    let lsn = lsn_col.value(row);
+                    let carries = !tomb_col.value(row)
+                        && row_carries_label(&batch, row, label, label_id, dict, &desc.scope);
+                    let row_view = carries.then(|| {
+                        Box::new(LabelScanRow {
+                            view: NodeView {
+                                id,
+                                labels: decode_node_labels(&batch, row, dict, &desc.scope),
+                                properties: BTreeMap::new(),
+                                lsn,
+                                schema_version: sv_col.value(row),
+                            },
+                            sst_row: Some((idx, next_ordinal + row as u64)),
+                        })
+                    });
+                    update_node_winner(&mut latest, id, lsn, row_view);
+                }
+                next_ordinal += batch.num_rows() as u64;
+                Ok(())
+            };
+            if let Some(body) = self.cache_get(&absolute) {
+                let reader = NodeSstReader::open(sst_label_def, body)?;
+                for batch in reader.scan_iter_with_predicates_and_projection(&[], Some(&[]))? {
+                    collect(batch.map_err(|error| {
+                        Error::invariant(format!("structural label scan read: {error}"))
+                    })?)?;
+                }
+            } else {
+                let metadata = self.node_sst_metadata(desc, &absolute).await?;
+                let (mut stream, _) = node_scan_limited_async(
+                    self.store.clone(),
+                    Path::from(absolute),
+                    desc.size_bytes,
+                    &sst_label_def,
+                    &[],
+                    Some(&[]),
+                    Some(metadata),
+                )
+                .await?;
+                while let Some(batches) = stream.next_row_group().await? {
+                    for batch in batches {
+                        collect(batch.map_err(|error| {
+                            Error::invariant(format!("structural label scan read: {error}"))
+                        })?)?;
+                    }
+                }
+            }
+            if next_ordinal != desc.row_count {
+                tracing::warn!(
+                    sst_id = %desc.id,
+                    expected = desc.row_count,
+                    observed = next_ordinal,
+                    "node SST row count disagrees with the manifest; using the full label scan"
+                );
+                return Ok(None);
+            }
+        }
+
+        // Phase 2. Winners come out in id order, which within one SST is also
+        // physical order, so each SST's row list is sorted by ordinal.
+        let mut out = Vec::new();
+        let mut by_sst: BTreeMap<usize, Vec<(usize, u64)>> = BTreeMap::new();
+        for (_, row) in latest.into_values() {
+            let Some(row) = row else {
+                continue;
+            };
+            if let Some((idx, ordinal)) = row.sst_row {
+                by_sst.entry(idx).or_default().push((out.len(), ordinal));
+            }
+            out.push(row.view);
+        }
+        if decode_projection.is_none_or(|columns| !columns.is_empty()) {
+            let mut selected = 0;
+            for (idx, rows) in &by_sst {
+                let desc = &self.manifest.manifest.ssts[*idx];
+                selected += rows.len();
+                if !self
+                    .fill_label_rows_from_property_pages(desc, decode_projection, rows, &mut out)
+                    .await?
+                    && !self
+                        .fill_label_rows_from_parquet(desc, decode_projection, rows, &mut out)
+                        .await?
+                {
+                    return Ok(None);
+                }
+            }
+            if let Some(cache) = &self.cache {
+                cache.record_label_selected_node_rows(selected);
+            }
+        }
+
+        out.retain_mut(|view| {
+            if !node_view_matches_predicates(view, predicates) {
+                return false;
+            }
+            if let Some(requested) = requested_projection {
+                view.properties
+                    .retain(|property, _| requested.contains(property.as_str()));
+            }
+            true
+        });
+        Ok(Some(out))
+    }
+
+    /// Phase 2 of [`Self::try_scan_label_two_phase`] through property pages.
+    /// `false` means the pages cannot answer exactly and Parquet must.
+    async fn fill_label_rows_from_property_pages(
+        &self,
+        desc: &SstDescriptor,
+        projection: Option<&[String]>,
+        rows: &[(usize, u64)],
+        out: &mut [NodeView],
+    ) -> Result<bool> {
+        // Bounded well below NAMIDB_NODE_PROPERTY_MAX_QUERY_ROWS so a dense
+        // label never trips the reader's batch limit.
+        const PROBE_BATCH: usize = 8192;
+        let Some(projection) = projection else {
+            return Ok(false);
+        };
+        let Some(reader) = self.node_property_reader(desc).await? else {
+            return Ok(false);
+        };
+        for chunk in rows.chunks(PROBE_BATCH) {
+            crate::cancel::check()?;
+            let ids = chunk
+                .iter()
+                .map(|(position, _)| *out[*position].id.as_bytes())
+                .collect::<Vec<_>>();
+            let projected = match reader.project_node_ids(projection, &ids).await {
+                Ok((projected, _)) => projected,
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    tracing::warn!(
+                        sst_id = %desc.id,
+                        %error,
+                        "node property page probe failed; using exact Parquet fallback"
+                    );
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            if projected.len() != ids.len() {
+                return Ok(false);
+            }
+            for ((position, ordinal), property_row) in chunk.iter().zip(&projected) {
+                if property_row.node_id != *out[*position].id.as_bytes()
+                    || property_row.ordinal.is_some_and(|found| found != *ordinal)
+                {
+                    tracing::warn!(
+                        sst_id = %desc.id,
+                        "node property row binding mismatch; using exact Parquet fallback"
+                    );
+                    return Ok(false);
+                }
+                out[*position].properties = projected_node_properties(property_row);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Phase 2 of [`Self::try_scan_label_two_phase`] through a Parquet row
+    /// selection of exactly the winning ordinals. `false` means the decoded
+    /// rows do not line up with phase 1.
+    async fn fill_label_rows_from_parquet(
+        &self,
+        desc: &SstDescriptor,
+        projection: Option<&[String]>,
+        rows: &[(usize, u64)],
+        out: &mut [NodeView],
+    ) -> Result<bool> {
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+        let sst_label_def = self.label_def_for_node_sst(desc);
+        let metadata = self.node_sst_metadata(desc, &absolute).await?;
+        let ordinals = rows.iter().map(|(_, ordinal)| *ordinal).collect::<Vec<_>>();
+        let batches = self
+            .decode_node_rows_by_ordinals(desc, &absolute, &sst_label_def, &metadata, &ordinals)
+            .await?;
+        let projection_set: Option<BTreeSet<&str>> =
+            projection.map(|columns| columns.iter().map(String::as_str).collect());
+        let mut rows = rows.iter();
+        for batch in &batches {
+            crate::cancel::check()?;
+            let id_col = batch
+                .column_by_name(COL_NODE_ID)
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                .ok_or_else(|| Error::invariant("node_id column missing"))?;
+            for row in 0..batch.num_rows() {
+                let Some((position, _)) = rows.next() else {
+                    return Ok(false);
+                };
+                if id_col.value(row) != out[*position].id.as_bytes() {
+                    return Ok(false);
+                }
+                out[*position].properties = decode_node_row_properties(
+                    batch,
+                    row,
+                    &sst_label_def,
+                    projection_set.as_ref(),
+                )?;
+            }
+        }
+        Ok(rows.next().is_none())
+    }
+
     async fn scan_nodes_with_optional_label(
         &self,
         label: Option<&str>,
@@ -6724,22 +7006,33 @@ impl<'mt> Snapshot<'mt> {
             projection.map(|columns| columns.iter().map(String::as_str).collect());
 
         if let Some(label) = label {
-            let rows = match self.disjoint_node_descriptors() {
-                Some(descriptors) => {
-                    self.try_scan_disjoint_label_sidecars(
-                        &descriptors,
-                        label,
-                        predicates,
-                        projection,
-                        None,
-                    )
-                    .await?
+            let rows = if let Some(descriptors) = self.disjoint_node_descriptors() {
+                self.try_scan_disjoint_label_sidecars(
+                    &descriptors,
+                    label,
+                    predicates,
+                    projection,
+                    None,
+                )
+                .await?
+            } else {
+                let mut rows = None;
+                if self.label_is_sparse(label) {
+                    rows = self
+                        .try_scan_overlapping_label_sidecars(label, predicates, projection, None)
+                        .await?;
                 }
-                None if self.label_is_sparse(label) => {
-                    self.try_scan_overlapping_label_sidecars(label, predicates, projection, None)
-                        .await?
+                if rows.is_none() {
+                    rows = self
+                        .try_scan_label_two_phase(
+                            label,
+                            predicates,
+                            decode_projection,
+                            requested_projection.as_ref(),
+                        )
+                        .await?;
                 }
-                None => None,
+                rows
             };
             if let Some(rows) = rows {
                 return Ok(rows);
@@ -6823,9 +7116,6 @@ impl<'mt> Snapshot<'mt> {
                     .column_by_name(SCHEMA_VERSION)
                     .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
                     .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
-                let ovf_col = batch
-                    .column_by_name(OVERFLOW_JSON)
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
                 for row in 0..batch.num_rows() {
                     let row_id_bytes: [u8; 16] = id_col
                         .value(row)
@@ -6846,50 +7136,15 @@ impl<'mt> Snapshot<'mt> {
                         update_node_winner(&mut latest, row_id, lsn, None);
                         continue;
                     }
-                    let mut properties: BTreeMap<String, Value> = BTreeMap::new();
-                    for p in &sst_label_def.properties {
-                        // Skip properties not in the projection (when one
-                        // is set). Engine columns are still required and
-                        // were included by the ProjectionMask.
-                        if let Some(keep) = &projection_set {
-                            if !keep.contains(p.name.as_str()) {
-                                continue;
-                            }
-                        }
-                        let col_name = prop_column_name(p);
-                        // Defensive: if Parquet's ProjectionMask elided the
-                        // column (because the caller asked for a subset)
-                        // the column won't be in the batch — skip silently.
-                        let Some(col) = batch.column_by_name(&col_name) else {
-                            continue;
-                        };
-                        if let Some(v) = arrow_value_to_value(col.as_ref(), row, &p.data_type)? {
-                            properties.insert(p.name.clone(), v);
-                        }
-                    }
-                    // Skip the per-row overflow JSON parse entirely when the
-                    // projection keeps nothing — an id-only scan was still
-                    // paying a serde_json parse per row for values it threw
-                    // away immediately.
-                    if projection_set.as_ref().is_none_or(|keep| !keep.is_empty()) {
-                        if let Some(ovf_col) = ovf_col.filter(|column| !column.is_null(row)) {
-                            let json_str = ovf_col.value(row);
-                            let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
-                            if let Some(keep) = &projection_set {
-                                for (k, v) in extra {
-                                    if keep.contains(k.as_str()) {
-                                        properties.insert(k, v);
-                                    }
-                                }
-                            } else {
-                                properties.extend(extra);
-                            }
-                        }
-                    }
                     let view = NodeView {
                         id: row_id,
                         labels: decode_node_labels(&batch, row, dict, &desc.scope),
-                        properties,
+                        properties: decode_node_row_properties(
+                            &batch,
+                            row,
+                            &sst_label_def,
+                            projection_set.as_ref(),
+                        )?,
                         lsn,
                         schema_version: sv_col.value(row),
                     };
@@ -9566,18 +9821,7 @@ impl<'mt> Snapshot<'mt> {
                 );
                 return Ok(None);
             }
-            let mut properties = BTreeMap::new();
-            for (name, cell) in &property_row.properties {
-                match cell {
-                    PropertyCell::Absent => {}
-                    PropertyCell::Null => {
-                        properties.insert(name.clone(), Value::Null);
-                    }
-                    PropertyCell::Value(value) => {
-                        properties.insert(name.clone(), value.clone());
-                    }
-                }
-            }
+            let properties = projected_node_properties(property_row);
             candidates.push((
                 node_id,
                 lsn,
@@ -9781,6 +10025,14 @@ struct LimitedNodeBatchContext<'a> {
 }
 
 type ProjectedNodeCandidate = (NodeId, u64, Option<NodeView>);
+
+/// Phase-1 winner of a two-phase label scan: the structural view, plus the
+/// `(sst index, physical ordinal)` its properties live at. Memtable rows carry
+/// complete properties already and have no SST row.
+struct LabelScanRow {
+    view: NodeView,
+    sst_row: Option<(usize, u64)>,
+}
 
 /// Paged walk of one node SST's label postings; see
 /// [`Snapshot::next_label_postings`].
@@ -10020,11 +10272,11 @@ fn decode_edge_properties(
     Ok(out)
 }
 
-fn update_node_winner(
-    map: &mut BTreeMap<NodeId, (u64, Option<NodeView>)>,
+fn update_node_winner<T>(
+    map: &mut BTreeMap<NodeId, (u64, Option<T>)>,
     id: NodeId,
     lsn: u64,
-    view: Option<NodeView>,
+    view: Option<T>,
 ) {
     match map.get(&id) {
         Some((existing_lsn, _)) if *existing_lsn >= lsn => {}
@@ -10623,6 +10875,71 @@ fn decode_node_labels(
         None => Vec::new(),
     };
     labels_from_ids(&ids, dict, scope_fallback)
+}
+
+/// Decode the properties of node SST row `row`: the declared columns plus the
+/// overflow JSON, kept to `projection` when one is set.
+fn decode_node_row_properties(
+    batch: &RecordBatch,
+    row: usize,
+    label_def: &LabelDef,
+    projection: Option<&BTreeSet<&str>>,
+) -> Result<BTreeMap<String, Value>> {
+    let mut properties: BTreeMap<String, Value> = BTreeMap::new();
+    for p in &label_def.properties {
+        // Skip properties not in the projection (when one is set). Engine
+        // columns are still required and were included by the ProjectionMask.
+        if projection.is_some_and(|keep| !keep.contains(p.name.as_str())) {
+            continue;
+        }
+        let col_name = prop_column_name(p);
+        // Defensive: if Parquet's ProjectionMask elided the column (because
+        // the caller asked for a subset) the column won't be in the batch,
+        // so skip it silently.
+        let Some(col) = batch.column_by_name(&col_name) else {
+            continue;
+        };
+        if let Some(v) = arrow_value_to_value(col.as_ref(), row, &p.data_type)? {
+            properties.insert(p.name.clone(), v);
+        }
+    }
+    // Skip the per-row overflow JSON parse entirely when the projection keeps
+    // nothing: an id-only scan was still paying a serde_json parse per row for
+    // values it threw away immediately.
+    if projection.is_some_and(|keep| keep.is_empty()) {
+        return Ok(properties);
+    }
+    let overflow = batch
+        .column_by_name(OVERFLOW_JSON)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .filter(|column| !column.is_null(row));
+    if let Some(overflow) = overflow {
+        let extra: BTreeMap<String, Value> = serde_json::from_str(overflow.value(row))?;
+        match projection {
+            Some(keep) => {
+                properties.extend(extra.into_iter().filter(|(k, _)| keep.contains(k.as_str())))
+            }
+            None => properties.extend(extra),
+        }
+    }
+    Ok(properties)
+}
+
+/// Properties of one property-page projection row. Absent cells stay absent.
+fn projected_node_properties(row: &NodePropertyProjection) -> BTreeMap<String, Value> {
+    let mut properties = BTreeMap::new();
+    for (name, cell) in &row.properties {
+        match cell {
+            PropertyCell::Absent => {}
+            PropertyCell::Null => {
+                properties.insert(name.clone(), Value::Null);
+            }
+            PropertyCell::Value(value) => {
+                properties.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    properties
 }
 
 /// Whether node SST row `row` carries `label`, without building its label
@@ -15801,6 +16118,147 @@ mod tests {
         assert_eq!(devices[0].properties["name"], Value::Str("d3".into()));
         assert_eq!(snap.count_nodes(Some("Device")).await.unwrap(), 1);
         assert!(snap.scan_label("Other").await.is_err());
+    }
+
+    fn spread_node_id(i: u16) -> NodeId {
+        let mut bytes = [0u8; 16];
+        bytes[14..].copy_from_slice(&i.to_be_bytes());
+        NodeId::from_uuid(Uuid::from_bytes(bytes))
+    }
+
+    #[tokio::test]
+    async fn overlapping_label_scan_decodes_only_winning_label_rows() {
+        let store = make_store();
+        let paths = make_paths("two-phase-selected-rows");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+
+        // 2,000 nodes in small row groups, three of them Devices.
+        let mut rows: Vec<_> = (0..2000_u16)
+            .map(|i| {
+                (
+                    spread_node_id(i),
+                    u64::from(i) + 1,
+                    upsert("o", vec![OTHER]),
+                )
+            })
+            .collect();
+        for i in [100_u16, 900, 1500] {
+            rows[usize::from(i)].2 = upsert(&format!("d{i}"), vec![DEVICE]);
+        }
+        let first = flush_batch_with_row_group_rows(64, &ms, &fence, &base, &schema, rows).await;
+        // Newer versions: 900 leaves Device, 1200 joins it, 1500 is deleted.
+        let second = flush_batch_with_row_group_rows(
+            64,
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (spread_node_id(900), 5000, upsert("o900", vec![OTHER])),
+                (spread_node_id(1200), 5001, upsert("d1200", vec![DEVICE])),
+                (spread_node_id(1500), 5002, MemOp::Tombstone),
+            ],
+        )
+        .await;
+        // Without label postings (an SST written before the label index) the
+        // sidecar routes cannot run, so every Device scan below is two-phase.
+        let mut manifest = second.manifest.clone();
+        for desc in manifest
+            .ssts
+            .iter_mut()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            desc.label_index = None;
+        }
+        let committed = LoadedManifest::new(
+            second.pointer,
+            second.pointer_etag,
+            second.pointer_version,
+            manifest,
+        );
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let name = vec!["name".to_string()];
+        let name_is_d1200 = ScanPredicate::Eq {
+            column: "name".into(),
+            value: crate::sst::stats::StatScalar::Utf8("d1200".into()),
+        };
+        let cases: [(&[ScanPredicate], Option<&[String]>, &[u16], u64); 4] = [
+            (&[], None, &[100, 1200], 2),
+            (&[], Some(&name), &[100, 1200], 2),
+            // An id-only projection never reads a property.
+            (&[], Some(&[]), &[100, 1200], 0),
+            (std::slice::from_ref(&name_is_d1200), None, &[1200], 2),
+        ];
+        for (predicates, projection, ids, selected) in cases {
+            let cache = SstCache::new(16 * 1024 * 1024);
+            let snap = Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                .with_cache(cache.clone());
+            assert!(snap.disjoint_node_descriptors().is_none());
+            let rows = snap
+                .scan_label_with_predicates_and_projection("Device", predicates, projection)
+                .await
+                .unwrap();
+            let expected = ids.iter().map(|i| spread_node_id(*i)).collect::<Vec<_>>();
+            assert_eq!(view_ids(&rows), expected, "{projection:?}");
+            assert_eq!(cache.label_selected_node_rows(), selected, "{projection:?}");
+            let legacy =
+                Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                    .with_ranged_reads(false)
+                    .scan_label_with_predicates_and_projection("Device", predicates, projection)
+                    .await
+                    .unwrap();
+            assert_eq!(rows, legacy, "{projection:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_projected_label_scan_falls_back_exactly_from_bad_property_pages() {
+        let store = make_store();
+        let paths = make_paths("two-phase-bad-pages");
+        let committed = relabel_overlap_fixture(&store, &paths).await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let name = vec!["name".to_string()];
+        let scan = || async {
+            Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                .scan_label_with_predicates_and_projection("Device", &[], Some(&name))
+                .await
+                .unwrap()
+        };
+        let expected = scan().await;
+        assert_eq!(view_ids(&expected), sorted_ids(&[2, 4, 6]));
+        assert_eq!(expected[0].properties["name"], Value::Str("b2".into()));
+
+        for desc in committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            let pages = crate::manifest::node_property_pages_sidecar(desc)
+                .expect("flush writes property pages");
+            let path = Path::from(format!(
+                "{}/{}",
+                paths.namespace_prefix().as_ref(),
+                pages.path
+            ));
+            let original = store.get(&path).await.unwrap().bytes().await.unwrap();
+            store.delete(&path).await.unwrap();
+            assert_eq!(scan().await, expected, "missing pages");
+            let mut corrupt = original.to_vec();
+            corrupt[0] ^= 0xFF;
+            store.put(&path, Bytes::from(corrupt).into()).await.unwrap();
+            assert_eq!(scan().await, expected, "corrupt pages");
+            store.put(&path, original.into()).await.unwrap();
+        }
     }
 
     #[tokio::test]
