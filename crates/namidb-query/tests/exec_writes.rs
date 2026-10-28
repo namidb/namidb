@@ -192,6 +192,32 @@ async fn set_and_remove_label_mutate_the_set() {
 }
 
 #[tokio::test]
+async fn keyword_property_keys_round_trip() {
+    let mut writer = WriterSession::open(store(), paths("w-keyword-keys"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (a:Evt {by: 'ana', order: 1})").await;
+    write_q(&mut writer, "MATCH (a:Evt) SET a.end = 2 REMOVE a.order").await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (a:Evt) RETURN a.by, a.end AS end, a.order AS order").unwrap())
+        .unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("a.by"),
+        Some(&RuntimeValue::String("ana".into()))
+    );
+    assert_eq!(rows[0].get("end"), Some(&RuntimeValue::Integer(2)));
+    assert_eq!(rows[0].get("order"), Some(&RuntimeValue::Null));
+
+    // A keyword alias is referenced in backticks, but the column is still
+    // named without them.
+    let plan = lower(&parse("MATCH (a:Evt) WITH a.end AS order RETURN `order`").unwrap()).unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert_eq!(rows[0].get("order"), Some(&RuntimeValue::Integer(2)));
+}
+
+#[tokio::test]
 async fn property_update_preserves_label_set() {
     let mut writer = WriterSession::open(store(), paths("w-propkeeplabels"))
         .await

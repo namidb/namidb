@@ -227,6 +227,28 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// A name that can never be read as a keyword: a property key after `.`
+    /// or a map key. Reserved words are taken as the name, spelled exactly as
+    /// in the source since keys are case-sensitive, so `e.by` and
+    /// `{end: 1}` parse. Variable and label slots keep [`expect_identifier`].
+    fn expect_name(&mut self) -> Result<Identifier, ParseError> {
+        if self.peek().is_some_and(Token::is_reserved_keyword) {
+            let span = self.bump().expect("peeked").span;
+            return Ok(Identifier::new(&self.src[span.start..span.end], span));
+        }
+        self.expect_identifier()
+    }
+
+    /// An `AS` alias. A keyword alias is accepted like [`expect_name`], but
+    /// it binds a variable that later clauses can only reference in
+    /// backticks, so it is marked quoted and displays that way.
+    fn expect_alias(&mut self) -> Result<Identifier, ParseError> {
+        let reserved = self.peek().is_some_and(Token::is_reserved_keyword);
+        let mut alias = self.expect_name()?;
+        alias.quoted |= reserved;
+        Ok(alias)
+    }
+
     // ─────────────────────────── productions ─────────────────────────
 
     fn parse_query(&mut self) -> Result<Query, Vec<ParseError>> {
@@ -536,7 +558,7 @@ impl<'src> Parser<'src> {
     fn parse_projection_item(&mut self) -> Result<ProjectionItem, ParseError> {
         let expr = self.parse_expression()?;
         let alias = if self.eat(&Token::As).is_some() {
-            Some(self.expect_identifier()?)
+            Some(self.expect_alias()?)
         } else {
             None
         };
@@ -625,7 +647,7 @@ impl<'src> Parser<'src> {
         let label = self.expect_identifier()?;
         self.expect(&Token::LParen)?;
         let property = self
-            .expect_identifier()
+            .expect_name()
             .map_err(|e| e.with_help("vector-index property goes in parentheses"))?;
         self.expect(&Token::RParen)?;
         self.expect_soft_keyword("METRIC")?;
@@ -779,9 +801,9 @@ impl<'src> Parser<'src> {
     /// `vector.dimensions` is folded into one name so it compares equal to
     /// the backtick-quoted spelling (one `QuotedIdent` token).
     fn parse_vector_option_key(&mut self) -> Result<Identifier, ParseError> {
-        let mut key = self.expect_identifier()?;
+        let mut key = self.expect_name()?;
         while self.eat(&Token::Dot).is_some() {
-            let seg = self.expect_identifier()?;
+            let seg = self.expect_name()?;
             key = Identifier::new(
                 format!("{}.{}", key.name, seg.name),
                 SourceSpan::new(key.span.start, seg.span.end),
@@ -867,11 +889,11 @@ impl<'src> Parser<'src> {
         self.expect(&Token::LParen)?;
         // One or more comma-separated text properties.
         let mut properties = vec![self
-            .expect_identifier()
+            .expect_name()
             .map_err(|e| e.with_help("fulltext-index properties go in parentheses"))?];
         while matches!(self.peek(), Some(Token::Comma)) {
             self.bump();
-            properties.push(self.expect_identifier()?);
+            properties.push(self.expect_name()?);
         }
         self.expect(&Token::RParen)?;
         let end = self
@@ -1003,7 +1025,7 @@ impl<'src> Parser<'src> {
     fn parse_ddl_property_ref(&mut self) -> Result<Identifier, ParseError> {
         let _var = self.expect_identifier()?;
         self.expect(&Token::Dot)?;
-        self.expect_identifier()
+        self.expect_name()
     }
 
     /// `CREATE CONSTRAINT [name] [IF NOT EXISTS] FOR (n:Label) REQUIRE (n.p, …)
@@ -1088,9 +1110,9 @@ impl<'src> Parser<'src> {
             self.expect(&Token::Colon)?;
             label = self.expect_identifier()?;
             self.expect(&Token::LParen)?;
-            let mut props = vec![self.expect_identifier()?];
+            let mut props = vec![self.expect_name()?];
             while self.eat(&Token::Comma).is_some() {
-                props.push(self.expect_identifier()?);
+                props.push(self.expect_name()?);
             }
             properties = props;
             end = self.expect_in(&Token::RParen, "index target")?.span.end;
@@ -1382,7 +1404,7 @@ impl<'src> Parser<'src> {
         // Qualified procedure name: <ident> (.<ident>)* → (namespace?, name).
         let mut parts = vec![self.expect_identifier()?.name];
         while self.eat(&Token::Dot).is_some() {
-            parts.push(self.expect_identifier()?.name);
+            parts.push(self.expect_name()?.name);
         }
         let (namespace, name) = if parts.len() == 1 {
             (None, parts.pop().unwrap())
@@ -1440,7 +1462,7 @@ impl<'src> Parser<'src> {
     fn parse_yield_item(&mut self) -> Result<YieldItem, ParseError> {
         let name = self.expect_identifier()?;
         let alias = if self.eat(&Token::As).is_some() {
-            Some(self.expect_identifier()?)
+            Some(self.expect_alias()?)
         } else {
             None
         };
@@ -1525,7 +1547,7 @@ impl<'src> Parser<'src> {
             Some(Token::Dot) => {
                 // a.prop = value
                 self.bump();
-                let key = self.expect_identifier()?;
+                let key = self.expect_name()?;
                 let prop_span = SourceSpan::new(start, key.span.end);
                 self.expect(&Token::Eq)?;
                 let value = self.parse_expression()?;
@@ -1609,7 +1631,7 @@ impl<'src> Parser<'src> {
         match self.peek() {
             Some(Token::Dot) => {
                 self.bump();
-                let key = self.expect_identifier()?;
+                let key = self.expect_name()?;
                 let span = SourceSpan::new(start, key.span.end);
                 Ok(RemoveItem::Property(PropertyAccess {
                     target: Expression {
@@ -2001,7 +2023,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_map_entry(&mut self) -> Result<(Identifier, Expression), ParseError> {
-        let key = self.expect_identifier()?;
+        let key = self.expect_name()?;
         self.expect(&Token::Colon)?;
         let value = self.parse_expression()?;
         Ok((key, value))
@@ -2178,7 +2200,7 @@ impl<'src> Parser<'src> {
             match self.peek() {
                 Some(Token::Dot) => {
                     self.bump();
-                    let key = self.expect_identifier()?;
+                    let key = self.expect_name()?;
                     let span = SourceSpan::new(expr.span.start, key.span.end);
                     expr = Expression {
                         kind: ExpressionKind::Property(Box::new(PropertyAccess {
@@ -2505,7 +2527,7 @@ impl<'src> Parser<'src> {
             // - else it's a property access; we backtrack-by-construction.
             // We just gobble the segments and let the caller decide.
             // To avoid ambiguity, we only take the dot-form when peek_at(1) is `(`.
-            let next_id = self.expect_identifier()?;
+            let next_id = self.expect_name()?;
             segments.push(next_id);
             if !self.check(&Token::LParen) && !self.check(&Token::Dot) {
                 break;
@@ -3790,8 +3812,78 @@ mod tests {
     }
 
     #[test]
-    fn reserved_keyword_as_property_key_reports_e003() {
-        let err = first_err("MATCH (n {WHERE: 1}) RETURN n");
+    fn reserved_keyword_as_map_key_is_accepted() {
+        ok("CREATE (a:Evt {by: 'ana', order: 1})");
+        let q = ok("MATCH (n {WHERE: 1}) RETURN {by: n.x, End: 2} AS m");
+        match &q.head.clauses[1] {
+            Clause::Return(r) => match &r.items[0].expression.kind {
+                ExpressionKind::Map(m) => {
+                    let keys: Vec<_> = m.entries.iter().map(|(k, _)| k.name.as_str()).collect();
+                    assert_eq!(keys, ["by", "End"]);
+                }
+                other => panic!("expected map, got {other:?}"),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn reserved_keyword_after_dot_is_property_key() {
+        // `e.by` goes through the identifier-head path, `n.x.end` through
+        // the postfix loop; the key keeps its source spelling.
+        for (src, key) in [
+            ("MATCH ()-[e]->() RETURN e.by", "by"),
+            ("MATCH (n) RETURN n.x.end", "end"),
+            ("MATCH (n) RETURN n.With", "With"),
+            ("MATCH (n) RETURN n.ASCENDING", "ASCENDING"),
+        ] {
+            let q = ok(src);
+            match &q.head.clauses[1] {
+                Clause::Return(r) => match &r.items[0].expression.kind {
+                    ExpressionKind::Property(p) => assert_eq!(p.key.name, key, "{src}"),
+                    other => panic!("expected property, got {other:?}"),
+                },
+                _ => panic!(),
+            }
+            assert!(parse(&q.to_string()).is_ok(), "re-parse of {q}");
+        }
+        ok("MATCH (n) WHERE n.order > 1 SET n.by = 1 REMOVE n.end RETURN n");
+        ok("CREATE INDEX FOR (n:X) ON (n.by)");
+        // The `ON :Label(prop)` lists take the same keys.
+        for src in [
+            "CREATE INDEX ON :Doc(by, order)",
+            "CREATE FULLTEXT INDEX t ON :Doc(order, end)",
+            "CREATE VECTOR INDEX v ON :Doc(order) METRIC cosine DIMENSION 3",
+        ] {
+            let q = ok(src);
+            assert!(parse(&q.to_string()).is_ok(), "re-parse of {q}");
+        }
+    }
+
+    #[test]
+    fn reserved_keyword_as_alias_is_accepted() {
+        let q = ok("MATCH (n) RETURN n.x AS by, n.y AS order");
+        match &q.head.clauses[1] {
+            Clause::Return(r) => {
+                let aliases: Vec<_> = r
+                    .items
+                    .iter()
+                    .map(|i| i.alias.as_ref().unwrap().name.as_str())
+                    .collect();
+                assert_eq!(aliases, ["by", "order"]);
+            }
+            _ => panic!(),
+        }
+        // The alias binds a variable, so later clauses quote it.
+        let q = ok("WITH 1 AS order RETURN `order` + 1 AS x");
+        assert!(parse(&q.to_string()).is_ok(), "re-parse of {q}");
+    }
+
+    #[test]
+    fn reserved_keyword_variable_still_reports_e003() {
+        let err = first_err("WITH 1 AS order RETURN order");
+        assert_eq!(err.code, ErrorCode::UnexpectedToken);
+        let err = first_err("MATCH (n:X) SET by.x = 1");
         assert_eq!(err.code, ErrorCode::ReservedKeyword);
     }
 

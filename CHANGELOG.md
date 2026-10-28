@@ -15,6 +15,36 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Keywords work as property keys, map keys and aliases.** `RETURN e.by`,
+  `SET n.end = 1`, `{order: 1}`, `RETURN x AS by` and
+  `CREATE INDEX ON :Evt(order)` used to fail with E003 because `by`, `end`
+  and `order` are reserved words. A word right after `.`, before `:` in a
+  map, after `AS` or in an index property list can only be a name, so it is
+  now read as one, spelled exactly as written. Variables and labels still
+  need backticks (`` MATCH (`order`) ``), and so does a later reference to a
+  keyword alias. `` RETURN `order` `` now names the column `order`, without
+  the backticks.
+
+### Added
+
+- **macOS x86_64 Python wheel.** Intel Macs and x86_64 Pythons on Apple
+  silicon (a Rosetta terminal, `python3-intel64`) found no matching wheel,
+  fell back to the sdist and failed without a Rust toolchain. The release
+  now ships a `macosx_*_x86_64` wheel, cross-built on the arm64 runner and
+  smoke-tested under Rosetta.
+
+### Changed
+
+- **Namespace names can contain `_`.** `forensic_case` used to be rejected
+  as an invalid namespace. The first character still has to be `[a-z0-9]`.
+
+- **`memory://` takes `?ns=` like the other schemes.** `memory://?ns=acme`
+  and `memory://acme?ns=acme` both open `acme`. A URI whose host and `?ns=`
+  disagree now fails with a clear conflict error instead of an
+  invalid-character one.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

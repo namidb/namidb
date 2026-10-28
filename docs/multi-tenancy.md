@@ -160,7 +160,7 @@ is two independent steps:
 
 ### Namespace names
 
-A namespace name must match `[a-z0-9][a-z0-9-]{0,62}` (length 1..=63),
+A namespace name must match `[a-z0-9][a-z0-9_-]{0,62}` (length 1..=63),
 validated by `NamespaceId::new` (`crates/namidb-core/src/id.rs:153-177`). The
 registry validates the same way on open (`registry.rs:168`), and the CLI exposes
 the check directly:

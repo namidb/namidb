@@ -4364,8 +4364,7 @@ fn proc_filter_term(
             Ok(acc.expect("non-empty condition map"))
         }
         // A bare list → membership (`tenant_id: ['a', 'b']` ⇒ `n.tenant_id IN […]`).
-        // The ergonomic inline spelling of `in`, which can't be a bare map key
-        // (it is a reserved Cypher keyword that must be backtick-quoted).
+        // Shorthand for `{ in: [...] }`.
         RuntimeValue::List(_) => {
             let list = proc_value_expr(val, sp)?;
             Ok(mk_filter_expr(
@@ -4453,10 +4452,7 @@ fn proc_filter_op(
 /// - `{ score: { gte: 0.5 }, region: { ne: "eu" } }` → `n.score >= 0.5 AND n.region <> "eu"`
 ///
 /// A scalar value ⇒ equality, a list value ⇒ `IN`, a `{ op: value }` map ⇒ the
-/// AND of its operators (`eq|ne|gt|gte|lt|lte|in`). The explicit `in` operator is
-/// reachable only when the filter is supplied as a `$param` (a bare `in:` map key
-/// can't be parsed inline — it is a reserved keyword); inline queries use the
-/// list-value form.
+/// AND of its operators (`eq|ne|gt|gte|lt|lte|in`), inline or from a `$param`.
 fn proc_filter_expr(filter: &RuntimeValue, alias: &str) -> Result<Expression, ExecError> {
     use crate::parser::ast::{BinaryOp, ExpressionKind};
     let map = match filter {
