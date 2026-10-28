@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
+use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -97,6 +97,61 @@ async fn row_cap_aborts_a_scan_over_the_cap() {
         .await
         .expect_err("a scan over the row cap must abort");
     assert!(matches!(err, ExecError::RowCap(2)), "got {err:?}");
+}
+
+/// 50 unlabelled-scan candidates (two labels), the last one linked to the
+/// first by a single edge.
+async fn seed_chain(name: &str) -> WriterSession {
+    let mut writer = WriterSession::open(store(), paths(name)).await.unwrap();
+    let ids: Vec<NodeId> = (0..50).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        let label = if i % 2 == 0 { "Even" } else { "Odd" };
+        writer
+            .upsert_node(label, *id, &NodeWriteRecord::default())
+            .unwrap();
+    }
+    writer
+        .upsert_edge("LINK", ids[49], ids[0], &EdgeWriteRecord::default())
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer
+}
+
+#[tokio::test]
+async fn row_cap_on_unlabelled_scan_errors_without_full_scan() {
+    // The leaf scan stops at cap + 1 nodes and still reports the cap.
+    let writer = seed_chain("limits-rowcap-unlabelled").await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (n) RETURN n").unwrap()).unwrap();
+    let err = execute_with_limits(&plan, &snap, &Params::new(), None, Some(2))
+        .await
+        .expect_err("an unlabelled scan over the row cap must abort");
+    assert!(matches!(err, ExecError::RowCap(2)), "got {err:?}");
+
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, Some(50))
+        .await
+        .expect("a cap at the node count must not abort");
+    assert_eq!(rows.len(), 50);
+}
+
+#[tokio::test]
+async fn row_cap_bounds_the_seed_pull_under_a_limit() {
+    // LIMIT over an Expand pulls seeds in growing rounds; each round is
+    // held to the row cap, so a source wider than the cap still aborts
+    // when the limit cannot be filled first.
+    let writer = seed_chain("limits-rowcap-seed-pull").await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (x)-[:MISSING]->(y) RETURN x, y LIMIT 1").unwrap()).unwrap();
+    let err = execute_with_limits(&plan, &snap, &Params::new(), None, Some(10))
+        .await
+        .expect_err("50 seeds against a cap of 10 must abort");
+    assert!(matches!(err, ExecError::RowCap(10)), "got {err:?}");
+
+    let plan = lower(&parse("MATCH (x)-->(y) RETURN x, y LIMIT 1").unwrap()).unwrap();
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, Some(50))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }
 
 #[tokio::test]

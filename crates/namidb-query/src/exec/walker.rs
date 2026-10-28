@@ -389,31 +389,19 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 predicates,
                 projection,
             } => {
-                let mut rows: Vec<Row> = Vec::new();
-                let nodes = match label.as_deref() {
-                    Some(label_name) => {
-                        snapshot
-                            .scan_label_with_predicates_and_projection(
-                                label_name,
-                                predicates,
-                                projection.as_deref(),
-                            )
-                            .await?
-                    }
-                    None => {
-                        snapshot
-                            .scan_all_nodes_with_predicates_and_projection(
-                                predicates,
-                                projection.as_deref(),
-                            )
-                            .await?
-                    }
-                };
-                for n in nodes {
-                    let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
-                    rows.push(Row::new().with(alias.clone(), value));
-                }
-                Ok(rows)
+                // Under a row cap, read one row past it and stop: the guard
+                // below still reports RowCap, but the scan never holds more
+                // than cap + 1 nodes.
+                let limit = crate::exec::limits::scoped_row_cap().map(|cap| cap.saturating_add(1));
+                scan_nodes(
+                    snapshot,
+                    label.as_deref(),
+                    alias,
+                    predicates,
+                    projection.as_deref(),
+                    limit,
+                )
+                .await
             }
 
             LogicalPlan::NodeById {
@@ -1145,8 +1133,9 @@ pub(crate) fn execute_inner_with_routing<'a>(
 /// of the output is a valid prefix of the full result:
 ///   * non-`DISTINCT` `Project` — 1:1, order-preserving → pass cap through;
 ///   * `Expand` — 1:N, order-preserving → run its own input UNCAPPED (a
-///     zero-edge seed yields no rows and must not starve the budget) and
-///     stop the expansion at a seed boundary once `out.len() >= cap`;
+///     zero-edge seed yields no rows and must not starve the budget), or,
+///     over a `NodeScan`, pull growing seed prefixes until the budget
+///     fills; stop the expansion at a seed boundary once `out.len() >= cap`;
 ///   * `NodeScan` — leaf → stop after `cap` rows (counter is global across
 ///     labels; predicates are pre-applied so truncation is safe).
 /// EVERY other operator drops, reorders, dedups, expands-by-data, or
@@ -1218,35 +1207,80 @@ fn execute_capped<'a>(
                 shortest,
                 path_binding,
             } => {
-                let rows =
-                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                let length = resolve_length(length, params)?;
-                execute_expand(
-                    rows,
-                    source,
-                    edge_type.as_deref(),
-                    *direction,
-                    rel_alias.as_deref(),
+                let resolved = resolve_length(length, params)?;
+                let edge_read_mode =
+                    routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref());
+                let skip_target_materialize = should_skip_target_materialize(
+                    routing,
                     target_alias,
-                    target_labels,
-                    length.clone(),
-                    *optional,
-                    *back_reference,
-                    *shortest,
                     path_binding.as_deref(),
-                    snapshot,
-                    routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
-                    should_skip_target_materialize(
-                        routing,
+                    resolved.clone(),
+                    *back_reference,
+                );
+                // A NodeScan seed source is pulled as a growing scan-order
+                // prefix instead of in full: `MATCH (x)-->(y) LIMIT 10` over
+                // millions of nodes must not materialise every node first.
+                // Each round expands only the seeds the previous one did not
+                // see, so `out` stays the same prefix as the uncapped result
+                // and edgeless seeds cannot starve the budget. Any other
+                // input runs uncapped once, as before.
+                // ponytail: when few seeds match, the rounds rescan the
+                // prefix (about 1.33x a full scan) and end up holding every
+                // seed; only the row cap bounds that case.
+                let mut want = match input.as_ref() {
+                    LogicalPlan::NodeScan { .. } => Some(cap.max(64)),
+                    _ => None,
+                };
+                let mut out: Vec<Row> = Vec::new();
+                let mut seen = 0usize;
+                loop {
+                    let (rows, exhausted) = match want {
+                        Some(w) => {
+                            let w = match crate::exec::limits::scoped_row_cap() {
+                                Some(row_cap) => w.min(row_cap.saturating_add(1)),
+                                None => w,
+                            };
+                            let rows =
+                                execute_capped(input, snapshot, params, outer, routing, w).await?;
+                            crate::exec::limits::check_row_cap(rows.len())?;
+                            let exhausted = rows.len() < w;
+                            (rows, exhausted)
+                        }
+                        None => (
+                            execute_inner_with_routing(input, snapshot, params, outer, routing)
+                                .await?,
+                            true,
+                        ),
+                    };
+                    let total = rows.len();
+                    let fresh: Vec<Row> = rows.into_iter().skip(seen).collect();
+                    seen = total;
+                    let mut expanded = execute_expand(
+                        fresh,
+                        source,
+                        edge_type.as_deref(),
+                        *direction,
+                        rel_alias.as_deref(),
                         target_alias,
-                        path_binding.as_deref(),
-                        length,
+                        target_labels,
+                        resolved.clone(),
+                        *optional,
                         *back_reference,
-                    ),
-                    Some(cap),
-                    false,
-                )
-                .await
+                        *shortest,
+                        path_binding.as_deref(),
+                        snapshot,
+                        edge_read_mode,
+                        skip_target_materialize,
+                        Some(cap - out.len()),
+                        false,
+                    )
+                    .await?;
+                    out.append(&mut expanded);
+                    if out.len() >= cap || exhausted {
+                        return Ok(out);
+                    }
+                    want = want.map(|w| w.saturating_mul(4));
+                }
             }
 
             LogicalPlan::NodeByPropertyValue {
@@ -1295,33 +1329,15 @@ fn execute_capped<'a>(
                 predicates,
                 projection,
             } => {
-                let mut rows: Vec<Row> = Vec::new();
-                let nodes = match label.as_deref() {
-                    Some(label_name) => {
-                        snapshot
-                            .scan_label_with_predicates_and_projection_limited(
-                                label_name,
-                                predicates,
-                                projection.as_deref(),
-                                cap,
-                            )
-                            .await?
-                    }
-                    None => {
-                        snapshot
-                            .scan_all_nodes_with_predicates_and_projection_limited(
-                                predicates,
-                                projection.as_deref(),
-                                cap,
-                            )
-                            .await?
-                    }
-                };
-                for n in nodes {
-                    let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
-                    rows.push(Row::new().with(alias.clone(), value));
-                }
-                Ok(rows)
+                scan_nodes(
+                    snapshot,
+                    label.as_deref(),
+                    alias,
+                    predicates,
+                    projection.as_deref(),
+                    Some(cap),
+                )
+                .await
             }
 
             // Cap unsafe to push through this operator — run it in full.
@@ -1329,6 +1345,48 @@ fn execute_capped<'a>(
         }
     }
     .boxed()
+}
+
+/// Leaf `NodeScan`: one row per live node, binding `alias`. With `limit`
+/// the storage scan stops after that many rows (a scan-order prefix).
+async fn scan_nodes(
+    snapshot: &Snapshot<'_>,
+    label: Option<&str>,
+    alias: &str,
+    predicates: &[namidb_storage::sst::predicates::ScanPredicate],
+    projection: Option<&[String]>,
+    limit: Option<usize>,
+) -> Result<Vec<Row>, ExecError> {
+    let nodes = match (label, limit) {
+        (Some(label), Some(limit)) => {
+            snapshot
+                .scan_label_with_predicates_and_projection_limited(
+                    label, predicates, projection, limit,
+                )
+                .await?
+        }
+        (Some(label), None) => {
+            snapshot
+                .scan_label_with_predicates_and_projection(label, predicates, projection)
+                .await?
+        }
+        (None, Some(limit)) => {
+            snapshot
+                .scan_all_nodes_with_predicates_and_projection_limited(
+                    predicates, projection, limit,
+                )
+                .await?
+        }
+        (None, None) => {
+            snapshot
+                .scan_all_nodes_with_predicates_and_projection(predicates, projection)
+                .await?
+        }
+    };
+    Ok(nodes
+        .into_iter()
+        .map(|n| Row::new().with(alias, RuntimeValue::Node(Box::new(NodeValue::from(n)))))
+        .collect())
 }
 
 // ───────────────────────── Expand ────────────────────────────────────

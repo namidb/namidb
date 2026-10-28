@@ -380,3 +380,77 @@ async fn cap_never_underfills_when_most_edges_are_rejected() {
         );
     }
 }
+
+#[tokio::test]
+async fn unlabelled_source_limit_over_untyped_expand_is_a_prefix() {
+    // `MATCH (a)-->(b)` scans every node as a seed (Movies included, which
+    // have no out-edges) and expands every edge type.
+    let full = pairs(&run("lp-untyped-full", &format!("MATCH (a)-->(b) {PAIR_RETURN}")).await);
+    assert_eq!(full.len(), 6);
+    for limit in [1usize, 3, 6, 10] {
+        let capped = pairs(
+            &run(
+                &format!("lp-untyped-{limit}"),
+                &format!("MATCH (a)-->(b) {PAIR_RETURN} LIMIT {limit}"),
+            )
+            .await,
+        );
+        assert_eq!(capped, &full[..limit.min(full.len())], "LIMIT {limit}");
+    }
+}
+
+/// The seed pull grows 64, 256, 1024: 500 edgeless nodes ahead of the
+/// connected ones force several rounds, and rows found across a round
+/// boundary must keep the uncapped order.
+#[tokio::test]
+async fn limit_fills_past_many_edgeless_seeds() {
+    let mut writer = WriterSession::open(store(), paths("lp-edgeless"))
+        .await
+        .unwrap();
+    for i in 0..500 {
+        writer
+            .upsert_node("Lonely", NodeId::new(), &node_with("v", i))
+            .unwrap();
+    }
+    let hub = NodeId::new();
+    writer.upsert_node("Hub", hub, &node_with("v", -1)).unwrap();
+    for i in 0..200 {
+        let id = NodeId::new();
+        writer
+            .upsert_node("Linked", id, &node_with("v", 1000 + i))
+            .unwrap();
+        writer.upsert_edge("TO", id, hub, &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let values = |rows: Vec<Row>| -> Vec<i64> {
+        rows.iter()
+            .map(|r| match r.get("v") {
+                Some(RuntimeValue::Integer(v)) => *v,
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect()
+    };
+    let run_query = |query: String| {
+        let snapshot = &snapshot;
+        async move {
+            let plan = lower(&parse(&query).unwrap()).unwrap();
+            execute_flat_path(&plan, snapshot, &Params::new())
+                .await
+                .unwrap()
+        }
+    };
+
+    let full = values(run_query("MATCH (a)-[:TO]->(h) RETURN a.v AS v".to_string()).await);
+    assert_eq!(full.len(), 200);
+    for limit in [1usize, 2, 63, 64, 65, 150, 200, 300] {
+        let got = values(
+            run_query(format!(
+                "MATCH (a)-[:TO]->(h) RETURN a.v AS v LIMIT {limit}"
+            ))
+            .await,
+        );
+        assert_eq!(got, &full[..limit.min(full.len())], "LIMIT {limit}");
+    }
+}

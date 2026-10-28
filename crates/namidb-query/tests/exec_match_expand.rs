@@ -618,9 +618,7 @@ async fn match_from_non_node_source_still_errors() {
     build_friend_graph(&mut writer).await;
     let snapshot = writer.snapshot();
     let plan = lower(&parse("WITH 1 AS n MATCH (n)-[:KNOWS]->(m) RETURN m").unwrap()).unwrap();
-    let err = execute(&plan, &snapshot, &Params::new())
-        .await
-        .unwrap_err();
+    let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
     assert!(err.to_string().contains("is not a Node"), "{err}");
 }
 
