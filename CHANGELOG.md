@@ -181,10 +181,19 @@ crates.io release will establish and document that API explicitly.
   that carry the label are merged in id order, each candidate resolves to
   its newest version, and versions that lost the label or were deleted are
   skipped. A LIMIT stops as soon as it has its rows and no longer fetches a
-  full page of candidates first. Scans, counts and filtered LIMITs take this
-  route only when the label is at most a quarter of the node rows, memtable
-  included, since each candidate is a full record lookup and a filter may
-  reject them all. A dense label goes through the two-pass scan below.
+  full page of candidates first. Each skipped candidate makes the next batch
+  of lookups larger, and on a dense label a LIMIT that keeps hitting stale
+  postings (say after a bulk relabel) gives up and uses the two-pass scan
+  below. Scans and filtered LIMITs take this route only when the label is at
+  most a quarter of the node rows, memtable included, since each candidate
+  is a full record lookup and a filter may reject them all. Counts and
+  other unbounded id-only scans never take it: the first pass of the two-pass scan answers
+  them without reading any property.
+
+  Still open: a flush that only deletes nodes carries no label counts, which
+  turns this route off until compaction. Splitting node SSTs by label and
+  storing embeddings in a binary column would cut the remaining work, but
+  both change the on-disk format and are left for later.
 
 ### Changed
 
@@ -194,9 +203,9 @@ crates.io release will establish and document that API explicitly.
   lsn and label columns of each SST and settles which version of each id
   wins. The second reads properties for the winning rows of the label only:
   from property pages for a projected scan, or from Parquet with a row
-  selection that skips every other page. `RETURN id(n)` style scans stop
-  after the first pass. Any mismatch between the passes falls back to the
-  full reconciliation. This also covers the BM25 and hybrid search label
+  selection that skips every other page. Counts and `RETURN id(n)` style
+  scans stop after the first pass. Any mismatch between the passes falls
+  back to the full reconciliation. This also covers the BM25 and hybrid search label
   walks. `SstCache::label_selected_node_rows()` reports how many label rows
   had their properties read, here or from property pages.
 ### Changed
@@ -352,6 +361,8 @@ crates.io release will establish and document that API explicitly.
   on its own slot, so only requests for the namespace being opened wait, and
   concurrent first requests for it still share one writer. An evicted
   namespace is still fully quiesced before anything reopens it.
+  had their properties read, here, from property pages or in the full
+  reconciliation.
 
 ## [2.6.19] - 2026-09-16
 
