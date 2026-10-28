@@ -52,6 +52,14 @@ crates.io release will establish and document that API explicitly.
   loads only the nodes that carry it. Variable-length hops still visit
   every neighbour, since the label only decides which ones are results.
 
+- **`id(n)`, `labels(n)` and `count(n)` decoded every property of `n`.** The
+  planner treated any use of a node variable inside a function or an
+  aggregate as a read of the whole node, so `WITH labels(n) AS l, count(*)
+  AS c, collect(id(n))[0..1] AS s` parsed the overflow JSON (embeddings
+  included) of every row it scanned. These calls now read only the id and
+  label columns. `keys(n)`, `properties(n)` and a bare `n` still load
+  everything.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed

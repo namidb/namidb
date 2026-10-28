@@ -477,6 +477,29 @@ async fn meaning_preserving_rewrites_agree() {
     )
     .await;
 
+    // A scan read only through id()/labels()/count(x) loads no property
+    // column. `WITH b` hands the whole node on and keeps every column.
+    assert_equivalent(
+        &w,
+        "structural-only scan vs full scan",
+        &[
+            "MATCH (b) RETURN id(b) AS i, elementId(b) AS e, labels(b) AS l",
+            "MATCH (b) WITH b RETURN id(b) AS i, elementId(b) AS e, labels(b) AS l",
+        ],
+    )
+    .await;
+    assert_equivalent(
+        &w,
+        "structural-only aggregation vs full scan",
+        &[
+            "MATCH (b:Q) WITH labels(b) AS l, count(b) AS c, collect(id(b)) AS ids \
+             RETURN l, c, size(ids) AS s",
+            "MATCH (b:Q) WITH b WITH labels(b) AS l, count(b) AS c, collect(id(b)) AS ids \
+             RETURN l, c, size(ids) AS s",
+        ],
+    )
+    .await;
+
     assert_equivalent(
         &w,
         "conjunctive multi-label vs labels() predicate",

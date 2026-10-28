@@ -153,16 +153,14 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
                             label,
                             alias,
                             predicates,
-                            projection,
-                        } if predicates.is_empty() && projection.is_none() => {
-                            extract_node_id_conjunct(
-                                &predicate,
-                                alias,
-                                Some(&produced_aliases(left)),
-                            )
-                            .filter(|seek| !seek.many)
-                            .map(|seek| (label.clone(), alias.clone(), seek))
-                        }
+                            ..
+                        } if predicates.is_empty() => extract_node_id_conjunct(
+                            &predicate,
+                            alias,
+                            Some(&produced_aliases(left)),
+                        )
+                        .filter(|seek| !seek.many)
+                        .map(|seek| (label.clone(), alias.clone(), seek)),
                         _ => None,
                     }
                 }
@@ -201,15 +199,17 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             // scan's label when it has one, or fanned across observed labels
             // when it doesn't (the unlabelled `MATCH (n) WHERE elementId(n)
             // = $id` shape a GUI fetch/expand uses). `id(n) IN <list>` seeks
-            // each listed id the same way. Avoids a full scan.
+            // each listed id the same way. Avoids a full scan. A scan
+            // projection does not block it: it only narrows what the scan
+            // decodes, and the seek loads the whole node anyway.
             if let LogicalPlan::NodeScan {
                 label,
                 alias,
                 predicates,
-                projection,
+                ..
             } = input.as_ref()
             {
-                if predicates.is_empty() && projection.is_none() {
+                if predicates.is_empty() {
                     if let Some(seek) = extract_node_id_conjunct(&predicate, alias, None) {
                         let lookup = id_seek(
                             label.clone(),
@@ -1210,6 +1210,23 @@ mod tests {
             "the outer UNWIND must drive the seek: {plan:?}"
         );
         assert!(!plan_contains_node_scan(&plan), "{plan:?}");
+    }
+
+    #[test]
+    fn id_seek_on_an_expand_source_survives_projection_pushdown() {
+        // The filter only lands on the scan after a pushdown round, by which
+        // time projection pushdown has narrowed the scan to its id column.
+        for q in [
+            "MATCH (a:Person)-[:KNOWS]->(b) WHERE id(a) = $id RETURN id(b)",
+            "MATCH (a)-[:KNOWS]->(b) WHERE id(a) IN $ids RETURN b",
+        ] {
+            let plan = crate::optimize::optimize(
+                lower(&parse(q).unwrap()).unwrap(),
+                &StatsCatalog::empty(),
+            );
+            assert!(find_node_by_id(&plan).is_some(), "{q}: {plan:?}");
+            assert!(!plan_contains_node_scan(&plan), "{q}: {plan:?}");
+        }
     }
 
     #[test]
