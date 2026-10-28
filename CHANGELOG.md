@@ -38,7 +38,8 @@ crates.io release will establish and document that API explicitly.
   stops as soon as the target is settled and returns one row (none when it
   is unreachable) with `node_id`, `distance`, `hops` and a new `path` column
   holding the node sequence from source to target. Without a target, `path`
-  is null and the other columns are unchanged.
+  is null and the other columns are unchanged. The MCP `graph_algorithm`
+  tool takes the same `target` for `shortest_path` and returns the route.
 
 ## [2.6.19] - 2026-09-16
 

@@ -833,8 +833,7 @@ pub fn shortest_path_to(
     target: NodeId,
     weighted: bool,
 ) -> Option<(f64, Vec<NodeId>)> {
-    shortest_path_to_cancellable(graph, source, target, weighted, &|| false)
-        .expect("never cancels")
+    shortest_path_to_cancellable(graph, source, target, weighted, &|| false).expect("never cancels")
 }
 
 /// [`shortest_path_to`] that polls `cancel` periodically.
@@ -2177,7 +2176,10 @@ mod tests {
         g.add_edge(b, c, None);
         g.add_edge(c, d, None);
         g.add_edge(a, d, None);
-        assert_eq!(shortest_path_to(&g, a, c, false), Some((2.0, vec![a, b, c])));
+        assert_eq!(
+            shortest_path_to(&g, a, c, false),
+            Some((2.0, vec![a, b, c]))
+        );
         assert_eq!(shortest_path_to(&g, a, d, false), Some((1.0, vec![a, d])));
         assert_eq!(shortest_path_to(&g, a, a, false), Some((0.0, vec![a])));
         // Directed: nothing leads back to a.
