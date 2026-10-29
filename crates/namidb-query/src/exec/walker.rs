@@ -295,35 +295,18 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 subplan,
                 optional,
             } => {
-                // Correlated lateral join: for each outer row, run the subplan
-                // with that row as the correlation and emit the row combined
-                // with each subplan row.
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                let mut out = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let sub_rows =
-                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
-                            .await?;
-                    if sub_rows.is_empty() {
-                        if let Some(pad) = optional {
-                            let mut padded = row;
-                            for name in pad {
-                                padded.set(name.clone(), RuntimeValue::Null);
-                            }
-                            out.push(padded);
-                        }
-                        continue;
-                    }
-                    for s in sub_rows {
-                        let mut merged = row.clone();
-                        for (k, v) in &s.bindings {
-                            merged.set(k.clone(), v.clone());
-                        }
-                        out.push(merged);
-                    }
-                }
-                Ok(out)
+                apply_rows(
+                    rows,
+                    subplan,
+                    optional.as_deref(),
+                    snapshot,
+                    params,
+                    routing,
+                    None,
+                )
+                .await
             }
 
             LogicalPlan::Create { .. }
@@ -1387,11 +1370,64 @@ fn execute_capped<'a>(
                 .await
             }
 
+            // An OPTIONAL MATCH keeps every input row at least once (matched
+            // or padded), so `cap` input rows already fill the budget.
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional: Some(pad),
+            } => {
+                let rows = execute_capped(input, snapshot, params, outer, routing, cap).await?;
+                apply_rows(rows, subplan, Some(pad), snapshot, params, routing, Some(cap)).await
+            }
+
             // Cap unsafe to push through this operator — run it in full.
             other => execute_inner_with_routing(other, snapshot, params, outer, routing).await,
         }
     }
     .boxed()
+}
+
+/// The per-row half of a correlated `Apply`: run `subplan` once per input
+/// row with that row as the correlation, and emit the row combined with
+/// each subplan row. With `optional` (a whole-pattern OPTIONAL MATCH) a row
+/// the subplan rejects is kept once with the `optional` aliases set to NULL.
+/// `cap` stops once that many rows are out, for a LIMIT above.
+pub(crate) async fn apply_rows(
+    rows: Vec<Row>,
+    subplan: &LogicalPlan,
+    optional: Option<&[String]>,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+    routing: &PlanRouting,
+    cap: Option<usize>,
+) -> Result<Vec<Row>, ExecError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if cap.is_some_and(|cap| out.len() >= cap) {
+            break;
+        }
+        let sub_rows =
+            execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
+        if sub_rows.is_empty() {
+            if let Some(pad) = optional {
+                let mut padded = row;
+                for name in pad {
+                    padded.set(name.clone(), RuntimeValue::Null);
+                }
+                out.push(padded);
+            }
+            continue;
+        }
+        for s in sub_rows {
+            let mut merged = row.clone();
+            for (k, v) in &s.bindings {
+                merged.set(k.clone(), v.clone());
+            }
+            out.push(merged);
+        }
+    }
+    Ok(out)
 }
 
 /// Scan limit that keeps a leaf node scan under the scoped row cap: one row
@@ -9184,29 +9220,16 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
                 let rows = input_set.materialize_all(None);
-                let mut out = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let sub_rows =
-                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
-                            .await?;
-                    if sub_rows.is_empty() {
-                        if let Some(pad) = optional {
-                            let mut padded = row;
-                            for name in pad {
-                                padded.set(name.clone(), RuntimeValue::Null);
-                            }
-                            out.push(padded);
-                        }
-                        continue;
-                    }
-                    for s in sub_rows {
-                        let mut merged = row.clone();
-                        for (k, v) in &s.bindings {
-                            merged.set(k.clone(), v.clone());
-                        }
-                        out.push(merged);
-                    }
-                }
+                let out = apply_rows(
+                    rows,
+                    subplan,
+                    optional.as_deref(),
+                    snapshot,
+                    params,
+                    routing,
+                    None,
+                )
+                .await?;
                 Ok(FactorRowSet::from_flat(out))
             }
 
