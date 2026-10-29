@@ -113,7 +113,7 @@ async fn drain_edges(snap: &Snapshot<'_>, edge_type: &str, batch: usize) -> Vec<
     let mut cursor = snap.edge_scan_cursor(edge_type).await.unwrap();
     let mut out = Vec::new();
     loop {
-        let rows = cursor.next_batch(batch).unwrap();
+        let rows = cursor.next_batch(batch).await.unwrap();
         assert!(rows.len() <= batch);
         if rows.is_empty() {
             return out;
@@ -276,13 +276,12 @@ async fn edge_cursor_stops_after_a_failed_batch() {
     let (writer, _) = overlapping_writer().await;
     let snap = writer.snapshot();
     let mut cursor = snap.edge_scan_cursor("TO").await.unwrap();
-    assert_eq!(cursor.next_batch(10).unwrap().len(), 10);
+    assert_eq!(cursor.next_batch(10).await.unwrap().len(), 10);
 
     let cancelled = Arc::new(AtomicBool::new(true));
-    let failed =
-        namidb_storage::cancel::with_cancel_flag(cancelled, async { cursor.next_batch(10) }).await;
+    let failed = namidb_storage::cancel::with_cancel_flag(cancelled, cursor.next_batch(10)).await;
     assert!(failed.is_err());
-    assert!(cursor.next_batch(10).is_err());
+    assert!(cursor.next_batch(10).await.is_err());
 }
 
 #[tokio::test]

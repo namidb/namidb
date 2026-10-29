@@ -411,10 +411,9 @@ Walking a whole label reads each stored record about once, like
 the iterator was created, even if writes, compactions or sweeps land while
 you walk it; the iterator keeps that version's files alive until it is
 dropped, or until `close()` on a `read_only` client, which drops the leases
-of iterators still open too. An edge iterator reads the type's SST files
-and decodes their property strings when it is created and keeps them until
-it is dropped, so its memory grows with the type like `scan_edge_type`;
-only the per-edge parsing and the dicts are built a batch at a time. If a
+of iterators still open too. An edge iterator reads each SST file of the
+type about 1,024 edges at a time, so its first step and its memory cost
+about one batch per file, not the whole type. If a
 step raises, the iterator is done: every later `next()` raises too, rather
 than skip the rows of the failed batch. The `scan_*` calls keep returning
 lists.
