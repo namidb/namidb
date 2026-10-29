@@ -101,9 +101,21 @@ crates.io release will establish and document that API explicitly.
 
 - **Python: `limit=` on `scan_label`, `scan_label_arrow` and
   `scan_edge_type`, plus `iter_label` / `iter_edge_type`.** The iterators
-  build one dict per step, so walking a 2M-node label no longer needs 2M
-  dicts alive at once. Edge scans still read the whole type before
-  applying the limit.
+  are lazy: `next(iter(c.iter_label("Artifact")))` used to decode all
+  1.87M rows before the first one came back, and now reads one batch of
+  1,024. Each step pulls the next batch with the GIL released, resuming
+  the id-ordered merge of the memtable and every node SST where the last
+  one stopped, so a batch reads the id, tombstone, lsn and label columns
+  of the row groups it reaches and point-reads only the rows it returns.
+  This holds on overlapping SSTs too. An iterator reads from the version
+  that was current when it was created, and keeps that version's files
+  alive against compaction and sweeps until it is dropped, so writes that
+  land meanwhile do not show up half way through. The `scan_*` calls stay
+  lists. An edge iterator, and `scan_edge_type(limit=)`, decode properties
+  for the edges they return only, but still read the type's SST files in
+  full when they start, since edge SSTs have no ranged scan yet. Storage
+  callers get the same through `Snapshot::label_scan_cursor` and
+  `Snapshot::edge_scan_cursor`.
 
 - **`--fence-policy` (`NAMIDB_FENCE_POLICY`) decides what a fenced writer
   does.** Until now a server whose namespace was claimed by another process
@@ -158,9 +170,10 @@ crates.io release will establish and document that API explicitly.
   (default 8, `0` turns it off), and every applied pass is followed by a
   sweep of objects written more than `auto_sweep_min_age_secs` ago (default
   60, `None` turns it off). The age counts from when a file was written, so
-  it does not protect a reader in another process that loaded the manifest
-  before the pass. Turn the auto sweep off while another process reads the
-  graph.
+  it is no grace period for a reader in another process. A
+  `read_only=True` client is safe anyway, since every sweep honours its
+  retention lease, but a server or the CLI reading the same directory is
+  not: turn the auto sweep off while one of those reads the graph.
 
 - **Compaction scratch for a `file://` Python client goes under
   `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless

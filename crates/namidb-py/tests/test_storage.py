@@ -217,6 +217,69 @@ def test_iter_label_and_edge_type_yield_the_scan(client: tg.Client) -> None:
     assert [(e["src"], e["dst"]) for e in edges] == [tuple(sorted(ids)[:2])]
 
 
+def _overlapping_people(client: tg.Client, count: int) -> list[str]:
+    # Two flushes over the same random ids overlap in key range, which is
+    # the layout a uuid keyed graph has once it holds more than one SST.
+    ids = [_new_uuid() for _ in range(count)]
+    client.put_nodes("Person", [{"_id": i, "n": n} for n, i in enumerate(ids)])
+    client.upsert_edge("KNOWS", ids[0], ids[1], {"w": 1})
+    client.commit()
+    client.flush()
+    client.merge_nodes("Person", [{"_id": i, "n": -n} for n, i in enumerate(ids) if n % 3 == 0])
+    for n, i in enumerate(ids[1:]):
+        client.upsert_edge("KNOWS", ids[n], i, {"w": n})
+    client.commit()
+    client.flush()
+    return ids
+
+
+def test_iter_label_reads_from_one_snapshot(tmp_path) -> None:
+    client = tg.Client(
+        f"file://{tmp_path}?ns=iter_case",
+        cache_bytes=0,
+        auto_sweep_min_age_secs=0,
+        compaction_l0_trigger=0,
+    )
+    ids = _overlapping_people(client, 2500)
+    nodes = client.scan_label("Person")
+    edges = client.scan_edge_type("KNOWS")
+    assert len(nodes) == 2500 and len(edges) == 2499
+
+    node_it = client.iter_label("Person")
+    edge_it = client.iter_edge_type("KNOWS")
+    got_nodes = [next(node_it)]
+    got_edges = [next(edge_it)]
+    # Deletes, new nodes, a compaction and a sweep land while both
+    # iterators are open. They keep reading the version they started on,
+    # and the sweep keeps its files.
+    for n in range(0, len(ids), 2):
+        client.tombstone_node("Person", ids[n])
+        client.tombstone_edge("KNOWS", ids[n], ids[n + 1])
+    client.put_nodes("Person", [{"_id": _new_uuid(), "n": 0} for _ in range(100)])
+    client.commit()
+    client.flush()
+    assert client.compact()["applied"] is True
+    client.sweep(min_age_secs=0)
+    got_nodes += list(node_it)
+    got_edges += list(edge_it)
+
+    assert got_nodes == nodes
+    assert got_edges == edges
+    assert len(client.scan_label("Person")) == 1350
+    assert list(client.iter_label("Person")) == client.scan_label("Person")
+
+
+def test_iter_label_limit_spans_batches(client: tg.Client) -> None:
+    _overlapping_people(client, 2500)
+    nodes = client.scan_label("Person")
+    edges = client.scan_edge_type("KNOWS")
+    for limit in (0, 1, 1024, 1500, 5000):
+        assert list(client.iter_label("Person", limit=limit)) == nodes[:limit]
+        assert client.scan_label("Person", limit=limit) == nodes[:limit]
+        assert list(client.iter_edge_type("KNOWS", limit=limit)) == edges[:limit]
+        assert client.scan_edge_type("KNOWS", limit=limit) == edges[:limit]
+
+
 # ── read_only clients ──────────────────────────────────────────────────
 
 

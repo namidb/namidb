@@ -328,11 +328,11 @@ it inline:
   folded into SSTs, old manifest versions. Only objects written more than
   `auto_sweep_min_age_secs` ago (default 60) go. That age counts from when
   the file was written, not from when it stopped being used, so it is no
-  grace period for a reader in another process: a server, the CLI or a
-  read-only client that loaded the manifest before the pass can find its
-  files gone. If another process reads the graph while this client
-  writes, pass `None` to turn the auto sweep off and call `sweep()` when
-  the readers are done.
+  grace period for a reader in another process. A `read_only=True` client
+  is safe anyway: it holds a retention lease that every sweep honours. A
+  server or the CLI reading the same directory holds none and can find
+  its files gone, so while one of those reads the graph, pass `None` to
+  turn the auto sweep off and call `sweep()` when it is done.
 - `client.sweep(min_age_secs=60, dry_run=False)` runs the same sweep on
   demand and returns counts of what it removed (or would remove). The
   auto sweep runs right after the pass, so that pass's own leftovers are
@@ -401,9 +401,14 @@ table = client.scan_label_arrow("Person")
 
 On a large label, pass `limit=` to `scan_label`, `scan_label_arrow` or
 `scan_edge_type` to look at a sample, or walk the scan with
-`iter_label(label)` / `iter_edge_type(edge_type)`. The iterators build one
-dict per step instead of a list of every row, so Python memory stays flat.
-The scan itself is still read in full before the first row comes back.
+`iter_label(label)` / `iter_edge_type(edge_type)`. The iterators read 1,024
+rows per step with the GIL released, so the first row comes back after one
+batch, not the whole label, and memory stays flat. Every row comes from the
+version that was current when the iterator was created, even if writes,
+compactions or sweeps land while you walk it; the iterator keeps that
+version's files alive until it is dropped. An edge iterator still reads the
+type's SST files when it is created and only defers the decoding of each
+edge. The `scan_*` calls keep returning lists.
 
 ## Storage backends
 
