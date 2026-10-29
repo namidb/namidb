@@ -6300,8 +6300,9 @@ impl<'mt> Snapshot<'mt> {
     /// Each candidate costs a full exact-record lookup, so the route runs
     /// only when that work is bounded: by the label being sparse, or by a
     /// small bare LIMIT whose candidates mostly confirm. A LIMIT that keeps
-    /// hitting superseded postings gives up after a budget. Anything else,
-    /// including the row cap's guard limit, is left to the two-phase scan.
+    /// hitting superseded postings gives up after a budget. Anything else is
+    /// left to the caller's fallback: the id-ordered merge for a limited scan
+    /// such as the row cap's guard limit, the two-phase scan otherwise.
     async fn try_scan_overlapping_label_sidecars(
         &self,
         label: &str,
