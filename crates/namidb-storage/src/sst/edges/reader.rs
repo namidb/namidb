@@ -450,6 +450,18 @@ impl EdgeSstReader {
     /// [`Self::lookup`] for each key (lookup is O(K²) in the worst
     /// case; this is O(edge_count + key_count)).
     pub fn scan_all_edges(&self) -> Result<Vec<EdgeRowProjection>> {
+        let edge_count = usize::try_from(self.footer.edge_count)
+            .map_err(|_| Error::invariant("edge count does not fit usize"))?;
+        let mut out: Vec<EdgeRowProjection> = Vec::with_capacity(edge_count);
+        for k_idx in 0..self.footer.key_count as usize {
+            out.extend(self.key_edges(k_idx)?);
+        }
+        Ok(out)
+    }
+
+    /// The edges of the `k_idx`-th key, in stored partner order. The first
+    /// one is edge `cumulative_edges()[k_idx]` in enumeration order.
+    pub fn key_edges(&self, k_idx: usize) -> Result<Vec<EdgeRowProjection>> {
         let key_ids = self.section(SECTION_KEY_IDS, "")?;
         let offsets_bytes = self.section(SECTION_OFFSETS, "")?;
         let partners_bytes = self.section(SECTION_PARTNERS, "")?;
@@ -461,43 +473,38 @@ impl EdgeSstReader {
             None
         };
 
-        let key_count = self.footer.key_count as usize;
         let stride = self.offset_width.bytes();
-        let edge_count = usize::try_from(self.footer.edge_count)
-            .map_err(|_| Error::invariant("edge count does not fit usize"))?;
-        let mut out: Vec<EdgeRowProjection> = Vec::with_capacity(edge_count);
-        let mut edge_idx = 0usize;
-
-        for k_idx in 0..key_count {
-            let key_id: [u8; 16] = key_ids[k_idx * 16..(k_idx + 1) * 16]
-                .try_into()
-                .map_err(|_| Error::invariant("key_ids row length != 16"))?;
-            let start = read_offset(offsets_bytes, k_idx * stride, self.offset_width)? as usize;
-            let expected_degree = self.cumulative_edges[k_idx + 1]
-                .checked_sub(self.cumulative_edges[k_idx])
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| Error::invariant("partner degree does not fit usize"))?;
-            let (partners, _consumed) =
-                read_partner_block_expected(partners_bytes, start, expected_degree)?;
-            for (i, partner_id) in partners.iter().enumerate() {
-                let edge_i = edge_idx + i;
-                let lsn = u64::from_le_bytes(
-                    lsn_bytes[edge_i * 8..edge_i * 8 + 8]
-                        .try_into()
-                        .map_err(|_| Error::invariant("per_edge_lsn row length != 8"))?,
-                );
-                let tombstone = match tomb_bytes {
-                    Some(b) => (b[edge_i / 8] >> (edge_i % 8)) & 1 == 1,
-                    None => false,
-                };
-                out.push(EdgeRowProjection {
-                    key_id,
-                    partner_id: *partner_id,
-                    lsn,
-                    tombstone,
-                });
-            }
-            edge_idx += partners.len();
+        let key_id: [u8; 16] = key_ids
+            .get(k_idx * 16..(k_idx + 1) * 16)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| Error::invariant("key_ids row length != 16"))?;
+        let start = read_offset(offsets_bytes, k_idx * stride, self.offset_width)? as usize;
+        let edge_idx = usize::try_from(self.cumulative_edges[k_idx])
+            .map_err(|_| Error::invariant("edge index does not fit usize"))?;
+        let expected_degree = self.cumulative_edges[k_idx + 1]
+            .checked_sub(self.cumulative_edges[k_idx])
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| Error::invariant("partner degree does not fit usize"))?;
+        let (partners, _consumed) =
+            read_partner_block_expected(partners_bytes, start, expected_degree)?;
+        let mut out = Vec::with_capacity(partners.len());
+        for (i, partner_id) in partners.iter().enumerate() {
+            let edge_i = edge_idx + i;
+            let lsn = u64::from_le_bytes(
+                lsn_bytes[edge_i * 8..edge_i * 8 + 8]
+                    .try_into()
+                    .map_err(|_| Error::invariant("per_edge_lsn row length != 8"))?,
+            );
+            let tombstone = match tomb_bytes {
+                Some(b) => (b[edge_i / 8] >> (edge_i % 8)) & 1 == 1,
+                None => false,
+            };
+            out.push(EdgeRowProjection {
+                key_id,
+                partner_id: *partner_id,
+                lsn,
+                tombstone,
+            });
         }
         Ok(out)
     }

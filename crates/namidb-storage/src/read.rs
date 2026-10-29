@@ -109,8 +109,12 @@ use crate::sst::nodes::{
 };
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
 
+#[path = "edge_scan_cursor.rs"]
+mod edge_scan_cursor;
 #[path = "overlap_prefix_read.rs"]
 mod overlap_prefix_read;
+pub use edge_scan_cursor::EdgeScanCursor;
+pub use overlap_prefix_read::NodeScanCursor;
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
 #[path = "search_lsm_read.rs"]
 mod search_lsm_read;
