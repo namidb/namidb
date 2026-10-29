@@ -491,9 +491,14 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             subplan: Box::new(convert_semi_apply_to_hash_semi_join(*subplan, catalog)),
             negated,
         },
-        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            optional,
+        } => LogicalPlan::Apply {
             input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
             subplan: Box::new(convert_semi_apply_to_hash_semi_join(*subplan, catalog)),
+            optional,
         },
         LogicalPlan::PatternList {
             input,

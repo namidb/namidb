@@ -359,6 +359,7 @@ fn lower_clause_seq(
                     Some(b) if correlated => LogicalPlan::Apply {
                         input: Box::new(b),
                         subplan: Box::new(subplan),
+                        optional: None,
                     },
                     Some(b) => LogicalPlan::CrossProduct {
                         left: Box::new(b),
@@ -528,7 +529,10 @@ impl LowerCtx {
     /// internal `__anonr<N>` alias on every anonymous relationship whose
     /// types overlap another one of the clause, so the hops after it can
     /// compare against it (see `Expand::unique_rels`). shortestPath parts
-    /// are left out.
+    /// are left out. A variable-length hop is only named when a later hop
+    /// needs it: binding its relationship list sends it to the flat
+    /// executor, and anchor inversion, which may need the other order,
+    /// never moves a variable-length hop.
     fn name_unique_rels(&mut self, parts: &[PatternPart]) -> Vec<PatternPart> {
         let mut out = parts.to_vec();
         let all: Vec<Vec<String>> = out
@@ -541,10 +545,10 @@ impl LowerCtx {
             for (rel, _) in part.element.chain.iter_mut() {
                 let mine = at;
                 at += 1;
-                let shared = all
-                    .iter()
-                    .enumerate()
-                    .any(|(i, t)| i != mine && rel_types_overlap(t, &all[mine]));
+                let later_only = rel.length.is_some();
+                let shared = all.iter().enumerate().any(|(i, t)| {
+                    (i > mine || (i < mine && !later_only)) && rel_types_overlap(t, &all[mine])
+                });
                 if rel.binding.is_none() && shared {
                     let name = loop {
                         let n = self.anon_counter;
@@ -647,10 +651,41 @@ fn lower_match(
     // A part whose head re-uses an already-bound alias reuses that binding
     // instead of emitting a new scan (see `lower_node_pattern_head`).
     let patterns = ctx.name_unique_rels(&m.patterns);
+    if m.optional && !optional_per_hop(m, &patterns, ctx) {
+        // The pattern matches as a whole or not at all: lower it as a plain
+        // MATCH over the outer row and keep the row with NULLs when it
+        // yields nothing.
+        let outer: Vec<String> = ctx.bindings.iter().cloned().collect();
+        let argument = LogicalPlan::Argument {
+            bindings: outer.clone(),
+        };
+        let subplan = lower_match_body(m, &patterns, Some(argument), false, ctx)?;
+        let pad = ctx
+            .bindings
+            .iter()
+            .filter(|b| !outer.contains(b))
+            .cloned()
+            .collect();
+        return Ok(LogicalPlan::Apply {
+            input: Box::new(input.unwrap_or(LogicalPlan::Empty)),
+            subplan: Box::new(subplan),
+            optional: Some(pad),
+        });
+    }
+    lower_match_body(m, &patterns, input, m.optional, ctx)
+}
+
+fn lower_match_body(
+    m: &MatchClause,
+    patterns: &[PatternPart],
+    input: Option<LogicalPlan>,
+    optional: bool,
+    ctx: &mut LowerCtx,
+) -> Result<LogicalPlan, LowerError> {
     let outer_rels = ctx.clause_rels.replace(Vec::new());
     let mut plan = input;
-    for part in &patterns {
-        plan = Some(lower_pattern_part(part, plan, m.optional, ctx)?);
+    for part in patterns {
+        plan = Some(lower_pattern_part(part, plan, optional, ctx)?);
     }
     ctx.clause_rels = outer_rels;
     let mut plan = plan.expect("MATCH must have ≥ 1 pattern part");
@@ -659,6 +694,31 @@ fn lower_match(
         plan = attach_where(plan, pred, ctx)?;
     }
     Ok(plan)
+}
+
+/// Whether an `OPTIONAL MATCH` can run as optional Expands, each padding
+/// NULLs on its own. That is only the whole-pattern answer for one hop
+/// from a bound node with nothing else to check: a second hop, a `WHERE`,
+/// inline properties or a label on the bound start can rule out a match
+/// after the first hop already bound its target.
+fn optional_per_hop(m: &MatchClause, patterns: &[PatternPart], ctx: &LowerCtx) -> bool {
+    let [part] = patterns else {
+        return false;
+    };
+    let elem = &part.element;
+    let [(_, target)] = elem.chain.as_slice() else {
+        return false;
+    };
+    m.where_.is_none()
+        && elem
+            .head
+            .binding
+            .as_ref()
+            .is_some_and(|b| ctx.bindings.contains(&b.name))
+        && elem.head.labels.is_empty()
+        && elem.head.properties.is_none()
+        && target.properties.is_none()
+        && !target.label_disjunction
 }
 
 /// Split a WHERE predicate into a SemiApply chain (for top-level
@@ -760,7 +820,27 @@ fn lower_exists_subplan(
 ) -> Result<LogicalPlan, LowerError> {
     let mut sub = LowerCtx::new();
     sub.bindings = outer_ctx.bindings.clone();
-    lower_pattern_element(elem, None, false, ShortestMode::None, &mut sub)
+    lower_unique_element(elem, &mut sub)
+}
+
+/// Lower a lone pattern element (a WHERE pattern predicate, `EXISTS(...)`,
+/// a pattern comprehension) with relationship uniqueness across its hops,
+/// as `lower_match` gives a MATCH clause.
+fn lower_unique_element(
+    elem: &PatternElement,
+    ctx: &mut LowerCtx,
+) -> Result<LogicalPlan, LowerError> {
+    let part = PatternPart {
+        binding: None,
+        element: elem.clone(),
+        span: elem.span,
+        shortest_path: None,
+    };
+    let part = ctx.name_unique_rels(&[part]).remove(0);
+    let outer_rels = ctx.clause_rels.replace(Vec::new());
+    let plan = lower_pattern_element(&part.element, None, false, ShortestMode::None, ctx);
+    ctx.clause_rels = outer_rels;
+    plan
 }
 
 /// Lower an `EXISTS { MATCH … }` subquery block. Outer bindings are seeded so
@@ -785,7 +865,7 @@ fn lower_pattern_comprehension_subplan(
 ) -> Result<LogicalPlan, LowerError> {
     let mut sub = LowerCtx::new();
     sub.bindings = outer_ctx.bindings.clone();
-    let mut plan = lower_pattern_element(&pc.pattern, None, false, ShortestMode::None, &mut sub)?;
+    let mut plan = lower_unique_element(&pc.pattern, &mut sub)?;
     if let Some(pred) = &pc.predicate {
         plan = LogicalPlan::Filter {
             input: Box::new(plan),

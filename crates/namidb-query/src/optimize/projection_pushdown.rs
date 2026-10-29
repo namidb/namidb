@@ -239,7 +239,7 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
             collect_from_plan(input, req);
             collect_from_plan(subplan, req);
         }
-        LogicalPlan::Apply { input, subplan } => {
+        LogicalPlan::Apply { input, subplan, .. } => {
             collect_from_plan(input, req);
             collect_from_plan(subplan, req);
         }
@@ -774,9 +774,14 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             subplan: Box::new(rewrite(*subplan, req)),
             negated,
         },
-        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            optional,
+        } => LogicalPlan::Apply {
             input: Box::new(rewrite(*input, req)),
             subplan: Box::new(rewrite(*subplan, req)),
+            optional,
         },
         LogicalPlan::PatternList {
             input,

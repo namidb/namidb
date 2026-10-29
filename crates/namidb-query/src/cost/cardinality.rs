@@ -518,7 +518,7 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
                 operator: plan.operator_name(),
             }
         }
-        LogicalPlan::Apply { input, subplan } => {
+        LogicalPlan::Apply { input, subplan, .. } => {
             // Correlated lateral join: per outer row, emit each subplan row.
             // Estimate like a cross product (output bindings are the union).
             let l = estimate_inner(input, catalog);

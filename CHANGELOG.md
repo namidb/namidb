@@ -51,6 +51,11 @@ crates.io release will establish and document that API explicitly.
   could walk the same relationship more than once now return fewer rows.
   See the entry under Fixed.
 
+- **An OPTIONAL MATCH matches its whole pattern or nothing.** A pattern with
+  more than one hop, a `WHERE`, or inline properties used to keep the part
+  that matched and pad the rest, or drop the row. Such queries now return
+  the rows Cypher does. See the entry under Fixed.
+
 ### Added
 
 - **macOS x86_64 Python wheel.** Intel Macs and x86_64 Pythons on Apple
@@ -212,14 +217,28 @@ crates.io release will establish and document that API explicitly.
   flat and factorized executors and in the WCOJ join, including
   variable-length hops mixed with fixed ones. An `OPTIONAL MATCH` applies
   the rule inside its own pattern and pads NULLs when it rules out every
-  match. Separate MATCH clauses still do not constrain each other, as in
-  Cypher.
+  match, and so does a pattern in `WHERE`, `EXISTS(...)` or a pattern
+  comprehension. Separate MATCH clauses still do not constrain each other,
+  as in Cypher.
 
   This changes results: such queries now return fewer rows, the ones a
   Cypher database returns. Hops whose types cannot overlap are not
   compared. With `NAMIDB_WCOJ=1`, two comma-separated cyclic parts that
   share an edge type now run on the regular join, since the second has to
   check the first part's relationships.
+
+- **An `OPTIONAL MATCH` kept half a match.** Each hop of the pattern was
+  optional on its own, so `MATCH (a) OPTIONAL MATCH (a)<-[:K]-(b)-[:K]->(x)`
+  returned `b` with a NULL `x` for every `b` that had no second hop, next to
+  the full matches, instead of the full matches alone or one row with `b`
+  and `x` both NULL. The same split hit a `WHERE` on the OPTIONAL MATCH,
+  which dropped the row when it ruled out every match instead of padding
+  it, inline properties on the far node (`(b {n: 1})`), which were ignored,
+  and a pattern that starts at a new node (`OPTIONAL MATCH (z:Missing)`),
+  which dropped the row. Such a pattern now runs as a plain MATCH for each
+  incoming row, and the row is kept once with every new variable NULL when
+  it finds nothing. A single hop from a bound node with none of those still
+  runs as before.
 
 - **A chained `OPTIONAL MATCH` failed when an earlier one found nothing.**
   `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (b)-[:S]->(c)` raised

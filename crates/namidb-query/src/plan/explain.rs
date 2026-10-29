@@ -673,7 +673,7 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 "SemiApply"
             });
         }
-        LogicalPlan::Apply { .. } => out.push_str("Apply"),
+        LogicalPlan::Apply { .. } => out.push_str(plan.operator_name()),
         LogicalPlan::PatternList {
             projection, alias, ..
         } => {

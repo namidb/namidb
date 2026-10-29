@@ -443,7 +443,7 @@ fn execute_write_inner_mode<'a>(
             // leaf carries the imports), then emit the outer row combined with
             // each subplan row. A read-only Apply falls through to the read
             // delegation below.
-            LogicalPlan::Apply { input, subplan } if subplan.contains_write() => {
+            LogicalPlan::Apply { input, subplan, .. } if subplan.contains_write() => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = if retain_output {
                     Vec::with_capacity(rows.len())

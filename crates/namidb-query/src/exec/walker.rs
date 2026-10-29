@@ -287,7 +287,11 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 Ok(out)
             }
 
-            LogicalPlan::Apply { input, subplan } => {
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional,
+            } => {
                 // Correlated lateral join: for each outer row, run the subplan
                 // with that row as the correlation and emit the row combined
                 // with each subplan row.
@@ -298,6 +302,16 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     let sub_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
                             .await?;
+                    if sub_rows.is_empty() {
+                        if let Some(pad) = optional {
+                            let mut padded = row;
+                            for name in pad {
+                                padded.set(name.clone(), RuntimeValue::Null);
+                            }
+                            out.push(padded);
+                        }
+                        continue;
+                    }
                     for s in sub_rows {
                         let mut merged = row.clone();
                         for (k, v) in &s.bindings {
@@ -9144,7 +9158,11 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 Ok(FactorRowSet::from_flat(out))
             }
 
-            LogicalPlan::Apply { input, subplan } => {
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional,
+            } => {
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
@@ -9154,6 +9172,16 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     let sub_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
                             .await?;
+                    if sub_rows.is_empty() {
+                        if let Some(pad) = optional {
+                            let mut padded = row;
+                            for name in pad {
+                                padded.set(name.clone(), RuntimeValue::Null);
+                            }
+                            out.push(padded);
+                        }
+                        continue;
+                    }
                     for s in sub_rows {
                         let mut merged = row.clone();
                         for (k, v) in &s.bindings {

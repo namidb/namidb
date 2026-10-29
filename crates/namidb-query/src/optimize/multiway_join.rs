@@ -599,9 +599,14 @@ fn recurse_children(plan: LogicalPlan, refs: &BTreeMap<String, usize>) -> Logica
             subplan,
             negated,
         },
-        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            optional,
+        } => LogicalPlan::Apply {
             input: Box::new(rewrite(*input, refs)),
             subplan,
+            optional,
         },
         LogicalPlan::PatternList {
             input,

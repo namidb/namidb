@@ -434,12 +434,17 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
         // predicate may reference them — keep all pending filters above the
         // Apply and recurse into the input with none. The subplan is a
         // separate (correlated) scope and is not visited.
-        LogicalPlan::Apply { input, subplan } => {
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            optional,
+        } => {
             let new_input = pushdown_at(*input, Vec::new());
             apply_filters(
                 LogicalPlan::Apply {
                     input: Box::new(new_input),
                     subplan,
+                    optional,
                 },
                 pending,
             )
