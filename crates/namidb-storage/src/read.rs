@@ -7059,9 +7059,6 @@ impl<'mt> Snapshot<'mt> {
 
         // id -> (winning lsn, the winner's structural view and physical row
         // when it carries `label`). Anything else is only a shadow.
-        // ponytail: one entry per stored id, shadows included, so memory is
-        // corpus-sized even for a tiny label; collect the label's ids first
-        // and check shadows only for those if that ever matters.
         let mut latest: BTreeMap<NodeId, (u64, Option<Box<LabelScanRow>>)> = BTreeMap::new();
         for (key, entry) in self.node_entries() {
             let MemKey::Node { id } = key else {
@@ -7082,6 +7079,11 @@ impl<'mt> Snapshot<'mt> {
             };
             update_node_winner(&mut latest, *id, entry.lsn, row);
         }
+        // The label's postings plus its memtable members name every id whose
+        // winner can carry `label`. A row of any other id can neither be a
+        // member nor hide one, so it skips the reconciliation, which would
+        // otherwise hold every stored id.
+        let candidates = self.label_candidate_ids(label, label_id, &latest).await?;
 
         for idx in self.manifest.index.node_descriptors() {
             let desc = &self.manifest.manifest.ssts[idx];
@@ -7112,6 +7114,12 @@ impl<'mt> Snapshot<'mt> {
                         .try_into()
                         .map_err(|_| Error::invariant("node_id row length != 16"))?;
                     let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
+                    if candidates
+                        .as_ref()
+                        .is_some_and(|ids| ids.binary_search(&id).is_err())
+                    {
+                        continue;
+                    }
                     let lsn = lsn_col.value(row);
                     let carries = !tomb_col.value(row)
                         && row_carries_label(&batch, row, label, label_id, dict, &desc.scope);
@@ -7169,6 +7177,9 @@ impl<'mt> Snapshot<'mt> {
                 return Ok(None);
             }
         }
+        if let Some(cache) = &self.cache {
+            cache.record_label_reconciled_node_ids(latest.len());
+        }
 
         // Phase 2. Winners come out in id order, which within one SST is also
         // physical order, so each SST's row list is sorted by ordinal.
@@ -7201,6 +7212,52 @@ impl<'mt> Snapshot<'mt> {
             true
         });
         Ok(Some(out))
+    }
+
+    /// Sorted ids of every SST posting of `label` plus its memtable members
+    /// in `latest`. `None` when some SST that can hold the label has no
+    /// usable postings, or when the label is too dense for the postings to
+    /// be worth reading.
+    async fn label_candidate_ids(
+        &self,
+        label: &str,
+        label_id: Option<LabelId>,
+        latest: &BTreeMap<NodeId, (u64, Option<Box<LabelScanRow>>)>,
+    ) -> Result<Option<Vec<NodeId>>> {
+        let Some(label_id) = label_id else {
+            return Ok(None);
+        };
+        let mut ids: Vec<NodeId> = latest
+            .iter()
+            .filter(|(_, (_, row))| row.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        // Around half the rows, reading the postings costs what the skipped
+        // reconciliation saves: a label of 53% of 220k nodes counted in 73 ms
+        // with them and 72 ms without.
+        if !self.label_share_at_most(label, ids.len(), 2) {
+            return Ok(None);
+        }
+        for idx in self.manifest.index.node_descriptors() {
+            if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
+                continue;
+            }
+            let Some(mut cursor) = self.label_posting_cursor(idx, label_id).await? else {
+                return Ok(None);
+            };
+            loop {
+                let Some(page) = self.next_label_postings(&mut cursor, 4096).await? else {
+                    return Ok(None);
+                };
+                if page.is_empty() {
+                    break;
+                }
+                ids.extend(page);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(Some(ids))
     }
 
     /// Phase 2 of [`Self::try_scan_label_two_phase`]: properties for the
@@ -16662,6 +16719,110 @@ mod tests {
         }
     }
 
+    /// Measurement for mid-sized labels, too dense for the record lookups of
+    /// the postings route: 220k nodes over two overlapping node SSTs (a
+    /// tenth rewritten), labels of 1/32, 1/16, 1/8 and 1/4 of the nodes and
+    /// one of the rest. Each label is read id-only (a count) and with one
+    /// property. Run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "measurement, prints numbers"]
+    async fn measure_mid_sized_label_reads_over_overlapping_node_ssts() {
+        const NODES: usize = 220_000;
+        const UPDATES: usize = 22_000;
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let ids: Vec<NodeId> = (0..NODES)
+            .map(|_| {
+                let raw = (u128::from(next()) << 64) | u128::from(next());
+                NodeId::from_uuid(Uuid::from_u128(raw))
+            })
+            .collect();
+        let label_of = |i: usize| -> u32 {
+            match i % 64 {
+                0..=1 => 0,
+                2..=5 => 1,
+                6..=13 => 2,
+                14..=29 => 3,
+                _ => 4,
+            }
+        };
+        let payload = |i: usize, version: u64| {
+            MemOp::Upsert(
+                NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("name".to_string(), Value::Str(format!("n{i}-{version}"))),
+                        ("note".to_string(), Value::Str(format!("{:0>80}", i))),
+                    ]),
+                    schema_version: 1,
+                    labels: vec![label_of(i)],
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+        let store = make_store();
+        let paths = make_paths("measure-mid-labels");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        for label in 0..5 {
+            base.manifest.label_dict.intern(&format!("L{label}"));
+        }
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().build();
+        let rows = (0..NODES)
+            .map(|i| (ids[i], i as u64 + 1, payload(i, 0)))
+            .collect();
+        let first =
+            flush_batch_with_row_group_rows(128 * 1024, &ms, &fence, &base, &schema, rows).await;
+        let mut touched: Vec<usize> = (0..UPDATES).map(|k| (k * 7919 + 3) % NODES).collect();
+        touched.sort_unstable_by_key(|i| ids[*i]);
+        touched.dedup();
+        let rows = touched
+            .iter()
+            .map(|&i| (ids[i], (NODES + i) as u64 + 1, payload(i, 1)))
+            .collect();
+        let committed =
+            flush_batch_with_row_group_rows(128 * 1024, &ms, &fence, &first, &schema, rows).await;
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        for (label, share) in [
+            ("L0", "1/32"),
+            ("L1", "1/16"),
+            ("L2", "1/8"),
+            ("L3", "1/4"),
+            ("L4", "rest"),
+        ] {
+            for projection in [vec![], vec!["name".to_string()]] {
+                // Best of three, each on a fresh cache.
+                let mut best = std::time::Duration::MAX;
+                let mut seen = (0, 0);
+                for _ in 0..3 {
+                    let cache = SstCache::new(256 * 1024 * 1024);
+                    let snap =
+                        Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                            .with_cache(cache.clone());
+                    let started = std::time::Instant::now();
+                    let rows = snap
+                        .scan_label_with_predicates_and_projection(label, &[], Some(&projection))
+                        .await
+                        .unwrap();
+                    best = best.min(started.elapsed());
+                    seen = (rows.len(), cache.label_reconciled_node_ids());
+                }
+                println!(
+                    "  {label} ({share:<4}) {projection:<10?} rows={:<6} reconciled ids={:<6} {best:?}",
+                    seen.0, seen.1,
+                );
+            }
+        }
+    }
+
     /// Measurement for the forensic report's label locality issue, scaled
     /// down: 200k nodes over 18 labels with two overlapping node SSTs of
     /// 128 Ki-row groups, a 9-node label and a dense label carrying
@@ -17088,6 +17249,9 @@ mod tests {
         assert_eq!(counted, 1);
         assert_eq!(cache.node_locator_probes(), 0);
         assert_eq!(cache.label_selected_node_rows(), 0);
+        // That pass reconciles only the three ids the Device postings name,
+        // not all 22 stored ones.
+        assert_eq!(cache.label_reconciled_node_ids(), 3);
 
         // A label that lives mostly in the memtable is not sparse, even when
         // the manifest has never seen it.
