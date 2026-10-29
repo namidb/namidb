@@ -297,7 +297,9 @@ crates.io release will establish and document that API explicitly.
   compaction writes, and the JSON parser could round a 17-digit double to
   its neighbour. Point lookups and property pages keep the exact value, so
   one embedding could read back with different bits on a lookup and on a
-  scan. Floats are now parsed exactly.
+  scan. Floats are now parsed exactly. The exact parser costs about 9 ns
+  more per float, which did not show up in a flush or a compaction of
+  4,096 nodes with 1,024-float embeddings (both about 15 s either way).
 
 - **A MATCH could bind the same relationship to two of its relationship
   variables.** Cypher requires every relationship in one MATCH pattern to
