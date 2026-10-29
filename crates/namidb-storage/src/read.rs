@@ -5923,9 +5923,10 @@ impl<'mt> Snapshot<'mt> {
             .await
     }
 
-    /// Whether the `_limited` node scans can stop early. When this is false
-    /// they reconcile every node first and truncate, so a caller pulling
-    /// growing prefixes would pay a full reconcile per call.
+    /// Whether every persisted node id has one version and the memtable holds
+    /// no nodes, so each SST is a run of the id-ordered scan on its own.
+    /// Otherwise the `_limited` scans merge the SSTs instead; see
+    /// [`Self::node_scan_stops_early`].
     pub fn node_scan_is_disjoint(&self) -> bool {
         self.disjoint_node_descriptors().is_some()
     }
