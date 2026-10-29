@@ -65,9 +65,7 @@ impl EdgeSstCursor {
 /// [`Snapshot::scan_edge_type`] returns them in, `(src, dst)` ascending.
 pub struct EdgeScanCursor {
     edge_type: String,
-    memtable: std::iter::Peekable<
-        std::collections::btree_map::IntoIter<(NodeId, NodeId), (u64, Option<EdgeView>)>,
-    >,
+    memtable: std::iter::Peekable<<EdgeWinners as IntoIterator>::IntoIter>,
     ssts: Vec<EdgeSstCursor>,
 }
 
