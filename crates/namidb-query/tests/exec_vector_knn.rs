@@ -273,6 +273,175 @@ async fn flat_vector_search_breaks_equal_scores_by_node_id() {
     );
 }
 
+/// Counts the bytes every GET returns, HEADs aside.
+#[derive(Debug)]
+struct ByteCountingStore {
+    inner: Arc<dyn ObjectStore>,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Display for ByteCountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ByteCountingStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ByteCountingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let head = options.head;
+        let result = self.inner.get_opts(location, options).await?;
+        if !head {
+            self.bytes.fetch_add(
+                result.range.end - result.range.start,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        Ok(result)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+}
+
+/// The exact scan scores from the embedding alone and loads only the top-k
+/// whole. It used to read every node of the label in full, so a label with a
+/// long text per node cost the text of every node for a k of 1.
+#[tokio::test]
+async fn flat_vector_search_reads_only_embeddings_until_it_has_the_top_k() {
+    let counting = Arc::new(ByteCountingStore {
+        inner: store(),
+        bytes: Default::default(),
+    });
+    let shared: Arc<dyn ObjectStore> = counting.clone();
+    let mut writer = WriterSession::open(shared.clone(), paths("knn-flat-projected"))
+        .await
+        .unwrap();
+    // Text that does not compress, so reading it shows up in the byte count.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut text = |len: usize| {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'a' + (state % 26) as u8)
+            })
+            .collect::<String>()
+    };
+    const DOCS: usize = 400;
+    const BODY: usize = 32 * 1024;
+    for i in 0..DOCS {
+        let properties = BTreeMap::from([
+            ("title".into(), CoreValue::Str(format!("doc-{i}"))),
+            ("body".into(), CoreValue::Str(text(BODY))),
+            ("embedding".into(), CoreValue::Vec(vec![1.0, i as f32, 0.0])),
+        ]);
+        writer
+            .upsert_node(
+                "Doc",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer
+        .flush(namidb_core::schema::Schema::default())
+        .await
+        .unwrap();
+    drop(writer);
+    let reader = WriterSession::open(shared, paths("knn-flat-projected"))
+        .await
+        .unwrap();
+
+    let plan = LogicalPlan::VectorSearch {
+        label: Some("Doc".into()),
+        alias: "d".into(),
+        property: "embedding".into(),
+        query: Expression {
+            kind: ExpressionKind::Parameter("q".into()),
+            span: SourceSpan::point(0),
+        },
+        k: RowCount::Const(1),
+        distance: VectorDistance::Cosine,
+        score_alias: "score".into(),
+        post_filter: None,
+    };
+    let mut params = Params::new();
+    params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0]));
+    let before = counting.bytes.load(std::sync::atomic::Ordering::SeqCst);
+    let rows = execute(&plan, &reader.snapshot(), &params).await.unwrap();
+    let read = counting.bytes.load(std::sync::atomic::Ordering::SeqCst) - before;
+
+    let [row] = rows.as_slice() else {
+        panic!("expected one row, got {}", rows.len())
+    };
+    let Some(RuntimeValue::Node(node)) = row.get("d") else {
+        panic!("expected a node")
+    };
+    // The winner is still the whole node.
+    assert_eq!(
+        node.properties.get("title"),
+        Some(&RuntimeValue::String("doc-0".into()))
+    );
+    assert!(node.properties.contains_key("body"));
+    let all_bodies = (DOCS * BODY) as u64;
+    assert!(
+        read < all_bodies / 4,
+        "read {read} bytes, the bodies alone are {all_bodies}"
+    );
+}
+
 // ── RFC-030 indexed path: freshness (delta-union) + filtered ANN ──────────
 // These exercise the Vamana index + the optimizer's VectorSearch rewrite, so
 // they run the full `optimize` pass with a catalog and require the feature.
