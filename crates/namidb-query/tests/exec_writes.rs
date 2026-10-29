@@ -5973,7 +5973,10 @@ async fn write_then_whole_pattern_optional_match() {
             .await
             .unwrap();
         assert_eq!(out.rows.len(), 1);
-        assert_eq!((int(&out.rows[0], "k"), int(&out.rows[0], "ck")), (Some(1), None));
+        assert_eq!(
+            (int(&out.rows[0], "k"), int(&out.rows[0], "ck")),
+            (Some(1), None)
+        );
     }
     assert_eq!(writer.snapshot().scan_label("X").await.unwrap().len(), 1);
 
@@ -5986,13 +5989,20 @@ async fn write_then_whole_pattern_optional_match() {
             .await
             .unwrap();
         assert_eq!(out.rows.len(), 1);
-        assert_eq!((int(&out.rows[0], "k"), int(&out.rows[0], "bk")), (Some(2), None));
+        assert_eq!(
+            (int(&out.rows[0], "k"), int(&out.rows[0], "bk")),
+            (Some(2), None)
+        );
     }
 
     // MATCH ... SET ... then a two-hop OPTIONAL MATCH in an explicit
     // transaction: the tail of the chain and the SET are only staged, and
     // the subplan still sees both.
-    write_q(&mut writer, "CREATE (:P {n: 1})-[:K]->(:P {n: 2})-[:K]->(:P {n: 3})").await;
+    write_q(
+        &mut writer,
+        "CREATE (:P {n: 1})-[:K]->(:P {n: 2})-[:K]->(:P {n: 3})",
+    )
+    .await;
     let [stage, _] = plans("MATCH (p:P {n: 3}) CREATE (p)-[:K]->(:P {n: 4})-[:K]->(:P {n: 5})");
     execute_write_staged(&stage, &mut writer, &Params::new())
         .await
@@ -6005,6 +6015,9 @@ async fn write_then_whole_pattern_optional_match() {
             .await
             .unwrap();
         assert_eq!(out.rows.len(), 1);
-        assert_eq!((int(&out.rows[0], "v"), int(&out.rows[0], "cn")), (Some(7), Some(5)));
+        assert_eq!(
+            (int(&out.rows[0], "v"), int(&out.rows[0], "cn")),
+            (Some(7), Some(5))
+        );
     }
 }

@@ -1378,7 +1378,16 @@ fn execute_capped<'a>(
                 optional: Some(pad),
             } => {
                 let rows = execute_capped(input, snapshot, params, outer, routing, cap).await?;
-                apply_rows(rows, subplan, Some(pad), snapshot, params, routing, Some(cap)).await
+                apply_rows(
+                    rows,
+                    subplan,
+                    Some(pad),
+                    snapshot,
+                    params,
+                    routing,
+                    Some(cap),
+                )
+                .await
             }
 
             // Cap unsafe to push through this operator — run it in full.
