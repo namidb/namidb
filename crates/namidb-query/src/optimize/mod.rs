@@ -237,6 +237,26 @@ fn visit_expression(expr: &Expression, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Every alias a MATCH clause names: its pattern bindings, the variables in
+/// inline properties and the WHERE. Over-approximates like
+/// [`expression_aliases`].
+pub(crate) fn match_clause_aliases(
+    patterns: &[crate::parser::ast::PatternPart],
+    where_: Option<&Expression>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for part in patterns {
+        if let Some(b) = &part.binding {
+            out.insert(b.name.clone());
+        }
+        visit_pattern_element(&part.element, &mut out);
+    }
+    if let Some(w) = where_ {
+        visit_expression(w, &mut out);
+    }
+    out
+}
+
 fn visit_pattern_element(pe: &PatternElement, out: &mut BTreeSet<String>) {
     visit_node_pattern(&pe.head, out);
     for (rel, node) in &pe.chain {

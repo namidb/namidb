@@ -435,3 +435,94 @@ async fn optional_match_where_reaches_the_scan_of_its_new_start() {
         assert!(explain.contains(&head_scan), "{explain}");
     }
 }
+
+/// An OPTIONAL MATCH that names no outer variable used to run its pattern
+/// once per outer row. It now runs once and its rows go to every row.
+#[tokio::test]
+async fn uncorrelated_optional_match_runs_once() {
+    let cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = namidb_storage::SessionCaches::none();
+    caches.sst_cache = Some(cache.clone());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("optional-once").unwrap());
+    let mut writer = WriterSession::open_with_caches(Arc::new(InMemory::new()), paths, caches)
+        .await
+        .unwrap();
+    for n in 0..50 {
+        writer
+            .upsert_node("A", random_id(n), &node(format!("a{n}"), String::new()))
+            .unwrap();
+    }
+    let w = random_id(500);
+    writer
+        .upsert_node("W", w, &node("w".into(), String::new()))
+        .unwrap();
+    for z in 0..4 {
+        let id = random_id(100 + z);
+        writer
+            .upsert_node("Z", id, &node(format!("z{z}"), String::new()))
+            .unwrap();
+        if z < 2 {
+            writer
+                .upsert_edge("R", id, w, &edge(String::new()))
+                .unwrap();
+        }
+    }
+    writer.commit_batch().await.unwrap();
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+
+    let mut params = Params::new();
+    params.insert("p".into(), RuntimeValue::String("z1".into()));
+    let pairs = |zs: &[&str]| {
+        let mut out: Vec<String> = (0..50)
+            .flat_map(|n| zs.iter().map(move |z| format!("a{n}|{z}")))
+            .collect();
+        out.sort();
+        out
+    };
+    let mut correlated: Vec<String> = (0..50)
+        .map(|n| format!("a{n}|{}", if n == 7 { "-" } else { "z0" }))
+        .collect();
+    correlated.sort();
+    // (filter, expected rows, label rows read: 50 A plus the Z scans)
+    for (filter, expected, reads) in [
+        ("true", pairs(&["z0", "z1"]), 54u64),
+        ("z.name = $p", pairs(&["z1"]), 54),
+        ("z.name = 'z3'", pairs(&["-"]), 54),
+        ("z.name = 'z0' AND a.name <> 'a7'", correlated, 250),
+    ] {
+        let query = format!(
+            "MATCH (a:A) OPTIONAL MATCH (z:Z)-[:R]->(w) WHERE {filter} \
+             RETURN a.name AS a, z.name AS z"
+        );
+        let plan = optimize(lower(&parse(&query).unwrap()).unwrap(), &catalog);
+        for factor in [false, true] {
+            let before = cache.label_selected_node_rows();
+            let rows = if factor {
+                execute_factor_path(&plan, &snapshot, &params).await
+            } else {
+                execute_flat_path(&plan, &snapshot, &params).await
+            }
+            .unwrap();
+            let mut got: Vec<String> = rows
+                .iter()
+                .map(|r| match (r.get("a"), r.get("z")) {
+                    (Some(RuntimeValue::String(a)), Some(RuntimeValue::String(z))) => {
+                        format!("{a}|{z}")
+                    }
+                    (Some(RuntimeValue::String(a)), _) => format!("{a}|-"),
+                    other => panic!("unexpected row {other:?}"),
+                })
+                .collect();
+            got.sort();
+            assert_eq!(got, expected, "{query} (factorized: {factor})");
+            assert_eq!(
+                cache.label_selected_node_rows() - before,
+                reads,
+                "{query} (factorized: {factor})"
+            );
+        }
+    }
+}

@@ -1405,7 +1405,8 @@ fn execute_capped<'a>(
 /// row with that row as the correlation, and emit the row combined with
 /// each subplan row. With `optional` (a whole-pattern OPTIONAL MATCH) a row
 /// the subplan rejects is kept once with the `optional` aliases set to NULL.
-/// `cap` stops once that many rows are out, for a LIMIT above.
+/// `cap` stops once that many rows are out, for a LIMIT above. A subplan
+/// that reads nothing from the row runs once and its rows are reused.
 pub(crate) async fn apply_rows(
     rows: Vec<Row>,
     subplan: &LogicalPlan,
@@ -1416,12 +1417,32 @@ pub(crate) async fn apply_rows(
     cap: Option<usize>,
 ) -> Result<Vec<Row>, ExecError> {
     let mut out = Vec::with_capacity(rows.len());
+    let correlated = reads_outer_row(subplan);
+    let mut shared: Option<Vec<Row>> = None;
     for row in rows {
         if cap.is_some_and(|cap| out.len() >= cap) {
             break;
         }
-        let sub_rows =
-            execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
+        let fresh;
+        let sub_rows: &[Row] = if correlated {
+            fresh =
+                execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
+            &fresh
+        } else {
+            if shared.is_none() {
+                shared = Some(
+                    execute_inner_with_routing(
+                        subplan,
+                        snapshot,
+                        params,
+                        Some(&Row::new()),
+                        routing,
+                    )
+                    .await?,
+                );
+            }
+            shared.as_deref().unwrap_or_default()
+        };
         if sub_rows.is_empty() {
             if let Some(pad) = optional {
                 let mut padded = row;
@@ -1441,6 +1462,18 @@ pub(crate) async fn apply_rows(
         }
     }
     Ok(out)
+}
+
+/// Whether `plan` reads its correlation row: only a non-empty `Argument`
+/// does. A nested apply's subplan gets its own row, so only its input counts.
+fn reads_outer_row(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Argument { bindings } => !bindings.is_empty(),
+        LogicalPlan::SemiApply { input, .. }
+        | LogicalPlan::Apply { input, .. }
+        | LogicalPlan::PatternList { input, .. } => reads_outer_row(input),
+        _ => plan.children().into_iter().any(reads_outer_row),
+    }
 }
 
 /// Scan limit that keeps a leaf node scan under the scoped row cap: one row

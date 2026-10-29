@@ -7300,7 +7300,7 @@ impl<'mt> Snapshot<'mt> {
             if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
                 continue;
             }
-            let Some(mut cursor) = self.label_posting_cursor(idx, label_id).await? else {
+            let Some(mut cursor) = self.label_posting_cursor(idx, label_id, None).await? else {
                 return Ok(None);
             };
             loop {
