@@ -1327,6 +1327,24 @@ impl<'mt> Snapshot<'mt> {
         predicates: &[crate::sst::ScanPredicate],
         max_candidates: usize,
     ) -> Result<Option<Vec<NodeId>>> {
+        Ok(self
+            .indexed_nodes_by_numeric_range(label, property, predicates, max_candidates, usize::MAX)
+            .await?
+            .map(|views| views.into_iter().map(|view| view.id).collect()))
+    }
+
+    /// The confirmed nodes behind [`Self::indexed_node_ids_by_numeric_range`],
+    /// in id order. Confirmation walks the candidates in id order and stops
+    /// once it has `limit` nodes, so a `LIMIT` (or a seed pull round) looks up
+    /// about `limit` candidates instead of the whole window.
+    async fn indexed_nodes_by_numeric_range(
+        &self,
+        label: &str,
+        property: &str,
+        predicates: &[crate::sst::ScanPredicate],
+        max_candidates: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<NodeView>>> {
         namidb_core::profile_scope!("Snapshot::indexed_node_ids_by_numeric_range");
         if predicates.is_empty() || max_candidates == 0 {
             return Ok(None);
@@ -1506,24 +1524,27 @@ impl<'mt> Snapshot<'mt> {
         candidates.sort_unstable();
         candidates.dedup();
 
-        let mut confirmed = Vec::with_capacity(candidates.len());
+        let mut confirmed = Vec::with_capacity(candidates.len().min(limit));
         const CONFIRM_BATCH: usize = 256;
         for batch in candidates.chunks(CONFIRM_BATCH) {
+            if confirmed.len() >= limit {
+                break;
+            }
             if let Some(cache) = &self.property_index_cache {
                 cache.record_equality_confirmation_candidates(batch.len());
             }
             let views = self.batch_lookup_nodes(label, batch).await?;
-            for (id, view) in batch.iter().zip(views) {
-                let Some(view) = view else { continue };
+            for view in views.into_iter().flatten() {
                 let value = view.properties.get(property);
                 if predicates
                     .iter()
                     .all(|predicate| crate::sst::eval_against_value(predicate, value))
                 {
-                    confirmed.push(*id);
+                    confirmed.push(view);
                 }
             }
         }
+        confirmed.truncate(limit);
         crate::route_telemetry::record_property(true);
         Ok(Some(confirmed))
     }
@@ -6580,14 +6601,13 @@ impl<'mt> Snapshot<'mt> {
 
         // A bare `LIMIT` over a selective range still benefits: the scan has
         // to walk until it has found `limit` matches, which for a rare value
-        // is the whole label. The route returns the confirmed set in id order
-        // — the same order the scan produces — so truncating here picks the
-        // same rows the scan would have.
-        if let Some(mut rows) = self
-            .try_scan_numeric_range_index(label, predicates, projection)
+        // is the whole label. The route confirms candidates in id order, the
+        // order the scan produces, and stops at `limit`, so it picks the same
+        // rows the scan would have.
+        if let Some(rows) = self
+            .try_scan_numeric_range_index(label, predicates, projection, limit)
             .await?
         {
-            rows.truncate(limit);
             return Ok(rows);
         }
 
@@ -6947,6 +6967,7 @@ impl<'mt> Snapshot<'mt> {
         label: Option<&str>,
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
+        limit: usize,
     ) -> Result<Option<Vec<NodeView>>> {
         if predicates.is_empty() {
             return Ok(None);
@@ -6959,21 +6980,21 @@ impl<'mt> Snapshot<'mt> {
             return Ok(None);
         }
         let label = label.unwrap_or("");
-        let Some(ids) = self
-            .indexed_node_ids_by_numeric_range(
+        // Already confirmed against the predicate and sorted by id, which is
+        // the order the scan returns rows in, so the first `limit` are the
+        // rows the scan would have returned.
+        let Some(mut rows) = self
+            .indexed_nodes_by_numeric_range(
                 label,
                 property,
                 predicates,
                 self.numeric_range_candidate_cap(),
+                limit,
             )
             .await?
         else {
             return Ok(None);
         };
-        // Already confirmed against the predicate and sorted by id, which is
-        // the order the scan returns rows in.
-        let views = self.batch_lookup_nodes(label, &ids).await?;
-        let mut rows: Vec<NodeView> = views.into_iter().flatten().collect();
         if let Some(requested) = projection {
             let keep: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
             for row in &mut rows {
@@ -7296,7 +7317,7 @@ impl<'mt> Snapshot<'mt> {
         projection: Option<&[String]>,
     ) -> Result<Vec<NodeView>> {
         if let Some(rows) = self
-            .try_scan_numeric_range_index(label, predicates, projection)
+            .try_scan_numeric_range_index(label, predicates, projection, usize::MAX)
             .await?
         {
             return Ok(rows);
@@ -17191,6 +17212,154 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// The merge over a legacy label-scoped node SST, typed by its scope with
+    /// `name` in a column of its own, overlapping an id-primary one that keeps
+    /// every property in the overflow JSON. A filter on `name` must read that
+    /// column from the legacy SST (whose overflow it does not project) and the
+    /// JSON from the other, and still return the uncapped prefix.
+    #[tokio::test]
+    async fn filtered_limited_scan_over_a_legacy_scoped_sst_reads_its_declared_column() {
+        let store = make_store();
+        let paths = make_paths("overlap-filtered-legacy");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: String, tag: i64, labels: Vec<u32>| {
+            MemOp::Upsert(
+                NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("name".into(), Value::Str(name)),
+                        ("tag".into(), Value::I64(tag)),
+                    ]),
+                    schema_version: 1,
+                    labels,
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+        let first = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            (0..300_u16)
+                .map(|i| {
+                    let name = format!("n{}", i % 4);
+                    (spread_node_id(i), u64::from(i) + 1, upsert(name, 1, vec![DEVICE]))
+                })
+                .collect(),
+        )
+        .await;
+        // Every third id is rewritten (with no label ids, as the per-label
+        // layout wrote it) or deleted.
+        let legacy: Vec<(NodeId, u64, MemOp)> = (0..300_u16)
+            .filter(|i| i % 3 == 0)
+            .map(|i| {
+                let op = if i % 9 == 0 {
+                    MemOp::Tombstone
+                } else {
+                    upsert(format!("n{}", (i + 1) % 4), 7, Vec::new())
+                };
+                (spread_node_id(i), 1000 + u64::from(i), op)
+            })
+            .collect();
+        let second = flush_batch(&ms, &fence, &first, &schema, legacy.clone()).await;
+
+        // Rewrite the second SST as a label-scoped body: same rows in the same
+        // order, `name` declared, no property pages.
+        let mut manifest = second.manifest.clone();
+        let idx = manifest
+            .ssts
+            .iter()
+            .position(|desc| desc.kind == SstKind::Nodes && desc.min_lsn >= 1000)
+            .unwrap();
+        let mut rows: Vec<crate::flush::NodeRow> = legacy
+            .into_iter()
+            .map(|(id, lsn, op)| crate::flush::NodeRow {
+                id: *id.as_bytes(),
+                lsn,
+                op,
+            })
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        let body = crate::flush::build_node_sst(&device_label(), &rows)
+            .unwrap()
+            .body;
+        let desc = &mut manifest.ssts[idx];
+        store
+            .put(
+                &object_store::path::Path::from(format!(
+                    "{}/{}",
+                    paths.namespace_prefix().as_ref(),
+                    desc.path
+                )),
+                body.clone().into(),
+            )
+            .await
+            .unwrap();
+        desc.scope = "Device".into();
+        desc.size_bytes = body.len() as u64;
+        desc.node_locator.as_mut().unwrap().property_pages = None;
+        for desc in manifest
+            .ssts
+            .iter_mut()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            desc.label_index = None;
+        }
+        let committed = LoadedManifest::new(
+            second.pointer,
+            second.pointer_etag,
+            second.pointer_version,
+            manifest,
+        );
+
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let name_is = |name: &str| ScanPredicate::Eq {
+            column: "name".into(),
+            value: crate::sst::stats::StatScalar::Utf8(name.into()),
+        };
+        let tag_is = |tag: i64| ScanPredicate::Eq {
+            column: "tag".into(),
+            value: crate::sst::stats::StatScalar::Int64(tag),
+        };
+        let name = vec!["name".to_string()];
+        let projections: [Option<&[String]>; 3] = [None, Some(&name), Some(&[])];
+        for predicates in [vec![name_is("n2")], vec![name_is("n1"), tag_is(7)]] {
+            for projection in projections {
+                let snap = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone());
+                assert!(snap.disjoint_node_descriptors().is_none());
+                let full = snap
+                    .scan_label_with_predicates_and_projection("Device", &predicates, projection)
+                    .await
+                    .unwrap();
+                assert!(full.len() > 10, "{predicates:?}: {}", full.len());
+                for limit in [1, 10, 1_000] {
+                    let cache = SstCache::new(16 * 1024 * 1024);
+                    let snap =
+                        Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+                            .with_cache(cache.clone());
+                    let limited = snap
+                        .scan_label_with_predicates_and_projection_limited(
+                            "Device",
+                            &predicates,
+                            projection,
+                            limit,
+                        )
+                        .await
+                        .unwrap();
+                    let case = format!("{predicates:?} {projection:?} {limit}");
+                    assert_eq!(limited, &full[..limit.min(full.len())], "{case}");
+                    assert_eq!(cache.limited_node_scan_fallbacks(), 0, "{case}");
                 }
             }
         }
