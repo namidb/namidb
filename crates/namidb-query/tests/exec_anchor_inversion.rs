@@ -582,7 +582,7 @@ async fn id_pin_at_the_end_of_a_chain_anchors_the_whole_chain() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let paths = NamespacePaths::new(
             "tenants",
-            NamespaceId::new(&format!("anchor-inv-chain-{route}")).unwrap(),
+            NamespaceId::new(format!("anchor-inv-chain-{route}")).unwrap(),
         );
         let mut writer = WriterSession::open(store, paths).await.unwrap();
         let node = |n: i64| {
