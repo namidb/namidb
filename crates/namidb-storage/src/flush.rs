@@ -14,8 +14,10 @@
 //! - [`EdgeWriteRecord`] for edge upserts (`MemKey::Edge`).
 //!
 //! JSON keeps `Value`'s `#[serde(untagged)]` shape interpretable across
-//! tools and through the WAL replay path. The bytes never leave RAM long
-//! enough to make the JSON overhead matter; SSTs are columnar Parquet/CSR.
+//! tools and through the WAL replay path. A node record that carries a
+//! vector, bytes or a list of numbers is the exception: as text a 1,024-float
+//! embedding is about 11 KB and slow to parse, so it goes through the WAL and
+//! the memtable in the binary encoding the SSTs use for `__binary_props`.
 //!
 //! Tombstones are represented by [`MemOp::Tombstone`](crate::memtable::MemOp)
 //! and need no payload.
@@ -105,7 +107,10 @@ static FLUSH_BUILD_GATE: Semaphore = Semaphore::const_new(1);
 // ── Wire-level records ─────────────────────────────────────────────────
 
 /// Decoded payload of a [`MemOp::Upsert`](crate::memtable::MemOp::Upsert) for
-/// a node. Stored bytes-on-wire encoding is JSON (see module docs for why).
+/// a node. Stored bytes-on-wire encoding is JSON, except for a record that
+/// carries a vector, bytes or a list of numbers: that one is the binary exact
+/// record behind a leading [`NODE_PAYLOAD_BINARY`] byte, so the WAL and the
+/// memtable never hold an embedding as text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NodeWriteRecord {
     #[serde(default)]
@@ -121,8 +126,21 @@ pub struct NodeWriteRecord {
     pub labels: Vec<u32>,
 }
 
+// First byte of a binary node payload. JSON text never starts with it, so
+// older payloads, which are always JSON, still decode.
+const NODE_PAYLOAD_BINARY: u8 = 0;
+
 impl NodeWriteRecord {
     pub fn encode(&self) -> Result<Bytes> {
+        if self.properties.values().any(is_binary_property_value) {
+            // Past the binary ceilings the record stays JSON.
+            if let Ok(binary) = encode_binary_node_record(self) {
+                let mut out = Vec::with_capacity(1 + binary.len());
+                out.push(NODE_PAYLOAD_BINARY);
+                out.extend_from_slice(&binary);
+                return Ok(Bytes::from(out));
+            }
+        }
         let bytes = serde_json::to_vec(self)?;
         Ok(Bytes::from(bytes))
     }
@@ -130,12 +148,15 @@ impl NodeWriteRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         #[cfg(test)]
         NODE_RECORD_DECODES.with(|n| n.set(n.get() + 1));
+        if let Some((&NODE_PAYLOAD_BINARY, body)) = bytes.split_first() {
+            return decode_binary_node_record(body);
+        }
         let v = serde_json::from_slice(bytes)?;
         Ok(v)
     }
 }
 
-// Test counter: JSON node payloads parsed on this thread.
+// Test counter: node payloads decoded on this thread.
 #[cfg(test)]
 thread_local! {
     pub(crate) static NODE_RECORD_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -225,8 +246,15 @@ pub(crate) fn encode_exact_node_record(
             } else {
                 encode_binary_node_record(record).ok()
             };
+            // The JSON fallback must be JSON even when the payload is binary,
+            // since a 2.x reader parses `RAW`/`ZSTD` records as text.
+            let json;
             let (raw, binary_tags) = match &binary {
                 Some(binary) => (binary.as_slice(), true),
+                None if payload.first() == Some(&NODE_PAYLOAD_BINARY) => {
+                    json = serde_json::to_vec(record)?;
+                    (json.as_slice(), false)
+                }
                 None => (payload.as_ref(), false),
             };
             let raw_len = u32::try_from(raw.len())

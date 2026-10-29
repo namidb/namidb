@@ -808,6 +808,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedding_survives_wal_replay_bit_for_bit() {
+        use std::collections::BTreeMap;
+
+        use namidb_core::Value;
+
+        use crate::flush::NodeWriteRecord;
+
+        // A NaN with a payload, -0.0, a subnormal and a value JSON would only
+        // keep with float_roundtrip; padded to a realistic 1,024 dims.
+        let mut emb = vec![
+            f32::from_bits(0x7fc0_1234),
+            -0.0,
+            f32::from_bits(1),
+            0.1_f32 + 0.2_f32,
+        ];
+        emb.extend((0..1_020).map(|i| (i as f32 * 0.618_034).sin()));
+        let list = vec![Value::F64(0.1 + 0.2), Value::I64(-7), Value::F64(-0.0)];
+        let mut properties = BTreeMap::new();
+        properties.insert("emb".to_string(), Value::Vec(emb.clone()));
+        properties.insert("scores".to_string(), Value::List(list.clone()));
+        properties.insert("title".to_string(), Value::Str("doc".into()));
+        let record = NodeWriteRecord {
+            properties,
+            schema_version: 3,
+            labels: vec![2, 5],
+        };
+        let payload = record.encode().unwrap();
+        // About 4 bytes a float, not the ~11 KB of JSON text.
+        assert!(payload.len() < 4 * 1_024 + 256, "{} bytes", payload.len());
+
+        let key = MemKey::Node { id: nid(9) };
+        let mut seg = WalSegment::new(1);
+        seg.push(WalRecord {
+            lsn: 3,
+            payload: WalEntry::from_apply(key.clone(), 3, &MemOp::Upsert(payload))
+                .encode()
+                .unwrap(),
+        });
+        let decoded = WalSegment::decode(1, seg.encode()).unwrap();
+        assert_eq!(decoded.records, seg.records);
+
+        let wal = WalStore::new(store(), paths("rec-emb"));
+        wal.append_segment(&seg).await.unwrap();
+        let mut manifest = Manifest::empty(Epoch::ZERO, Uuid::now_v7());
+        manifest.wal_segments.push(WalSegmentDescriptor {
+            seq: 1,
+            path: format!("tenants/rec-emb/wal/{:016x}.wal", 1),
+            last_lsn: 3,
+            xxh3: None,
+        });
+        let out = recover_memtable(&manifest, &wal).await.unwrap();
+        let MemOp::Upsert(bytes) = &out.memtable.get(&key).unwrap().op else {
+            panic!("expected an upsert");
+        };
+        let back = NodeWriteRecord::decode(bytes).unwrap();
+        assert_eq!(back.schema_version, 3);
+        assert_eq!(back.labels, vec![2, 5]);
+        assert_eq!(back.properties["title"], Value::Str("doc".into()));
+        let Value::Vec(got) = &back.properties["emb"] else {
+            panic!("emb is not a vector: {:?}", back.properties["emb"]);
+        };
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(got), bits(&emb));
+        let Value::List(got) = &back.properties["scores"] else {
+            panic!("scores is not a list");
+        };
+        let f64_bits = |v: &[Value]| {
+            v.iter()
+                .map(|x| match x {
+                    Value::F64(f) => f.to_bits(),
+                    Value::I64(i) => *i as u64,
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(f64_bits(got), f64_bits(&list));
+    }
+
+    #[tokio::test]
     async fn recover_detects_lsn_mismatch_between_envelope_and_frame() {
         let store = store();
         let wal = WalStore::new(store, paths("rec-lsnmismatch"));

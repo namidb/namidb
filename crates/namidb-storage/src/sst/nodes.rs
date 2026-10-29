@@ -2555,8 +2555,7 @@ mod tests {
                 }
             })
             .collect();
-        // The memtable payload is JSON; the SST must return exactly what the
-        // payload holds.
+        // The SST must return exactly what the memtable payload holds.
         let expected: Vec<BTreeMap<String, Value>> = node_rows
             .iter()
             .map(|row| match &row.op {
@@ -2569,10 +2568,11 @@ mod tests {
             properties: vec![],
         };
         // The footer's binary key list comes from the build, not from
-        // decoding every vector the writer was just handed.
+        // decoding every vector the writer was just handed. The two binary
+        // payloads (rows a and b) are each decoded once on the way in.
         let before = BINARY_PROPS_DECODES.with(|n| n.get());
         let body = build_node_sst(&label, &node_rows).unwrap().body;
-        assert_eq!(BINARY_PROPS_DECODES.with(|n| n.get()), before);
+        assert_eq!(BINARY_PROPS_DECODES.with(|n| n.get()), before + 2);
         let reader = NodeSstReader::open(label, body.clone()).unwrap();
 
         // The JSON keeps only what is not a numeric array or byte string.
