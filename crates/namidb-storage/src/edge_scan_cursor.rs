@@ -19,7 +19,10 @@ use crate::error::{Error, Result};
 use crate::flush::EdgeWriteRecord;
 use crate::manifest::SstKind;
 use crate::memtable::{MemKey, MemOp};
-use crate::sst::edges::format::OVERFLOW_JSON_NAME;
+use crate::sst::edges::format::{
+    CODEC_PROPERTY_PAGED_NONE, CODEC_PROPERTY_PAGED_ZSTD, OVERFLOW_JSON_NAME,
+    SECTION_PROPERTY_STREAM,
+};
 use crate::sst::edges::paged_reader::PagedEdgeReader;
 
 type EdgeWinners = BTreeMap<(NodeId, NodeId), (u64, Option<EdgeView>)>;
@@ -31,14 +34,40 @@ const SCAN_CHUNK_EDGES: u64 = 1024;
 struct EdgeSstCursor {
     reader: Arc<PagedEdgeReader>,
     next_key: u64,
-    /// `(src, dst, lsn, tombstone, row in the chunk)`, in `(src, dst)` order.
+    /// `(src, dst, lsn, tombstone, property row)`, in `(src, dst)` order.
     rows: VecDeque<(NodeId, NodeId, u64, bool, usize)>,
-    /// The current chunk's property strings, which `rows` index.
+    /// Property strings of the edges from `props_start` on, which `rows`
+    /// index: the current chunk's, or the whole SST's for legacy streams.
     overflow: Option<Vec<Option<String>>>,
     declared: Vec<(String, Vec<Option<String>>)>,
+    props_start: u64,
+    /// Legacy Arrow property streams decode in full on every read, so they
+    /// are read once for the whole SST, as before chunked reads.
+    whole_props: bool,
+    props_loaded: bool,
 }
 
 impl EdgeSstCursor {
+    fn new(reader: Arc<PagedEdgeReader>) -> Self {
+        let whole_props = reader.footer().sections.iter().any(|entry| {
+            entry.kind == SECTION_PROPERTY_STREAM
+                && !matches!(
+                    entry.codec,
+                    CODEC_PROPERTY_PAGED_NONE | CODEC_PROPERTY_PAGED_ZSTD
+                )
+        });
+        Self {
+            reader,
+            next_key: 0,
+            rows: VecDeque::new(),
+            overflow: None,
+            declared: Vec::new(),
+            props_start: 0,
+            whole_props,
+            props_loaded: false,
+        }
+    }
+
     async fn front(&mut self, declared_names: &[String]) -> Result<Option<(NodeId, NodeId)>> {
         while self.rows.is_empty() && self.next_key < self.reader.key_count() {
             crate::cancel::check()?;
@@ -46,17 +75,27 @@ impl EdgeSstCursor {
                 .reader
                 .read_key_chunk(self.next_key, SCAN_CHUNK_EDGES)
                 .await?;
-            let chunk = first_edge..first_edge + edges.len() as u64;
-            self.overflow = self
-                .reader
-                .read_property_rows(OVERFLOW_JSON_NAME, chunk.clone())
-                .await?;
-            self.declared.clear();
-            for name in declared_names {
-                if let Some(values) = self.reader.read_property_rows(name, chunk.clone()).await? {
-                    self.declared.push((name.clone(), values));
+            if !self.props_loaded {
+                let rows = if self.whole_props {
+                    self.props_loaded = true;
+                    0..self.reader.edge_count()
+                } else {
+                    first_edge..first_edge + edges.len() as u64
+                };
+                self.props_start = rows.start;
+                self.overflow = self
+                    .reader
+                    .read_property_rows(OVERFLOW_JSON_NAME, rows.clone())
+                    .await?;
+                self.declared.clear();
+                for name in declared_names {
+                    if let Some(values) = self.reader.read_property_rows(name, rows.clone()).await?
+                    {
+                        self.declared.push((name.clone(), values));
+                    }
                 }
             }
+            let base = (first_edge - self.props_start) as usize;
             let mut rows: Vec<_> = edges
                 .into_iter()
                 .enumerate()
@@ -66,7 +105,7 @@ impl EdgeSstCursor {
                         NodeId::from_uuid(Uuid::from_bytes(row.partner_id)),
                         row.lsn,
                         row.tombstone,
-                        i,
+                        base + i,
                     )
                 })
                 .collect();
@@ -147,13 +186,9 @@ impl Snapshot<'_> {
             crate::cancel::check()?;
             let desc = &self.manifest.manifest.ssts[idx];
             let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
-            ssts.push(EdgeSstCursor {
-                reader: self.fetch_paged_edge_reader(&absolute).await?,
-                next_key: 0,
-                rows: VecDeque::new(),
-                overflow: None,
-                declared: Vec::new(),
-            });
+            ssts.push(EdgeSstCursor::new(
+                self.fetch_paged_edge_reader(&absolute).await?,
+            ));
         }
         Ok(EdgeScanCursor {
             edge_type: edge_type.to_string(),
@@ -230,5 +265,45 @@ impl EdgeScanCursor {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use namidb_core::Value;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+    use super::*;
+    use crate::sst::edges::paged_reader::tests::legacy_arrow_property_body;
+
+    #[tokio::test]
+    async fn legacy_property_streams_are_read_once_per_sst() {
+        let body = legacy_arrow_property_body(1_500, 2);
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("edge/legacy-arrow.sst");
+        store.put(&path, PutPayload::from(body)).await.unwrap();
+        let reader = Arc::new(PagedEdgeReader::open(store, path).await.unwrap());
+        assert!(!reader.is_range_complete());
+        let mut sst = EdgeSstCursor::new(reader);
+
+        let names = vec!["codigo".to_string()];
+        let mut walked = 0u64;
+        while sst.front(&names).await.unwrap().is_some() {
+            // Decoding a legacy stream per chunk made a full walk
+            // quadratic, so the cursor holds the whole decoded stream.
+            assert_eq!(sst.props_start, 0);
+            assert_eq!(sst.overflow.as_ref().unwrap().len(), 3_000);
+            let (_, _, lsn, _, row) = sst.rows.pop_front().unwrap();
+            let ordinal = lsn - 10_000;
+            let props =
+                decode_edge_properties(sst.overflow.as_ref().unwrap().get(row), &sst.declared, row)
+                    .unwrap();
+            assert_eq!(props["n"], Value::I64(ordinal as i64));
+            assert_eq!(props["codigo"], Value::Str(format!("C-{ordinal}")));
+            walked += 1;
+        }
+        assert_eq!(walked, 3_000);
     }
 }

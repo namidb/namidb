@@ -1628,7 +1628,7 @@ fn expected_sst_id_from_path(path: &Path) -> Option<[u8; 16]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use object_store::memory::InMemory;
     use object_store::{ObjectStoreExt, PutPayload};
@@ -2274,6 +2274,64 @@ mod tests {
     }
 
     fn remove_section(body: Bytes, kind: u16, format_minor: u8) -> Bytes {
+        rebuild_without(body, kind, format_minor, |_, bytes| bytes.to_vec())
+    }
+
+    /// A v1.0 body of `keys` keys with `degree` edges each, whose overflow
+    /// and `codigo` property streams are Arrow IPC, as before 2.1.0.
+    pub(crate) fn legacy_arrow_property_body(keys: u64, degree: u64) -> Bytes {
+        let mut options =
+            EdgeSstWriterOptions::new(EdgeDirection::Forward, "CITES", "Articulo", "Articulo");
+        options.declared_properties = vec!["codigo".into()];
+        let mut writer = EdgeSstWriter::new(options);
+        for key_index in 0..keys {
+            for partner_index in 0..degree {
+                let ordinal = key_index * degree + partner_index;
+                writer
+                    .append(EdgeRecord {
+                        key_id: id(1, key_index),
+                        partner_id: id(2, ordinal),
+                        lsn: 10_000 + ordinal,
+                        tombstone: false,
+                        declared_properties: vec![Some(format!("\"C-{ordinal}\""))],
+                        overflow_json: Some(format!("{{\"n\":{ordinal}}}")),
+                    })
+                    .unwrap();
+            }
+        }
+        let body = writer.finish().unwrap().body;
+        let eager = EdgeSstReader::open(body.clone()).unwrap();
+        rebuild_without(body, SECTION_EDGE_ORDINALS, 0, |entry, bytes| {
+            if entry.kind != SECTION_PROPERTY_STREAM {
+                return bytes.to_vec();
+            }
+            let values = eager
+                .read_declared_property_strings(&entry.name)
+                .unwrap()
+                .unwrap();
+            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "value",
+                arrow_schema::DataType::Utf8,
+                true,
+            )]));
+            let column = Arc::new(arrow_array::StringArray::from(values));
+            let batch = arrow_array::RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+            let mut stream = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), &schema).unwrap();
+            stream.write(&batch).unwrap();
+            stream.finish().unwrap();
+            stream.into_inner().unwrap()
+        })
+    }
+
+    /// Copy `body` without the `kind` section or the page checksums, with
+    /// each kept section's bytes passed through `rewrite`. A rewritten
+    /// property stream becomes a legacy one (`CODEC_NONE`).
+    fn rebuild_without(
+        body: Bytes,
+        kind: u16,
+        format_minor: u8,
+        rewrite: impl Fn(&SectionEntry, &[u8]) -> Vec<u8>,
+    ) -> Bytes {
         let (footer, _) = EdgeFileFooter::decode(&body).unwrap();
         let mut file = body[..HEADER_LEN].to_vec();
         file[9] = format_minor;
@@ -2285,9 +2343,14 @@ mod tests {
         {
             let start = entry.offset as usize;
             let end = start + entry.length as usize;
+            let bytes = rewrite(entry, &body[start..end]);
             let mut rewritten = entry.clone();
             rewritten.offset = file.len() as u64;
-            file.extend_from_slice(&body[start..end]);
+            if bytes[..] != body[start..end] {
+                rewritten.length = bytes.len() as u64;
+                rewritten.codec = CODEC_NONE;
+            }
+            file.extend_from_slice(&bytes);
             sections.push(rewritten);
         }
         // Synthesising a legacy body rewrites the header minor version and
