@@ -496,3 +496,204 @@ async fn with_alias_predicate_still_anchors_at_the_indexed_target() {
     assert_eq!(fmt(&rows_aliased), fmt(&rows_pattern));
     assert!(!rows_aliased.is_empty());
 }
+
+/// The target is pinned by `id()` instead of a property: the forward
+/// spelling must anchor at the target too, and agree with the reversed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn id_anchored_target_matches_reversed_spelling() {
+    for (route, flush) in [("memtable", false), ("flushed", true)] {
+        let (writer, companies) = corpus(&format!("anchor-inv-id-{route}"), flush).await;
+        let (one, two) = (companies[2], companies[4]);
+        let per_company = (PEOPLE / COMPANIES) as usize;
+        for (pin, expected) in [
+            (format!("id(c) = '{one}'"), per_company),
+            (
+                format!("elementId(c) IN ['{one}', '{two}', '{one}', null]"),
+                2 * per_company,
+            ),
+        ] {
+            let slow = format!(
+                "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE {pin} \
+                 RETURN id(p) AS p, w.since AS since"
+            );
+            let fast = format!(
+                "MATCH (c:Company)<-[w:WORKS_AT]-(p:Person) WHERE {pin} \
+                 RETURN id(p) AS p, w.since AS since"
+            );
+            let snapshot = writer.snapshot();
+            let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+            let plan = optimize(lower(&parse(&slow).unwrap()).unwrap(), &catalog);
+            assert!(
+                !plan_has_node_scan_of(&plan, "Person"),
+                "{route}: `{slow}` must anchor at the id-pinned target: {plan:?}"
+            );
+            let rows = rows_canonical(&writer, &slow).await;
+            assert_eq!(rows.len(), expected, "{route}: `{slow}`");
+            assert_eq!(rows, rows_canonical(&writer, &fast).await, "{route}: {pin}");
+        }
+    }
+}
+
+/// The id pin sits on the MIDDLE node of a two-hop chain and only ids are
+/// returned. Pushdown moves the pin onto the first hop in round one, while
+/// projection pushdown narrows the head scan to its id in the same round; the
+/// inversion in round two used to refuse a projected head scan and kept the
+/// whole `Person` scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn id_pin_on_a_middle_node_anchors_past_a_projected_scan() {
+    let (writer, companies) = corpus("anchor-inv-id-two-hop", true).await;
+    let per_company = (PEOPLE / COMPANIES) as usize;
+    let query = format!(
+        "MATCH (p:Person)-[:WORKS_AT]->(c:Company)<-[:WORKS_AT]-(q:Person) \
+         WHERE id(c) = '{}' RETURN id(p) AS p, id(q) AS q",
+        companies[2]
+    );
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    let plan = optimize(lower(&parse(&query).unwrap()).unwrap(), &catalog);
+    assert!(
+        !plan_has_node_scan_of(&plan, "Person"),
+        "the id-pinned middle node must anchor the chain: {plan:?}"
+    );
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let plain = lower(&parse(&query).unwrap()).unwrap();
+    let unoptimized = execute(&plain, &snapshot, &Params::new()).await.unwrap();
+    let ids = |rows: &[namidb_query::Row]| {
+        let mut out: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{:?}|{:?}", r.get("p"), r.get("q")))
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(ids(&rows), ids(&unoptimized));
+    // `p` and `q` reach `c` over two different WORKS_AT edges, so never the
+    // same person.
+    assert_eq!(rows.len(), per_company * (per_company - 1));
+}
+
+/// A chain pinned by `id()` on its LAST node, three nodes from the scan,
+/// starts at that node and walks every hop backwards. Labels, relationship
+/// predicates, relationship uniqueness and a named path all come out the
+/// same as the written order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn id_pin_at_the_end_of_a_chain_anchors_the_whole_chain() {
+    for (route, flush) in [("memtable", false), ("flushed", true)] {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = NamespacePaths::new(
+            "tenants",
+            NamespaceId::new(format!("anchor-inv-chain-{route}")).unwrap(),
+        );
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+        let node = |n: i64| {
+            let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+            props.insert("n".into(), CoreValue::I64(n));
+            NodeWriteRecord {
+                properties: props,
+                schema_version: 1,
+                ..Default::default()
+            }
+        };
+        let edge = |w: i64| {
+            let mut props: BTreeMap<String, CoreValue> = BTreeMap::new();
+            props.insert("w".into(), CoreValue::I64(w));
+            EdgeWriteRecord {
+                properties: props,
+                schema_version: 1,
+            }
+        };
+        let mk = |label: &str, count: i64, writer: &mut WriterSession| -> Vec<NodeId> {
+            (0..count)
+                .map(|n| {
+                    let id = NodeId::new();
+                    writer.upsert_node(label, id, &node(n)).unwrap();
+                    id
+                })
+                .collect()
+        };
+        let idents = mk("Identifier", 30, &mut writer);
+        let devices = mk("Device", 6, &mut writer);
+        let people = mk("Person", 3, &mut writer);
+        for (i, id) in idents.iter().enumerate() {
+            writer
+                .upsert_edge("R", *id, devices[i % 6], &edge(i as i64 % 3))
+                .unwrap();
+        }
+        for (d, id) in devices.iter().enumerate() {
+            writer
+                .upsert_edge("S", *id, people[d % 3], &edge(d as i64))
+                .unwrap();
+            // A ring with one chord, walked undirected below.
+            writer
+                .upsert_edge("K", *id, devices[(d + 1) % 6], &edge(0))
+                .unwrap();
+        }
+        writer
+            .upsert_edge("K", devices[0], devices[3], &edge(0))
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        if flush {
+            let schema = writer.snapshot().manifest().manifest.schema.clone();
+            writer.flush(schema).await.unwrap();
+        }
+        let (p, d, i) = (people[1], devices[0], idents[7]);
+        for (query, scanned) in [
+            (
+                format!(
+                    "MATCH (i:Identifier)-[r:R]->(d:Device)-[s:S]->(p:Person) \
+                     WHERE id(p) = '{p}' RETURN id(i) AS i, r.w AS w, id(d) AS d, s.w AS sw"
+                ),
+                "Identifier",
+            ),
+            (
+                format!(
+                    "MATCH (i:Identifier)-[r:R]->(d)-[:S]->(p) \
+                     WHERE id(p) = '{p}' AND r.w = 1 RETURN id(i) AS i"
+                ),
+                "Identifier",
+            ),
+            (
+                format!(
+                    "MATCH q = (i:Identifier)-[:R]->(d:Device)-[:S]->(p:Person) \
+                     WHERE id(p) = '{p}' RETURN q"
+                ),
+                "Identifier",
+            ),
+            (
+                format!(
+                    "MATCH (p:Person)<-[:S]-(d:Device)<-[:R]-(i:Identifier) \
+                     WHERE id(i) = '{i}' RETURN id(p) AS p, id(d) AS d"
+                ),
+                "Person",
+            ),
+            (
+                format!(
+                    "MATCH (a:Device)-[:K]-(b:Device)-[:K]-(c:Device)-[:K]-(e:Device) \
+                     WHERE id(e) = '{d}' RETURN id(a) AS a, id(b) AS b, id(c) AS c"
+                ),
+                "Device",
+            ),
+        ] {
+            let snapshot = writer.snapshot();
+            let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+            let lowered = lower(&parse(&query).unwrap()).unwrap();
+            let plan = optimize(lowered.clone(), &catalog);
+            assert!(
+                !plan_has_node_scan_of(&plan, scanned),
+                "{route}: `{query}` must start at the pinned node: {plan:?}"
+            );
+            let canonical = |rows: Vec<namidb_query::Row>| {
+                let mut out: Vec<String> = rows
+                    .iter()
+                    .map(|row| format!("{:?}", row.bindings))
+                    .collect();
+                out.sort();
+                out
+            };
+            let fast = canonical(execute(&plan, &snapshot, &Params::new()).await.unwrap());
+            let written = canonical(execute(&lowered, &snapshot, &Params::new()).await.unwrap());
+            assert!(!fast.is_empty(), "{route}: `{query}` found nothing");
+            assert_eq!(fast, written, "{route}: `{query}`");
+        }
+    }
+}

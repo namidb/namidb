@@ -998,6 +998,9 @@ fn call_scalar_function(
         },
 
         // --- Lowering helpers (internal)
+        // Every element is bound (anonymous ones get internal names), so a
+        // NULL element means an OPTIONAL MATCH found nothing: the path is NULL.
+        "__path" if args.iter().any(|a| matches!(a, RuntimeValue::Null)) => Ok(RuntimeValue::Null),
         "__path" => Ok(RuntimeValue::Path(args.to_vec())),
         "__label_eq" => match args {
             // Label-membership test: `MATCH (n:A:B)` lowers to one

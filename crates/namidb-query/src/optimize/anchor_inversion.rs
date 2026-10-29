@@ -7,14 +7,18 @@
 //! unique lookup. Found live during the 200k-node S3 validation: the first
 //! form took ~18s warm and timed out cold; the second answered instantly.
 //!
-//! This pass rewrites the first shape into the second: when a single-hop,
-//! non-optional Expand reads from a BARE NodeScan and a Filter directly
-//! above it pins the expand TARGET with an index-answerable equality, anchor
-//! at the target (`NodeByPropertyValue`) and walk the edge in the inverse
-//! direction. Row bindings are unchanged — the relationship value carries
-//! the stored `(src, dst)` regardless of traversal direction, and the old
-//! source's label constraint moves into the inverted Expand's
-//! `target_labels`, where the executor enforces it conjunctively.
+//! This pass rewrites the first shape into the second: when a chain of
+//! single-hop, non-optional Expands reads from a BARE NodeScan and a Filter
+//! directly above its last hop pins that hop's TARGET with an
+//! index-answerable equality, anchor at the target (`NodeByPropertyValue`)
+//! and walk the chain back to the scan, each edge in the inverse direction.
+//! Row bindings are unchanged — the relationship value carries the stored
+//! `(src, dst)` regardless of traversal direction, and each node's label
+//! constraint moves into the inverted Expand that now reaches it, where the
+//! executor enforces it conjunctively. Filters between the hops ride on top
+//! and pushdown sinks them again; relationship uniqueness is re-linked to
+//! the new hop order. A pin on a middle node re-anchors the part of the
+//! chain below it, and the hops above it keep walking forward.
 //!
 //! Deliberately narrow:
 //! - `length: None` only — a starred alias binds the path's relationship
@@ -23,9 +27,12 @@
 //! - `optional: false` only — OPTIONAL nullifies the *target* side; swapping
 //!   endpoints would nullify the wrong side.
 //! - `back_reference: false`, `shortest: None`, no `path_binding`.
-//! - The source must be a bare `NodeScan` (no pushed predicates, no
-//!   projection): if the source is filtered too, choosing sides needs real
-//!   cost comparison, which stays with the join-reorder work.
+//! - An id equality or `IN` on the target (`WHERE id(c) = $id`) anchors
+//!   through `NodeById` instead, always: each id is at most one row.
+//! - The source must be a bare `NodeScan` (no pushed predicates; a pushed
+//!   projection is fine, it only narrows decoding): if the source is
+//!   filtered too, choosing sides needs real cost comparison, which stays
+//!   with the join-reorder work.
 //! - A `multi: true` (posting list) target anchor is only taken when label
 //!   statistics say the target label is no larger than the source label;
 //!   `multi: false` (unique) is always at most one row and always wins.
@@ -34,7 +41,7 @@ use crate::cost::StatsCatalog;
 use crate::parser::RelationshipDirection;
 use crate::plan::LogicalPlan;
 
-use super::unique_lookup::extract_indexed_conjunct;
+use super::unique_lookup::{extract_indexed_conjunct, extract_node_id_conjunct, id_seek};
 
 pub fn apply_anchor_inversion(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     rewrite(plan, catalog)
@@ -111,6 +118,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(rewrite(*input, catalog)),
             source,
@@ -124,6 +132,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Project {
             input,
@@ -209,9 +218,14 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             subplan: Box::new(rewrite(*subplan, catalog)),
             negated,
         },
-        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            optional,
+        } => LogicalPlan::Apply {
             input: Box::new(rewrite(*input, catalog)),
             subplan: Box::new(rewrite(*subplan, catalog)),
+            optional,
         },
         LogicalPlan::PatternList {
             input,
@@ -272,44 +286,98 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     }
 }
 
+/// One hop of the chain being inverted, as written.
+struct Hop<'p> {
+    source: &'p String,
+    edge_type: &'p Option<Vec<String>>,
+    direction: RelationshipDirection,
+    rel_alias: &'p Option<String>,
+    target_alias: &'p String,
+    target_labels: &'p Vec<String>,
+    unique_rels: &'p Vec<String>,
+}
+
 fn try_invert(
     predicate: &crate::parser::Expression,
     input: &LogicalPlan,
     catalog: &StatsCatalog,
 ) -> Option<LogicalPlan> {
-    let LogicalPlan::Expand {
-        input: expand_input,
-        source,
-        edge_type,
-        direction,
-        rel_alias,
-        target_alias,
-        target_labels,
-        length,
-        optional,
-        back_reference,
-        shortest,
-        path_binding,
-    } = input
-    else {
-        return None;
-    };
-    if length.is_some()
-        || *optional
-        || *back_reference
-        || !matches!(shortest, crate::plan::ShortestMode::None)
-        || path_binding.is_some()
+    // Collect the chain top-down: the pinned hop first, then each hop below
+    // it whose target is the source of the one above, with any Filter
+    // between two hops set aside to re-attach on top.
+    let mut hops: Vec<Hop<'_>> = Vec::new();
+    let mut between: Vec<crate::parser::Expression> = Vec::new();
+    let mut cursor = input;
+    loop {
+        match cursor {
+            LogicalPlan::Expand {
+                input: expand_input,
+                source,
+                edge_type,
+                direction,
+                rel_alias,
+                target_alias,
+                target_labels,
+                length,
+                optional,
+                back_reference,
+                shortest,
+                path_binding,
+                unique_rels,
+            } => {
+                if length.is_some()
+                    || *optional
+                    || *back_reference
+                    || !matches!(shortest, crate::plan::ShortestMode::None)
+                    || path_binding.is_some()
+                    || hops
+                        .last()
+                        .is_some_and(|above| above.source != target_alias)
+                {
+                    return None;
+                }
+                hops.push(Hop {
+                    source,
+                    edge_type,
+                    direction: *direction,
+                    rel_alias,
+                    target_alias,
+                    target_labels,
+                    unique_rels,
+                });
+                cursor = expand_input;
+            }
+            LogicalPlan::Filter {
+                predicate,
+                input: inner,
+            } if !hops.is_empty() && matches!(inner.as_ref(), LogicalPlan::Expand { .. }) => {
+                between.push(predicate.clone());
+                cursor = inner;
+            }
+            _ => break,
+        }
+    }
+    let pinned = hops.first()?;
+    let (source, target_alias, target_labels) = (
+        hops.last()?.source,
+        pinned.target_alias,
+        pinned.target_labels,
+    );
+    // Every relationship a hop must differ from has to be one of the chain's,
+    // so the pairs can be re-linked to the new order below.
+    let chain_rels: Vec<&String> = hops.iter().filter_map(|h| h.rel_alias.as_ref()).collect();
+    if hops
+        .iter()
+        .any(|h| h.unique_rels.iter().any(|r| !chain_rels.contains(&r)))
     {
         return None;
     }
-    // The stored-edge orientation must stay decidable after the swap.
-    let inverted_direction = match direction {
-        RelationshipDirection::Right => RelationshipDirection::Left,
-        RelationshipDirection::Left => RelationshipDirection::Right,
-        RelationshipDirection::Both => RelationshipDirection::Both,
-    };
     // Source side must be a completely unselective scan; anything filtered
-    // would need a real cost comparison to pick a side. One exception sees
+    // would need a real cost comparison to pick a side. A projection is not a
+    // filter: it only narrows decoding, and the inverted Expand loads the old
+    // source as its target anyway. Projection pushdown runs at the end of
+    // every round, so refusing it would block every inversion that only
+    // becomes possible in round two (a pin pushed onto an inner hop). One exception sees
     // through the veil: a label DISJUNCTION source `(o:A|B)` lowers to an
     // unlabeled scan behind a pure `__label_eq OR __label_eq` filter — its
     // selectivity is exactly as knowable as a labeled scan's (the sum of
@@ -322,42 +390,169 @@ fn try_invert(
         Option<String>,
         Option<(crate::parser::Expression, Vec<String>)>,
     );
-    let (source_alias, source_label, source_disjunction): SourceShape<'_> =
-        match expand_input.as_ref() {
-            LogicalPlan::NodeScan {
-                label,
+    let (source_alias, source_label, source_disjunction): SourceShape<'_> = match cursor {
+        LogicalPlan::NodeScan {
+            label,
+            alias,
+            predicates,
+            ..
+        } if predicates.is_empty() => (alias, label.clone(), None),
+        LogicalPlan::Filter {
+            predicate: label_pred,
+            input: scan,
+        } => {
+            let LogicalPlan::NodeScan {
+                label: None,
                 alias,
                 predicates,
-                projection,
-            } if predicates.is_empty() && projection.is_none() => (alias, label.clone(), None),
-            LogicalPlan::Filter {
-                predicate: label_pred,
-                input: scan,
-            } => {
-                let LogicalPlan::NodeScan {
-                    label: None,
-                    alias,
-                    predicates,
-                    projection,
-                } = scan.as_ref()
-                else {
-                    return None;
-                };
-                if !predicates.is_empty() || projection.is_some() {
-                    return None;
-                }
-                let labels = crate::optimize::extract_label_disjunction(label_pred, alias)?;
-                (alias, None, Some((label_pred.clone(), labels)))
+                ..
+            } = scan.as_ref()
+            else {
+                return None;
+            };
+            if !predicates.is_empty() {
+                return None;
             }
-            _ => return None,
-        };
+            let labels = crate::optimize::extract_label_disjunction(label_pred, alias)?;
+            (alias, None, Some((label_pred.clone(), labels)))
+        }
+        _ => return None,
+    };
     debug_assert_eq!(source, source_alias);
     // The equality must pin the expand TARGET under its declared label. A
     // multi-label (conjunctive) target keeps the scan-side plan: the lookup
     // could only prove one of the labels.
-    let [target_label] = target_labels.as_slice() else {
+    if target_labels.len() > 1 {
         return None;
+    }
+    let source_labels = source_disjunction
+        .as_ref()
+        .map(|(_, labels)| labels.as_slice());
+    let source_count = source_node_count(source_label.as_deref(), source_labels, catalog);
+    // An id seek is at most one row per id and proves the target exists, so
+    // it anchors, labelled or not, unless a literal id list is longer than
+    // the source scan it would replace.
+    let id_anchor = extract_node_id_conjunct(predicate, target_alias, None).filter(|seek| {
+        match (&seek.value.kind, source_count) {
+            (crate::parser::ast::ExpressionKind::List(ids), Some(count)) if seek.many => {
+                ids.len() as u64 <= count
+            }
+            _ => true,
+        }
+    });
+    let (anchor, residual) = match id_anchor {
+        Some(seek) => id_seek(
+            target_labels.first().cloned(),
+            target_alias,
+            seek,
+            LogicalPlan::Empty,
+        ),
+        None => property_anchor(
+            predicate,
+            target_alias,
+            target_labels.first()?,
+            source_count,
+            catalog,
+        )?,
     };
+    let mut inverted = anchor;
+    for (i, hop) in hops.iter().enumerate() {
+        // The hop now reaches the node the hop below it reached, or the scan
+        // at the bottom.
+        let reached_labels = match hops.get(i + 1) {
+            Some(below) => below.target_labels.clone(),
+            // A disjunction cannot ride the conjunctive target_labels field;
+            // its OR-filter re-attaches below and now runs over the anchor's
+            // small neighbourhood instead of the whole namespace.
+            None => match &source_disjunction {
+                Some(_) => Vec::new(),
+                None => source_label.iter().cloned().collect(),
+            },
+        };
+        // Relationship uniqueness: the hops that now run before this one.
+        let unique_rels = hops[..i]
+            .iter()
+            .filter_map(|earlier| {
+                let name = earlier.rel_alias.as_ref()?;
+                let paired = hop.unique_rels.contains(name)
+                    || hop
+                        .rel_alias
+                        .as_ref()
+                        .is_some_and(|mine| earlier.unique_rels.contains(mine));
+                paired.then(|| name.clone())
+            })
+            .collect();
+        inverted = LogicalPlan::Expand {
+            input: Box::new(inverted),
+            source: hop.target_alias.clone(),
+            edge_type: hop.edge_type.clone(),
+            // The stored-edge orientation must stay decidable after the swap.
+            direction: match hop.direction {
+                RelationshipDirection::Right => RelationshipDirection::Left,
+                RelationshipDirection::Left => RelationshipDirection::Right,
+                RelationshipDirection::Both => RelationshipDirection::Both,
+            },
+            rel_alias: hop.rel_alias.clone(),
+            target_alias: hop.source.clone(),
+            target_labels: reached_labels,
+            length: None,
+            optional: false,
+            back_reference: false,
+            shortest: crate::plan::ShortestMode::None,
+            path_binding: None,
+            unique_rels,
+        };
+    }
+    for predicate in between.into_iter().rev() {
+        inverted = LogicalPlan::Filter {
+            input: Box::new(inverted),
+            predicate,
+        };
+    }
+    let mut result = match source_disjunction {
+        Some((label_pred, _)) => LogicalPlan::Filter {
+            input: Box::new(inverted),
+            predicate: label_pred,
+        },
+        None => inverted,
+    };
+    if let Some(residual) = residual {
+        result = LogicalPlan::Filter {
+            input: Box::new(result),
+            predicate: residual,
+        };
+    }
+    Some(result)
+}
+
+/// Rows the source scan would produce, when the catalog knows: a
+/// disjunction source counts as the SUM of its disjunct labels.
+fn source_node_count(
+    source_label: Option<&str>,
+    source_disjunction: Option<&[String]>,
+    catalog: &StatsCatalog,
+) -> Option<u64> {
+    match source_disjunction {
+        Some(labels) => labels.iter().try_fold(0u64, |total, label| {
+            catalog
+                .label(label)
+                .map(|stats| total.saturating_add(stats.node_count))
+        }),
+        None => source_label
+            .and_then(|label| catalog.label(label))
+            .map(|stats| stats.node_count),
+    }
+}
+
+/// The `NodeByPropertyValue` anchor (plus residual) for an index-answerable
+/// equality on the target, when it is worth taking over the source scan.
+fn property_anchor(
+    predicate: &crate::parser::Expression,
+    target_alias: &str,
+    target_label: &String,
+    source_count: Option<u64>,
+    catalog: &StatsCatalog,
+) -> Option<(LogicalPlan, Option<crate::parser::Expression>)> {
     let indexed = extract_indexed_conjunct(
         predicate,
         target_alias,
@@ -370,20 +565,8 @@ fn try_invert(
     }
     if indexed.multi {
         // A posting-list anchor fans out; only take it when the target label
-        // is provably no larger than the label(s) we would otherwise scan —
-        // a disjunction source counts as the SUM of its disjunct labels.
+        // is provably no larger than the label(s) we would otherwise scan.
         let target_count = catalog.label(target_label).map(|stats| stats.node_count);
-        let source_count = match &source_disjunction {
-            Some((_, labels)) => labels.iter().try_fold(0u64, |total, label| {
-                catalog
-                    .label(label)
-                    .map(|stats| total.saturating_add(stats.node_count))
-            }),
-            None => source_label
-                .as_deref()
-                .and_then(|label| catalog.label(label))
-                .map(|stats| stats.node_count),
-        };
         match (target_count, source_count) {
             (Some(target), Some(source)) if target <= source => {}
             _ => return None,
@@ -393,45 +576,12 @@ fn try_invert(
     let anchor = LogicalPlan::NodeByPropertyValue {
         input: Box::new(LogicalPlan::Empty),
         label: indexed.label,
-        alias: target_alias.clone(),
+        alias: target_alias.to_owned(),
         property: indexed.property,
         value: indexed.value,
         multi: indexed.multi,
     };
-    let inverted = LogicalPlan::Expand {
-        input: Box::new(anchor),
-        source: target_alias.clone(),
-        edge_type: edge_type.clone(),
-        direction: inverted_direction,
-        rel_alias: rel_alias.clone(),
-        target_alias: source_alias.clone(),
-        // A disjunction cannot ride the conjunctive target_labels field; its
-        // OR-filter re-attaches below and now runs over the anchor's small
-        // neighbourhood instead of the whole namespace.
-        target_labels: match &source_disjunction {
-            Some(_) => Vec::new(),
-            None => source_label.iter().cloned().collect(),
-        },
-        length: None,
-        optional: false,
-        back_reference: false,
-        shortest: crate::plan::ShortestMode::None,
-        path_binding: None,
-    };
-    let mut result = match source_disjunction {
-        Some((label_pred, _)) => LogicalPlan::Filter {
-            input: Box::new(inverted),
-            predicate: label_pred,
-        },
-        None => inverted,
-    };
-    if let Some(residual) = indexed.residual {
-        result = LogicalPlan::Filter {
-            input: Box::new(result),
-            predicate: residual,
-        };
-    }
-    Some(result)
+    Some((anchor, indexed.residual))
 }
 
 #[cfg(test)]
@@ -487,7 +637,15 @@ mod tests {
             ..
         } = plan
         {
-            if matches!(input.as_ref(), LogicalPlan::NodeByPropertyValue { .. }) {
+            // An id seek keeps its exact `id(c) = key` check on top.
+            let anchor = match input.as_ref() {
+                LogicalPlan::Filter { input, .. } => input.as_ref(),
+                other => other,
+            };
+            if matches!(
+                anchor,
+                LogicalPlan::NodeByPropertyValue { .. } | LogicalPlan::NodeById { .. }
+            ) {
                 return Some((
                     source.clone(),
                     *direction,
@@ -534,6 +692,54 @@ mod tests {
             has_filter(&plan),
             "w.since must survive as a residual filter"
         );
+    }
+
+    #[test]
+    fn id_equality_or_in_on_target_inverts_the_anchor() {
+        for q in [
+            "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(c) = $cid RETURN id(p)",
+            "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE elementId(c) IN $cids RETURN p",
+            "MATCH (p:Person)-[w:WORKS_AT]->(c) WHERE id(c) = $cid AND w.since = 0 RETURN p",
+        ] {
+            // No statistics at all: an id seek needs none to win.
+            let plan = rewrite_query(q, &StatsCatalog::empty());
+            let (source, direction, target_alias, target_labels) =
+                find_inverted(&plan).unwrap_or_else(|| panic!("`{q}` must invert: {plan:?}"));
+            assert_eq!(source, "c");
+            assert_eq!(direction, RelationshipDirection::Left);
+            assert_eq!(target_alias, "p");
+            assert_eq!(target_labels, vec!["Person".to_string()]);
+            assert!(!plan_has_node_scan(&plan), "`{q}`: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn id_on_the_source_or_a_multi_label_target_does_not_invert() {
+        for q in [
+            "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(p) = $pid RETURN c",
+            "MATCH (p:Person)-[w:WORKS_AT]->(c:Company:Listed) WHERE id(c) = $cid RETURN p",
+        ] {
+            let plan = rewrite_query(q, &StatsCatalog::empty());
+            assert!(find_inverted(&plan).is_none(), "`{q}`: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn a_literal_id_list_longer_than_the_source_does_not_invert() {
+        // 3 Person rows: a 4-id list costs more seeks and reverse hops than
+        // scanning them; a 3-id list (or a parameter) still anchors.
+        let cat = catalog(true, false, 10, 3);
+        let ids = |n: usize| {
+            let ids: Vec<String> = (0..n).map(|i| format!("'{i}'")).collect();
+            format!(
+                "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(c) IN [{}] RETURN p",
+                ids.join(", ")
+            )
+        };
+        assert!(find_inverted(&rewrite_query(&ids(4), &cat)).is_none());
+        assert!(find_inverted(&rewrite_query(&ids(3), &cat)).is_some());
+        let q = "MATCH (p:Person)-[w:WORKS_AT]->(c:Company) WHERE id(c) IN $cids RETURN p";
+        assert!(find_inverted(&rewrite_query(q, &cat)).is_some());
     }
 
     #[test]

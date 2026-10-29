@@ -60,6 +60,14 @@ impl RequiredSet {
             .and_modify(|p| *p = RequiredProps::All)
             .or_insert(RequiredProps::All);
     }
+
+    /// The binding is used, but only through structural columns (its id
+    /// and labels), which every scan decodes regardless of the projection.
+    fn record_touch(&mut self, alias: &str) {
+        self.by_alias
+            .entry(alias.to_string())
+            .or_insert_with(|| RequiredProps::Set(BTreeSet::new()));
+    }
 }
 
 /// Apply projection pushdown to `plan`. Returns a plan where every
@@ -231,7 +239,7 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
             collect_from_plan(input, req);
             collect_from_plan(subplan, req);
         }
-        LogicalPlan::Apply { input, subplan } => {
+        LogicalPlan::Apply { input, subplan, .. } => {
             collect_from_plan(input, req);
             collect_from_plan(subplan, req);
         }
@@ -315,6 +323,16 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
 
 fn collect_from_aggregate(agg: &AggregateExpr, req: &mut RequiredSet) {
     match agg {
+        // `count(n)` / `count(DISTINCT n)` see only whether `n` is null and
+        // its id.
+        AggregateExpr::Count {
+            arg:
+                Some(Expression {
+                    kind: ExpressionKind::Variable(id),
+                    ..
+                }),
+            ..
+        } => req.record_touch(&id.name),
         AggregateExpr::Count { arg: Some(e), .. }
         | AggregateExpr::Sum { arg: e, .. }
         | AggregateExpr::Avg { arg: e, .. }
@@ -443,7 +461,18 @@ fn collect_from_expr(expr: &Expression, req: &mut RequiredSet) {
             collect_from_expr(pattern, req);
         }
         ExpressionKind::IsNull { expr, .. } => collect_from_expr(expr, req),
-        ExpressionKind::FunctionCall { args, .. } => {
+        ExpressionKind::FunctionCall { name, args, .. } => {
+            // `id(n)`, `elementId(n)` and `labels(n)` read no property.
+            // `keys(n)` and `properties(n)` do, and stay `All` below.
+            if let ([segment], [arg]) = (name.segments.as_slice(), args.as_slice()) {
+                if let ExpressionKind::Variable(id) = &arg.kind {
+                    let fname = segment.name.to_ascii_lowercase();
+                    if matches!(fname.as_str(), "id" | "elementid" | "labels") {
+                        req.record_touch(&id.name);
+                        return;
+                    }
+                }
+            }
             for a in args {
                 collect_from_expr(a, req);
             }
@@ -641,6 +670,7 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(rewrite(*input, req)),
             source,
@@ -654,6 +684,7 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(rewrite(*input, req)),
@@ -743,9 +774,14 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             subplan: Box::new(rewrite(*subplan, req)),
             negated,
         },
-        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            optional,
+        } => LogicalPlan::Apply {
             input: Box::new(rewrite(*input, req)),
             subplan: Box::new(rewrite(*subplan, req)),
+            optional,
         },
         LogicalPlan::PatternList {
             input,
@@ -861,6 +897,55 @@ mod tests {
             projection: None,
         }
     }
+    /// The projection of the scan of `alias` after pushdown over `q`.
+    fn scan_projection(q: &str, alias: &str) -> Option<Vec<String>> {
+        fn find(plan: &LogicalPlan, alias: &str) -> Option<Option<Vec<String>>> {
+            if let LogicalPlan::NodeScan {
+                alias: a,
+                projection,
+                ..
+            } = plan
+            {
+                if a == alias {
+                    return Some(projection.clone());
+                }
+            }
+            plan.children().into_iter().find_map(|c| find(c, alias))
+        }
+        let plan = crate::plan::lower(&crate::parser::parse(q).unwrap()).unwrap();
+        find(&apply_projection_pushdown(plan), alias).expect("scan of alias")
+    }
+
+    #[test]
+    fn id_and_labels_only_project_no_properties() {
+        for q in [
+            "MATCH (n) RETURN id(n) AS i",
+            "MATCH (n:L) RETURN elementId(n) AS i, labels(n) AS l",
+            "MATCH (n) WITH labels(n) AS l, count(*) AS c, collect(id(n))[0..1] AS s \
+             RETURN l, c, s",
+            "MATCH (n:L) RETURN count(n) AS c, count(DISTINCT n) AS d",
+        ] {
+            assert_eq!(scan_projection(q, "n"), Some(vec![]), "{q}");
+        }
+        assert_eq!(
+            scan_projection("MATCH (n:L) RETURN id(n) AS i, n.name AS name", "n"),
+            Some(vec!["name".to_string()])
+        );
+    }
+
+    #[test]
+    fn keys_and_bare_variable_still_project_all() {
+        for q in [
+            "MATCH (n:L) RETURN keys(n) AS k",
+            "MATCH (n:L) RETURN properties(n) AS p, id(n) AS i",
+            "MATCH (n:L) RETURN id(n) AS i, n",
+            "MATCH (n:L) RETURN collect(n) AS ns",
+            "MATCH (n:L) WITH n, id(n) AS i RETURN n.x AS x, i",
+        ] {
+            assert_eq!(scan_projection(q, "n"), None, "{q}");
+        }
+    }
+
     fn project_only(input: LogicalPlan, items: Vec<(Expression, &str)>) -> LogicalPlan {
         LogicalPlan::Project {
             input: Box::new(input),

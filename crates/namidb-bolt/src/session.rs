@@ -524,6 +524,8 @@ pub enum BackendError {
     /// The authenticated principal is not allowed to run this statement (e.g.
     /// a read-only token attempting a write).
     Forbidden(String),
+    /// A write inside a transaction the client opened in read access mode.
+    AccessMode(String),
     /// The query ran past its configured wall-clock budget. A re-run would
     /// time out again, so this is deliberately NOT a transient error.
     Timeout(String),
@@ -548,6 +550,7 @@ impl BackendError {
             BackendError::Storage(_) => "Neo.TransientError.General.DatabaseUnavailable",
             BackendError::Constraint(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
             BackendError::Forbidden(_) => "Neo.ClientError.Security.Forbidden",
+            BackendError::AccessMode(_) => "Neo.ClientError.Statement.AccessMode",
             BackendError::Timeout(_) => "Neo.ClientError.Transaction.TransactionTimedOut",
             BackendError::Cancelled(_) => "Neo.TransientError.Transaction.Terminated",
             BackendError::ResourceLimit(_) => "Neo.ClientError.Statement.ResourceLimitExceeded",
@@ -564,6 +567,7 @@ impl BackendError {
             | BackendError::Storage(s)
             | BackendError::Constraint(s)
             | BackendError::Forbidden(s)
+            | BackendError::AccessMode(s)
             | BackendError::Timeout(s)
             | BackendError::ResourceLimit(s)
             | BackendError::Cancelled(s)
@@ -655,6 +659,20 @@ pub trait Backend: Send + Sync {
         self.begin_tx().await
     }
 
+    /// BEGIN carrying both the `db` routing field and the access mode from
+    /// the `extra` map. `read_only` is true when the driver sent `mode: "r"`,
+    /// which is what `session.execute_read` does. A backend can then serve
+    /// the transaction from a snapshot instead of taking its writer. The
+    /// default ignores the mode and delegates to [`Backend::begin_tx_on`].
+    async fn begin_tx_on_mode(
+        &self,
+        db: Option<&str>,
+        read_only: bool,
+    ) -> std::result::Result<(), BackendError> {
+        let _ = read_only;
+        self.begin_tx_on(db).await
+    }
+
     /// Execute one statement inside the open explicit transaction. The
     /// default delegates to [`Backend::run`] (auto-commit), which is the
     /// pre-transaction behaviour for backends that do not override it.
@@ -718,6 +736,12 @@ fn db_from_extra(extra: &BTreeMap<String, Value>) -> Option<String> {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         _ => None,
     }
+}
+
+/// Whether a BEGIN `extra` map asks for read access mode (`mode: "r"`).
+/// Absent means write mode, the Bolt default.
+fn read_only_from_extra(extra: &BTreeMap<String, Value>) -> bool {
+    matches!(extra.get("mode"), Some(Value::String(m)) if m == "r")
 }
 
 /// Bound valid Bolt pipelining while a long RUN is in flight. A normal driver
@@ -1245,7 +1269,12 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             }
             Request::Begin(extra) => {
                 let db = db_from_extra(&extra);
-                match self.backend.begin_tx_on(db.as_deref()).await {
+                let read_only = read_only_from_extra(&extra);
+                match self
+                    .backend
+                    .begin_tx_on_mode(db.as_deref(), read_only)
+                    .await
+                {
                     Ok(()) => {
                         self.state = State::TxReady;
                         self.write_response(Response::success_empty()).await
@@ -2624,6 +2653,105 @@ mod tests {
         .await;
         drop(client);
         task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn begin_access_mode_is_read_only_only_for_r() {
+        let extra = |mode: &str| BTreeMap::from([("mode".into(), Value::String(mode.into()))]);
+        assert!(read_only_from_extra(&extra("r")));
+        assert!(!read_only_from_extra(&extra("w")));
+        assert!(!read_only_from_extra(&BTreeMap::new()));
+    }
+
+    /// BEGIN {mode: "r", db} must reach the backend as a read-only begin on
+    /// that database, not the plain `begin_tx_on` that takes the writer.
+    #[tokio::test]
+    async fn begin_passes_read_access_mode_to_the_backend() {
+        struct ModeBackend {
+            begun: std::sync::Mutex<Option<(Option<String>, bool)>>,
+        }
+
+        #[async_trait]
+        impl Backend for ModeBackend {
+            async fn run(
+                &self,
+                _cypher: &str,
+                _params: Params,
+            ) -> std::result::Result<RunOutcome, BackendError> {
+                panic!("no RUN in this test")
+            }
+
+            async fn begin_tx_on_mode(
+                &self,
+                db: Option<&str>,
+                read_only: bool,
+            ) -> std::result::Result<(), BackendError> {
+                *self.begun.lock().unwrap() = Some((db.map(str::to_string), read_only));
+                Ok(())
+            }
+        }
+
+        let backend = Arc::new(ModeBackend {
+            begun: std::sync::Mutex::new(None),
+        });
+        let (mut client, server) = duplex(64 * 1024);
+        let session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-begin-mode".into(),
+            },
+            AuthPolicy::Open,
+            backend.clone(),
+        );
+        let task = tokio::spawn(async move { session.run().await });
+
+        send_handshake(&mut client).await;
+        let _ = read_handshake_reply(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::HELLO,
+                fields: vec![Value::Map(BTreeMap::new())],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::LOGON,
+                fields: vec![Value::Map(BTreeMap::from([(
+                    "scheme".into(),
+                    Value::String("none".into()),
+                )]))],
+            }),
+        )
+        .await;
+        let _ = read_msg(&mut client).await;
+
+        write_msg(
+            &mut client,
+            &pack_request(&Value::Struct {
+                tag: crate::value::struct_tag::BEGIN,
+                fields: vec![Value::Map(BTreeMap::from([
+                    ("mode".into(), Value::String("r".into())),
+                    ("db".into(), Value::String("acme".into())),
+                ]))],
+            }),
+        )
+        .await;
+        assert!(matches!(
+            decode_response(&read_msg(&mut client).await),
+            Response::Success(_)
+        ));
+        assert_eq!(
+            *backend.begun.lock().unwrap(),
+            Some((Some("acme".to_string()), true))
+        );
+
+        drop(client);
+        let _ = task.await.expect("session task panicked");
     }
 
     #[tokio::test]

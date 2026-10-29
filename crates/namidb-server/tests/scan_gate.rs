@@ -53,6 +53,7 @@ async fn boot() -> String {
         default_namespace: NS.to_string(),
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
+        fence_policy: Default::default(),
         http_request_timeout: None,
     };
     tokio::spawn(async move {

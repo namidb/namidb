@@ -32,7 +32,6 @@ const RUN_MAGIC: &[u8; 8] = b"NFTXRUN1";
 const RUN_HEADER_LEN: u64 = 8 + 8 + 8 + 4;
 const DIRECTORY_RECORD_HEADER_LEN: u64 = 4 + 4;
 const IO_BUFFER_BYTES: usize = 16 * 1024;
-const SHARED_SPOOL_DIR_ENV: &str = "NAMIDB_SPOOL_DIR";
 
 /// Environment variable controlling the logical occurrence-sort buffer.
 pub const INDEX_BUILD_MEMORY_ENV: &str = "NAMIDB_INDEX_BUILD_MEMORY_BYTES";
@@ -81,8 +80,8 @@ impl ExternalTextIndexBuildOptions {
         let spool_directory = env::var_os(INDEX_BUILD_SPOOL_DIR_ENV)
             .filter(|value| !value.is_empty())
             .or_else(|| env::var_os(COMPACTION_SPOOL_DIR_ENV).filter(|value| !value.is_empty()))
-            .or_else(|| env::var_os(SHARED_SPOOL_DIR_ENV).filter(|value| !value.is_empty()))
-            .map(PathBuf::from);
+            .map(PathBuf::from)
+            .or_else(crate::sst::paged_index::default_spool_dir);
         if let Some(directory) = spool_directory.as_deref() {
             validate_spool_directory(directory)?;
         }
@@ -580,7 +579,11 @@ impl SpoolFactory {
     }
 
     fn create(&self) -> Result<File> {
-        if let Some(directory) = self.explicit_directory.as_deref() {
+        let directory = self
+            .explicit_directory
+            .clone()
+            .or_else(crate::sst::paged_index::default_spool_dir);
+        if let Some(directory) = directory {
             return tempfile::tempfile_in(directory).map_err(Error::from);
         }
         #[cfg(unix)]

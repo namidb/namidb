@@ -800,13 +800,13 @@ fn wire_sum(parts: &[usize]) -> Result<usize> {
     })
 }
 
-struct CanonicalValueWriter<'a> {
-    output: &'a mut DiskSpool,
+struct CanonicalValueWriter<'a, W: Write> {
+    output: &'a mut W,
     crc: crc32fast::Hasher,
     written: u64,
 }
 
-impl CanonicalValueWriter<'_> {
+impl<W: Write> CanonicalValueWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.output.write_all(bytes)?;
         self.crc.update(bytes);
@@ -822,7 +822,10 @@ impl CanonicalValueWriter<'_> {
     }
 }
 
-fn encode_value_streaming(value: &Value, output: &mut CanonicalValueWriter<'_>) -> Result<()> {
+fn encode_value_streaming<W: Write>(
+    value: &Value,
+    output: &mut CanonicalValueWriter<'_, W>,
+) -> Result<()> {
     match value {
         Value::Null => output.write(&[0])?,
         Value::Bool(value) => output.write(&[1, u8::from(*value)])?,
@@ -894,6 +897,33 @@ fn encode_value_streaming(value: &Value, output: &mut CanonicalValueWriter<'_>) 
         }
     }
     Ok(())
+}
+
+/// Canonical binary encoding of `value`, the same bytes a property page
+/// stores for it. Node SSTs use it for the `__binary_props` column. Fails on
+/// a value [`decode_canonical_value`] would refuse, so nothing is written
+/// that cannot be read back.
+pub(crate) fn encode_canonical_value(value: &Value) -> Result<Vec<u8>> {
+    let config = NodePropertyPageConfig::default();
+    let encoded_len = measure_value(value, 0, &mut 0, &config)?;
+    if encoded_len > config.max_value_bytes {
+        return Err(Error::precondition(
+            "encoded value exceeds the decode ceiling",
+        ));
+    }
+    let mut output = Vec::with_capacity(encoded_len);
+    let mut writer = CanonicalValueWriter {
+        output: &mut output,
+        crc: crc32fast::Hasher::new(),
+        written: 0,
+    };
+    encode_value_streaming(value, &mut writer)?;
+    Ok(output)
+}
+
+/// Inverse of [`encode_canonical_value`], under the default ceilings.
+pub(crate) fn decode_canonical_value(bytes: &[u8]) -> Result<Value> {
+    decode_top_level_value(bytes, &NodePropertyPageConfig::default())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

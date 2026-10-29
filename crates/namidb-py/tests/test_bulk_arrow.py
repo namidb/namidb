@@ -33,7 +33,157 @@ def test_merge_nodes_basic(client: tg.Client) -> None:
 def test_merge_nodes_missing_id_raises(client: tg.Client) -> None:
     with pytest.raises(ValueError) as exc_info:
         client.merge_nodes("Person", [{"name": "no id"}])
-    assert "'id'" in str(exc_info.value)
+    assert "'_id'" in str(exc_info.value)
+
+
+def test_merge_nodes_preserves_unmentioned_props(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "a": 1, "b": 2}])
+    client.commit()
+    client.merge_nodes("Person", [{"_id": node_id, "b": 3}])
+    client.commit()
+    assert client.lookup_node("Person", node_id)["properties"] == {"a": 1, "b": 3}
+
+
+def test_merge_nodes_none_removes_key(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "a": 1, "b": 2}])
+    client.merge_nodes("Person", [{"_id": node_id, "b": None}])
+    client.commit()
+    assert client.lookup_node("Person", node_id)["properties"] == {"a": 1}
+
+
+def test_merge_nodes_keeps_extra_labels(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.upsert_node_with_labels(["A", "B"], node_id, {"x": 1})
+    client.commit()
+    client.merge_nodes("A", [{"_id": node_id, "y": 2}])
+    client.commit()
+    node = client.lookup_node("A", node_id)
+    assert node["labels"] == ["A", "B"]
+    assert node["properties"] == {"x": 1, "y": 2}
+
+
+def test_merge_nodes_reads_flushed_nodes_in_one_batch(tmp_path) -> None:
+    # A per-row point read decodes a whole row group of the node SST for
+    # every row. The batch read answers from the exact-record index instead,
+    # so with the Parquet bodies set aside a merge must still see the stored
+    # labels and properties.
+    uri = f"file://{tmp_path}?ns=merge"
+    writer = tg.Client(uri)
+    ids = [str(uuid.uuid4()) for _ in range(4)]
+    for i, node_id in enumerate(ids):
+        writer.upsert_node_with_labels(["A", "B"], node_id, {"x": i})
+    writer.commit()
+    writer.flush()
+    del writer
+    bodies = {body: body.read_bytes() for body in tmp_path.rglob("*-nodes.parquet")}
+    assert bodies
+    for body in bodies:
+        body.unlink()
+
+    client = tg.Client(uri)
+    staged = [{"_id": node_id, "y": i} for i, node_id in enumerate(ids)]
+    assert client.merge_nodes("A", staged + [{"_id": ids[0], "y": 9}]) == 5
+    client.commit()
+    for body, data in bodies.items():
+        body.write_bytes(data)
+    rows = client.cypher(
+        "MATCH (n:B) RETURN n.x AS x, n.y AS y, labels(n) AS l ORDER BY x"
+    ).rows()
+    assert rows == [
+        {"x": 0, "y": 9, "l": ["A", "B"]},
+        {"x": 1, "y": 1, "l": ["A", "B"]},
+        {"x": 2, "y": 2, "l": ["A", "B"]},
+        {"x": 3, "y": 3, "l": ["A", "B"]},
+    ]
+
+
+def test_merge_nodes_same_id_twice_in_batch(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    n = client.merge_nodes(
+        "Person",
+        [{"_id": node_id, "a": 1}, {"_id": node_id, "b": 2}, {"_id": node_id, "a": 3}],
+    )
+    assert n == 3
+    client.commit()
+    assert client.lookup_node("Person", node_id)["properties"] == {"a": 3, "b": 2}
+
+
+def test_put_nodes_replaces(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.upsert_node_with_labels(["A", "B"], node_id, {"a": 1, "b": 2})
+    client.commit()
+    assert client.put_nodes("A", [{"_id": node_id, "b": 3}]) == 1
+    client.commit()
+    node = client.lookup_node("A", node_id)
+    assert node["labels"] == ["A"]
+    assert node["properties"] == {"b": 3}
+
+
+def test_merge_nodes_reupsert_same_unique_value_ok(client: tg.Client) -> None:
+    client.cypher("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE")
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "email": "a@x.io"}])
+    client.commit()
+    # The node's own value is not a conflict, for merge, put or a repeat in
+    # one batch.
+    client.merge_nodes("Person", [{"_id": node_id, "email": "a@x.io", "n": 1}])
+    client.put_nodes(
+        "Person",
+        [{"_id": node_id, "email": "a@x.io"}, {"_id": node_id, "email": "a@x.io"}],
+    )
+    client.commit()
+    with pytest.raises(ValueError, match="unique"):
+        client.merge_nodes("Person", [{"_id": str(uuid.uuid4()), "email": "a@x.io"}])
+
+
+def test_put_nodes_repeated_id_moves_unique_value(client: tg.Client) -> None:
+    # put is last-write-wins per id, so only each id's final value counts:
+    # x moves from "a" to "b" and y takes "a" in the same batch.
+    client.cypher("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE")
+    x, y = str(uuid.uuid4()), str(uuid.uuid4())
+    rows = [{"_id": x, "email": "a"}, {"_id": x, "email": "b"}, {"_id": y, "email": "a"}]
+    assert client.put_nodes("Person", rows) == 3
+    client.commit()
+    assert client.lookup_node("Person", x)["properties"] == {"email": "b"}
+    assert client.lookup_node("Person", y)["properties"] == {"email": "a"}
+    with pytest.raises(ValueError, match="unique"):
+        client.put_nodes("Person", [{"_id": str(uuid.uuid4()), "email": "b"}])
+
+
+def test_upsert_node_reupsert_same_unique_value_ok(client: tg.Client) -> None:
+    client.cypher("CREATE CONSTRAINT FOR (p:Person) REQUIRE p.email IS UNIQUE")
+    node_id = str(uuid.uuid4())
+    client.upsert_node("Person", node_id, {"email": "a@x.io"})
+    client.commit()
+    client.upsert_node("Person", node_id, {"email": "a@x.io", "n": 1})
+    client.upsert_node_with_labels(["Person", "Admin"], node_id, {"email": "a@x.io"})
+    client.commit()
+    with pytest.raises(ValueError, match="unique"):
+        client.upsert_node("Person", str(uuid.uuid4()), {"email": "a@x.io"})
+
+
+def test_merge_nodes_id_visible_as_property(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"id": node_id, "name": "Alice"}])
+    client.commit()
+    row = client.cypher(
+        "MATCH (p:Person) WHERE p.id = $id RETURN p.id AS id, p._id AS iid",
+        params={"id": node_id},
+    ).first()
+    assert row is not None
+    assert row["id"] == node_id
+    assert str(row["iid"]) == node_id
+
+
+def test_merge_nodes_underscore_id_keeps_business_id(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "id": "case-42"}])
+    client.commit()
+    assert client.lookup_node("Person", node_id)["properties"] == {"id": "case-42"}
+    row = client.cypher("MATCH (p:Person) RETURN p.id AS id").first()
+    assert row == {"id": "case-42"}
 
 
 def test_merge_nodes_id_must_be_string(client: tg.Client) -> None:
@@ -54,7 +204,8 @@ def test_merge_nodes_then_lookup(client: tg.Client) -> None:
     client.commit()
     looked_up = client.lookup_node("Person", node_id)
     assert looked_up is not None
-    assert looked_up["properties"] == {"name": "Alice", "age": 30}
+    # A legacy `id` key is the node id and also stays a property.
+    assert looked_up["properties"] == {"id": node_id, "name": "Alice", "age": 30}
 
 
 def test_merge_edges_basic(client: tg.Client) -> None:
@@ -186,9 +337,9 @@ def test_scan_label_arrow_basic(client: tg.Client) -> None:
     client.merge_nodes(
         "Person",
         [
-            {"id": ids[0], "name": "Alice", "age": 30},
-            {"id": ids[1], "name": "Bob"},  # no age
-            {"id": ids[2], "name": "Carol", "age": 42, "city": "NYC"},
+            {"_id": ids[0], "name": "Alice", "age": 30},
+            {"_id": ids[1], "name": "Bob"},  # no age
+            {"_id": ids[2], "name": "Carol", "age": 42, "city": "NYC"},
         ],
     )
     client.commit()
@@ -204,6 +355,41 @@ def test_scan_label_arrow_basic(client: tg.Client) -> None:
     assert rows_by_name["Bob"]["age"] is None
     assert rows_by_name["Bob"]["city"] is None
     assert rows_by_name["Carol"]["city"] == "NYC"
+
+
+def test_scan_label_arrow_legacy_id_key(client: tg.Client) -> None:
+    # A legacy row keeps `id` as a property; it repeats the node id, so the
+    # table still has exactly one `id` column.
+    ids = [str(uuid.uuid4()) for _ in range(2)]
+    client.merge_nodes("Person", [{"id": ids[0], "name": "Alice"}])
+    client.merge_nodes("Person", [{"_id": ids[1], "name": "Bob"}])
+    client.commit()
+    table = client.scan_label_arrow("Person")
+    assert table.column_names == ["id", "label", "labels", "lsn", "schema_version", "name"]
+    assert sorted(table["id"].to_pylist()) == sorted(ids)
+
+
+def test_scan_label_arrow_legacy_id_key_any_spelling(client: tg.Client) -> None:
+    # An upper-case UUID is the same node id, so the columns do not depend
+    # on how a batch spelled it.
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"id": node_id.upper(), "name": "Alice"}])
+    client.commit()
+    table = client.scan_label_arrow("Person")
+    assert table.column_names == ["id", "label", "labels", "lsn", "schema_version", "name"]
+    assert table["id"].to_pylist() == [node_id]
+
+
+def test_scan_label_arrow_business_id_is_renamed(client: tg.Client) -> None:
+    node_id = str(uuid.uuid4())
+    client.merge_nodes("Person", [{"_id": node_id, "id": "case-42", "lsn": 7}])
+    client.commit()
+    table = client.scan_label_arrow("Person")
+    assert table.column_names[5:] == ["property.id", "property.lsn"]
+    row = table.to_pylist()[0]
+    assert row["id"] == node_id
+    assert row["property.id"] == "case-42"
+    assert row["property.lsn"] == 7
 
 
 def test_scan_label_arrow_empty(client: tg.Client) -> None:

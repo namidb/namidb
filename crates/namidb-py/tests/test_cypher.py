@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import threading
+import time
+import uuid
 
 import pytest
 
@@ -414,3 +417,141 @@ def test_acompact_returns_the_same_report_shape(client: tg.Client) -> None:
         "new_ssts_written": 0,
         "bloom_sidecars_written": 0,
     }
+
+
+# ── concurrency, timeouts and row caps ─────────────────────────────────
+
+# About a second of CPU on a laptop; long enough to observe from another
+# thread, short enough to keep the suite quick.
+SLOW_READ = "UNWIND range(1, 1200) AS a UNWIND range(1, 1200) AS b RETURN count(*) AS n"
+
+
+def _run_in_thread(client: tg.Client, query: str) -> dict:
+    out: dict = {}
+
+    def work() -> None:
+        out["start"] = time.monotonic()
+        out["result"] = client.cypher(query).first()
+        out["end"] = time.monotonic()
+
+    t = threading.Thread(target=work)
+    t.start()
+    out["thread"] = t
+    return out
+
+
+def test_cypher_releases_the_gil(client: tg.Client) -> None:
+    run = _run_in_thread(client, SLOW_READ)
+    ticks = []
+    while run["thread"].is_alive():
+        ticks.append(time.monotonic())
+        time.sleep(0.001)
+    run["thread"].join()
+    assert run["result"] == {"n": 1200 * 1200}
+    during = [t for t in ticks if run["start"] < t < run["end"]]
+    assert len(during) > 10, "the main thread stalled while the query ran"
+
+
+def test_reads_do_not_hold_the_writer_lock(client: tg.Client) -> None:
+    run = _run_in_thread(client, SLOW_READ)
+    while "start" not in run:
+        time.sleep(0.001)
+    time.sleep(0.05)
+    client.upsert_node("Person", str(uuid.uuid4()), {"name": "Alice"})
+    client.commit()
+    committed = time.monotonic()
+    run["thread"].join()
+    assert committed < run["end"], "the commit waited for the read to finish"
+
+
+def test_reads_on_one_client_run_concurrently(client: tg.Client) -> None:
+    run = _run_in_thread(client, SLOW_READ)
+    while "start" not in run:
+        time.sleep(0.001)
+    time.sleep(0.05)
+    # Would time out if the slow read held the client's lock.
+    assert client.cypher("RETURN 1 AS x", timeout_ms=500).first() == {"x": 1}
+    assert run["thread"].is_alive(), "the slow read finished too early to tell"
+    run["thread"].join()
+
+
+SLOW_WRITE = (
+    "UNWIND range(1, 1200) AS a UNWIND range(1, 1200) AS b "
+    "WITH count(*) AS n CREATE (:Big {n: n})"
+)
+
+
+def test_reads_do_not_wait_for_a_long_write(client: tg.Client) -> None:
+    client.upsert_node("Person", str(uuid.uuid4()), {"name": "Alice"})
+    client.commit()
+    run = _run_in_thread(client, SLOW_WRITE)
+    while "start" not in run:
+        time.sleep(0.001)
+    time.sleep(0.05)
+    assert client.cypher("MATCH (p:Person) RETURN count(p) AS n").first() == {"n": 1}
+    assert len(client.scan_label("Person")) == 1
+    assert client.scan_label("Big") == [], "a read saw an uncommitted write"
+    read = time.monotonic()
+    run["thread"].join()
+    assert read < run["end"], "the read waited for the write to finish"
+    # Once the write returns, reads see it.
+    assert len(client.scan_label("Big")) == 1
+
+
+def test_timeout_bounds_the_wait_behind_a_long_write(client: tg.Client) -> None:
+    run = _run_in_thread(client, SLOW_WRITE)
+    while "start" not in run:
+        time.sleep(0.001)
+    time.sleep(0.05)
+    with pytest.raises(tg.QueryTimeoutError):
+        client.cypher("CREATE (:Person {name: 'late'})", timeout_ms=50)
+    gave_up = time.monotonic()
+    run["thread"].join()
+    assert gave_up < run["end"], "the write waited for the other write instead of timing out"
+    assert client.cypher("MATCH (p:Person) RETURN count(p) AS n").first() == {"n": 0}
+
+
+def test_cypher_timeout_raises_query_timeout_error(client: tg.Client) -> None:
+    with pytest.raises(tg.QueryTimeoutError) as exc_info:
+        client.cypher(SLOW_READ, timeout_ms=1)
+    assert isinstance(exc_info.value, TimeoutError)
+    # A generous timeout does not get in the way.
+    assert client.cypher("RETURN 1 AS x", timeout_ms=60_000).first() == {"x": 1}
+
+
+def test_acypher_timeout_raises_query_timeout_error(client: tg.Client) -> None:
+    async def run() -> None:
+        await client.acypher(SLOW_READ, timeout_ms=1)
+
+    with pytest.raises(tg.QueryTimeoutError):
+        asyncio.run(run())
+
+
+def test_cypher_max_rows_raises_query_row_cap_error(client: tg.Client) -> None:
+    client.cypher("UNWIND range(1, 20) AS i CREATE (:Person {i: i})")
+    query = "MATCH (p:Person) RETURN p.i AS i"
+    with pytest.raises(tg.QueryRowCapError) as exc_info:
+        client.cypher(query, max_rows=5)
+    assert isinstance(exc_info.value, RuntimeError)
+    assert len(client.cypher(query, max_rows=20)) == 20
+
+
+def test_read_only_client_honours_timeout_and_row_cap(tmp_path) -> None:
+    uri = f"file://{tmp_path}?ns=ro_limits"
+    writer = tg.Client(uri)
+    writer.cypher("UNWIND range(1, 20) AS i CREATE (:Person {i: i})")
+    reader = tg.Client(uri, read_only=True)
+    query = "MATCH (p:Person) RETURN p.i AS i"
+    with pytest.raises(tg.QueryRowCapError):
+        reader.cypher(query, max_rows=5)
+    with pytest.raises(tg.QueryTimeoutError):
+        reader.cypher(SLOW_READ, timeout_ms=1)
+    assert len(reader.cypher(query, max_rows=20)) == 20
+
+
+def test_keywords_after_dot_and_as(client: tg.Client) -> None:
+    client.cypher("CREATE (:Doc)-[:MENTIONS {by: 'ana', order: 2}]->(:Doc)")
+    row = client.cypher(
+        "MATCH ()-[e:MENTIONS]->() RETURN e.by AS by, e.order AS order"
+    ).first()
+    assert row == {"by": "ana", "order": 2}

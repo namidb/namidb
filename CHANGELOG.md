@@ -15,6 +15,547 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-29
+
+### Breaking
+
+- **`CALL algo.*` rejects option keys it does not read.** `algo.pagerank`,
+  `algo.louvain`, `algo.label_propagation`, `algo.fastRP` and
+  `algo.shortest_path` used to drop unknown keys, so `{dampng: 0.9}` ran
+  with the default damping. They now fail with the list of allowed options,
+  like the projection-only procedures already did. A query that passes a
+  stray key, for example `algo.louvain({seed: 1})`, now errors; drop the key.
+  The check runs before the graph is built, so it fails fast.
+
+- **`algo.shortest_path` returns a fourth column, `path`.** A `YIELD` that
+  names its columns is unaffected, but a call without `YIELD`, or a client
+  that reads columns by position or count, now sees `node_id`, `distance`,
+  `hops`, `path`.
+
+- **Python `merge_nodes` now merges.** It used to replace the whole node,
+  so a second call carrying only some keys dropped every other property,
+  and a node with labels `A` and `B` merged under `A` lost `B`. Each row is
+  now merged into the stored node: unmentioned keys are kept, a `None`
+  value removes the key, and the label is added to the node's labels. Rows
+  that repeat an id in one call merge in order. The stored nodes are read in
+  one batch per call, not one point read per row. The old replace behaviour
+  lives on as the new `put_nodes`, which skips the read and is the faster
+  choice for a first load. In `put_nodes` the last row for an id wins, and
+  unique constraints are checked against each id's final value only.
+
+- **Python bulk rows take the node id from `_id`.** That matches `n._id` in
+  Cypher, and leaves `id` free to be an ordinary property. Rows keyed by
+  `id` alone still work, and the `id` value is now also stored as a
+  property, so `n.id` and `WHERE n.id = $id` find the node instead of
+  returning null.
+
+- **Node SSTs and their exact record sidecars use a new format that 2.x
+  cannot read.** Embeddings and other numeric arrays moved out of the
+  overflow JSON (see Changed). Nothing in the manifest marks the change, so
+  a 2.x binary or wheel still opens a store that 3.0 has written to or
+  compacted, but any node read that touches an SST written or compacted by
+  3.0 fails with a `corrupted artefact at ...` error (a node SST schema or
+  column count mismatch, or `unknown exact node record encoding`), and its
+  compaction fails too. A downgrade therefore needs a backup taken before
+  the upgrade. Stores written by 2.x open and read as
+  before. Their SSTs move to the new format when compaction merges them
+  with newer data; a bucket that is already one fully compacted SST keeps
+  the old layout until then.
+- **A MATCH no longer binds one relationship twice.** Queries whose pattern
+  could walk the same relationship more than once now return fewer rows.
+  See the entry under Fixed.
+
+- **An OPTIONAL MATCH matches its whole pattern or nothing.** A pattern with
+  more than one hop, a `WHERE`, or inline properties used to keep the part
+  that matched and pad the rest, or drop the row. Such queries now return
+  the rows Cypher does. See the entry under Fixed.
+
+### Added
+
+- **macOS x86_64 Python wheel.** Intel Macs and x86_64 Pythons on Apple
+  silicon (a Rosetta terminal, `python3-intel64`) found no matching wheel,
+  fell back to the sdist and failed without a Rust toolchain. The release
+  now ships a `macosx_*_x86_64` wheel, cross-built on the arm64 runner and
+  smoke-tested under Rosetta.
+
+- **`algo.shortest_path` takes an optional `target`.** It used to ignore
+  `target` and return the distance to every reachable node. With a target it
+  returns one row (none when it is unreachable) with `node_id`, `distance`,
+  `hops` and `path`, the source to target node sequence with labels and
+  properties. In the default direction the search runs on the stored
+  adjacency without loading the projected graph, so it only reads the part
+  of the graph it explores before reaching the target; an unreachable target
+  still explores everything reachable from the source. With `direction:
+  'reverse'` or `'undirected'` it builds the projected graph first, like the
+  untargeted call.
+  A null `target` is treated as no target. Without a target, `path` is null
+  and the other columns are unchanged. The MCP `graph_algorithm` tool takes
+  the same `target` for `shortest_path` and returns the route; a `target`
+  that is not a string is rejected.
+
+- **`Client.sweep(min_age_secs=60, dry_run=False)`** in the Python client
+  deletes objects no manifest version references any more and reports what
+  it removed. `aborted_by_pin` in the report is true when a pin lease landed
+  mid-sweep and nothing was deleted, so the sweep should be run again.
+
+- **Python: `Client(uri, read_only=True)` reads a namespace without taking
+  it from its writer.** Opening any `Client` used to claim the writer
+  epoch, so a notebook that only wanted to look at the data fenced the
+  process loading it. A read-only client loads the current manifest,
+  replays the unflushed WAL so it sees every commit, and holds a retention
+  lease, renewed in the background, so the writer's cleanup keeps its
+  files. `refresh()` moves it to the newest commit, and a read on a
+  version more than an hour old, or whose lease may have expired,
+  refreshes on its own so a forgotten reader cannot hold back cleanup
+  forever. `close()` (or a `with` block) drops the lease, and a read after
+  that reloads the newest version under a new one. A read that times out
+  while the client renews or refreshes leaves no lease behind and drops
+  none another read still needs. Every mutator
+  raises `PermissionError`. The storage side is
+  `namidb_storage::ReaderSession`.
+
+- **Python: `timeout_ms` and `max_rows` on `cypher` / `acypher`.** Both
+  are keyword-only and off by default. They raise the new
+  `namidb.QueryTimeoutError` (a `TimeoutError`) and
+  `namidb.QueryRowCapError` (a `RuntimeError`). The timeout also bounds
+  a write's wait for the client's lock behind another write, a read-only
+  client's refresh, and a write's commit. A timed-out write is
+  discarded, not committed.
+
+- **Python: `limit=` on `scan_label`, `scan_label_arrow` and
+  `scan_edge_type`, plus `iter_label` / `iter_edge_type`.** The iterators
+  are lazy: `next(iter(c.iter_label("Artifact")))` used to decode all
+  1.87M rows before the first one came back, and now reads one batch of
+  1,024. Each step pulls the next batch with the GIL released, resuming
+  the id-ordered merge of the memtable and every node SST where the last
+  one stopped, so a batch reads the id, tombstone, lsn and label columns
+  of the row groups it reaches and point-reads only the rows it returns.
+  This holds on overlapping SSTs too. An SST whose label counts rule the
+  label out, and whose versions are all older than any of the label's, is
+  skipped, so a small label written after a big load does not walk the big
+  one first. Walking the whole label reads each stored
+  record about once. An iterator reads from the version that was current
+  when it was created, and keeps that version's files alive against
+  compaction and sweeps until it is dropped (on a `read_only` client,
+  `close()` drops those leases too), so writes that land meanwhile do not
+  show up half way through. A step that fails ends the iterator: later
+  steps raise again instead of resuming after the lost batch. The `scan_*`
+  calls stay lists. An edge iterator, and `scan_edge_type(limit=)`, still
+  read the type's SST files and decode their property strings in full
+  when they start, since edge SSTs have no ranged scan yet, and the
+  iterator holds them until it is dropped; only the JSON parsing and the
+  dicts are done per batch. Storage callers get the same through
+  `Snapshot::label_scan_cursor` and `Snapshot::edge_scan_cursor`. The
+  limited scan over overlapping SSTs that these share now also stops on a
+  query timeout between row groups.
+
+- **`--fence-policy` (`NAMIDB_FENCE_POLICY`) decides what a fenced writer
+  does.** Until now a server whose namespace was claimed by another process
+  always reopened, which takes the epoch back and fences the other process
+  in turn. Two pods on one namespace during a rolling deploy kept doing that
+  to each other, failing in-flight writes and replaying the WAL on every
+  round. `steal` (the default) keeps the old behavior. `yield` leaves the
+  namespace to the new owner and reports the writer degraded, so readiness
+  goes 503 and the orchestrator stops routing writes there. A yielded writer
+  stays down for the life of the process (or of the open namespace in
+  `--multi-tenant` mode), even when a later flush or write on it fails with
+  a different error. A poisoned session or a plain CAS loss still reopens
+  under both policies, but under `yield` that reopen yields instead when
+  another process already holds a newer epoch. That includes a claim caught
+  halfway, which shows up on this side as a CAS loss rather than a fence.
+
+- **`NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` caps reads per
+  namespace.** The read admission gate is process-wide, so in
+  `--multi-tenant` mode one busy tenant could hold every permit and make the
+  others queue into the retryable "too many concurrent queries" error. With
+  this set, each namespace also gets its own cap, taken before the global
+  one and inside the same admission window. Off (`0`) by default. The
+  rejection names whichever of the two gates was full.
+
+### Changed
+
+- **Embeddings are stored in binary, not as JSON text.** A vector, an int8
+  vector, a byte string or a list of numbers (what a Python list of floats
+  becomes through a Cypher parameter) used to be written into the node's
+  `__overflow_json` column, so a 1,024-float embedding was about 20 KB of
+  decimal text that every read of the row parsed, whether or not it asked
+  for the embedding. Node SSTs now carry those values in a new
+  `__binary_props` column, in the same binary encoding the property pages
+  use, and the footer lists which names the column holds. A projection that
+  names none of them (`RETURN c.kind`) never reads the column, and one that
+  does reads the floats without parsing text. The exact records behind point
+  lookups and label postings (`.nloc2`) moved to the same binary encoding.
+
+  The overflow JSON itself is now parsed selectively under a projection:
+  keys that were not asked for are skipped without building a value, which
+  also speeds up SSTs written by 2.x that still hold embeddings there. Those
+  SSTs keep reading as before, alongside new ones, with the newest version
+  of each node winning. Compaction writes them in binary when it merges
+  them with newer SSTs; a lone, fully compacted 2.x SST is left as it is,
+  since rewriting a multi-gigabyte vector corpus only to change its layout
+  would cost more than it saves.
+
+  On a 200k-node store with 4,096 1,024-float embeddings, reading the
+  `name` of those 4,096 nodes through their exact records took 53 MB of
+  reads and 193 ms in the 2.x layout and takes 45 MB and 58 ms now. Through
+  the property pages, the default when they exist, it was already 60 ms.
+
+- **An unindexed vector search reads only the embedding until it has its
+  top k.** `search.vector`, `search.hybrid`, `db.index.vector.queryNodes`
+  and an `ORDER BY cosine_similarity(...) LIMIT k` query without a usable
+  vector index used to load every node of the label in full before
+  ranking. Without a filter they now read only the vector property and load
+  the k winners whole afterwards. With a filter they still load every node,
+  since the filter may read any property. On 400 nodes with 32 KB of text
+  each, a k of 1 went from 8 MB read to under 3.3 MB.
+
+- **A projected scan of a small label over overlapping node SSTs no longer
+  reads every node SST.** `MATCH (d:Device) RETURN d.name` and
+  `RETURN id(d)` took the two-pass label scan, whose first pass reads the
+  id, lsn and label columns of every node in the store. A label holding at
+  most 1/64 of the node rows now resolves its members through the label
+  postings and reads only their records. Measured on 220k nodes in two
+  overlapping SSTs with 128 Ki-row groups and 9 devices: `RETURN d.name`
+  went from 48 ms to 0.5 ms and `RETURN id(d)` from 41 ms to 0.5 ms, both now
+  reading one block per device per SST. `scan_label('Device')` was already
+  on that route and takes 0.6 ms. Larger labels keep the two-pass scan,
+  whose second pass decodes properties for the label's own rows only.
+  That is why node SSTs are still not split by label: on these numbers the
+  remaining cost of a label read is the structural pass of a mid-sized
+  label, about 40 ms per 220k nodes, not other labels' properties.
+
+- **Namespace names can contain `_`.** `forensic_case` used to be rejected
+  as an invalid namespace. The first character still has to be `[a-z0-9]`.
+
+- **`memory://` takes `?ns=` like the other schemes.** `memory://?ns=acme`
+  and `memory://acme?ns=acme` both open `acme`. A URI whose host and `?ns=`
+  disagree, or that carries any other parameter (say a mistyped `?nss=`),
+  now fails with a clear error instead of an invalid-character one.
+
+- **Label scans over overlapping node SSTs no longer load whole SST files.**
+  A denser label, or a projected scan that is better served by property
+  pages, now runs in two passes. The first reads only the id, tombstone,
+  lsn and label columns of each SST and settles which version of each id
+  wins. The second reads properties for the winning rows of the label only:
+  from property pages for a projected scan, or from Parquet with a row
+  selection that skips every other page. Counts and `RETURN id(n)` style
+  scans stop after the first pass. Any mismatch between the passes falls
+  back to the full reconciliation. This also covers the BM25 and hybrid
+  search label walks. `SstCache::label_selected_node_rows()` reports how
+  many label rows had their properties read, here or from property pages.
+
+- **The embedded Python client now compacts and reclaims space on its own.**
+  It has no maintenance loop like the server, so L0 SSTs piled up until
+  someone called `compact()`, and even then nothing was deleted: merged-away
+  L0 files and flushed WAL segments stayed on disk for good. `flush()` now
+  runs a compaction pass once a bucket holds `compaction_l0_trigger` L0 SSTs
+  (default 8, `0` turns it off), and every applied pass is followed by a
+  sweep of objects written more than `auto_sweep_min_age_secs` ago (default
+  60, `None` turns it off). The age counts from when a file was written, so
+  it is no grace period for a reader in another process. A
+  `read_only=True` client is safe while it can write its retention lease
+  under `manifest/pins/`, since every sweep honours it. One on read-only
+  credentials gets no lease, and a server or the CLI reading the same
+  directory holds none: turn the auto sweep off while one of those reads
+  the graph.
+
+- **Compaction scratch for a `file://` Python client goes under
+  `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless
+  `NAMIDB_SPOOL_DIR` was set, which filled the system disk on large graphs.
+  Pass `spool_dir=` to put it elsewhere. Text and vector index builds now
+  honour the same directory instead of `/var/tmp` or `$TMPDIR`. The setting
+  is process-wide and each new client resets it, and a spool dir that was
+  deleted falls back to the default instead of failing every flush.
+
+- **A compaction triggered by `flush()` that fails is a `RuntimeWarning`.**
+  The flush is already durable at that point, so raising would tell a
+  retrying caller its data was lost.
+
+- **`scan_label_arrow` no longer emits two `id` columns.** A node loaded
+  with the legacy `id` key keeps `id` as a property, which clashed with the
+  metadata `id` column and made `table["id"]` raise. A property that only
+  repeats the node id (in any UUID spelling, upper case included) is
+  dropped from the table, and any other property
+  named like a metadata column comes back as `property.<key>`.
+
+- **Bolt read transactions no longer take the writer lock.** Neo4j drivers
+  send every managed read (`session.execute_read`) as `BEGIN {mode: "r"}`,
+  but the server ignored the access mode and held the writer lock for the
+  whole transaction. Driver reads queued behind each other and behind every
+  write, and failed with a busy error after `--writer-lock-timeout`. A read
+  access mode transaction now reads the snapshot published at BEGIN without
+  touching the writer, and a write inside it fails with
+  `Neo.ClientError.Statement.AccessMode`. Write mode transactions are
+  unchanged. In `--multi-tenant` mode a namespace with an open read
+  transaction is never evicted as idle, so a reopened copy of it cannot
+  compact and sweep files that the transaction's snapshot still reads.
+  Embedders get a new `Backend::begin_tx_on_mode` method whose default
+  ignores the mode, so other backends keep working as before.
+
+### Fixed
+
+- **A float could come back one bit off.** Node properties pass through
+  JSON on their way from the WAL to a flush and into the Parquet rows a
+  compaction writes, and the JSON parser could round a 17-digit double to
+  its neighbour. Point lookups and property pages keep the exact value, so
+  one embedding could read back with different bits on a lookup and on a
+  scan. Floats are now parsed exactly. The exact parser costs about 9 ns
+  more per float, which did not show up in a flush or a compaction of
+  4,096 nodes with 1,024-float embeddings (both about 15 s either way).
+
+- **A MATCH could bind the same relationship to two of its relationship
+  variables.** Cypher requires every relationship in one MATCH pattern to
+  be a different relationship, but each hop only kept its own variable
+  length walk from repeating an edge. `MATCH (a)-[:K]-(b)-[:K]-(c)` walked
+  every edge out and straight back, so a 2-hop chain counted each `a = c`
+  return trip, and `MATCH (a)-[:K]->(b), (x)-[:K]->(y)` paired every edge
+  with itself. Every relationship of a MATCH clause, named or anonymous and
+  across its comma-separated parts, now differs from the others, in the
+  flat and factorized executors and in the WCOJ join, including
+  variable-length hops mixed with fixed ones. An `OPTIONAL MATCH` applies
+  the rule inside its own pattern and pads NULLs when it rules out every
+  match, and so does a pattern in `WHERE`, `EXISTS(...)` or a pattern
+  comprehension. Separate MATCH clauses still do not constrain each other,
+  as in Cypher.
+
+  This changes results: such queries now return fewer rows, the ones a
+  Cypher database returns. Hops whose types cannot overlap are not
+  compared. With `NAMIDB_WCOJ=1`, two comma-separated cyclic parts that
+  share an edge type now run on the regular join, since the second has to
+  check the first part's relationships.
+
+- **An `OPTIONAL MATCH` kept half a match.** Each hop of the pattern was
+  optional on its own, so `MATCH (a) OPTIONAL MATCH (a)<-[:K]-(b)-[:K]->(x)`
+  returned `b` with a NULL `x` for every `b` that had no second hop, next to
+  the full matches, instead of the full matches alone or one row with `b`
+  and `x` both NULL. The same split hit a `WHERE` on the OPTIONAL MATCH,
+  which dropped the row when it ruled out every match instead of padding
+  it, inline properties on the far node (`(b {n: 1})`), which were ignored,
+  and a pattern that starts at a new node (`OPTIONAL MATCH (z:Missing)`),
+  which dropped the row. Such a pattern now runs as a plain MATCH for each
+  incoming row, and the row is kept once with every new variable NULL when
+  it finds nothing. That works after a write clause too (`MERGE (a) WITH a
+  OPTIONAL MATCH ...`), its `WHERE` and an `id()` or index pin on its new
+  start are used as in a plain MATCH, and a bare `LIMIT` above it stops
+  reading its input once it has enough rows. A single hop from a bound node
+  with none of those still runs as before.
+
+- **A chained `OPTIONAL MATCH` failed when an earlier one found nothing.**
+  `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (b)-[:S]->(c)` raised
+  "Expand source `b` is not a Node" for every row where `b` was NULL. A NULL
+  source now pads the rest of the pattern with NULLs under `OPTIONAL MATCH`
+  and yields no rows under a plain `MATCH`, in the flat, shortest path and
+  factorized executors alike. Other non-node sources still raise the error.
+
+- **`MATCH (x)-->(y) RETURN x, y LIMIT 10` read every node before the first
+  edge.** A bare `LIMIT` over an expand from an unlabelled (or labelled)
+  scan ran the scan in full to feed the expand, which on a 2.4M node graph
+  was enough to get the process killed for memory. The scan is now pulled in
+  growing prefixes (64 nodes, then four times more each round) until the
+  limit is filled, and the rows are the same ones, in the same order, as
+  before. This also works while nodes sit in the memtable or node SSTs
+  overlap (with random ids, such as uuid5, any store with more than one node
+  SST): a limited scan there merges the SSTs in id order, reading only the
+  id, tombstone, lsn and label columns plus the columns a pushed down filter
+  tests (from property pages when the SST has them, so a filter on a small
+  property does not read the embeddings), keeps the newest version of each
+  id, tests the filter on that version, and stops once it has the rows it
+  needs. It then reads the properties of those rows only, from the SST row
+  that won, so a node the filter rejects costs no point read. A labelled
+  scan still tries the label postings first, and a filter on an indexed
+  number the range index, which now confirms candidates in id order and
+  stops at the limit instead of looking up the whole matching window. Each
+  round of the seed pull restarts the scan from the first id, so when few
+  seeds expand the rounds read between about 1.3 and 2.3 times what one
+  full pass would. A labelled or filtered seed pull over overlapping SSTs
+  still makes its round after 4,096 seeds one full scan, since the postings
+  and the range index redo their whole prefix each round. Resuming each
+  round after the last seed would avoid both but is not done yet.
+
+- **The query row cap did not bound memory for a node scan.** With a row cap
+  in scope (`NAMIDB_QUERY_ROW_CAP` on the server), `MATCH (n) RETURN n`
+  loaded every node and only then reported the cap. The scan now stops one
+  row past the cap and fails with the same error, in the flat and factorized
+  executors. On node SSTs that overlap, filtered and labelled scans go
+  through the same id-ordered merge as a `LIMIT`, so they also stop one row
+  past the cap and hold no more rows than that. When the manifest
+  shows the scan cannot reach the cap, it keeps the plain read, so the SST
+  body is still cached across queries. A `LIMIT` that the first seeds of an
+  expand already fill no longer trips a row cap smaller than the seed batch.
+
+- **`OPTIONAL MATCH p = ...` did not give a NULL `p` when nothing matched.**
+  A variable-length or `shortestPath` path was left unbound, so `RETURN p`
+  failed with "binding `p` not bound", and a fixed-length path came back as
+  a path holding NULL elements. Both are now NULL.
+
+- **`WHERE id(n) IN $ids` scanned the whole label.** Only `id(n) = $x` was
+  turned into a point lookup, and only when it was the entire `WHERE`. An
+  `IN` list, an id equality next to another condition (including an inline
+  `{k: v}` on the first node of a longer pattern), and the
+  `UNWIND $ids AS x MATCH (n) WHERE id(n) = x` workaround all fell back to
+  a full scan plus filter. They now seek each id, and the ids of one lookup
+  are resolved in a single batched read instead of one cold read per id.
+
+  An id seek now behaves exactly like the filter it replaces: a null, a
+  non-string or a malformed id matches no node instead of failing the
+  query, and only the lowercase id string that `id()` returns matches. An
+  upper-case or braced UUID, or a node passed where its id was meant
+  (`WHERE id(b) = m`), used to find the node through `id(n) = $x` while the
+  same value found nothing in any other spelling of the query. One
+  difference remains: `id(n) IN $ids` with a value that is not a list
+  fails with an UNWIND error, as Neo4j also rejects it, where the scan
+  returned no rows.
+
+  `MATCH (n:L {_id: $x})` still accepts any UUID spelling and a node, like
+  `CREATE (n:L {_id: $x})` does, but a null or malformed `_id` now matches
+  nothing instead of failing the query.
+
+- **`RETURN id(t)` decoded every expanded neighbour.** A target used only
+  through `count(t)` or `count(id(t))` already skipped loading its row, but
+  projecting `id(t)` or `elementId(t)` counted as reading the whole node, so
+  listing the ids around a hub decoded the properties of every neighbour.
+  It now takes the same id-only route. A target that a later pattern
+  matches again with a label (`MATCH (m)-->(p) MATCH (c)-->(p:Person)`) is
+  still loaded, since that label check needs the node's real labels; the
+  id-only route used to drop every such row, which `count(p)` and
+  `count(*)` already did before this release. When the later pattern starts
+  at that alias (`MATCH (m)-->(p) MATCH (p:Person)`), its labels and inline
+  properties used to be ignored, so rows for nodes that are not a Person
+  came back. They now filter the bound node; under `OPTIONAL MATCH` a node
+  that does not match keeps the row with the new variables NULL.
+
+- **A pattern pinned by `id()` on its last node started from the first.**
+  `MATCH (i:Identifier)-[:R]->(d:Device) WHERE id(d) = $id` scanned every
+  `Identifier` and expanded forward, while the reversed spelling answered
+  at once. The planner already re-anchored a pattern at a target pinned by
+  an indexed property; it now does the same for `id(d) = ...` and
+  `id(d) IN ...`, with or without a label on the target, unless a literal
+  id list is longer than the label it would replace scanning. A longer chain
+  of single hops is re-anchored at whichever node is pinned:
+  `MATCH (i)-[:R]->(d)-[:S]->(p) WHERE id(p) = $id` starts at `p` and walks
+  both hops backwards, and with `WHERE id(d) = $id` it starts at `d`, walks
+  back to `i` and forward to `p`, also when only `id(...)` or `labels(...)`
+  are returned. Labels, relationship filters, relationship uniqueness and a
+  named path (`MATCH q = ...`) give the same rows as the written order. A
+  chain with a variable-length or `OPTIONAL` hop keeps its written order.
+
+- **A labelled hop decoded every neighbour to check its label.** When the
+  query read a property of the target (`-[:R]->(t:Device) RETURN t.name`),
+  each distinct neighbour was loaded first and the label was tested after,
+  so a hub with 1.7M neighbours decoded 1.7M rows even if a handful were
+  devices. A single hop now proves the label from the label index and
+  loads only the nodes that carry it, and skips the others without a read
+  even when the hop is too wide to keep its neighbours in memory. This also
+  holds when node SSTs overlap, as they do once a store has more than one
+  level: each neighbour is checked against the label index of the newest
+  SST that can hold it, and the SST's node locator tells a newer version
+  that is not a match from one that is not there, so a small recent flush
+  without a bloom filter does not send every neighbour to the point reader.
+  Only unflushed writes are read whole. If the overlapping SSTs also share
+  a range of LSNs, every neighbour is read as before. Variable-length hops
+  still visit every neighbour, since the label only decides which ones are
+  results.
+
+- **`id(n)`, `labels(n)` and `count(n)` decoded every property of `n`.** The
+  planner treated any use of a node variable inside a function or an
+  aggregate as a read of the whole node, so `WITH labels(n) AS l, count(*)
+  AS c, collect(id(n))[0..1] AS s` parsed the overflow JSON (embeddings
+  included) of every row it scanned. These calls now read only the id and
+  label columns. `keys(n)`, `properties(n)` and a bare `n` still load
+  everything.
+
+- **A label scan on a store with more than one node SST decoded every node
+  in the store.** Node ids are random, so two node SSTs always overlap in key
+  range, and every label accelerator turned itself off. The fallback then
+  parsed the overflow JSON of every row of every label and kept a full view
+  of each one in memory before filtering by label. Reading 9 `:Device` nodes
+  out of 2.8M took 23 s and 12.5 GB.
+
+  The fallback now checks the label first. A row outside the label is kept
+  only as a marker for last-writer-wins, so a newer version that dropped the
+  label still hides the older one, and its properties are never decoded.
+  The same applies to property-page projections.
+
+- **`MATCH (n:L) RETURN n LIMIT k` and `count` read the whole store once
+  there was more than one node SST.** The LIMIT prefix scan and the label
+  index both required node SSTs with disjoint key ranges and an empty
+  memtable, which a store with more than one level never has. They now work
+  with overlap too: the label postings of every SST and the memtable ids
+  that carry the label are merged in id order, each candidate resolves to
+  its newest version, and versions that lost the label or were deleted are
+  skipped. A LIMIT stops as soon as it has its rows and no longer fetches a
+  full page of candidates first. Each skipped candidate makes the next batch
+  of lookups larger, and on a dense label a LIMIT that keeps hitting stale
+  postings (say after a bulk relabel) gives up and uses the id-ordered merge
+  described above. Scans, filtered LIMITs and LIMITs above 4,096 rows take
+  this route only when the label is at most a quarter of the node rows,
+  memtable included, since each candidate is a full record lookup and a
+  filter may reject them all. That includes the hidden limit a row cap adds
+  to a node scan, so a capped query over a dense label is not looked up one
+  record at a time. Counts and other unbounded id-only scans take it only
+  for a label of at most 1/64 of the node rows; otherwise the first pass of
+  the two-pass scan answers them without reading any property.
+
+  Still open: a flush that only deletes nodes carries no label counts, which
+  turns this route off until compaction. Node SSTs are still not split by
+  label (see the label scan entry under Changed for why that was not
+  needed).
+
+- **Keywords work as property keys, map keys and aliases.** `RETURN e.by`,
+  `SET n.end = 1`, `{order: 1}`, `RETURN x AS by` and
+  `CREATE INDEX ON :Evt(order)` used to fail with E003 because `by`, `end`
+  and `order` are reserved words. A word right after `.`, before `:` in a
+  map, after `AS` or in an index property list can only be a name, so it is
+  now read as one, spelled exactly as written. Variables and labels still
+  need backticks (`` MATCH (`order`) ``), and so does a later reference to a
+  keyword alias. A bare backtick-quoted variable now names its column
+  without the backticks, like Neo4j: `` RETURN `order` `` gives a column
+  `order` and `` RETURN `my node` `` a column `my node` (it used to be
+  `` `my node` ``, backticks included).
+
+- **`CALL algo.*` failed when a projected label or edge type had no data
+  yet.** An edge type that was never declared and had no edges, or a label
+  with no nodes, made the whole call error with `unknown edge type` /
+  `unknown label`, so a pipeline could not name a type before ingest reached
+  it. Such a label or type now just contributes no nodes or edges.
+
+- **Re-upserting a node with its own unique value raised a constraint
+  error.** The low-level Python writes (`upsert_node`,
+  `upsert_node_with_labels`, `merge_nodes`) checked uniqueness as if the
+  node were new, so writing a node again with an unchanged unique property,
+  or listing the same id twice in one batch, conflicted with itself. The
+  node's own row is now excluded from the check.
+
+- **Python calls held the GIL for their whole duration.** A long query or
+  WAL replay froze every other Python thread. Every blocking call now
+  releases the GIL while it waits.
+
+- **Python reads were serialised behind the writer lock.** `cypher` reads,
+  `lookup_node`, `scan_*` and edge lookups held the writer mutex for the
+  whole query, so two threads could not read at once, a long read stalled
+  every write, and a bulk load stalled every read. Reads now run on the
+  latest committed snapshot without the lock. Write statements are
+  planned again under the lock.
+  `sweep()` and the sweep after a compaction take their horizon from the
+  oldest snapshot a read in the same process still holds, so they never
+  delete files an in-flight read in another thread needs.
+
+- **The external policy endpoint now receives the namespace.** The PDP
+  request was documented with an `input.namespace` field, but nothing ever
+  set it, so an OPA policy could not tell tenants apart. Queries and schema
+  commands now carry the namespace they run against, over HTTP and Bolt.
+  `AuthzHook::check` and `check_schema` take the namespace as a new
+  argument.
+
+- **A slow cold open no longer stalls every other tenant.** In
+  `--multi-tenant` mode the registry held its map lock for the whole open of
+  a new namespace (pointer resolve, segment listing, WAL replay) and for the
+  wait on an evicted writer. Every request to every other namespace queued
+  behind it, including ones that were already open. Each namespace now opens
+  on its own slot, so only requests for the namespace being opened wait, and
+  concurrent first requests for it still share one writer. An evicted
+  namespace is still fully quiesced before anything reopens it.
+
 ## [2.6.19] - 2026-09-16
 
 ### Fixed
@@ -3621,7 +4162,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.19...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/namidb/namidb/compare/v2.6.19...v3.0.0
 [2.6.19]: https://github.com/namidb/namidb/compare/v2.6.18...v2.6.19
 [2.6.18]: https://github.com/namidb/namidb/compare/v2.6.17...v2.6.18
 [2.6.17]: https://github.com/namidb/namidb/compare/v2.6.16...v2.6.17

@@ -13,12 +13,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use namidb_core::id::{NamespaceId, NodeId};
+use namidb_core::schema::Schema;
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSession};
+use namidb_storage::sst::predicates::ScanPredicate;
+use namidb_storage::{
+    EdgeWriteRecord, NamespacePaths, NodeWriteRecord, SessionCaches, SstCache, WriterSession,
+};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
-use namidb_query::{execute_flat_path, lower, parse, Params, Row, RuntimeValue};
+use namidb_query::{
+    execute_flat_path, lower, parse, predicate_pushdown, Params, Row, RuntimeValue,
+};
 
 fn store() -> Arc<dyn ObjectStore> {
     Arc::new(InMemory::new())
@@ -377,6 +383,475 @@ async fn cap_never_underfills_when_most_edges_are_rejected() {
             got,
             full[..expected].to_vec(),
             "LIMIT {limit} must be an order-preserving prefix of the uncapped result"
+        );
+    }
+}
+
+/// `MATCH (a)-->(b)` scans every node as a seed (Movies included, which
+/// have no out-edges) and expands every edge type. The flush puts the nodes
+/// in an SST so the capped runs take the seed pull, not the memtable path.
+#[tokio::test]
+async fn unlabelled_source_limit_over_untyped_expand_is_a_prefix() {
+    let cache = SstCache::new(8 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-untyped"), caches)
+        .await
+        .unwrap();
+    build_graph(&mut writer).await;
+    writer.flush(Schema::empty()).await.unwrap();
+    let snapshot = writer.snapshot();
+    let run_query = |query: String| {
+        let snapshot = &snapshot;
+        async move {
+            let plan = lower(&parse(&query).unwrap()).unwrap();
+            pairs(
+                &execute_flat_path(&plan, snapshot, &Params::new())
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+
+    let full = run_query(format!("MATCH (a)-->(b) {PAIR_RETURN}")).await;
+    assert_eq!(full.len(), 6);
+    for limit in [1usize, 3, 6, 10] {
+        let capped = run_query(format!("MATCH (a)-->(b) {PAIR_RETURN} LIMIT {limit}")).await;
+        assert_eq!(capped, &full[..limit.min(full.len())], "LIMIT {limit}");
+    }
+    // One limited scan per capped query, each of the 9 nodes (fewer than
+    // the first round of 64 seeds), and none fell back to a full scan.
+    assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+    assert_eq!(cache.limited_node_scan_output_rows(), 4 * 9);
+}
+
+/// The seed pull grows 64, 256, 1024: 500 edgeless nodes ahead of the
+/// connected ones force several rounds, and rows found across a round
+/// boundary must keep the uncapped order. The flush puts the nodes in an
+/// SST, where the pull runs in rounds (from the memtable it scans once).
+#[tokio::test]
+async fn limit_fills_past_many_edgeless_seeds() {
+    let mut writer = WriterSession::open(store(), paths("lp-edgeless"))
+        .await
+        .unwrap();
+    for i in 0..500 {
+        writer
+            .upsert_node("Lonely", NodeId::new(), &node_with("v", i))
+            .unwrap();
+    }
+    let hub = NodeId::new();
+    writer.upsert_node("Hub", hub, &node_with("v", -1)).unwrap();
+    for i in 0..200 {
+        let id = NodeId::new();
+        writer
+            .upsert_node("Linked", id, &node_with("v", 1000 + i))
+            .unwrap();
+        writer.upsert_edge("TO", id, hub, &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    let snapshot = writer.snapshot();
+
+    let values = |rows: Vec<Row>| -> Vec<i64> {
+        rows.iter()
+            .map(|r| match r.get("v") {
+                Some(RuntimeValue::Integer(v)) => *v,
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect()
+    };
+    let run_query = |query: String| {
+        let snapshot = &snapshot;
+        async move {
+            let plan = lower(&parse(&query).unwrap()).unwrap();
+            execute_flat_path(&plan, snapshot, &Params::new())
+                .await
+                .unwrap()
+        }
+    };
+
+    let full = values(run_query("MATCH (a)-[:TO]->(h) RETURN a.v AS v".to_string()).await);
+    assert_eq!(full.len(), 200);
+    for limit in [1usize, 2, 63, 64, 65, 150, 200, 300] {
+        let got = values(
+            run_query(format!(
+                "MATCH (a)-[:TO]->(h) RETURN a.v AS v LIMIT {limit}"
+            ))
+            .await,
+        );
+        assert_eq!(got, &full[..limit.min(full.len())], "LIMIT {limit}");
+    }
+}
+
+#[tokio::test]
+async fn nodescan_limit_uses_prefix_on_multi_level_layout() {
+    // Two flushes that rewrite some of the same random ids leave two node
+    // SSTs whose key ranges overlap, the normal shape of a store with more
+    // than one level. The scan used to give up on its LIMIT prefix there and
+    // reconcile every node; it must now stop early and still return exactly
+    // the uncapped prefix, with or without a WITH in between.
+    let sst_cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-multi-level"), caches)
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = (0..40).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("L", *id, &node_with("k", i as i64))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    for (i, id) in ids.iter().enumerate().step_by(3) {
+        writer
+            .upsert_node("L", *id, &node_with("k", 100 + i as i64))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    assert!(
+        snapshot.metadata_node_count(None).is_none(),
+        "the two node SSTs must overlap"
+    );
+    let exec = |query: &str| {
+        let plan = lower(&parse(query).unwrap()).unwrap();
+        let snapshot = &snapshot;
+        async move {
+            execute_flat_path(&plan, snapshot, &Params::new())
+                .await
+                .unwrap()
+        }
+    };
+    let full = exec("MATCH (n:L) RETURN keys(n) AS ks, n.k AS k").await;
+    assert_eq!(full.len(), 40);
+    let fast_paths = sst_cache.limited_node_scan_fast_paths();
+    let fallbacks = sst_cache.limited_node_scan_fallbacks();
+    for query in [
+        "MATCH (n:L) RETURN keys(n) AS ks, n.k AS k LIMIT 2",
+        "MATCH (n:L) WITH n LIMIT 2 RETURN keys(n) AS ks, n.k AS k",
+    ] {
+        assert_eq!(exec(query).await, full[..2].to_vec(), "{query}");
+    }
+    assert_eq!(sst_cache.limited_node_scan_fast_paths(), fast_paths + 2);
+    assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
+}
+
+/// A whole-pattern OPTIONAL MATCH keeps every input row at least once, so a
+/// bare LIMIT above it only needs that many input rows. It used to run the
+/// label scan in full and the subplan for every node before truncating.
+#[tokio::test]
+async fn limit_over_whole_pattern_optional_match_caps_its_input() {
+    let sst_cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-optional-apply"), caches)
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = (0..40).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("L", *id, &node_with("k", i as i64))
+            .unwrap();
+    }
+    for pair in ids.windows(3).step_by(5) {
+        writer.upsert_edge("R", pair[0], pair[1], &edge()).unwrap();
+        writer.upsert_edge("S", pair[1], pair[2], &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    for factorized in [false, true] {
+        let exec = |query: String| {
+            let plan = lower(&parse(&query).unwrap()).unwrap();
+            let snapshot = &snapshot;
+            async move {
+                if factorized {
+                    namidb_query::execute_factor_path(&plan, snapshot, &Params::new()).await
+                } else {
+                    execute_flat_path(&plan, snapshot, &Params::new()).await
+                }
+                .unwrap()
+            }
+        };
+        for pattern in ["(n)-[:R]->(m)-[:S]->(o)", "(n)-[:R]->(o {k: 1})"] {
+            let base = format!("MATCH (n:L) OPTIONAL MATCH {pattern} RETURN n.k AS k, o.k AS ok");
+            let full = exec(base.clone()).await;
+            assert_eq!(full.len(), 40, "{pattern}");
+            let fast_paths = sst_cache.limited_node_scan_fast_paths();
+            assert_eq!(exec(format!("{base} LIMIT 3")).await, full[..3].to_vec());
+            assert_eq!(
+                sst_cache.limited_node_scan_fast_paths(),
+                fast_paths + 1,
+                "{pattern}: the label scan must be the limited one"
+            );
+        }
+    }
+}
+
+/// `MATCH (a)-->(b) RETURN ... LIMIT k` on two overlapping node SSTs plus
+/// memtable rows, with updates, deletes and a relabel spread over all three.
+/// The seed pull used to run only on disjoint SSTs, so this layout scanned
+/// every node in full (on a 2.4M node store, enough to be killed for
+/// memory). The unlabelled limited scan now merges the SSTs in id order and
+/// stops early, and the rows must still be the uncapped prefix.
+#[tokio::test]
+async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
+    let sst_cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-overlap-seed"), caches)
+        .await
+        .unwrap();
+    const N: usize = 400;
+    let ids: Vec<NodeId> = (0..N).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("A", *id, &node_with("v", i as i64))
+            .unwrap();
+    }
+    for i in 0..N {
+        writer
+            .upsert_edge("TO", ids[i], ids[(i + 1) % N], &edge())
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    // Second SST: rewrites, deletes and a relabel of first-SST ids, plus
+    // new nodes.
+    for (i, id) in ids.iter().enumerate() {
+        if i % 7 == 0 {
+            writer.tombstone_node("A", *id).unwrap();
+        } else if i % 5 == 0 {
+            writer
+                .upsert_node_with_labels(["B".to_string()], *id, &node_with("v", 5000 + i as i64))
+                .unwrap();
+        } else if i % 3 == 0 {
+            writer
+                .upsert_node("A", *id, &node_with("v", 10_000 + i as i64))
+                .unwrap();
+        }
+    }
+    let mut fresh = Vec::new();
+    for i in 0..20 {
+        let id = NodeId::new();
+        fresh.push(id);
+        let label = if i % 2 == 0 { "A" } else { "B" };
+        writer
+            .upsert_node(label, id, &node_with("v", 30_000 + i))
+            .unwrap();
+        writer.upsert_edge("TO", id, ids[1], &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    // Memtable on top: more rewrites and deletes, some undoing the SST ones.
+    for (i, id) in ids.iter().enumerate() {
+        if i % 13 == 0 {
+            writer.tombstone_node("A", *id).unwrap();
+        } else if i % 11 == 0 {
+            writer
+                .upsert_node("A", *id, &node_with("v", 20_000 + i as i64))
+                .unwrap();
+        }
+    }
+    // Only the newest version of these carries `A`: a labelled scan that
+    // settled on an older one would drop them.
+    for (i, id) in fresh.iter().enumerate().skip(1).step_by(2) {
+        writer
+            .upsert_node_with_labels(["A".to_string()], *id, &node_with("v", 40_000 + i as i64))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+
+    let snapshot = writer.snapshot();
+    assert!(
+        !snapshot.node_scan_is_disjoint(),
+        "the layout must overlap or the test proves nothing"
+    );
+    let values = |rows: Vec<Row>| -> Vec<(i64, i64)> {
+        rows.iter()
+            .map(|r| match (r.get("v"), r.get("w")) {
+                (Some(RuntimeValue::Integer(v)), Some(RuntimeValue::Integer(w))) => (*v, *w),
+                (Some(RuntimeValue::Integer(v)), None) => (*v, 0),
+                other => panic!("unexpected row shape: {other:?}"),
+            })
+            .collect()
+    };
+    let run_query = |query: String| {
+        let snapshot = &snapshot;
+        async move {
+            let plan = lower(&parse(&query).unwrap()).unwrap();
+            values(
+                execute_flat_path(&plan, snapshot, &Params::new())
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+
+    for (body, labelled) in [
+        ("MATCH (a)-->(b) RETURN a.v AS v, b.v AS w", false),
+        ("MATCH (a) RETURN a.v AS v", false),
+        ("MATCH (a:A) RETURN a.v AS v", true),
+        ("MATCH (a:A)-->(b) RETURN a.v AS v, b.v AS w", true),
+        ("MATCH (a:B)-->(b) RETURN a.v AS v, b.v AS w", true),
+    ] {
+        let full = run_query(body.to_string()).await;
+        assert!(full.len() > 40, "{body}: {}", full.len());
+        for limit in [1usize, 5, 63, 64, 65, 300, 1000] {
+            let fast_paths = sst_cache.limited_node_scan_fast_paths();
+            let fallbacks = sst_cache.limited_node_scan_fallbacks();
+            let output = sst_cache.limited_node_scan_output_rows();
+            let got = run_query(format!("{body} LIMIT {limit}")).await;
+            assert_eq!(got, &full[..limit.min(full.len())], "{body} LIMIT {limit}");
+            assert_eq!(
+                sst_cache.limited_node_scan_fallbacks(),
+                fallbacks,
+                "{body} LIMIT {limit} reconciled every node"
+            );
+            assert!(sst_cache.limited_node_scan_fast_paths() > fast_paths);
+            if limit == 5 && !labelled {
+                // One round of 64 seeds is plenty: nearly every node has an
+                // out-edge.
+                assert!(sst_cache.limited_node_scan_output_rows() - output <= 64);
+            }
+        }
+    }
+
+    // A bare labelled LIMIT takes the label postings. A filtered one on a
+    // label as dense as `A`, or on no label, takes the merge too: it reads
+    // the filtered column with the structural ones and tests the winning
+    // version, so a rejected node costs no point read.
+    let predicate = [ScanPredicate::IsNotNull {
+        column: "v".to_string(),
+    }];
+    assert!(snapshot.node_scan_stops_early());
+    for label in [Some("A"), None] {
+        let full = match label {
+            Some(label) => snapshot
+                .scan_label_with_predicates_and_projection(label, &predicate, None)
+                .await
+                .unwrap(),
+            None => snapshot
+                .scan_all_nodes_with_predicates_and_projection(&predicate, None)
+                .await
+                .unwrap(),
+        };
+        assert!(full.len() > 250, "{label:?}: {}", full.len());
+        for limit in [1usize, 5, 300, 1000] {
+            let fallbacks = sst_cache.limited_node_scan_fallbacks();
+            let got = match label {
+                Some(label) => snapshot
+                    .scan_label_with_predicates_and_projection_limited(
+                        label, &predicate, None, limit,
+                    )
+                    .await
+                    .unwrap(),
+                None => snapshot
+                    .scan_all_nodes_with_predicates_and_projection_limited(&predicate, None, limit)
+                    .await
+                    .unwrap(),
+            };
+            assert_eq!(
+                got,
+                &full[..limit.min(full.len())],
+                "{label:?} LIMIT {limit}"
+            );
+            assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
+        }
+    }
+}
+
+/// When the seeds rarely expand, the rounds of the seed pull grow to the
+/// store size. An unlabelled, unfiltered scan over overlapping SSTs only has
+/// the merge, which reads the winners' rows by ordinal from the SST that
+/// holds them, so its rounds keep growing like on disjoint SSTs. A labelled
+/// or filtered one can also take routes that redo their whole prefix every
+/// round (the label postings, the numeric range index, a merge that falls
+/// back), so past 4,096 seeds its last round is one full scan. The rows are
+/// the same either way.
+#[tokio::test]
+async fn overlapping_seed_pull_rounds_when_seeds_rarely_expand() {
+    const N: usize = 6000;
+    for (query, name, rounds, seeds) in [
+        (
+            "MATCH (a)-[:RARE]->(b) RETURN a.v AS v, b.v AS w LIMIT 10",
+            "lp-overlap-rare",
+            5,
+            64 + 256 + 1024 + 4096 + N,
+        ),
+        (
+            "MATCH (a:A)-[:RARE]->(b) WHERE a.v >= 0 RETURN a.v AS v, b.v AS w LIMIT 10",
+            "lp-overlap-rare-filtered",
+            4,
+            64 + 256 + 1024 + 4096,
+        ),
+    ] {
+        let sst_cache = SstCache::new(64 * 1024 * 1024);
+        let mut caches = SessionCaches::none();
+        caches.sst_cache = Some(sst_cache.clone());
+        let mut writer = WriterSession::open_with_caches(store(), paths(name), caches)
+            .await
+            .unwrap();
+        let ids: Vec<NodeId> = (0..N).map(|_| NodeId::new()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            writer
+                .upsert_node("A", *id, &node_with("v", i as i64))
+                .unwrap();
+        }
+        writer
+            .upsert_edge("RARE", ids[N - 2], ids[N - 1], &edge())
+            .unwrap();
+        writer.commit_batch().await.unwrap();
+        writer.flush(Schema::empty()).await.unwrap();
+        // A second SST spanning the first one's id range makes them overlap.
+        for i in [0, N / 2, N - 1] {
+            writer
+                .upsert_node("A", ids[i], &node_with("v", 10_000 + i as i64))
+                .unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+        writer.flush(Schema::empty()).await.unwrap();
+
+        let snapshot = writer.snapshot();
+        assert!(!snapshot.node_scan_is_disjoint());
+        let output = sst_cache.limited_node_scan_output_rows();
+        let fast_paths = sst_cache.limited_node_scan_fast_paths();
+        let fallbacks = sst_cache.limited_node_scan_fallbacks();
+        // Pushdown moves the filter into the scan, as the planner does.
+        let plan = predicate_pushdown(lower(&parse(query).unwrap()).unwrap());
+        let rows = execute_flat_path(&plan, &snapshot, &Params::new())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{query}");
+        assert_eq!(
+            rows[0].get("v"),
+            Some(&RuntimeValue::Integer((N - 2) as i64))
+        );
+        assert_eq!(
+            rows[0].get("w"),
+            Some(&RuntimeValue::Integer(10_000 + (N - 1) as i64))
+        );
+        // Rounds of 64, 256, 1,024 and 4,096, then either one more limited
+        // round over every node or one full scan.
+        assert_eq!(
+            sst_cache.limited_node_scan_fast_paths() - fast_paths,
+            rounds,
+            "{query}"
+        );
+        assert_eq!(
+            sst_cache.limited_node_scan_fallbacks(),
+            fallbacks,
+            "{query}"
+        );
+        assert_eq!(
+            sst_cache.limited_node_scan_output_rows() - output,
+            seeds as u64,
+            "{query}"
         );
     }
 }

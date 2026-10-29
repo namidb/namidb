@@ -34,6 +34,7 @@ pub mod pin;
 pub mod property_index;
 pub mod range_cache;
 pub mod read;
+pub mod reader;
 pub mod recovery;
 pub mod route_telemetry;
 pub mod search_lsm;
@@ -99,12 +100,15 @@ pub use range_cache::{
 #[cfg(feature = "vector-index")]
 pub use read::VectorFilterSearch;
 pub use read::{
-    EdgeListView, EdgeView, NodeView, OwnedSnapshot, PinnedSnapshot, Snapshot, SnapshotCell,
+    EdgeListView, EdgeScanCursor, EdgeView, NodeScanCursor, NodeView, OwnedSnapshot,
+    PinnedSnapshot, Snapshot, SnapshotCell,
 };
+pub use reader::ReaderSession;
 pub use recovery::{
     recover_memtable, recover_memtable_with_snapshot, write_memtable_snapshot,
     MemtableSnapshotEntry, MemtableSnapshotFile, RecoveredMemtable, WalEntry, WalOp,
 };
+pub use sst::paged_index::set_default_spool_dir;
 #[cfg(feature = "vector-index")]
 pub use sst::vector::vector_filter_bitmap_searches;
 pub use sst::{

@@ -188,9 +188,14 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             left: Box::new(apply_vector_search(*left, catalog)),
             right: Box::new(apply_vector_search(*right, catalog)),
         },
-        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            optional,
+        } => LogicalPlan::Apply {
             input: Box::new(apply_vector_search(*input, catalog)),
             subplan: Box::new(apply_vector_search(*subplan, catalog)),
+            optional,
         },
         LogicalPlan::SemiApply {
             input,

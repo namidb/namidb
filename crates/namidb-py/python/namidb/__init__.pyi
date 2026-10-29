@@ -7,7 +7,7 @@ surface so IDEs / Pylance / mypy can type-check user code.
 
 from __future__ import annotations
 
-from typing import Any, Coroutine, Optional, TypedDict
+from typing import Any, Coroutine, Iterator, Optional, TypedDict
 
 __version__: str
 
@@ -28,6 +28,49 @@ class _CompactionReport(TypedDict):
     source_ssts_removed: int
     new_ssts_written: int
     bloom_sidecars_written: int
+
+
+class _SweepReport(TypedDict):
+    orphans_found: int
+    orphans_deleted: int
+    bytes_freed: int
+    skipped_too_young: int
+    wal_segments_reclaimed: int
+    wal_bytes_freed: int
+    manifest_snapshots_reclaimed: int
+    manifest_bytes_freed: int
+    pointer_files_reclaimed: int
+    pointer_bytes_freed: int
+    memtable_snapshots_reclaimed: int
+    memtable_snapshot_bytes_freed: int
+    expired_pins_reclaimed: int
+    pins_honoured: int
+    # True when a pin lease landed mid-sweep: nothing was deleted, run it again.
+    aborted_by_pin: bool
+
+
+class QueryTimeoutError(TimeoutError):
+    """A Cypher query ran past its `timeout_ms`."""
+
+
+class QueryRowCapError(RuntimeError):
+    """A Cypher read produced more rows than its `max_rows`."""
+
+
+class NodeIter(Iterator[dict[str, Any]]):
+    """Returned by [`Client.iter_label`]: one node dict per step, read
+    from storage a batch at a time."""
+
+    def __iter__(self) -> NodeIter: ...
+    def __next__(self) -> dict[str, Any]: ...
+
+
+class EdgeIter(Iterator[dict[str, Any]]):
+    """Returned by [`Client.iter_edge_type`]: one edge dict per step,
+    built a batch at a time."""
+
+    def __iter__(self) -> EdgeIter: ...
+    def __next__(self) -> dict[str, Any]: ...
 
 
 class QueryResult:
@@ -70,7 +113,7 @@ class QueryResult:
 class Client:
     """A namespace handle: object store + writer session + a tokio
     runtime that drives every async storage call from synchronous
-    Python.
+    Python. Blocking calls release the GIL.
 
     Open with::
 
@@ -79,13 +122,50 @@ class Client:
             "s3://my-bucket/data?ns=prod"
             "&region=us-west-2"
         )
+
+    With `read_only=True` the client never claims the namespace, so a
+    writer in another process keeps running. It reads the newest commit
+    as of open (or the last `refresh()`, at most an hour back), and
+    every mutator raises `PermissionError`. Use it as a context manager,
+    or call `close()`, to drop its retention lease when done.
     """
 
     def __init__(
         self,
         uri: str,
         cache_bytes: Optional[int] = ...,
-    ) -> None: ...
+        *,
+        read_only: bool = False,
+        spool_dir: Optional[str] = None,
+        auto_sweep_min_age_secs: Optional[int] = 60,
+        compaction_l0_trigger: int = 8,
+    ) -> None:
+        """`spool_dir` holds compaction scratch files; it defaults to
+        `NAMIDB_SPOOL_DIR`, then `<root>/.namidb-spool` for `file://`
+        URIs. An applied compaction sweeps retired objects older than
+        `auto_sweep_min_age_secs` (`None` disables; the age counts from
+        the write, so turn it off while a server or the CLI reads the
+        same graph; a `read_only` client is safe while it can write its
+        lease under `manifest/pins/`).
+        `flush()` compacts
+        once a bucket holds `compaction_l0_trigger` L0 SSTs (`0`
+        disables). A `read_only` client never compacts or sweeps, so
+        these three options do nothing there and no spool dir is
+        created."""
+
+    def refresh(self) -> bool:
+        """Move a `read_only` client to the newest committed version.
+        Returns `True` when it advanced. A no-op returning `False` on a
+        writer client, which always reads its own latest commit."""
+
+    def close(self) -> None:
+        """Release a `read_only` client's retention lease so the writer
+        can reclaim the version it was serving. The client keeps working:
+        its next read or `refresh()` reloads the newest version under a new
+        lease. A no-op on a writer client."""
+
+    def __enter__(self) -> "Client": ...
+    def __exit__(self, *args: object) -> bool: ...
 
     # ── Storage CRUD (stages into the current batch) ────────────────
 
@@ -129,15 +209,27 @@ class Client:
         empty."""
 
     def flush(self) -> None:
-        """Flush the memtable to L0 SSTs."""
+        """Flush the memtable to L0 SSTs, then run a compaction pass if
+        a bucket reached `compaction_l0_trigger` L0 SSTs. A failed pass
+        only emits a `RuntimeWarning`: the flush itself is durable."""
 
     def compact(self) -> _CompactionReport:
         """Run one leveled compaction pass. Expensive preparation runs
         without the writer mutex; the returned report describes whether
-        the pass applied and which immutable SSTs it replaced."""
+        the pass applied and which immutable SSTs it replaced. An
+        applied pass is followed by a sweep unless
+        `auto_sweep_min_age_secs` is `None`."""
 
     def acompact(self) -> Coroutine[Any, Any, _CompactionReport]:
         """Async sibling of [`Client.compact`], returning the same report."""
+
+    def sweep(self, min_age_secs: int = 60, dry_run: bool = False) -> _SweepReport:
+        """Delete objects no manifest version references any more and
+        that are at least `min_age_secs` old: SSTs a compaction merged
+        away, WAL segments a flush retired, superseded manifests. With
+        `dry_run=True` nothing is deleted. The auto sweep after a
+        compaction skips that pass's own young leftovers, so call this
+        once more at the end of a bulk load."""
 
     # ── Bulk APIs (batched under one runtime + lock hop) ────────────
 
@@ -146,12 +238,32 @@ class Client:
         label: str,
         rows: list[dict[str, Any]],
     ) -> int:
-        """Stage many node upserts in one call. Each `row` is a
-        dict with an `"id"` (UUID string) and arbitrary properties.
+        """Stage many node upserts that merge into the stored nodes.
+        Each `row` is a dict with an `"_id"` (UUID string, the internal
+        node id) and arbitrary properties. A row keyed by the legacy
+        `"id"` uses it as the node id and also keeps it as an `id`
+        property.
+
+        Unmentioned keys are kept, a `None` value removes the key, and
+        `label` is added to the node's labels. Each node is read before
+        it is written; use [`Client.put_nodes`] for first loads.
 
         Returns the count of staged rows. Like
         [`Client.upsert_node`], the mutations require a subsequent
         [`Client.commit`] to become durable."""
+
+    def put_nodes(
+        self,
+        label: str,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """Stage many node upserts that replace the stored nodes. Rows
+        take the same shape as [`Client.merge_nodes`], but each row is
+        the node's full property set and `label` its only label. No
+        read happens first.
+
+        Returns the count of staged rows. Requires a subsequent
+        [`Client.commit`]."""
 
     def merge_edges(
         self,
@@ -190,19 +302,40 @@ class Client:
     ) -> list[dict[str, Any]]:
         """All incoming edges of `(edge_type, dst)`."""
 
-    def scan_label(self, label: str) -> list[dict[str, Any]]:
+    def scan_label(
+        self, label: str, limit: Optional[int] = ...
+    ) -> list[dict[str, Any]]:
         """Every node under `label` (memtable + SSTs,
-        last-write-wins)."""
+        last-write-wins), or the first `limit` of them."""
 
-    def scan_edge_type(self, edge_type: str) -> list[dict[str, Any]]:
+    def scan_edge_type(
+        self, edge_type: str, limit: Optional[int] = ...
+    ) -> list[dict[str, Any]]:
         """Every edge of `edge_type` (memtable + SSTs,
-        last-write-wins)."""
+        last-write-wins), or the first `limit` of them."""
 
-    def scan_label_arrow(self, label: str) -> _Table:
+    def iter_label(self, label: str, limit: Optional[int] = ...) -> NodeIter:
+        """Like [`Client.scan_label`], but lazy: it reads 1,024 nodes per
+        step with the GIL released, all from the version current when it
+        was created, whose files it keeps alive until it is dropped (or
+        until `close()` on a `read_only` client). After a step raises,
+        every later step raises too."""
+
+    def iter_edge_type(
+        self, edge_type: str, limit: Optional[int] = ...
+    ) -> EdgeIter:
+        """Like [`Client.scan_edge_type`], but builds 1,024 edges per
+        step, all from the version current when it was created. The
+        type's SST files and property strings are read when the iterator
+        is created and held until it is dropped."""
+
+    def scan_label_arrow(self, label: str, limit: Optional[int] = ...) -> _Table:
         """Like [`Client.scan_label`] but returns a `pyarrow.Table`
         directly. Columns: `id`, `label` (representative), `labels`
         (full set, list<string>), `lsn`, `schema_version`, then the
-        union of property keys (missing keys -> null)."""
+        union of property keys (missing keys are null). A property named
+        like one of those columns is renamed `property.<key>`, or dropped
+        when it is an `id` that only repeats the node id."""
 
     # ── Cypher ─────────────────────────────────────────────────────
 
@@ -210,18 +343,31 @@ class Client:
         self,
         query: str,
         params: Optional[dict[str, Any]] = ...,
+        *,
+        timeout_ms: Optional[int] = ...,
+        max_rows: Optional[int] = ...,
     ) -> QueryResult:
         """Run a Cypher query synchronously.
 
         Write plans (CREATE / SET / DELETE / MERGE / REMOVE) are
         durably committed before this returns — `commit_batch()`
         runs inside `execute_write`. Call `flush()` periodically to
-        push the memtable into L0 SSTs."""
+        push the memtable into L0 SSTs.
+
+        Reads run on the latest committed snapshot without waiting for
+        the writer lock. `timeout_ms` raises `QueryTimeoutError` once that much
+        time has passed since the call, waiting for the client's lock
+        included (a timed-out write is discarded).
+        `max_rows` raises `QueryRowCapError` when a read produces more
+        rows than that; writes ignore it."""
 
     def acypher(
         self,
         query: str,
         params: Optional[dict[str, Any]] = ...,
+        *,
+        timeout_ms: Optional[int] = ...,
+        max_rows: Optional[int] = ...,
     ) -> Coroutine[Any, Any, QueryResult]:
         """Async sibling of [`Client.cypher`]. Returns a Python
         coroutine. Backed by the `pyo3-async-runtimes` tokio

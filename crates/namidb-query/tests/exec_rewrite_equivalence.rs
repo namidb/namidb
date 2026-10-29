@@ -178,6 +178,15 @@ fn render(v: &RuntimeValue) -> String {
 /// Assert every spelling in `family` returns the same multiset of rows.
 /// Runs through the FULL optimizer, as the server does.
 async fn assert_equivalent(writer: &WriterSession, name: &str, family: &[&str]) {
+    assert_equivalent_with(writer, name, family, &Params::new()).await;
+}
+
+async fn assert_equivalent_with(
+    writer: &WriterSession,
+    name: &str,
+    family: &[&str],
+    params: &Params,
+) {
     let snapshot = writer.snapshot();
     let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
     let mut baseline: Option<(String, Vec<String>)> = None;
@@ -187,7 +196,7 @@ async fn assert_equivalent(writer: &WriterSession, name: &str, family: &[&str]) 
             lower(&parsed).unwrap_or_else(|e| panic!("{name}: lower `{query}`: {e:?}")),
             &catalog,
         );
-        let rows = execute(&plan, &snapshot, &Params::new())
+        let rows = execute(&plan, &snapshot, params)
             .await
             .unwrap_or_else(|e| panic!("{name}: execute `{query}`: {e:?}"));
         let got = multiset(&rows);
@@ -366,6 +375,36 @@ async fn meaning_preserving_rewrites_agree() {
     )
     .await;
 
+    // `RETURN id(b)` reads only the identity too. `WITH b` passes the whole
+    // node on, which keeps it hydrated, so it is the reference spelling.
+    assert_equivalent(
+        &w,
+        "projected id() agrees with the hydrated spelling",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i",
+            "MATCH (a:P)-[:E]->(b:Q) WITH b RETURN id(b) AS i",
+        ],
+    )
+    .await;
+    assert_equivalent(
+        &w,
+        "projected elementId() still proves the target label",
+        &[
+            "MATCH (a:P)-[:E]->(b:S) RETURN elementId(b) AS i",
+            "MATCH (a:P)-[:E]->(b:S) WITH b RETURN elementId(b) AS i",
+        ],
+    )
+    .await;
+    assert_equivalent(
+        &w,
+        "projected id() beside a property stays hydrated",
+        &[
+            "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i, b.n AS n",
+            "MATCH (a:P)-[:E]->(b:Q) WITH b RETURN id(b) AS i, b.n AS n",
+        ],
+    )
+    .await;
+
     // THE DANGEROUS CASE. `b` is counted AND read for a property in the same
     // statement, so it must NOT be classified identity-only. If it were, the
     // stub's empty properties would make `max(b.n)` null while the count
@@ -438,6 +477,29 @@ async fn meaning_preserving_rewrites_agree() {
     )
     .await;
 
+    // A scan read only through id()/labels()/count(x) loads no property
+    // column. `WITH b` hands the whole node on and keeps every column.
+    assert_equivalent(
+        &w,
+        "structural-only scan vs full scan",
+        &[
+            "MATCH (b) RETURN id(b) AS i, elementId(b) AS e, labels(b) AS l",
+            "MATCH (b) WITH b RETURN id(b) AS i, elementId(b) AS e, labels(b) AS l",
+        ],
+    )
+    .await;
+    assert_equivalent(
+        &w,
+        "structural-only aggregation vs full scan",
+        &[
+            "MATCH (b:Q) WITH labels(b) AS l, count(b) AS c, collect(id(b)) AS ids \
+             RETURN l, c, size(ids) AS s",
+            "MATCH (b:Q) WITH b WITH labels(b) AS l, count(b) AS c, collect(id(b)) AS ids \
+             RETURN l, c, size(ids) AS s",
+        ],
+    )
+    .await;
+
     assert_equivalent(
         &w,
         "conjunctive multi-label vs labels() predicate",
@@ -447,4 +509,201 @@ async fn meaning_preserving_rewrites_agree() {
         ],
     )
     .await;
+}
+
+fn plan_has_node_by_id(plan: &namidb_query::LogicalPlan) -> bool {
+    matches!(plan, namidb_query::LogicalPlan::NodeById { .. })
+        || plan.children().into_iter().any(plan_has_node_by_id)
+}
+
+/// `WHERE id(n) IN $ids` is served by a seek. It must return what the
+/// filter it replaces returns (spelled `id(b) + ''` here so it stays a scan)
+/// for duplicate, null, malformed, upper-case, unknown, deleted and
+/// wrong-label ids, and for a key that is a node rather than its id.
+#[tokio::test]
+async fn id_seek_agrees_with_the_filter_it_replaces() {
+    let mut w = fixture().await;
+    // Flushed, then deleted: a memtable tombstone shadows its SST row.
+    let gone = NodeId::new();
+    w.upsert_node("Q", gone, &node(vec![("n", s("gone"))]))
+        .unwrap();
+    w.commit_batch().await.unwrap();
+    let schema = w.schema().clone();
+    w.flush(schema).await.unwrap();
+    w.tombstone_node("Q", gone).unwrap();
+    w.commit_batch().await.unwrap();
+    let snapshot = w.snapshot();
+    let all = execute(
+        &lower(&parse("MATCH (b) RETURN b").unwrap()).unwrap(),
+        &snapshot,
+        &Params::new(),
+    )
+    .await
+    .unwrap();
+    let id_of = |name: &str| {
+        all.iter()
+            .find_map(|row| match row.get("b") {
+                Some(RuntimeValue::Node(n))
+                    if n.properties.get("n") == Some(&RuntimeValue::String(name.into())) =>
+                {
+                    Some(n.id.to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("fixture node {name}"))
+    };
+    let ids = RuntimeValue::List(vec![
+        RuntimeValue::String(id_of("q1")),
+        RuntimeValue::String(id_of("q1")),
+        RuntimeValue::String(id_of("q2")),
+        RuntimeValue::String(id_of("q3").to_uppercase()),
+        RuntimeValue::String(id_of("p1")),
+        RuntimeValue::String(NodeId::new().to_string()),
+        RuntimeValue::String(gone.to_string()),
+        RuntimeValue::String("junk".into()),
+        RuntimeValue::Null,
+        RuntimeValue::Integer(7),
+    ]);
+    let mut params = Params::new();
+    params.insert("ids".into(), ids);
+    params.insert("none".into(), RuntimeValue::List(vec![]));
+    params.insert("one".into(), RuntimeValue::String(id_of("q2")));
+    params.insert(
+        "upper".into(),
+        RuntimeValue::String(id_of("q2").to_uppercase()),
+    );
+    params.insert("nothing".into(), RuntimeValue::Null);
+    params.insert("gone".into(), RuntimeValue::String(gone.to_string()));
+
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    for query in [
+        "MATCH (b:Q) WHERE id(b) IN $ids RETURN b.n AS n",
+        "MATCH (b) WHERE elementId(b) IN $ids RETURN b.n AS n",
+        "MATCH (b:Q) WHERE id(b) IN $ids RETURN *",
+        "MATCH (b:Q) WHERE id(b) = $nothing RETURN b.n AS n",
+        "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) = x RETURN b.n AS n",
+        "MATCH (m:Q) MATCH (b:Q) WHERE id(b) = m RETURN b.n AS n",
+        "MATCH (b:Q)-[:E]->(r) WHERE id(b) IN $ids AND b.n > 'q1' RETURN r.n AS n",
+        "MATCH (b:Q {n: 'q1'})-[:E]->(r) WHERE id(b) IN $ids RETURN r.n AS n",
+    ] {
+        let plan = optimize(lower(&parse(query).unwrap()).unwrap(), &catalog);
+        assert!(plan_has_node_by_id(&plan), "`{query}` must seek: {plan:?}");
+    }
+
+    for (name, family) in [
+        (
+            "labelled id IN",
+            [
+                "MATCH (b:Q) WHERE id(b) IN $ids RETURN b.n AS n",
+                "MATCH (b:Q) WHERE id(b) + '' IN $ids RETURN b.n AS n",
+            ],
+        ),
+        (
+            "unlabelled elementId IN",
+            [
+                "MATCH (b) WHERE elementId(b) IN $ids RETURN b.n AS n",
+                "MATCH (b) WHERE elementId(b) + '' IN $ids RETURN b.n AS n",
+            ],
+        ),
+        (
+            "the seek binding stays out of RETURN *",
+            [
+                "MATCH (b:Q) WHERE id(b) IN $ids RETURN *",
+                "MATCH (b:Q) WHERE id(b) + '' IN $ids RETURN *",
+            ],
+        ),
+        (
+            "empty id list",
+            [
+                "MATCH (b) WHERE id(b) IN $none RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' IN $none RETURN b.n AS n",
+            ],
+        ),
+        (
+            "id IN with a residual conjunct",
+            [
+                "MATCH (b:Q) WHERE id(b) IN $ids AND b.n <> 'q2' RETURN b.n AS n",
+                "MATCH (b:Q) WHERE id(b) + '' IN $ids AND b.n <> 'q2' RETURN b.n AS n",
+            ],
+        ),
+        (
+            "id IN on an expand source with a pushed conjunct",
+            [
+                "MATCH (b:Q)-[:E]->(r) WHERE id(b) IN $ids AND b.n > 'q1' RETURN r.n AS n",
+                "MATCH (b:Q)-[:E]->(r) WHERE id(b) + '' IN $ids AND b.n > 'q1' RETURN r.n AS n",
+            ],
+        ),
+        (
+            "id IN on an expand source with an inline property",
+            [
+                "MATCH (b:Q {n: 'q1'})-[:E]->(r) WHERE id(b) IN $ids RETURN r.n AS n",
+                "MATCH (b:Q {n: 'q1'})-[:E]->(r) WHERE id(b) + '' IN $ids RETURN r.n AS n",
+            ],
+        ),
+        (
+            "id equality",
+            [
+                "MATCH (b) WHERE id(b) = $one RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' = $one RETURN b.n AS n",
+            ],
+        ),
+        (
+            "upper-case id equality",
+            [
+                "MATCH (b) WHERE id(b) = $upper RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' = $upper RETURN b.n AS n",
+            ],
+        ),
+        (
+            "null id equality",
+            [
+                "MATCH (b) WHERE id(b) = $nothing RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' = $nothing RETURN b.n AS n",
+            ],
+        ),
+        (
+            "correlated id equality",
+            [
+                "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) = x RETURN b.n AS n",
+                "UNWIND $ids AS x MATCH (b:Q) WHERE id(b) + '' = x RETURN b.n AS n",
+            ],
+        ),
+        (
+            "deleted id equality",
+            [
+                "MATCH (b) WHERE id(b) = $gone RETURN b.n AS n",
+                "MATCH (b) WHERE id(b) + '' = $gone RETURN b.n AS n",
+            ],
+        ),
+        (
+            "a node is not its id",
+            [
+                "MATCH (m:Q) MATCH (b:Q) WHERE id(b) = m RETURN b.n AS n",
+                "MATCH (m:Q) MATCH (b:Q) WHERE id(b) + '' = m RETURN b.n AS n",
+            ],
+        ),
+        (
+            "a collected node is not its id",
+            [
+                "MATCH (m:Q) WITH collect(m) AS ms UNWIND ms AS x \
+                 MATCH (b:Q) WHERE id(b) = x RETURN b.n AS n",
+                "MATCH (m:Q) WITH collect(m) AS ms UNWIND ms AS x \
+                 MATCH (b:Q) WHERE id(b) + '' = x RETURN b.n AS n",
+            ],
+        ),
+    ] {
+        assert_equivalent_with(&w, name, &family, &params).await;
+    }
+
+    // The `{_id: ...}` sigil reads its key the way CREATE does, so an
+    // upper-case spelling still finds the node and a null finds nothing.
+    for (query, expected) in [
+        ("MATCH (b:Q {_id: $upper}) RETURN b.n AS n", vec!["n=q2"]),
+        ("MATCH (b:Q {_id: $nothing}) RETURN b.n AS n", vec![]),
+        ("MATCH (b:Q {_id: $gone}) RETURN b.n AS n", vec![]),
+    ] {
+        let plan = optimize(lower(&parse(query).unwrap()).unwrap(), &catalog);
+        let rows = execute(&plan, &snapshot, &params).await.unwrap();
+        assert_eq!(multiset(&rows), expected, "`{query}`");
+    }
 }

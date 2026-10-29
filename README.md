@@ -171,6 +171,10 @@ CALL algo.triangle_count() YIELD node_id, triangles, coefficient RETURN *;
 
 -- Hop distance from a starting node (BFS; pass weighted: true for Dijkstra).
 CALL algo.shortest_path({source: "<node-uuid>"}) YIELD node_id, distance, hops RETURN *;
+-- Add a target to stop there and get the node sequence. Edges follow their
+-- stored direction unless you pass direction: 'undirected'.
+CALL algo.shortest_path({source: "<node-uuid>", target: "<node-uuid>"})
+YIELD distance, hops, path RETURN *;
 
 -- Modularity communities (Louvain) and bridge nodes (Brandes betweenness).
 CALL algo.louvain() YIELD node_id, community RETURN node_id, community;
@@ -418,7 +422,7 @@ The official image is on [Docker Hub](https://hub.docker.com/r/namidb/namidb-ser
 docker run --rm -p 8080:8080 \
   -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
   -e NAMIDB_AUTH_TOKEN="$(openssl rand -hex 32)" \
-  namidb/namidb-server:2 --store "s3://my-bucket?ns=prod&region=us-west-2"
+  namidb/namidb-server:3 --store "s3://my-bucket?ns=prod&region=us-west-2"
 ```
 
 A token (or `--no-auth`) is required: since 2.2.0 the server refuses to boot
@@ -432,7 +436,7 @@ root-owned by images before 2.2.0):
 ```bash
 docker run --rm -p 8080:8080 -v namidb-data:/var/lib/namidb \
   -e NAMIDB_AUTH_TOKEN=... \
-  namidb/namidb-server:2 --store "file:///var/lib/namidb?ns=prod"
+  namidb/namidb-server:3 --store "file:///var/lib/namidb?ns=prod"
 ```
 
 FUSE-backed bind mounts (macOS Docker Desktop's gRPC-FUSE, some network
@@ -597,7 +601,7 @@ cache, and admission guarantees are specified in the
 | `NAMIDB_BOLT_MEMORY_BUDGET_BYTES` | half of `NAMIDB_MEMORY_MAX_BYTES`, or `1073807360` (~1 GiB) when that governor is disabled | Process-wide admission budget shared by framed, decoded, converted and prefetched authenticated Bolt data. An incomplete frame holds `64 KiB + 2 × wire body bytes`; at its terminator a data frame must atomically upgrade to `64 KiB + 16 × wire body bytes` or fail retryably. Use smaller batches or raise this only with matching process/cgroup headroom. |
 | `NAMIDB_BOLT_PARTIAL_MESSAGE_TIMEOUT` | `120s` | Deadline from the first byte of an authenticated partial frame through framing/budget admission. `0s` disables it; a completely idle connection holds no message-memory permit and has no partial-frame deadline. |
 | `NAMIDB_CORRELATED_WRITE_CHUNK_ROWS` | `128` (hard-clamped to `1024`) | Existing-node rows point-probed and hydrated at once for a write-only `UNWIND … MATCH (n {unique_key: …}) SET …`. The request parameters remain caller-owned, while old wide node values (including embeddings) are released one bounded chunk at a time. |
-| `NAMIDB_SPOOL_DIR` | `/var/tmp` on Unix; native temp directory elsewhere; `/var/tmp/namidb-spool` in the official image | Disk directory for corpus-sized exact-node values and remote compaction inputs. Size it for all compacted inputs plus the new Parquet and exact-record outputs (roughly 3× the compacted live node bytes; commonly 12–15 GiB per million 1024d nodes, with extra headroom for superseded versions). |
+| `NAMIDB_SPOOL_DIR` | `/var/tmp` on Unix; native temp directory elsewhere; `/var/tmp/namidb-spool` in the official image | Disk directory for corpus-sized exact-node values and remote compaction inputs. Size it for all compacted inputs plus the new Parquet and exact-record outputs (roughly 3× the compacted live node bytes; commonly 12–15 GiB per million 1024d nodes, with extra headroom for superseded versions). The embedded Python client defaults to `<root>/.namidb-spool` for `file://` URIs and takes a `spool_dir=` argument. |
 | `NAMIDB_INDEX_BUILD_SPOOL_DIR` | compaction spool, then `NAMIDB_SPOOL_DIR` | Dedicated disk directory for external FTS/vector sort runs and immutable output bodies. |
 | `NAMIDB_INDEX_BUILD_MEMORY_BYTES` | `268435456` (256 MiB) on the compaction rebuild path; `67108864` (64 MiB) for per-flush Search-LSM delta builders | Aggregate logical memory ceiling used by external search-index builders; corpus-sized state spills to the index spool. One explicit setting overrides both paths, so size it for the larger full-corpus rebuild. |
 | `NAMIDB_SEARCH_LSM_MAX_SEGMENTS` | `8` | Hard live-segment cap per active vector/full-text generation. Values must be at least `2` and are capped at `32`. A flush that needs another physical delta is backpressured until compaction frees a slot; an exactly proven-empty event needs no slot. |
@@ -777,8 +781,10 @@ The server also takes durability/backpressure knobs for critical workloads:
 | `--writer-lock-timeout` (`NAMIDB_WRITER_LOCK_TIMEOUT`) | 30s | Cap how long a foreground write/DDL waits for the writer; a stuck writer returns 503 fast instead of growing an unbounded queue. |
 | `--query-timeout` (`NAMIDB_QUERY_TIMEOUT`) | 30s | Wall-clock budget for a single read query (HTTP and Bolt); a runaway scan aborts with a timeout error instead of pinning a worker. `0s` = unbounded. |
 | `--write-timeout` (`NAMIDB_WRITE_TIMEOUT`) | 60s | Wall-clock budget for a single write statement — its own default, deliberately larger than the read budget. For a bulk load, set `NAMIDB_WRITE_TIMEOUT=0s` (unbounded) or chunk the writes into smaller statements. `0s` = unbounded. |
+| `--fence-policy` (`NAMIDB_FENCE_POLICY`) | `steal` | What a writer does when another process claims its namespace. `steal` reopens and takes it back, which suits a single server. `yield` leaves it to the new owner and keeps the writer degraded until the process (or, in multi-tenant mode, the namespace) is opened again; use it when a control plane decides which node owns each namespace. |
+| `NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` (env only) | 0 (off) | In `--multi-tenant` mode, cap the concurrent reads of each namespace inside the process-wide read gate (`NAMIDB_MAX_CONCURRENT_QUERIES`), so one busy tenant cannot take every permit. |
 
-A fenced or poisoned writer reopens itself automatically, and `/v0/health` reports `writer: degraded` (503) until it recovers — a rolling deploy or an accidental second replica on the same bucket drains cleanly instead of serving stale reads behind a green check.
+A poisoned writer, or a fenced one under the default `steal` policy, reopens itself automatically, and `/v0/health` reports `writer: degraded` (503) until it recovers. Under `--fence-policy=yield` a fenced writer does not reopen and stays degraded. Either way a rolling deploy or an accidental second replica on the same bucket drains cleanly instead of serving stale reads behind a green check.
 
 <br />
 

@@ -12,10 +12,10 @@ pip install 'namidb[pandas]'    # + DataFrame interop
 pip install 'namidb[polars]'    # + polars interop
 ```
 
-Wheels go out for Linux (x86_64, aarch64), macOS (arm64), and Windows
-(x86_64) from the `python-wheels.yml` workflow on every `py-v*` tag.
-`pyarrow >= 14` is a hard transitive dependency. Intel macOS falls back
-to the sdist, which is slower to install but behaves the same at runtime.
+Wheels go out for Linux (x86_64, aarch64), macOS (arm64, x86_64), and
+Windows (x86_64) from the `python-wheels.yml` workflow on every `py-v*` tag.
+`pyarrow >= 14` is a hard transitive dependency. Any other platform falls
+back to the sdist, which needs a Rust toolchain to install.
 
 ## Build from source
 
@@ -81,6 +81,82 @@ end of every write plan. You still want to call `client.flush()` now and
 then to push the memtable into L0 SSTs. That's different from the
 `upsert_node` / `upsert_edge` / `tombstone_*` API, which stages mutations
 and waits for an explicit `client.commit()`.
+
+### Timeouts and row limits
+
+`cypher` and `acypher` take two keyword-only limits:
+
+```python
+from namidb import QueryRowCapError, QueryTimeoutError
+
+try:
+    client.cypher("MATCH (n)-[]->(m) RETURN n, m", timeout_ms=5_000, max_rows=100_000)
+except QueryTimeoutError:   # a TimeoutError subclass
+    ...
+except QueryRowCapError:    # a RuntimeError subclass
+    ...
+```
+
+`timeout_ms` counts from the call, including time a write spends waiting
+for the client's lock behind another write, or a read-only client's read
+waits behind a `refresh()`. A write that times out is thrown away, not
+committed.
+`max_rows` fails a read once any step of the plan produces more rows than
+that. Writes ignore it.
+
+### Threads
+
+Every blocking call releases the GIL while it waits on storage, so other
+Python threads keep running. Reads (`cypher` reads, `lookup_node`,
+`scan_*`, edge lookups) run on the latest committed snapshot without
+waiting for the writer lock, so several threads can query one `Client` at
+the same time, a long read does not hold up writes, and a long write (a
+bulk load, say) does not hold up reads. A read sees each write once the
+call that made it returns. Writes still go one at a time. A `sweep()`,
+explicit or after a compaction, keeps every file a read still running in
+another thread needs.
+
+## Reading from another process
+
+A namespace has one writer. Opening a plain `Client` claims the namespace
+and fences whatever process was writing before, so a second process that
+only wants to read should open it read-only:
+
+```python
+reader = namidb.Client("s3://bucket/data?ns=prod", read_only=True)
+reader.cypher("MATCH (p:Person) RETURN count(p) AS n")
+
+# Later, pick up whatever the writer committed since:
+if reader.refresh():
+    print("new data")
+```
+
+A read-only client never claims the writer epoch. It sees every commit up
+to the moment it was opened (or last refreshed), including commits the
+writer has not flushed yet, and stays on that version until `refresh()`,
+or for at most an hour: a read on an older version refreshes first.
+Every mutating call (`upsert_*`, `tombstone_*`, `merge_*`, `put_nodes`,
+`load_*`, `commit`, `flush`, `compact`, `sweep`, write or DDL Cypher)
+raises `PermissionError`. The namespace must already exist. A reader never
+compacts or sweeps, so `spool_dir`, `auto_sweep_min_age_secs` and
+`compaction_l0_trigger` do nothing there.
+
+It keeps a small retention lease under `manifest/pins/` so the writer's
+cleanup does not delete files it still reads. The client renews the lease
+in the background, so a read that runs for a long time keeps its files.
+While the lease lives, the writer cannot reclaim anything from that
+version on, so once the version is an hour old and no read is using it the
+lease is left to expire, and the next read refreshes first. A read also
+refreshes first when the lease may have expired anyway (the process was
+suspended, say). `close()`, or leaving a
+`with namidb.Client(uri, read_only=True) as reader:` block, drops the
+lease right away, and a read after that reloads the newest version under a
+new lease; otherwise it expires about 15 minutes after it was last
+renewed, or after the process dies. Credentials that cannot write under
+`manifest/pins/` get no lease, and then only the writer's sweep age
+margin protects the reader's files. `refresh()` replays the writer's
+unflushed WAL, so it costs more the longer the writer goes without a
+flush.
 
 ## Vector and full-text indexes
 
@@ -193,10 +269,10 @@ mapping:
 
 ## Bulk inserts
 
-`Client.merge_nodes` and `Client.merge_edges` batch a lot of writes
-behind a single tokio-runtime plus mutex round-trip. They're the right
-ingestion path once you have thousands of rows, since Cypher `CREATE`
-parses, plans and executes once per call:
+`Client.put_nodes`, `Client.merge_nodes` and `Client.merge_edges` batch
+a lot of writes behind a single tokio-runtime plus mutex round-trip.
+They're the right ingestion path once you have thousands of rows, since
+Cypher `CREATE` parses, plans and executes once per call:
 
 ```python
 import uuid
@@ -204,10 +280,10 @@ import namidb
 
 client = namidb.Client("memory://acme")
 
-# Bulk insert: each row needs an "id" UUID string + arbitrary properties.
-client.merge_nodes(
+# First load: each row needs an "_id" UUID string + arbitrary properties.
+client.put_nodes(
     "Person",
-    [{"id": str(uuid.uuid4()), "name": f"p{i}", "age": 20 + i} for i in range(10_000)],
+    [{"_id": str(uuid.uuid4()), "name": f"p{i}", "age": 20 + i} for i in range(10_000)],
 )
 # Edges: each row needs "src" + "dst" UUIDs.
 client.merge_edges(
@@ -221,9 +297,70 @@ client.commit()        # WAL + manifest CAS
 client.flush()         # memtable -> L0 SSTs
 ```
 
-`merge_nodes` / `merge_edges` stage into the current batch (same
-lifecycle as `upsert_*`), so call `client.commit()` to make the
+`put_nodes` replaces each node: the row is its full property set and
+`label` its only label. Nothing is read first, so it is the fast path for
+first loads. `merge_nodes` reads each node and merges the row into it:
+keys the row doesn't mention are kept, a `None` value removes the key,
+and `label` is added to the node's existing labels. Rows repeating an id
+in one call merge in order.
+
+`_id` is the internal node id, the same thing `n._id` returns in Cypher.
+It is not stored as a property, so a business key called `id` can sit
+next to it. Rows keyed by `id` alone (the older form) still work: `id`
+becomes the node id and is also kept as an `id` property, so
+`WHERE n.id = $id` finds the node.
+
+`put_nodes` / `merge_nodes` / `merge_edges` stage into the current batch
+(same lifecycle as `upsert_*`), so call `client.commit()` to make the
 mutations durable.
+
+## Compaction and disk space
+
+There is no background maintenance in embedded mode, so the client does
+it inline:
+
+- `flush()` runs a compaction pass once any bucket holds
+  `compaction_l0_trigger` L0 SSTs (default 8). Each extra L0 file is one
+  more file every read has to visit. Pass `compaction_l0_trigger=0` to
+  turn it off and call `compact()` yourself.
+- A compaction that applies is followed by a sweep that deletes what it
+  retired: the merged-away L0 files, WAL segments that flushes already
+  folded into SSTs, old manifest versions. Only objects written more than
+  `auto_sweep_min_age_secs` ago (default 60) go. That age counts from when
+  the file was written, not from when it stopped being used, so it is no
+  grace period for a reader in another process. A `read_only=True` client
+  is safe as long as it can write its lease under `manifest/pins/`, since
+  every sweep honours it. A reader on read-only credentials or a read-only
+  filesystem gets no lease, and a server or the CLI reading the same
+  directory holds none, so either can find its files gone. While one of
+  those reads the graph, pass `None` to turn the auto sweep off and call
+  `sweep()` when it is done.
+- `client.sweep(min_age_secs=60, dry_run=False)` runs the same sweep on
+  demand and returns counts of what it removed (or would remove). The
+  auto sweep runs right after the pass, so that pass's own leftovers are
+  usually still too young. Call `sweep()` once more at the end of a bulk
+  load, or `sweep(min_age_secs=0)` if no other process reads the graph.
+- If the compaction a `flush()` triggered fails, the flush still counts
+  (it is already durable) and you get a `RuntimeWarning` instead of an
+  exception.
+
+Compaction writes scratch files while it merges. For a `file://` URI they
+go under `<root>/.namidb-spool`, next to the graph, unless you pass
+`spool_dir=` or set `NAMIDB_SPOOL_DIR`. Other backends use
+`NAMIDB_SPOOL_DIR`, else `/var/tmp`. Plan for roughly three times the
+compacted bytes on that volume while a big pass runs. The spool dir is
+per process, so the last client opened decides it for every client in
+the process, and a spool dir that has been deleted falls back to the
+default.
+
+```python
+client = namidb.Client(
+    "file:///data/graph?ns=case",
+    spool_dir="/data/scratch",
+    compaction_l0_trigger=8,
+    auto_sweep_min_age_secs=60,
+)
+```
 
 ## Arrow / pandas / polars output
 
@@ -263,6 +400,24 @@ table = client.scan_label_arrow("Person")
 # Columns: id, label, lsn, schema_version, then the union of property
 # keys across the scanned views (missing keys filled with None).
 ```
+
+On a large label, pass `limit=` to `scan_label`, `scan_label_arrow` or
+`scan_edge_type` to look at a sample, or walk the scan with
+`iter_label(label)` / `iter_edge_type(edge_type)`. A node iterator reads
+1,024 rows per step with the GIL released, so the first row comes back
+after one batch, not the whole label, and memory stays at about one batch.
+Walking a whole label reads each stored record about once, like
+`scan_label` does. Every row comes from the version that was current when
+the iterator was created, even if writes, compactions or sweeps land while
+you walk it; the iterator keeps that version's files alive until it is
+dropped, or until `close()` on a `read_only` client, which drops the leases
+of iterators still open too. An edge iterator reads the type's SST files
+and decodes their property strings when it is created and keeps them until
+it is dropped, so its memory grows with the type like `scan_edge_type`;
+only the per-edge parsing and the dicts are built a batch at a time. If a
+step raises, the iterator is done: every later `next()` raises too, rather
+than skip the rows of the failed batch. The `scan_*` calls keep returning
+lists.
 
 ## Storage backends
 
@@ -370,7 +525,10 @@ default.
 - A synchronous Python API plus async coroutine APIs (`acypher`,
   `acompact`).
   Under the hood every call drives a tokio runtime owned by the
-  `Client`; the first call per process pays the bootstrap cost.
+  `Client` with the GIL released; the first call per process pays the
+  bootstrap cost.
+- One writer per namespace, any number of `read_only=True` readers in
+  other processes.
 - Persistent Vamana vector and BM25 full-text indexes, including their
   Cypher DDL and off-writer-lock compaction lifecycle.
 - The same SST plus bloom cache the Rust read path uses
@@ -427,8 +585,8 @@ Run every command below from the repository root.
         "$(git rev-parse "py-v$VERSION^{commit}")"
    git push --atomic origin "v$VERSION" "py-v$VERSION"
    ```
-6. `python-wheels.yml` builds 4 wheels (Linux x86_64/aarch64, macOS
-   arm64, Windows x86_64) plus the sdist, smoke-tests one wheel on
+6. `python-wheels.yml` builds 5 wheels (Linux x86_64/aarch64, macOS
+   arm64/x86_64, Windows x86_64) plus the sdist, smoke-tests one wheel on
    Python 3.9 and 3.13, then publishes to PyPI via OIDC trusted
    publishing (set up once per account at
    https://pypi.org/manage/account/publishing/).

@@ -11,11 +11,12 @@
 #![allow(clippy::useless_conversion)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use object_store::ObjectStore;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyPermissionError, PyRuntimeError, PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use tokio::runtime::Runtime;
@@ -25,21 +26,210 @@ use uuid::Uuid;
 use namidb_core::{NodeId, Value};
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
-    execute, execute_write, parse as cypher_parse, plan as build_plan, show_constraints_rows,
-    show_indexes_rows, show_schema_columns, ExecError, LowerError, Params, ParseError, Row,
-    RuntimeValue, StatsCatalog,
+    execute_with_limits, execute_write_with_deadline, parse as cypher_parse, plan as build_plan,
+    show_constraints_rows, show_indexes_rows, show_schema_columns, ExecError, LowerError, Params,
+    ParseError, Query, Row, RuntimeValue, StatsCatalog,
 };
 use namidb_storage::{
-    CommitOutcome, EdgeListView, EdgeView, EdgeWriteRecord, NodeView, NodeWriteRecord, SstCache,
-    WriterSession,
+    sweep_orphans, CommitOutcome, EdgeListView, EdgeScanCursor, EdgeView, EdgeWriteRecord,
+    JanitorReport, ManifestStore, NodeScanCursor, NodeView, NodeWriteRecord, OwnedSnapshot,
+    PinnedSnapshot, ReaderSession, SnapshotCell, SstCache, WriterSession,
 };
 
-/// A namespace handle: object store + writer session + a tokio runtime
-/// that drives every async storage call from synchronous Python.
+// pyo3 0.22's macro expands a `gil-refs` feature check this crate does not
+// declare.
+#[allow(unexpected_cfgs)]
+mod query_errors {
+    use pyo3::exceptions::{PyRuntimeError, PyTimeoutError};
+
+    pyo3::create_exception!(
+        namidb,
+        QueryTimeoutError,
+        PyTimeoutError,
+        "A Cypher query ran past its `timeout_ms`."
+    );
+    pyo3::create_exception!(
+        namidb,
+        QueryRowCapError,
+        PyRuntimeError,
+        "A Cypher read produced more rows than its `max_rows`."
+    );
+}
+use query_errors::{QueryRowCapError, QueryTimeoutError};
+
+/// What a [`Client`] holds: the namespace's writer, or a reader that never
+/// claims the writer epoch (`read_only=True`).
+#[derive(Clone)]
+enum Session {
+    Writer(Arc<Writer>),
+    Reader(Arc<Mutex<ReaderSession>>),
+}
+
+/// The snapshot one read runs on. A writer's is registered with the sweep's
+/// retention horizon until it drops. A reader's is a plain `Arc`, because
+/// [`ReaderSession`] releases a retired version's pin once nothing else
+/// holds its snapshot.
+enum ReadSnapshot {
+    Pinned(PinnedSnapshot),
+    Shared(Arc<OwnedSnapshot>),
+}
+
+impl std::ops::Deref for ReadSnapshot {
+    type Target = OwnedSnapshot;
+    fn deref(&self) -> &OwnedSnapshot {
+        match self {
+            ReadSnapshot::Pinned(p) => p,
+            ReadSnapshot::Shared(s) => s,
+        }
+    }
+}
+
+impl Session {
+    /// The committed snapshot reads run on. A writer's is taken without its
+    /// lock, so reads never wait for a write. A reader's lock is held only to
+    /// clone it; waiting for that lock, or for a refresh it is due, gives up
+    /// at `deadline`.
+    async fn snapshot(&self, deadline: Option<Instant>) -> PyResult<ReadSnapshot> {
+        Ok(match self {
+            Session::Writer(w) => ReadSnapshot::Pinned(w.reads.load()),
+            Session::Reader(r) => {
+                let mut r = lock_until(r, deadline).await?;
+                match deadline {
+                    // keep_alive is cancel-safe: a refresh cut short leaves
+                    // the version already loaded in place and releases the
+                    // lease it took, and a later read finishes it.
+                    Some(d) => {
+                        let _ = tokio::time::timeout_at(d.into(), r.keep_alive()).await;
+                    }
+                    None => r.keep_alive().await,
+                }
+                ReadSnapshot::Shared(r.snapshot())
+            }
+        })
+    }
+
+    async fn close(&self) -> PyResult<()> {
+        match self {
+            Session::Writer(_) => Ok(()),
+            Session::Reader(r) => r.lock().await.release().await.map_err(map_storage_err),
+        }
+    }
+
+    fn writer(&self) -> PyResult<&Arc<Writer>> {
+        match self {
+            Session::Writer(w) => Ok(w),
+            Session::Reader(_) => Err(PyPermissionError::new_err(
+                "this Client was opened with read_only=True",
+            )),
+        }
+    }
+}
+
+/// The namespace's writer and the snapshot of its last commit. Every lock
+/// guard publishes the writer's snapshot when it drops, if the call moved
+/// the manifest, so reads pick up a commit as soon as the call returns
+/// without waiting for whatever write holds the lock next.
+///
+/// `reads` is also the sweep's view of in-process reads: `load()` picks the
+/// published snapshot and registers its version in one step under the
+/// cell's own mutex, and the published version only changes under the
+/// writer lock, which a sweep holds while it computes its horizon.
+struct Writer {
+    session: Mutex<WriterSession>,
+    reads: SnapshotCell,
+}
+
+impl Writer {
+    fn new(session: WriterSession) -> Self {
+        Self {
+            reads: SnapshotCell::new(session.owned_snapshot()),
+            session: Mutex::new(session),
+        }
+    }
+
+    async fn lock(&self) -> WriterGuard<'_> {
+        WriterGuard {
+            guard: self.session.lock().await,
+            reads: &self.reads,
+        }
+    }
+
+    async fn lock_until(&self, deadline: Option<Instant>) -> PyResult<WriterGuard<'_>> {
+        Ok(WriterGuard {
+            guard: lock_until(&self.session, deadline).await?,
+            reads: &self.reads,
+        })
+    }
+}
+
+struct WriterGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, WriterSession>,
+    reads: &'a SnapshotCell,
+}
+
+impl WriterGuard<'_> {
+    /// Make the writer's current version the one reads pick up.
+    fn publish(&self) {
+        if self.reads.manifest_version() != self.guard.manifest_version() {
+            self.reads.store(self.guard.owned_snapshot());
+        }
+    }
+}
+
+impl std::ops::Deref for WriterGuard<'_> {
+    type Target = WriterSession;
+    fn deref(&self) -> &WriterSession {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WriterGuard<'_> {
+    fn deref_mut(&mut self) -> &mut WriterSession {
+        &mut self.guard
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        // Staging alone does not move the manifest, so per-row upserts skip
+        // the snapshot rebuild.
+        self.publish();
+    }
+}
+
+/// Renew a `read_only` client's leases between reads, so a read that
+/// outlasts the lease TTL keeps its files. Ends once the client is gone.
+async fn renew_reader_pins(reader: Weak<Mutex<ReaderSession>>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        let Some(reader) = reader.upgrade() else {
+            return;
+        };
+        reader.lock().await.renew_pins().await;
+    }
+}
+
+/// Lock `mutex`, giving up with `QueryTimeoutError` once `deadline` passes.
+async fn lock_until<T>(
+    mutex: &Mutex<T>,
+    deadline: Option<Instant>,
+) -> PyResult<tokio::sync::MutexGuard<'_, T>> {
+    match deadline {
+        None => Ok(mutex.lock().await),
+        Some(deadline) => tokio::time::timeout_at(deadline.into(), mutex.lock())
+            .await
+            .map_err(|_| QueryTimeoutError::new_err("query timed out waiting for the client lock")),
+    }
+}
+
+/// A namespace handle: object store + writer (or reader) session + a tokio
+/// runtime that drives every async storage call from synchronous Python.
+/// Every blocking call releases the GIL while it waits.
 #[pyclass(module = "namidb")]
 pub struct Client {
     runtime: Runtime,
-    session: Arc<Mutex<WriterSession>>,
+    session: Session,
     /// Serialises compaction passes without sharing the writer mutex. Two
     /// concurrent `acompact()` calls must not prepare from the same basis and
     /// race to remove the same immutable inputs.
@@ -47,6 +237,12 @@ pub struct Client {
     store: Arc<dyn ObjectStore>,
     paths: namidb_storage::NamespacePaths,
     cache: SstCache,
+    /// Orphan age for the sweep that follows an applied compaction; `None`
+    /// leaves reclaiming to explicit `sweep()` calls.
+    auto_sweep_min_age: Option<Duration>,
+    /// `flush()` compacts inline once a bucket holds this many L0 SSTs
+    /// (`0` disables).
+    compaction_l0_trigger: usize,
 }
 
 #[pymethods]
@@ -68,30 +264,80 @@ impl Client {
     /// - `az://<account>/<container>[/<prefix>]?ns=<ns>[&endpoint=...][&allow_http=true][&use_emulator=true]`
     /// — Azure Blob Storage. Auth from `AZURE_STORAGE_ACCOUNT_NAME`
     /// + `AZURE_STORAGE_ACCESS_KEY` (or SAS token via env).
+    ///
+    /// With `read_only=True` the client never claims the namespace, so a
+    /// writer in another process keeps running. It serves the newest commit
+    /// as of open (or the last [`Client::refresh`], at most an hour back)
+    /// and every mutator raises `PermissionError`. The namespace must
+    /// already exist. [`Client::close`] drops its retention lease.
+    ///
+    /// `spool_dir` is where compaction writes its scratch files. It defaults
+    /// to `NAMIDB_SPOOL_DIR`, then to `<root>/.namidb-spool` for `file://`
+    /// URIs. `auto_sweep_min_age_secs` reclaims objects an applied compaction
+    /// retired once they were written that long ago (`None` disables; it is
+    /// no grace period for a reader in another process), and `flush()`
+    /// compacts once a bucket reaches `compaction_l0_trigger` L0 SSTs (`0`
+    /// disables). A `read_only` client never compacts or sweeps, so these
+    /// options do nothing there and no spool dir is created.
     #[new]
-    #[pyo3(signature = (uri, cache_bytes=None))]
-    fn new(uri: &str, cache_bytes: Option<usize>) -> PyResult<Self> {
+    #[pyo3(signature = (uri, cache_bytes=None, *, read_only=false, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8))]
+    fn new(
+        py: Python<'_>,
+        uri: &str,
+        cache_bytes: Option<usize>,
+        read_only: bool,
+        spool_dir: Option<String>,
+        auto_sweep_min_age_secs: Option<u64>,
+        compaction_l0_trigger: usize,
+    ) -> PyResult<Self> {
         let (store, paths) = parse_uri(uri)?;
+        if !read_only {
+            configure_spool_dir(uri, spool_dir)?;
+        }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
-        let session = runtime
-            .block_on(WriterSession::open(store.clone(), paths.clone()))
-            .map_err(map_storage_err)?;
         let cache = SstCache::new(cache_bytes.unwrap_or(64 * 1024 * 1024));
+        let session = py
+            .allow_threads(|| {
+                runtime.block_on(async {
+                    Ok::<_, namidb_storage::Error>(if read_only {
+                        let reader =
+                            ReaderSession::open(store.clone(), paths.clone(), Some(cache.clone()))
+                                .await?;
+                        let reader = Arc::new(Mutex::new(reader));
+                        tokio::spawn(renew_reader_pins(Arc::downgrade(&reader)));
+                        Session::Reader(reader)
+                    } else {
+                        let writer = WriterSession::open(store.clone(), paths.clone()).await?;
+                        Session::Writer(Arc::new(Writer::new(writer)))
+                    })
+                })
+            })
+            .map_err(map_storage_err)?;
         Ok(Self {
             runtime,
-            session: Arc::new(Mutex::new(session)),
+            session,
             compaction_lock: Arc::new(Mutex::new(())),
             store,
             paths,
             cache,
+            auto_sweep_min_age: auto_sweep_min_age_secs
+                .filter(|_| !read_only)
+                .map(Duration::from_secs),
+            compaction_l0_trigger: if read_only { 0 } else { compaction_l0_trigger },
         })
     }
 
     /// Stage a node upsert into the current batch.
-    fn upsert_node(&self, label: &str, id: &str, properties: &Bound<'_, PyDict>) -> PyResult<()> {
+    fn upsert_node(
+        &self,
+        py: Python<'_>,
+        label: &str,
+        id: &str,
+        properties: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
         let id = parse_node_id(id)?;
         let props = py_dict_to_value_map(properties)?;
         let record = NodeWriteRecord {
@@ -99,15 +345,23 @@ impl Client {
             schema_version: 0,
             ..Default::default()
         };
-        self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            let labels = [label.to_string()];
-            namidb_query::enforce_node_unique_constraints(&session, &labels, &record.properties)
+        let session = self.session.writer()?;
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                let labels = [label.to_string()];
+                namidb_query::enforce_node_unique_constraints(
+                    &session,
+                    &labels,
+                    &record.properties,
+                    Some(id),
+                )
                 .await
                 .map_err(PyValueError::new_err)?;
-            session
-                .upsert_node(label, id, &record)
-                .map_err(map_storage_err)
+                session
+                    .upsert_node(label, id, &record)
+                    .map_err(map_storage_err)
+            })
         })?;
         Ok(())
     }
@@ -117,6 +371,7 @@ impl Client {
     /// later upsert with a different set replaces it (last-write-wins).
     fn upsert_node_with_labels(
         &self,
+        py: Python<'_>,
         labels: Vec<String>,
         id: &str,
         properties: &Bound<'_, PyDict>,
@@ -128,24 +383,35 @@ impl Client {
             schema_version: 0,
             ..Default::default()
         };
-        self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            namidb_query::enforce_node_unique_constraints(&session, &labels, &record.properties)
+        let session = self.session.writer()?;
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                namidb_query::enforce_node_unique_constraints(
+                    &session,
+                    &labels,
+                    &record.properties,
+                    Some(id),
+                )
                 .await
                 .map_err(PyValueError::new_err)?;
-            session
-                .upsert_node_with_labels(labels, id, &record)
-                .map_err(map_storage_err)
+                session
+                    .upsert_node_with_labels(labels, id, &record)
+                    .map_err(map_storage_err)
+            })
         })?;
         Ok(())
     }
 
     /// Stage a node tombstone into the current batch.
-    fn tombstone_node(&self, label: &str, id: &str) -> PyResult<()> {
+    fn tombstone_node(&self, py: Python<'_>, label: &str, id: &str) -> PyResult<()> {
         let id = parse_node_id(id)?;
-        self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            session.tombstone_node(label, id).map_err(map_storage_err)
+        let session = self.session.writer()?;
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                session.tombstone_node(label, id).map_err(map_storage_err)
+            })
         })?;
         Ok(())
     }
@@ -153,6 +419,7 @@ impl Client {
     /// Stage an edge upsert into the current batch.
     fn upsert_edge(
         &self,
+        py: Python<'_>,
         edge_type: &str,
         src: &str,
         dst: &str,
@@ -165,11 +432,14 @@ impl Client {
             properties: props,
             schema_version: 0,
         };
-        self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            session
-                .upsert_edge(edge_type, src, dst, &record)
-                .map_err(map_storage_err)
+        let session = self.session.writer()?;
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                session
+                    .upsert_edge(edge_type, src, dst, &record)
+                    .map_err(map_storage_err)
+            })
         })?;
         Ok(())
     }
@@ -181,13 +451,22 @@ impl Client {
     /// number of rows loaded. This is the file-to-graph fast path, no
     /// per-row dict construction.
     #[pyo3(signature = (label, path, commit_every=0))]
-    fn load_parquet_nodes(&self, label: &str, path: &str, commit_every: usize) -> PyResult<usize> {
+    fn load_parquet_nodes(
+        &self,
+        py: Python<'_>,
+        label: &str,
+        path: &str,
+        commit_every: usize,
+    ) -> PyResult<usize> {
         let path = std::path::PathBuf::from(path);
-        let outcome = self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            namidb_storage::load_nodes_from_parquet(&path, &mut session, label, commit_every)
-                .await
-                .map_err(map_storage_err)
+        let session = self.session.writer()?;
+        let outcome = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                namidb_storage::load_nodes_from_parquet(&path, &mut session, label, commit_every)
+                    .await
+                    .map_err(map_storage_err)
+            })
         })?;
         Ok(outcome.rows_loaded)
     }
@@ -199,54 +478,101 @@ impl Client {
     #[pyo3(signature = (edge_type, path, commit_every=0))]
     fn load_parquet_edges(
         &self,
+        py: Python<'_>,
         edge_type: &str,
         path: &str,
         commit_every: usize,
     ) -> PyResult<usize> {
         let path = std::path::PathBuf::from(path);
-        let outcome = self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            namidb_storage::load_edges_from_parquet(&path, &mut session, edge_type, commit_every)
+        let session = self.session.writer()?;
+        let outcome = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                namidb_storage::load_edges_from_parquet(
+                    &path,
+                    &mut session,
+                    edge_type,
+                    commit_every,
+                )
                 .await
                 .map_err(map_storage_err)
+            })
         })?;
         Ok(outcome.rows_loaded)
     }
 
     /// Stage an edge tombstone into the current batch.
-    fn tombstone_edge(&self, edge_type: &str, src: &str, dst: &str) -> PyResult<()> {
+    fn tombstone_edge(
+        &self,
+        py: Python<'_>,
+        edge_type: &str,
+        src: &str,
+        dst: &str,
+    ) -> PyResult<()> {
         let src = parse_node_id(src)?;
         let dst = parse_node_id(dst)?;
-        self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            session
-                .tombstone_edge(edge_type, src, dst)
-                .map_err(map_storage_err)
+        let session = self.session.writer()?;
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                session
+                    .tombstone_edge(edge_type, src, dst)
+                    .map_err(map_storage_err)
+            })
         })?;
         Ok(())
     }
 
     /// Durably commit the current batch (WAL append + manifest CAS).
     /// Returns the last LSN persisted, or `None` when the batch was empty.
-    fn commit(&self) -> PyResult<Option<u64>> {
-        let last_lsn = self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            let outcome = session.commit_batch().await.map_err(map_storage_err)?;
-            Ok::<Option<u64>, PyErr>(match outcome {
-                CommitOutcome::Empty => None,
-                CommitOutcome::Committed { last_lsn, .. } => Some(last_lsn),
+    fn commit(&self, py: Python<'_>) -> PyResult<Option<u64>> {
+        let session = self.session.writer()?;
+        let last_lsn = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                let outcome = session.commit_batch().await.map_err(map_storage_err)?;
+                Ok::<Option<u64>, PyErr>(match outcome {
+                    CommitOutcome::Empty => None,
+                    CommitOutcome::Committed { last_lsn, .. } => Some(last_lsn),
+                })
             })
         })?;
         Ok(last_lsn)
     }
 
-    /// Flush the memtable into L0 SSTs.
-    fn flush(&self) -> PyResult<()> {
-        self.runtime.block_on(async {
-            let mut session = self.session.lock().await;
-            let schema = session.snapshot().manifest().manifest.schema.clone();
-            session.flush(schema).await.map_err(map_storage_err)
+    /// Flush the memtable into L0 SSTs, then run a compaction pass when a
+    /// bucket has reached `compaction_l0_trigger` L0 SSTs.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let session = self.session.writer()?;
+        let l0 = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let mut session = session.lock().await;
+                let schema = session.snapshot().manifest().manifest.schema.clone();
+                session.flush(schema).await.map_err(map_storage_err)?;
+                Ok::<_, PyErr>(session.max_l0_bucket_len())
+            })
         })?;
+        // Embedded mode has no maintenance loop, so without this L0 grows
+        // until someone calls compact() and every read fans out across it.
+        // The flush is already durable, so a failed pass is only a warning:
+        // raising would read as "data not persisted" to a retrying caller.
+        if self.compaction_l0_trigger > 0 && l0 >= self.compaction_l0_trigger {
+            let session = session.clone();
+            let compaction_lock = self.compaction_lock.clone();
+            let auto_sweep = self.auto_sweep();
+            let compacted = py.allow_threads(|| {
+                self.runtime
+                    .block_on(run_compaction_inner(session, compaction_lock, auto_sweep))
+            });
+            if let Err(e) = compacted {
+                PyErr::warn_bound(
+                    py,
+                    &py.get_type_bound::<PyRuntimeWarning>(),
+                    &format!("flush succeeded, but the compaction it triggered failed: {e}"),
+                    1,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -257,21 +583,75 @@ impl Client {
     /// mutex is held only while capturing a basis and while installing the
     /// prepared manifest update. Returns a dict describing the pass.
     fn compact(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let report = self.runtime.block_on(run_compaction_inner(
-            self.session.clone(),
-            self.compaction_lock.clone(),
-        ))?;
+        let session = self.session.writer()?.clone();
+        let compaction_lock = self.compaction_lock.clone();
+        let auto_sweep = self.auto_sweep();
+        let report = py.allow_threads(|| {
+            self.runtime
+                .block_on(run_compaction_inner(session, compaction_lock, auto_sweep))
+        })?;
         compaction_report_to_py(py, &report)
     }
 
     /// Async sibling of [`Client::compact`]. Returns the same report dict.
     fn acompact<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let session = self.session.clone();
+        let session = self.session.writer()?.clone();
         let compaction_lock = self.compaction_lock.clone();
+        let auto_sweep = self.auto_sweep();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let report = run_compaction_inner(session, compaction_lock).await?;
+            let report = run_compaction_inner(session, compaction_lock, auto_sweep).await?;
             Python::with_gil(|py| compaction_report_to_py(py, &report))
         })
+    }
+
+    /// Delete objects no manifest version references any more and that are
+    /// at least `min_age_secs` old: SSTs a compaction merged away, WAL
+    /// segments a flush retired, superseded manifests. With `dry_run=True`
+    /// nothing is deleted and the dict reports what would be.
+    #[pyo3(signature = (min_age_secs=60, dry_run=false))]
+    fn sweep(&self, py: Python<'_>, min_age_secs: u64, dry_run: bool) -> PyResult<Py<PyDict>> {
+        let session = self.session.writer()?;
+        let manifest_store = ManifestStore::new(self.store.clone(), self.paths.clone());
+        let report = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let _compaction_guard = self.compaction_lock.lock().await;
+                let guard = session.lock().await;
+                sweep_locked(
+                    &guard,
+                    &manifest_store,
+                    Duration::from_secs(min_age_secs),
+                    !dry_run,
+                )
+                .await
+            })
+        })?;
+        let d = PyDict::new_bound(py);
+        d.set_item("orphans_found", report.orphans_found)?;
+        d.set_item("orphans_deleted", report.orphans_deleted)?;
+        d.set_item("bytes_freed", report.bytes_freed)?;
+        d.set_item("skipped_too_young", report.skipped_too_young)?;
+        d.set_item("wal_segments_reclaimed", report.wal_segments_reclaimed)?;
+        d.set_item("wal_bytes_freed", report.wal_bytes_freed)?;
+        d.set_item(
+            "manifest_snapshots_reclaimed",
+            report.manifest_snapshots_reclaimed,
+        )?;
+        d.set_item("manifest_bytes_freed", report.manifest_bytes_freed)?;
+        d.set_item("pointer_files_reclaimed", report.pointer_files_reclaimed)?;
+        d.set_item("pointer_bytes_freed", report.pointer_bytes_freed)?;
+        d.set_item(
+            "memtable_snapshots_reclaimed",
+            report.memtable_snapshots_reclaimed,
+        )?;
+        d.set_item(
+            "memtable_snapshot_bytes_freed",
+            report.memtable_snapshot_bytes_freed,
+        )?;
+        d.set_item("expired_pins_reclaimed", report.expired_pins_reclaimed)?;
+        d.set_item("pins_honoured", report.pins_honoured)?;
+        // A pin lease that landed mid-sweep deletes nothing; run it again.
+        d.set_item("aborted_by_pin", report.aborted_by_pin)?;
+        Ok(d.into())
     }
 
     /// Look up a single node by `(label, id)`.
@@ -282,10 +662,12 @@ impl Client {
         id: &str,
     ) -> PyResult<Option<Py<PyDict>>> {
         let id = parse_node_id(id)?;
-        let view: Option<NodeView> = self.runtime.block_on(async {
-            let session = self.session.lock().await;
-            let snap = session.snapshot().with_cache(self.cache.clone());
-            snap.lookup_node(label, id).await.map_err(map_storage_err)
+        let view: Option<NodeView> = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let owned = self.session.snapshot(None).await?;
+                let snap = owned.borrow().with_cache(self.cache.clone());
+                snap.lookup_node(label, id).await.map_err(map_storage_err)
+            })
         })?;
         match view {
             Some(v) => Ok(Some(node_view_to_py(py, &v)?.into())),
@@ -296,12 +678,14 @@ impl Client {
     /// All outgoing edges of `(edge_type, src)`.
     fn out_edges<'py>(&self, py: Python<'py>, edge_type: &str, src: &str) -> PyResult<Py<PyList>> {
         let src = parse_node_id(src)?;
-        let list: EdgeListView = self.runtime.block_on(async {
-            let session = self.session.lock().await;
-            let snap = session.snapshot().with_cache(self.cache.clone());
-            snap.out_edges(edge_type, src)
-                .await
-                .map_err(map_storage_err)
+        let list: EdgeListView = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let owned = self.session.snapshot(None).await?;
+                let snap = owned.borrow().with_cache(self.cache.clone());
+                snap.out_edges(edge_type, src)
+                    .await
+                    .map_err(map_storage_err)
+            })
         })?;
         edge_list_to_py(py, &list)
     }
@@ -309,21 +693,26 @@ impl Client {
     /// All incoming edges of `(edge_type, dst)`.
     fn in_edges<'py>(&self, py: Python<'py>, edge_type: &str, dst: &str) -> PyResult<Py<PyList>> {
         let dst = parse_node_id(dst)?;
-        let list: EdgeListView = self.runtime.block_on(async {
-            let session = self.session.lock().await;
-            let snap = session.snapshot().with_cache(self.cache.clone());
-            snap.in_edges(edge_type, dst).await.map_err(map_storage_err)
+        let list: EdgeListView = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let owned = self.session.snapshot(None).await?;
+                let snap = owned.borrow().with_cache(self.cache.clone());
+                snap.in_edges(edge_type, dst).await.map_err(map_storage_err)
+            })
         })?;
         edge_list_to_py(py, &list)
     }
 
-    /// All nodes under `label` (memtable + SSTs, last-write-wins).
-    fn scan_label<'py>(&self, py: Python<'py>, label: &str) -> PyResult<Py<PyList>> {
-        let views: Vec<NodeView> = self.runtime.block_on(async {
-            let session = self.session.lock().await;
-            let snap = session.snapshot().with_cache(self.cache.clone());
-            snap.scan_label(label).await.map_err(map_storage_err)
-        })?;
+    /// All nodes under `label` (memtable + SSTs, last-write-wins). `limit`
+    /// stops after that many nodes.
+    #[pyo3(signature = (label, limit=None))]
+    fn scan_label<'py>(
+        &self,
+        py: Python<'py>,
+        label: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Py<PyList>> {
+        let views = self.scan_nodes(py, label, limit)?;
         let list = PyList::empty_bound(py);
         for v in &views {
             list.append(node_view_to_py(py, v)?)?;
@@ -331,15 +720,16 @@ impl Client {
         Ok(list.into())
     }
 
-    /// All edges of `edge_type` (memtable + SSTs, last-write-wins).
-    fn scan_edge_type<'py>(&self, py: Python<'py>, edge_type: &str) -> PyResult<Py<PyList>> {
-        let views: Vec<EdgeView> = self.runtime.block_on(async {
-            let session = self.session.lock().await;
-            let snap = session.snapshot().with_cache(self.cache.clone());
-            snap.scan_edge_type(edge_type)
-                .await
-                .map_err(map_storage_err)
-        })?;
+    /// All edges of `edge_type` (memtable + SSTs, last-write-wins). `limit`
+    /// stops after that many edges.
+    #[pyo3(signature = (edge_type, limit=None))]
+    fn scan_edge_type<'py>(
+        &self,
+        py: Python<'py>,
+        edge_type: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Py<PyList>> {
+        let views = self.scan_edges(py, edge_type, limit)?;
         let list = PyList::empty_bound(py);
         for v in &views {
             list.append(edge_view_to_py(py, v)?)?;
@@ -347,95 +737,139 @@ impl Client {
         Ok(list.into())
     }
 
-    /// Stage a batch of node upserts under a single tokio runtime + lock
-    /// hop. Each `row` is a `dict[str, Any]` that must contain a string
-    /// `"id"` (UUID); all other keys become node properties.
-    ///
-    /// Returns the count of staged rows. Like [`Client::upsert_node`],
-    /// the mutations are durable only after a subsequent
-    /// [`Client::commit`].
-    fn merge_nodes(&self, label: &str, rows: &Bound<'_, PyList>) -> PyResult<usize> {
-        let mut parsed: Vec<(NodeId, BTreeMap<String, Value>)> = Vec::with_capacity(rows.len());
-        for (idx, row_obj) in rows.iter().enumerate() {
-            let row = row_obj
-                .downcast::<PyDict>()
-                .map_err(|_| PyValueError::new_err(format!("row #{idx} is not a dict")))?;
-            let id_obj = row.get_item("id")?.ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "row #{idx} is missing the required 'id' key (UUID string)"
-                ))
-            })?;
-            let id_str: String = id_obj
-                .extract()
-                .map_err(|_| PyValueError::new_err(format!("row #{idx} 'id' is not a string")))?;
-            let id = parse_node_id(&id_str)?;
-            let mut props = BTreeMap::new();
-            for (k, v) in row.iter() {
-                let key: String = k.extract()?;
-                if key == "id" {
-                    continue;
-                }
-                props.insert(key, py_any_to_value(&v)?);
-            }
-            parsed.push((id, props));
-        }
-        let label = label.to_string();
-        let session = self.session.clone();
-        let count = self.runtime.block_on(async move {
-            let mut guard = session.lock().await;
-            // Unique property names declared for this label (empty if none).
-            let unique_props: Vec<String> = guard
-                .schema()
-                .label(&label)
-                .map(|d| {
-                    d.properties
-                        .iter()
-                        .filter(|p| p.unique)
-                        .map(|p| p.name.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let labels = [label.clone()];
-            let mut seen: std::collections::HashMap<(String, String), NodeId> =
-                std::collections::HashMap::new();
-            for (id, props) in &parsed {
-                let record = NodeWriteRecord {
-                    properties: props.clone(),
-                    schema_version: 0,
-                    ..Default::default()
-                };
-                // Committed + already-staged duplicates, via the RYOW overlay.
-                namidb_query::enforce_node_unique_constraints(&guard, &labels, &record.properties)
+    /// Like [`Client::scan_label`], but lazy: the iterator reads the label
+    /// [`ITER_BATCH`] nodes at a time as it is consumed, all from the
+    /// snapshot current when it was created.
+    #[pyo3(signature = (label, limit=None))]
+    fn iter_label(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        label: &str,
+        limit: Option<usize>,
+    ) -> PyResult<NodeIter> {
+        let this: &Client = &slf;
+        let (snapshot, cursor) = py.allow_threads(|| {
+            this.runtime.block_on(async {
+                let owned = this.session.snapshot(None).await?;
+                let cursor = owned
+                    .borrow()
+                    .with_cache(this.cache.clone())
+                    .label_scan_cursor(label)
                     .await
-                    .map_err(PyValueError::new_err)?;
-                // Two rows in THIS batch carrying the same unique value.
-                for uprop in &unique_props {
-                    if let Some(v) = props.get(uprop) {
-                        let key = (uprop.clone(), format!("{v:?}"));
-                        if let Some(prev) = seen.insert(key, *id) {
-                            if prev != *id {
-                                return Err(PyValueError::new_err(format!(
-                                    "{label}.{uprop} = {v:?} appears on two ids in the same \
-                                     merge_nodes batch (unique constraint)"
-                                )));
-                            }
-                        }
-                    }
-                }
-                guard
-                    .upsert_node(&label, *id, &record)
                     .map_err(map_storage_err)?;
-            }
-            Ok::<_, PyErr>(parsed.len())
+                Ok::<_, PyErr>((owned, cursor))
+            })
         })?;
-        Ok(count)
+        Ok(NodeIter {
+            client: slf.into(),
+            snapshot,
+            cursor,
+            batch: Vec::new().into_iter(),
+            remaining: limit,
+        })
+    }
+
+    /// Like [`Client::scan_edge_type`], but lazy: the iterator decodes the
+    /// type [`ITER_BATCH`] edges at a time as it is consumed, all from the
+    /// snapshot current when it was created.
+    #[pyo3(signature = (edge_type, limit=None))]
+    fn iter_edge_type(
+        &self,
+        py: Python<'_>,
+        edge_type: &str,
+        limit: Option<usize>,
+    ) -> PyResult<EdgeIter> {
+        let cursor = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let owned = self.session.snapshot(None).await?;
+                let snap = owned.borrow().with_cache(self.cache.clone());
+                snap.edge_scan_cursor(edge_type)
+                    .await
+                    .map_err(map_storage_err)
+            })
+        })?;
+        Ok(EdgeIter {
+            cursor,
+            batch: Vec::new().into_iter(),
+            remaining: limit,
+        })
+    }
+
+    /// Move a `read_only` client to the newest committed version. Returns
+    /// `True` when it advanced. A writer client always reads its own latest
+    /// commit, so this is a no-op returning `False` there.
+    fn refresh(&self, py: Python<'_>) -> PyResult<bool> {
+        let Session::Reader(reader) = &self.session else {
+            return Ok(false);
+        };
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                // ponytail: reads wait on this lock while the WAL tail
+                // replays; swap in the new snapshot outside it if refreshes
+                // get slow enough to matter.
+                let mut reader = reader.lock().await;
+                reader.refresh().await.map_err(map_storage_err)
+            })
+        })
+    }
+
+    /// Release the retention lease a `read_only` client holds on the
+    /// version it serves, so the writer's cleanup can reclaim it right away
+    /// instead of when the lease expires. The client keeps working: its next
+    /// read or `refresh()` reloads the newest version under a new lease. A
+    /// no-op on a writer.
+    /// `with Client(...) as c:` calls this on exit.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.runtime.block_on(self.session.close()))
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __exit__(&self, py: Python<'_>, _args: &Bound<'_, pyo3::types::PyTuple>) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
+    }
+
+    /// Stage a batch of node upserts that merge into the stored nodes. Each
+    /// `row` is a `dict[str, Any]` keyed by `"_id"` (UUID string), or by the
+    /// legacy `"id"`, which is then also kept as an `id` property. Every other
+    /// key is merged into the node's current properties: unmentioned keys are
+    /// kept, a `None` value removes the key, and `label` is added to the
+    /// node's labels. Rows repeating an id in one batch merge in order.
+    ///
+    /// This reads each node before writing it; use [`Client::put_nodes`] for
+    /// first loads. Returns the count of staged rows. Like
+    /// [`Client::upsert_node`], the mutations are durable only after a
+    /// subsequent [`Client::commit`].
+    fn merge_nodes(
+        &self,
+        py: Python<'_>,
+        label: &str,
+        rows: &Bound<'_, PyList>,
+    ) -> PyResult<usize> {
+        self.stage_nodes(py, label, rows, true)
+    }
+
+    /// Stage a batch of node upserts that replace the stored nodes (no read).
+    /// Rows take the same shape as [`Client::merge_nodes`], but each row is
+    /// the node's full property set and `label` its only label.
+    fn put_nodes(&self, py: Python<'_>, label: &str, rows: &Bound<'_, PyList>) -> PyResult<usize> {
+        self.stage_nodes(py, label, rows, false)
     }
 
     /// Stage a batch of edge upserts. Each row needs `"src"` and `"dst"`
     /// UUID strings; remaining keys become edge properties. Like
     /// [`Client::upsert_edge`], the mutations are durable only after a
     /// subsequent [`Client::commit`].
-    fn merge_edges(&self, edge_type: &str, rows: &Bound<'_, PyList>) -> PyResult<usize> {
+    fn merge_edges(
+        &self,
+        py: Python<'_>,
+        edge_type: &str,
+        rows: &Bound<'_, PyList>,
+    ) -> PyResult<usize> {
         let mut parsed: Vec<(NodeId, NodeId, BTreeMap<String, Value>)> =
             Vec::with_capacity(rows.len());
         for (idx, row_obj) in rows.iter().enumerate() {
@@ -463,19 +897,21 @@ impl Client {
             parsed.push((src, dst, props));
         }
         let edge_type = edge_type.to_string();
-        let session = self.session.clone();
-        let count = self.runtime.block_on(async move {
-            let mut guard = session.lock().await;
-            for (src, dst, props) in &parsed {
-                let record = EdgeWriteRecord {
-                    properties: props.clone(),
-                    schema_version: 0,
-                };
-                guard
-                    .upsert_edge(&edge_type, *src, *dst, &record)
-                    .map_err(map_storage_err)?;
-            }
-            Ok::<_, PyErr>(parsed.len())
+        let session = self.session.writer()?.clone();
+        let count = py.allow_threads(|| {
+            self.runtime.block_on(async move {
+                let mut guard = session.lock().await;
+                for (src, dst, props) in &parsed {
+                    let record = EdgeWriteRecord {
+                        properties: props.clone(),
+                        schema_version: 0,
+                    };
+                    guard
+                        .upsert_edge(&edge_type, *src, *dst, &record)
+                        .map_err(map_storage_err)?;
+                }
+                Ok::<_, PyErr>(parsed.len())
+            })
         })?;
         Ok(count)
     }
@@ -483,13 +919,16 @@ impl Client {
     /// Scan every node under `label` and return the result as a
     /// `pyarrow.Table`. Columns: `id`, `label`, `lsn`,
     /// `schema_version`, then the union of property keys across the
-    /// scanned views (missing keys are filled with `None`).
-    fn scan_label_arrow<'py>(&self, py: Python<'py>, label: &str) -> PyResult<Py<PyAny>> {
-        let views: Vec<NodeView> = self.runtime.block_on(async {
-            let session = self.session.lock().await;
-            let snap = session.snapshot().with_cache(self.cache.clone());
-            snap.scan_label(label).await.map_err(map_storage_err)
-        })?;
+    /// scanned views (missing keys are filled with `None`). `limit` stops
+    /// after that many nodes.
+    #[pyo3(signature = (label, limit=None))]
+    fn scan_label_arrow<'py>(
+        &self,
+        py: Python<'py>,
+        label: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let views = self.scan_nodes(py, label, limit)?;
         let mut prop_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for v in &views {
             for k in v.properties.keys() {
@@ -546,14 +985,16 @@ impl Client {
             ..Default::default()
         };
         let dir = std::path::PathBuf::from(path);
-        let session = self.session.clone();
-        let outcome = self.runtime.block_on(async move {
-            let mut guard = session.lock().await;
-            let outcome = namidb_markdown::load_vault(&dir, &mut guard, &opts)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(format!("vault load failed: {e}")))?;
-            guard.commit_batch().await.map_err(map_storage_err)?;
-            Ok::<_, PyErr>(outcome)
+        let session = self.session.writer()?.clone();
+        let outcome = py.allow_threads(|| {
+            self.runtime.block_on(async move {
+                let mut guard = session.lock().await;
+                let outcome = namidb_markdown::load_vault(&dir, &mut guard, &opts)
+                    .await
+                    .map_err(|e| PyRuntimeError::new_err(format!("vault load failed: {e}")))?;
+                guard.commit_batch().await.map_err(map_storage_err)?;
+                Ok::<_, PyErr>(outcome)
+            })
         })?;
 
         let d = PyDict::new_bound(py);
@@ -591,46 +1032,64 @@ impl Client {
     /// returns** — the executor calls `commit_batch()` internally at
     /// the end of every write plan. Call `client.flush()` to push the
     /// memtable into L0 SSTs once enough writes have accumulated.
-    #[pyo3(signature = (query, params=None))]
+    ///
+    /// Reads run on the latest committed snapshot without waiting for the
+    /// writer lock, so several threads can query one client at once and a
+    /// long write does not hold them up.
+    ///
+    /// `timeout_ms` aborts the query with `QueryTimeoutError` once that much
+    /// wall time has passed since the call, waiting for the client's lock
+    /// included. A write that times out is discarded, not committed.
+    /// `max_rows` aborts a read with `QueryRowCapError` as soon as any step
+    /// produces more rows than that; writes ignore it.
+    #[pyo3(signature = (query, params=None, *, timeout_ms=None, max_rows=None))]
     fn cypher(
         &self,
         py: Python<'_>,
         query: &str,
         params: Option<&Bound<'_, PyDict>>,
+        timeout_ms: Option<u64>,
+        max_rows: Option<usize>,
     ) -> PyResult<Py<QueryResult>> {
         let params = match params {
             Some(d) => py_dict_to_params(d)?,
             None => Params::new(),
         };
-        let session = self.session.clone();
-        let cache = self.cache.clone();
-        let query_owned = query.to_string();
-        let result: QueryResult = self.runtime.block_on(async move {
-            let mut guard = session.lock().await;
-            run_cypher_inner(&mut guard, &query_owned, &params, cache).await
+        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        let result: QueryResult = py.allow_threads(|| {
+            self.runtime.block_on(run_cypher(
+                &self.session,
+                query,
+                &params,
+                self.cache.clone(),
+                deadline,
+                max_rows,
+            ))
         })?;
         Py::new(py, result)
     }
 
     /// Async sibling of [`Client::cypher`]. Returns a Python coroutine
     /// that resolves to a [`QueryResult`].
-    #[pyo3(signature = (query, params=None))]
+    #[pyo3(signature = (query, params=None, *, timeout_ms=None, max_rows=None))]
     fn acypher<'py>(
         &self,
         py: Python<'py>,
         query: &str,
         params: Option<&Bound<'_, PyDict>>,
+        timeout_ms: Option<u64>,
+        max_rows: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let params = match params {
             Some(d) => py_dict_to_params(d)?,
             None => Params::new(),
         };
+        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
         let query = query.to_string();
         let session = self.session.clone();
         let cache = self.cache.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = session.lock().await;
-            let result = run_cypher_inner(&mut guard, &query, &params, cache).await?;
+            let result = run_cypher(&session, &query, &params, cache, deadline, max_rows).await?;
             Python::with_gil(|py| Py::new(py, result))
         })
     }
@@ -656,6 +1115,322 @@ impl Client {
     }
 }
 
+impl Client {
+    /// What an applied compaction should sweep afterwards, if anything.
+    fn auto_sweep(&self) -> Option<(ManifestStore, Duration)> {
+        self.auto_sweep_min_age.map(|age| {
+            (
+                ManifestStore::new(self.store.clone(), self.paths.clone()),
+                age,
+            )
+        })
+    }
+
+    /// Shared body of [`Client::merge_nodes`] (`merge = true`) and
+    /// [`Client::put_nodes`].
+    fn stage_nodes(
+        &self,
+        py: Python<'_>,
+        label: &str,
+        rows: &Bound<'_, PyList>,
+        merge: bool,
+    ) -> PyResult<usize> {
+        let mut parsed: Vec<(NodeId, BTreeMap<String, Value>)> = Vec::with_capacity(rows.len());
+        for (idx, row_obj) in rows.iter().enumerate() {
+            let row = row_obj
+                .downcast::<PyDict>()
+                .map_err(|_| PyValueError::new_err(format!("row #{idx} is not a dict")))?;
+            // `_id` is the internal node id, as in Cypher. A legacy row keyed by
+            // `id` still works, and its `id` stays a property so `n.id` reads it.
+            let (id_key, id_obj) = match row.get_item("_id")? {
+                Some(v) => ("_id", v),
+                None => (
+                    "id",
+                    row.get_item("id")?.ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "row #{idx} is missing the required '_id' key (UUID string)"
+                        ))
+                    })?,
+                ),
+            };
+            let id_str: String = id_obj.extract().map_err(|_| {
+                PyValueError::new_err(format!("row #{idx} '{id_key}' is not a string"))
+            })?;
+            let id = parse_node_id(&id_str)?;
+            let mut props = BTreeMap::new();
+            for (k, v) in row.iter() {
+                let key: String = k.extract()?;
+                if key == "_id" {
+                    continue;
+                }
+                props.insert(key, py_any_to_value(&v)?);
+            }
+            parsed.push((id, props));
+        }
+        let count = parsed.len();
+        let label = label.to_string();
+        let session = self.session.writer()?;
+        let cache = self.cache.clone();
+        py.allow_threads(|| {
+            self.runtime.block_on(async move {
+                let mut guard = session.lock().await;
+                // Unique property names declared for this label (empty if none).
+                let unique_props: Vec<String> = guard
+                    .schema()
+                    .label(&label)
+                    .map(|d| {
+                        d.properties
+                            .iter()
+                            .filter(|p| p.unique)
+                            .map(|p| p.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut nodes: Vec<(NodeId, Vec<String>, BTreeMap<String, Value>)> =
+                    Vec::with_capacity(count);
+                // Rows repeating an id fold into one node, so the unique checks
+                // below see only each id's final value.
+                let mut slot: std::collections::HashMap<NodeId, usize> =
+                    std::collections::HashMap::new();
+                if merge {
+                    // Read-modify-write against the RYOW overlay, so nodes staged
+                    // by earlier calls count too.
+                    let snap = guard.overlay_snapshot().with_cache(cache);
+                    // One batched read for every id. The empty label asks for
+                    // each node under whatever labels it has, so they can be
+                    // unioned; a per-id point read would decode a whole row
+                    // group of a compacted SST for every row.
+                    let mut distinct: Vec<NodeId> = parsed.iter().map(|(id, _)| *id).collect();
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    let found = snap
+                        .batch_lookup_nodes("", &distinct)
+                        .await
+                        .map_err(map_storage_err)?;
+                    let mut stored: std::collections::HashMap<NodeId, NodeView> = distinct
+                        .into_iter()
+                        .zip(found)
+                        .filter_map(|(id, view)| view.map(|view| (id, view)))
+                        .collect();
+                    for (id, props) in parsed {
+                        let i = match slot.get(&id) {
+                            Some(&i) => i,
+                            None => {
+                                let (labels, base) = match stored.remove(&id) {
+                                    Some(n) => (n.labels.into_iter().collect(), n.properties),
+                                    None => (Vec::new(), BTreeMap::new()),
+                                };
+                                slot.insert(id, nodes.len());
+                                nodes.push((id, labels, base));
+                                nodes.len() - 1
+                            }
+                        };
+                        let (_, labels, current) = &mut nodes[i];
+                        if !labels.contains(&label) {
+                            labels.push(label.clone());
+                        }
+                        for (k, v) in props {
+                            if matches!(v, Value::Null) {
+                                current.remove(&k);
+                            } else {
+                                current.insert(k, v);
+                            }
+                        }
+                    }
+                } else {
+                    // Replace semantics: the last row for an id wins.
+                    for (id, props) in parsed {
+                        match slot.get(&id) {
+                            Some(&i) => nodes[i].2 = props,
+                            None => {
+                                slot.insert(id, nodes.len());
+                                nodes.push((id, vec![label.clone()], props));
+                            }
+                        }
+                    }
+                }
+                let mut seen: std::collections::HashMap<(String, String), NodeId> =
+                    std::collections::HashMap::new();
+                for (id, labels, props) in nodes {
+                    // Committed + already-staged duplicates, via the RYOW overlay.
+                    // The node's own row is excluded: this write replaces it.
+                    namidb_query::enforce_node_unique_constraints(
+                        &guard,
+                        &labels,
+                        &props,
+                        Some(id),
+                    )
+                    .await
+                    .map_err(PyValueError::new_err)?;
+                    // Two rows in THIS batch carrying the same unique value.
+                    for uprop in &unique_props {
+                        if let Some(v) = props.get(uprop) {
+                            let key = (uprop.clone(), format!("{v:?}"));
+                            if let Some(prev) = seen.insert(key, id) {
+                                if prev != id {
+                                    return Err(PyValueError::new_err(format!(
+                                        "{label}.{uprop} = {v:?} appears on two ids in the same \
+                                     batch (unique constraint)"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    let record = NodeWriteRecord {
+                        properties: props,
+                        schema_version: 0,
+                        ..Default::default()
+                    };
+                    guard
+                        .upsert_node_with_labels(labels, id, &record)
+                        .map_err(map_storage_err)?;
+                }
+                Ok::<_, PyErr>(())
+            })
+        })?;
+        Ok(count)
+    }
+
+    fn scan_nodes(
+        &self,
+        py: Python<'_>,
+        label: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<NodeView>> {
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let owned = self.session.snapshot(None).await?;
+                let snap = owned.borrow().with_cache(self.cache.clone());
+                match limit {
+                    Some(limit) => {
+                        snap.scan_label_with_predicates_and_projection_limited(
+                            label,
+                            &[],
+                            None,
+                            limit,
+                        )
+                        .await
+                    }
+                    None => snap.scan_label(label).await,
+                }
+                .map_err(map_storage_err)
+            })
+        })
+    }
+
+    fn scan_edges(
+        &self,
+        py: Python<'_>,
+        edge_type: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<EdgeView>> {
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let owned = self.session.snapshot(None).await?;
+                let snap = owned.borrow().with_cache(self.cache.clone());
+                match limit {
+                    // The cursor decodes only the edges it returns.
+                    Some(limit) => snap
+                        .edge_scan_cursor(edge_type)
+                        .await
+                        .and_then(|mut cursor| cursor.next_batch(limit)),
+                    None => snap.scan_edge_type(edge_type).await,
+                }
+                .map_err(map_storage_err)
+            })
+        })
+    }
+}
+
+/// How many rows `iter_label` / `iter_edge_type` read per storage call.
+const ITER_BATCH: usize = 1024;
+
+/// Iterator returned by [`Client::iter_label`]. It reads the label one
+/// batch at a time with the GIL released, from the snapshot it was
+/// created on, which it keeps alive (and its files with it) until it is
+/// dropped.
+#[pyclass(module = "namidb")]
+pub struct NodeIter {
+    client: Py<Client>,
+    snapshot: ReadSnapshot,
+    cursor: NodeScanCursor,
+    batch: std::vec::IntoIter<NodeView>,
+    remaining: Option<usize>,
+}
+
+#[pymethods]
+impl NodeIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        if self.remaining == Some(0) {
+            return Ok(None);
+        }
+        if self.batch.len() == 0 {
+            let want = self.remaining.map_or(ITER_BATCH, |r| r.min(ITER_BATCH));
+            let client = self.client.borrow(py);
+            let client: &Client = &client;
+            let (snapshot, cursor) = (&self.snapshot, &mut self.cursor);
+            let rows = py.allow_threads(|| {
+                client.runtime.block_on(async {
+                    let snap = snapshot.borrow().with_cache(client.cache.clone());
+                    cursor
+                        .next_batch(&snap, want)
+                        .await
+                        .map_err(map_storage_err)
+                })
+            })?;
+            self.batch = rows.into_iter();
+        }
+        let Some(view) = self.batch.next() else {
+            self.remaining = Some(0);
+            return Ok(None);
+        };
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= 1;
+        }
+        node_view_to_py(py, &view).map(Some)
+    }
+}
+
+/// Iterator returned by [`Client::iter_edge_type`]. It decodes the type
+/// one batch at a time with the GIL released.
+#[pyclass(module = "namidb")]
+pub struct EdgeIter {
+    cursor: EdgeScanCursor,
+    batch: std::vec::IntoIter<EdgeView>,
+    remaining: Option<usize>,
+}
+
+#[pymethods]
+impl EdgeIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        if self.remaining == Some(0) {
+            return Ok(None);
+        }
+        if self.batch.len() == 0 {
+            let want = self.remaining.map_or(ITER_BATCH, |r| r.min(ITER_BATCH));
+            let cursor = &mut self.cursor;
+            let rows = py.allow_threads(|| cursor.next_batch(want).map_err(map_storage_err))?;
+            self.batch = rows.into_iter();
+        }
+        let Some(view) = self.batch.next() else {
+            self.remaining = Some(0);
+            return Ok(None);
+        };
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= 1;
+        }
+        edge_view_to_py(py, &view).map(Some)
+    }
+}
+
 // ── Embedded maintenance ──────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -676,8 +1451,9 @@ struct CompactionReport {
 /// free to acquire `session` throughout the expensive prepare phase. Storage's
 /// install step folds those newer writes/flushes into the current manifest.
 async fn run_compaction_inner(
-    session: Arc<Mutex<WriterSession>>,
+    session: Arc<Writer>,
     compaction_lock: Arc<Mutex<()>>,
+    auto_sweep: Option<(ManifestStore, Duration)>,
 ) -> PyResult<CompactionReport> {
     let _compaction_guard = compaction_lock.lock().await;
     let basis = {
@@ -717,9 +1493,16 @@ async fn run_compaction_inner(
         .await
         .map_err(map_storage_err)?;
     let l0_after = guard.max_l0_bucket_len();
+    let applied = outcome.source_ssts_removed > 0;
+    if let Some((manifest_store, min_age)) = auto_sweep.filter(|_| applied) {
+        // The merged-away inputs and the WAL earlier flushes retired stay on
+        // disk until a sweep. The pass is already installed, so a failed sweep
+        // only leaves them for the next one.
+        let _ = sweep_locked(&guard, &manifest_store, min_age, true).await;
+    }
 
     Ok(CompactionReport {
-        applied: outcome.source_ssts_removed > 0,
+        applied,
         manifest_version_before,
         manifest_version_after: outcome.committed.manifest.version,
         l0_before,
@@ -728,6 +1511,69 @@ async fn run_compaction_inner(
         new_ssts_written: outcome.new_ssts_written,
         bloom_sidecars_written: outcome.bloom_sidecars_written,
     })
+}
+
+/// Sweep orphaned objects. The caller holds both the compaction lock and the
+/// writer guard, so no prepared compaction output is waiting to be installed
+/// and no flush or commit sits between its object PUT and the manifest CAS.
+/// Reads run on snapshots taken without the writer lock, so the horizon is
+/// the oldest version a read in this process still holds, or the current
+/// version when none is running. It is safe without that lock: publishing
+/// here first means a read that has not registered yet will load the current
+/// version, and a read that loaded an older one registered it in the same
+/// step (see [`Writer`]). The published version cannot move again until the
+/// guard drops.
+/// Readers in other processes are covered only by pin leases: `min_age`
+/// counts from an object's write, not from when it stopped being referenced.
+async fn sweep_locked(
+    guard: &WriterGuard<'_>,
+    manifest_store: &ManifestStore,
+    min_age: Duration,
+    delete: bool,
+) -> PyResult<JanitorReport> {
+    guard.publish();
+    let horizon = guard.reads.retention_horizon();
+    sweep_orphans(manifest_store, horizon, min_age, 1, delete)
+        .await
+        .map_err(map_storage_err)
+}
+
+/// Point compaction scratch at `spool_dir`, else `NAMIDB_SPOOL_DIR`, else
+/// `<root>/.namidb-spool` for a `file://` URI, so a big compaction fills the
+/// graph volume instead of `/var/tmp`. The leading dot keeps it from ever
+/// parsing as a namespace. A default that cannot be created (a read-only
+/// root) keeps the platform fallback; an explicit `spool_dir` must work.
+/// The setting is process-wide and every client resets it, so a later
+/// `memory://` or `s3://` client does not inherit a `file://` graph's dir.
+fn configure_spool_dir(uri: &str, spool_dir: Option<String>) -> PyResult<()> {
+    let explicit = spool_dir.is_some();
+    let dir = spool_dir
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("NAMIDB_SPOOL_DIR")
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .or_else(|| {
+            let rest = uri.strip_prefix("file://")?;
+            let root = rest.split_once('?').map_or(rest, |(path, _)| path);
+            Some(std::path::Path::new(root).join(".namidb-spool"))
+        });
+    let dir = match dir {
+        Some(dir) => match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir),
+            Err(e) if explicit => {
+                return Err(PyValueError::new_err(format!(
+                    "spool_dir {}: {e}",
+                    dir.display()
+                )))
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+    namidb_storage::set_default_spool_dir(dir);
+    Ok(())
 }
 
 fn compaction_report_to_py(py: Python<'_>, report: &CompactionReport) -> PyResult<Py<PyDict>> {
@@ -782,18 +1628,102 @@ fn empty_query_result() -> QueryResult {
     }
 }
 
-/// Drive a Cypher query under a held `WriterSession` guard. Caller is
-/// responsible for acquiring the `tokio::sync::Mutex` lock; this
-/// helper just performs parse + lower + optimize + execute, then
-/// extracts the row-set + projected column list.
-async fn run_cypher_inner(
-    guard: &mut WriterSession,
+/// Parse, plan and run one Cypher statement. Reads run on a committed
+/// snapshot without the writer lock; schema DDL and write plans take the
+/// lock and are planned again under it, because a plan built from the
+/// lock-free snapshot can be stale by the time the lock is held.
+async fn run_cypher(
+    session: &Session,
     query: &str,
     params: &Params,
     cache: SstCache,
+    deadline: Option<Instant>,
+    row_cap: Option<usize>,
 ) -> PyResult<QueryResult> {
     let parsed = cypher_parse(query).map_err(parse_errs_to_pyerr)?;
+    if !is_schema_ddl(&parsed) {
+        let owned = session.snapshot(deadline).await?;
+        let snap = owned.borrow().with_cache(cache);
+        if let Some(result) = run_read(&parsed, &snap, params, deadline, row_cap).await? {
+            return Ok(result);
+        }
+    }
+    let mut guard = session.writer()?.lock_until(deadline).await?;
+    run_write(&mut guard, &parsed, params, deadline).await
+}
 
+fn is_schema_ddl(parsed: &Query) -> bool {
+    parsed.as_create_vector_index().is_some()
+        || parsed.as_create_fulltext_index().is_some()
+        || parsed.as_drop_vector_index().is_some()
+        || parsed.as_drop_fulltext_index().is_some()
+        || parsed.as_create_constraint().is_some()
+        || parsed.as_create_index().is_some()
+}
+
+/// The read side of [`run_cypher`]: SHOW, EXPLAIN and read plans. Returns
+/// `None` when the statement writes.
+async fn run_read(
+    parsed: &Query,
+    snap: &namidb_storage::Snapshot<'_>,
+    params: &Params,
+    deadline: Option<Instant>,
+    row_cap: Option<usize>,
+) -> PyResult<Option<QueryResult>> {
+    let manifest = &snap.manifest().manifest;
+    if let Some(c) = parsed.as_show_schema() {
+        use namidb_query::parser::ast::ShowKind;
+        let rows = match c.kind {
+            ShowKind::Constraints => show_constraints_rows(&manifest.schema),
+            ShowKind::Indexes => show_indexes_rows(manifest),
+        };
+        return Ok(Some(QueryResult {
+            columns: show_schema_columns(),
+            rows,
+        }));
+    }
+
+    let catalog = StatsCatalog::from_manifest(manifest);
+    let plan = build_plan(parsed, &catalog).map_err(lower_err_to_pyerr)?;
+
+    // `EXPLAIN [RAW] [VERBOSE] <query>`: render the plan instead of
+    // executing — the same rendering (tree + `# route:` footer) the server
+    // serves. Without this check the embedded client silently EXECUTED the
+    // query, so an `EXPLAIN CREATE ...` wrote data.
+    if parsed.explain {
+        let rows = namidb_query::explain_plan_lines(parsed, &plan, snap, &catalog)
+            .into_iter()
+            .map(|line| {
+                let mut row = Row::new();
+                row.set("plan", RuntimeValue::String(line));
+                row
+            })
+            .collect();
+        return Ok(Some(QueryResult {
+            columns: vec!["plan".into()],
+            rows,
+        }));
+    }
+    if plan.contains_write() {
+        return Ok(None);
+    }
+
+    let rows = execute_with_limits(&plan, snap, params, deadline, row_cap)
+        .await
+        .map_err(exec_err_to_pyerr)?;
+    // One shared implementation across the embedded client, HTTP and Bolt:
+    // three surfaces disagreeing about column order is its own bug.
+    let columns = namidb_query::result_columns(&plan, &rows);
+    Ok(Some(QueryResult { columns, rows }))
+}
+
+/// The write side of [`run_cypher`], run under the held writer guard.
+async fn run_write(
+    guard: &mut WriterSession,
+    parsed: &Query,
+    params: &Params,
+    deadline: Option<Instant>,
+) -> PyResult<QueryResult> {
     // Schema DDL / introspection is intercepted before planning — these clauses
     // never lower to a `LogicalPlan`. Running them as the sole statement here
     // lets the embedded client issue them directly (no Bolt/HTTP round-trip).
@@ -864,56 +1794,12 @@ async fn run_cypher_inner(
         }
         return Ok(empty_query_result());
     }
-    if let Some(c) = parsed.as_show_schema() {
-        use namidb_query::parser::ast::ShowKind;
-        let snap = guard.snapshot();
-        let manifest = &snap.manifest().manifest;
-        let rows = match c.kind {
-            ShowKind::Constraints => show_constraints_rows(&manifest.schema),
-            ShowKind::Indexes => show_indexes_rows(manifest),
-        };
-        return Ok(QueryResult {
-            columns: show_schema_columns(),
-            rows,
-        });
-    }
-
     let catalog = StatsCatalog::from_manifest(&guard.snapshot().manifest().manifest);
-    let plan = build_plan(&parsed, &catalog).map_err(lower_err_to_pyerr)?;
-
-    // `EXPLAIN [RAW] [VERBOSE] <query>`: render the plan instead of
-    // executing — the same rendering (tree + `# route:` footer) the server
-    // serves. Without this check the embedded client silently EXECUTED the
-    // query, so an `EXPLAIN CREATE ...` wrote data.
-    if parsed.explain {
-        let snap = guard.snapshot();
-        let rows = namidb_query::explain_plan_lines(&parsed, &plan, &snap, &catalog)
-            .into_iter()
-            .map(|line| {
-                let mut row = Row::new();
-                row.set("plan", RuntimeValue::String(line));
-                row
-            })
-            .collect();
-        return Ok(QueryResult {
-            columns: vec!["plan".into()],
-            rows,
-        });
-    }
-
-    let rows = if plan.contains_write() {
-        let outcome = execute_write(&plan, guard, params)
-            .await
-            .map_err(exec_err_to_pyerr)?;
-        outcome.rows
-    } else {
-        let snap = guard.snapshot().with_cache(cache);
-        execute(&plan, &snap, params)
-            .await
-            .map_err(exec_err_to_pyerr)?
-    };
-    // One shared implementation across the embedded client, HTTP and Bolt:
-    // three surfaces disagreeing about column order is its own bug.
+    let plan = build_plan(parsed, &catalog).map_err(lower_err_to_pyerr)?;
+    let rows = execute_write_with_deadline(&plan, guard, params, deadline)
+        .await
+        .map_err(exec_err_to_pyerr)?
+        .rows;
     let columns = namidb_query::result_columns(&plan, &rows);
     Ok(QueryResult { columns, rows })
 }
@@ -1393,7 +2279,23 @@ fn lower_err_to_pyerr(e: LowerError) -> PyErr {
 }
 
 fn exec_err_to_pyerr(e: ExecError) -> PyErr {
-    PyRuntimeError::new_err(format!("Cypher execution error: {e}"))
+    match e {
+        _ if is_deadline(&e) => QueryTimeoutError::new_err(e.to_string()),
+        ExecError::RowCap(_) => QueryRowCapError::new_err(e.to_string()),
+        _ => PyRuntimeError::new_err(format!("Cypher execution error: {e}")),
+    }
+}
+
+/// Whether `e` is the query's own `timeout_ms` firing. Python has no admin
+/// cancel path, so a cancel can only come from the same deadline machinery.
+/// A deadline that fires in a write's commit tail arrives as a storage error.
+fn is_deadline(e: &ExecError) -> bool {
+    matches!(
+        e,
+        ExecError::Timeout
+            | ExecError::Cancelled
+            | ExecError::Storage(namidb_storage::Error::Timeout | namidb_storage::Error::Cancelled)
+    )
 }
 
 // ── pyarrow helpers ───────────────────────────────────────────────────
@@ -1427,7 +2329,27 @@ fn build_node_views_table(
         "lsn".to_string(),
         "schema_version".to_string(),
     ];
-    all_names.extend(prop_keys.iter().cloned());
+    // A property named like a metadata column (`id` kept from a legacy row
+    // keyed by `id`, or a business key) would make the schema ambiguous.
+    // Drop it when it only echoes the node id, else rename it `property.<key>`.
+    let prop_columns: Vec<(String, &String)> = prop_keys
+        .iter()
+        .filter_map(|key| {
+            if !all_names.contains(key) {
+                return Some((key.clone(), key));
+            }
+            // Compared as parsed ids: a legacy row may spell its UUID in
+            // upper case, braced or without hyphens.
+            let echoes_id = key == "id"
+                && views.iter().all(|v| match v.properties.get(key) {
+                    None => true,
+                    Some(Value::Str(s)) => s.parse::<NodeId>().is_ok_and(|id| id == v.id),
+                    Some(_) => false,
+                });
+            (!echoes_id).then(|| (format!("property.{key}"), key))
+        })
+        .collect();
+    all_names.extend(prop_columns.iter().map(|(name, _)| name.clone()));
 
     let ids = PyList::empty_bound(py);
     for v in views {
@@ -1465,10 +2387,10 @@ fn build_node_views_table(
     }
     arrays.append(pyarrow.call_method1("array", (svs,))?)?;
 
-    for key in prop_keys {
+    for (_, key) in &prop_columns {
         let pylist = PyList::empty_bound(py);
         for v in views {
-            let pyval = match v.properties.get(key) {
+            let pyval = match v.properties.get(*key) {
                 Some(val) => value_to_py(py, val)?,
                 None => py.None(),
             };
@@ -1485,9 +2407,35 @@ fn build_node_views_table(
 /// Surface every public name on the Rust extension; the wrapper at
 /// `python/namidb/__init__.py` re-exports them as `namidb.<name>`.
 #[pymodule]
-fn _lib(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _lib(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<QueryResult>()?;
+    m.add_class::<NodeIter>()?;
+    m.add_class::<EdgeIter>()?;
+    m.add(
+        "QueryTimeoutError",
+        py.get_type_bound::<QueryTimeoutError>(),
+    )?;
+    m.add("QueryRowCapError", py.get_type_bound::<QueryRowCapError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The commit tail cannot be hit on purpose from Python: a deadline that
+    // short fires while staging.
+    #[test]
+    fn a_deadline_in_the_commit_is_a_timeout() {
+        assert!(is_deadline(&ExecError::Timeout));
+        assert!(is_deadline(&ExecError::Storage(
+            namidb_storage::Error::Timeout
+        )));
+        assert!(is_deadline(&ExecError::Storage(
+            namidb_storage::Error::Cancelled
+        )));
+        assert!(!is_deadline(&ExecError::RowCap(1)));
+    }
 }

@@ -3,7 +3,8 @@
 //!
 //! Supported schemes:
 //!
-//! - `memory://<namespace>` — ephemeral, single-process.
+//! - `memory://<namespace>` (or `memory://?ns=<namespace>`): ephemeral,
+//!   single-process.
 //! - `file:///abs/dir?ns=<namespace>` (or `file://./rel?ns=<ns>`) —
 //!   local filesystem with manifest CAS via `flock` + atomic rename.
 //! - `s3://<bucket>[/<prefix>]?ns=<ns>[&region=...][&endpoint=...][&allow_http=true|false]`
@@ -110,14 +111,45 @@ fn parse_memory(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), Uri
     let rest = uri
         .strip_prefix("memory://")
         .expect("caller checked memory://");
-    if rest.is_empty() {
-        return Err(UriError::Malformed {
-            uri: uri.to_string(),
-            reason: "memory:// requires a namespace (e.g. memory://acme)".into(),
-        });
+    // The namespace is the authority (`memory://acme`) or `?ns=` like the
+    // other schemes (`memory://?ns=acme`); both is fine when they agree.
+    let (host, query) = match rest.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (rest, None),
+    };
+    let mut ns_query: Option<String> = None;
+    if let Some(q) = query {
+        for (key, val) in url::form_urlencoded::parse(q.as_bytes()) {
+            if key == "ns" || key == "namespace" {
+                ns_query = Some(val.into_owned());
+            } else {
+                // memory:// takes nothing else, so a typo like `?nss=`
+                // must not quietly open the host namespace.
+                return Err(UriError::Malformed {
+                    uri: uri.to_string(),
+                    reason: format!("unknown memory:// parameter '{key}'"),
+                });
+            }
+        }
     }
-    let namespace = NamespaceId::new(rest).map_err(|e| UriError::BadNamespace {
-        name: rest.to_string(),
+    let ns_str = match (host, ns_query) {
+        ("", None) => {
+            return Err(UriError::Malformed {
+                uri: uri.to_string(),
+                reason: "memory:// requires a namespace (e.g. memory://acme)".into(),
+            });
+        }
+        (h, Some(q)) if !h.is_empty() && h != q => {
+            return Err(UriError::Malformed {
+                uri: uri.to_string(),
+                reason: format!("memory:// namespace '{h}' conflicts with ?ns={q}"),
+            });
+        }
+        (_, Some(q)) => q,
+        (h, None) => h.to_string(),
+    };
+    let namespace = NamespaceId::new(&ns_str).map_err(|e| UriError::BadNamespace {
+        name: ns_str.clone(),
         reason: e.to_string(),
     })?;
     // Deliberately NOT marked create-only for pinned reads (unlike file://):
@@ -441,6 +473,35 @@ mod tests {
             parse_uri("memory://"),
             Err(UriError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn memory_accepts_ns_query() {
+        for uri in [
+            "memory://acme?ns=acme",
+            "memory://?ns=acme",
+            "memory://?namespace=acme",
+        ] {
+            let (_store, paths) = parse_uri(uri).unwrap();
+            assert_eq!(paths.namespace().as_str(), "acme", "{uri}");
+        }
+        assert!(matches!(
+            parse_uri("memory://acme?ns=other"),
+            Err(UriError::Malformed { .. })
+        ));
+        assert!(matches!(
+            parse_uri("memory://?ns="),
+            Err(UriError::BadNamespace { .. })
+        ));
+        for uri in ["memory://?foo=bar", "memory://acme?nss=prod"] {
+            let err = parse_uri(uri).expect_err(uri);
+            assert!(
+                err.to_string().contains("unknown memory:// parameter"),
+                "{uri}: {err}"
+            );
+        }
+        let (_store, paths) = parse_uri("memory://forensic_case").unwrap();
+        assert_eq!(paths.namespace().as_str(), "forensic_case");
     }
 
     #[test]

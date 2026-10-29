@@ -105,11 +105,12 @@ jobs:
         target:
           - { os: linux,   arch: x86_64,  rust_target: x86_64-unknown-linux-gnu,    runner: ubuntu-22.04, manylinux: "2_28" }
           - { os: linux,   arch: aarch64, rust_target: aarch64-unknown-linux-gnu,   runner: ubuntu-22.04, manylinux: "2_28" }
-          # macOS x86_64 (Intel) is intentionally not built: GitHub's
-          # `macos-13` runners are scarce and Intel Macs are <20 % of
-          # the Python install base on macOS. Users on Intel Macs fall
-          # back to the sdist.
           - { os: macos,   arch: arm64,   rust_target: aarch64-apple-darwin,        runner: macos-14,     manylinux: "" }
+          # Intel Macs and x86_64 Pythons on Apple silicon (Rosetta terminals,
+          # python3-intel64) need their own wheel or pip falls back to the
+          # sdist and a Rust build. Cross-built on macos-14, since macos-13
+          # runners are scarce.
+          - { os: macos,   arch: x86_64,  rust_target: x86_64-apple-darwin,         runner: macos-14,     manylinux: "" }
           - { os: windows, arch: x86_64,  rust_target: x86_64-pc-windows-msvc,      runner: windows-2022, manylinux: "" }
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -194,7 +195,7 @@ jobs:
 
           mapfile -t WHEELS < <(find dist -maxdepth 1 -type f -name '*.whl' -print | sort)
           mapfile -t SDISTS < <(find dist -maxdepth 1 -type f -name '*.tar.gz' -print)
-          test "${#WHEELS[@]}" -eq 4
+          test "${#WHEELS[@]}" -eq 5
           test "${#SDISTS[@]}" -eq 1
 
           for WHEEL in "${WHEELS[@]}"; do
@@ -220,7 +221,7 @@ jobs:
 
   # ── Smoke test: install one of the built wheels and import namidb ──────
   smoke-test:
-    name: smoke · ${{ matrix.os }} · py${{ matrix.python }}
+    name: smoke · ${{ matrix.os }} · py${{ matrix.python }}${{ matrix.arch && format(' · {0}', matrix.arch) || '' }}
     needs: build-wheels
     runs-on: ${{ matrix.os }}
     strategy:
@@ -230,6 +231,9 @@ jobs:
           - { os: ubuntu-22.04, python: "3.9",  artifact: wheel-linux-x86_64 }
           - { os: ubuntu-22.04, python: "3.13", artifact: wheel-linux-x86_64 }
           - { os: macos-14,     python: "3.12", artifact: wheel-macos-arm64 }
+          # An x64 Python on Apple silicon runs under Rosetta, which is the
+          # setup that used to fall back to the sdist.
+          - { os: macos-14,     python: "3.12", artifact: wheel-macos-x86_64, arch: x64 }
           - { os: windows-2022, python: "3.12", artifact: wheel-windows-x86_64 }
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -238,6 +242,20 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+      # The macOS Python is a universal2 build, which starts as arm64 on
+      # macos-14 unless told otherwise. Put a wrapper first on PATH so every
+      # later `python` runs the x86_64 slice under Rosetta.
+      - name: Run Python under Rosetta
+        if: matrix.arch == 'x64'
+        shell: bash
+        run: |
+          real="$(command -v python)"
+          mkdir -p "$RUNNER_TEMP/x64bin"
+          printf '#!/bin/bash\nexec arch -x86_64 "%s" "$@"\n' "$real" > "$RUNNER_TEMP/x64bin/python"
+          chmod +x "$RUNNER_TEMP/x64bin/python"
+          echo "$RUNNER_TEMP/x64bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/x64bin/python" -c "import platform; assert platform.machine() == 'x86_64', platform.machine()"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ matrix.artifact }}
@@ -277,11 +295,16 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          python -m pip install pytest pytest-asyncio pandas
           # polars 1.41.x SIGABRTs on the macos-14 / py3.12 runner during the
           # async cypher test (1.40.1 was fine on 2026-05-27); cap below 1.41
           # until the upstream regression clears. pip still picks the best
-          # 1.40.x per (OS, python) in the matrix.
-          python -m pip install pytest pytest-asyncio pandas 'polars<1.41'
+          # 1.40.x per (OS, python) in the matrix. Rosetta on macos-14 has no
+          # AVX, which the x86_64 polars wheel needs, so the x64 entry skips
+          # it and the polars test skips itself.
+          if [ "${{ matrix.arch }}" != "x64" ]; then
+            python -m pip install 'polars<1.41'
+          fi
           python -m pytest crates/namidb-py/tests -v
 
   # ── PyPI publish (only on tag push, OIDC trusted publisher) ────────────
@@ -326,8 +349,8 @@ jobs:
               path.name: hashlib.sha256(path.read_bytes()).hexdigest()
               for path in artifacts
           }
-          if len(local) != 5:
-              raise SystemExit(f"expected 5 local distributions, found {sorted(local)}")
+          if len(local) != 6:
+              raise SystemExit(f"expected 6 local distributions, found {sorted(local)}")
 
           request = urllib.request.Request(
               f"https://pypi.org/pypi/namidb/{version}/json",
@@ -356,7 +379,7 @@ jobs:
                   f"unexpected={unexpected}, hash_mismatch={mismatched}"
               )
           print(
-              f"PyPI preflight ok: {len(remote)}/5 byte-identical files "
+              f"PyPI preflight ok: {len(remote)}/6 byte-identical files "
               "already present"
           )
           PY
@@ -414,7 +437,7 @@ jobs:
                   for item in payload["urls"]
               }
               if remote == local:
-                  print("PyPI release verified: exactly 5 byte-identical files")
+                  print("PyPI release verified: exactly 6 byte-identical files")
                   break
 
               unexpected = sorted(remote.keys() - local.keys())

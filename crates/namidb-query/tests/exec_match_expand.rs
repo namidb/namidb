@@ -545,6 +545,163 @@ async fn optional_match_yields_null_when_no_neighbour() {
     assert_eq!(rows.len(), 5);
 }
 
+/// Run `query` over the friend graph (no LIKES edges, so an
+/// `OPTIONAL MATCH (a)-[:LIKES]->(b)` binds `b` to NULL on every row).
+async fn run_on_friend_graph(name: &str, query: &str) -> Vec<namidb_query::Row> {
+    let mut writer = WriterSession::open(store(), paths(name)).await.unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+    let plan = lower(&parse(query).unwrap()).unwrap();
+    execute(&plan, &snapshot, &Params::new()).await.unwrap()
+}
+
+#[tokio::test]
+async fn chained_optional_match_from_null_source_keeps_rows() {
+    let rows = run_on_friend_graph(
+        "exec-opt-null-src",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         OPTIONAL MATCH (b)-[r:KNOWS]->(c) \
+         RETURN a.name AS name, b, r, c",
+    )
+    .await;
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        for col in ["b", "r", "c"] {
+            assert!(matches!(row.get(col), Some(RuntimeValue::Null)), "{col}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn chained_optional_var_length_from_null_source_keeps_rows() {
+    // Hop 0 must not bind the NULL source as `c`.
+    let rows = run_on_friend_graph(
+        "exec-opt-null-src-varlen",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         OPTIONAL MATCH (b)-[:KNOWS*0..2]->(c) \
+         RETURN a.name AS name, c",
+    )
+    .await;
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        assert!(matches!(row.get("c"), Some(RuntimeValue::Null)));
+    }
+}
+
+#[tokio::test]
+async fn match_from_null_source_yields_no_rows() {
+    let rows = run_on_friend_graph(
+        "exec-null-src-match",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         MATCH (b)-[:KNOWS]->(c) \
+         RETURN c",
+    )
+    .await;
+    assert!(rows.is_empty());
+
+    let rows = run_on_friend_graph(
+        "exec-null-src-with",
+        "WITH null AS n MATCH (n)-[:KNOWS]->(m) RETURN m",
+    )
+    .await;
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn match_from_non_node_source_still_errors() {
+    let mut writer = WriterSession::open(store(), paths("exec-int-src"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+    let plan = lower(&parse("WITH 1 AS n MATCH (n)-[:KNOWS]->(m) RETURN m").unwrap()).unwrap();
+    let err = execute(&plan, &snapshot, &Params::new()).await.unwrap_err();
+    assert!(err.to_string().contains("is not a Node"), "{err}");
+}
+
+#[tokio::test]
+async fn optional_shortest_path_from_null_source_binds_null_path() {
+    let rows = run_on_friend_graph(
+        "exec-opt-null-shortest",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         OPTIONAL MATCH p = shortestPath((b)-[:KNOWS*..5]->(a)) \
+         RETURN a.name AS name, p",
+    )
+    .await;
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+        assert!(matches!(row.get("p"), Some(RuntimeValue::Null)));
+    }
+}
+
+#[tokio::test]
+async fn optional_shortest_path_without_match_binds_null_path() {
+    // Non-NULL source, no path (no LIKES edges): `p` is NULL, not unbound.
+    let rows = run_on_friend_graph(
+        "exec-opt-shortest-nomatch",
+        "MATCH (a:Person), (b:Person) WHERE a <> b \
+         OPTIONAL MATCH p = shortestPath((a)-[:LIKES*..5]->(b)) \
+         RETURN p",
+    )
+    .await;
+    assert_eq!(rows.len(), 20);
+    for row in &rows {
+        assert!(matches!(row.get("p"), Some(RuntimeValue::Null)));
+    }
+}
+
+#[tokio::test]
+async fn optional_fixed_length_path_without_match_is_null() {
+    // A fixed-length path is assembled from its elements; an unmatched
+    // element makes the whole path NULL, not a path holding NULLs.
+    for (name, query) in [
+        (
+            "exec-opt-fixed-path-nomatch",
+            "MATCH (a:Person) OPTIONAL MATCH p = (a)-[:LIKES]->(b) RETURN p",
+        ),
+        (
+            "exec-opt-fixed-path-null-src",
+            "MATCH (a:Person) \
+             OPTIONAL MATCH (a)-[:LIKES]->(b) \
+             OPTIONAL MATCH p = (b)-[:KNOWS]->(c) \
+             RETURN p",
+        ),
+    ] {
+        let rows = run_on_friend_graph(name, query).await;
+        assert_eq!(rows.len(), 5, "{query}");
+        for row in &rows {
+            assert!(matches!(row.get("p"), Some(RuntimeValue::Null)), "{query}");
+        }
+    }
+
+    // A matched fixed-length path is still a path.
+    let rows = run_on_friend_graph(
+        "exec-opt-fixed-path-match",
+        "MATCH (a:Person) OPTIONAL MATCH p = (a)-[:KNOWS]->(b) RETURN p",
+    )
+    .await;
+    assert!(rows
+        .iter()
+        .any(|row| matches!(row.get("p"), Some(RuntimeValue::Path(_)))));
+}
+
+#[tokio::test]
+async fn not_exists_from_null_source_is_true() {
+    let rows = run_on_friend_graph(
+        "exec-exists-null-src",
+        "MATCH (a:Person) \
+         OPTIONAL MATCH (a)-[:LIKES]->(b) \
+         WITH a, b WHERE NOT EXISTS((b)-[:KNOWS]->()) \
+         RETURN a.name AS name",
+    )
+    .await;
+    assert_eq!(rows.len(), 5);
+}
+
 #[tokio::test]
 async fn exists_predicate_filters_via_semiapply() {
     let mut writer = WriterSession::open(store(), paths("exec-exists"))
@@ -1610,6 +1767,50 @@ async fn element_id_filter_lowers_to_point_lookup() {
             assert_eq!(n.properties.get("name").cloned(), name);
         }
         other => panic!("expected the looked-up node, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn match_with_id_in_list_uses_node_by_id() {
+    use namidb_query::{parse_lower_optimize, StatsCatalog};
+
+    let mut writer = WriterSession::open(store(), paths("exec-id-in"))
+        .await
+        .unwrap();
+    let ids = build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+
+    let mut params = Params::new();
+    params.insert(
+        "ids".into(),
+        RuntimeValue::List(vec![
+            RuntimeValue::String(ids[2].to_string()),
+            RuntimeValue::String(ids[0].to_string()),
+            RuntimeValue::String(ids[2].to_string()),
+            RuntimeValue::Null,
+            RuntimeValue::String("not-a-uuid".into()),
+        ]),
+    );
+    for query in [
+        "MATCH (a:Person) WHERE id(a) IN $ids RETURN a.name AS name",
+        "MATCH (a) WHERE elementId(a) IN $ids RETURN a.name AS name",
+    ] {
+        let plan = parse_lower_optimize(query, &StatsCatalog::empty()).unwrap();
+        assert!(
+            has_node_by_id(&plan) && !explain(&plan).contains("NodeScan"),
+            "`{query}` must seek each id instead of scanning:\n{}",
+            explain(&plan)
+        );
+        let rows = execute(&plan, &snapshot, &params).await.unwrap();
+        let mut names: Vec<_> = rows
+            .iter()
+            .map(|row| match row.get("name") {
+                Some(RuntimeValue::String(s)) => s.clone(),
+                other => panic!("unexpected: {other:?}"),
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["Alice", "Carol"], "`{query}`");
     }
 }
 

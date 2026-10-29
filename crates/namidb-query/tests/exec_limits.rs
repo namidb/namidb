@@ -10,8 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use namidb_core::id::{NamespaceId, NodeId};
+use namidb_core::schema::Schema;
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
+use namidb_storage::{
+    EdgeWriteRecord, NamespacePaths, NodeWriteRecord, SessionCaches, SstCache, WriterSession,
+};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -97,6 +100,115 @@ async fn row_cap_aborts_a_scan_over_the_cap() {
         .await
         .expect_err("a scan over the row cap must abort");
     assert!(matches!(err, ExecError::RowCap(2)), "got {err:?}");
+}
+
+/// 200 `Item` nodes chained by `LINK` edges (each node but one has an
+/// out-edge). With `flush` the nodes sit in one node SST, where the limited
+/// scan can stop early; without it they stay in the memtable.
+async fn seed_chain(name: &str, flush: bool) -> (WriterSession, SstCache) {
+    let cache = SstCache::new(8 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths(name), caches)
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = (0..200).map(|_| NodeId::new()).collect();
+    for id in &ids {
+        writer
+            .upsert_node("Item", *id, &NodeWriteRecord::default())
+            .unwrap();
+    }
+    for pair in ids.windows(2) {
+        writer
+            .upsert_edge("LINK", pair[0], pair[1], &EdgeWriteRecord::default())
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    if flush {
+        writer.flush(Schema::empty()).await.unwrap();
+    }
+    (writer, cache)
+}
+
+#[tokio::test]
+async fn row_cap_on_unlabelled_scan_reads_one_past_the_cap() {
+    let (writer, cache) = seed_chain("limits-rowcap-unlabelled", true).await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (n) RETURN n").unwrap()).unwrap();
+    let err = execute_with_limits(&plan, &snap, &Params::new(), None, Some(2))
+        .await
+        .expect_err("an unlabelled scan over the row cap must abort");
+    assert!(matches!(err, ExecError::RowCap(2)), "got {err:?}");
+    assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+    assert_eq!(cache.limited_node_scan_output_rows(), 3);
+
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, Some(200))
+        .await
+        .expect("a cap at the node count must not abort");
+    assert_eq!(rows.len(), 200);
+}
+
+#[tokio::test]
+async fn row_cap_above_the_node_count_keeps_the_plain_scan() {
+    // The manifest proves 200 nodes cannot reach a cap of 1000, so the scan
+    // stays on the plain read, which caches the SST body for the next query.
+    let (writer, cache) = seed_chain("limits-rowcap-plain", true).await;
+    let snap = writer.snapshot();
+    for query in ["MATCH (n) RETURN n", "MATCH (n:Item) RETURN n"] {
+        let plan = lower(&parse(query).unwrap()).unwrap();
+        let rows = execute_with_limits(&plan, &snap, &Params::new(), None, Some(1000))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 200, "{query}");
+    }
+    assert_eq!(cache.limited_node_scan_fast_paths(), 0);
+    assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+}
+
+#[tokio::test]
+async fn limit_over_expand_reads_one_round_of_seeds() {
+    let (writer, cache) = seed_chain("limits-seed-pull-round", true).await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (x)-->(y) RETURN x, y LIMIT 1").unwrap()).unwrap();
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+    assert_eq!(cache.limited_node_scan_output_rows(), 64);
+}
+
+#[tokio::test]
+async fn row_cap_does_not_trip_when_the_first_seeds_fill_the_limit() {
+    let (writer, cache) = seed_chain("limits-rowcap-seed-pull", true).await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (x)-->(y) RETURN x, y LIMIT 1").unwrap()).unwrap();
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, Some(10))
+        .await
+        .expect("one seed fills the limit, far below the cap");
+    assert_eq!(rows.len(), 1);
+    assert!(cache.limited_node_scan_output_rows() <= 11);
+
+    // Nothing matches, so the pull has to go past the cap and reports it.
+    let plan = lower(&parse("MATCH (x)-[:MISSING]->(y) RETURN x, y LIMIT 1").unwrap()).unwrap();
+    let err = execute_with_limits(&plan, &snap, &Params::new(), None, Some(10))
+        .await
+        .expect_err("200 seeds against a cap of 10 must abort");
+    assert!(matches!(err, ExecError::RowCap(10)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn limit_over_expand_scans_memtable_nodes_once() {
+    // With nodes in the memtable a limited scan reconciles everything, so
+    // the seed pull must not run it round after round.
+    let (writer, cache) = seed_chain("limits-seed-pull-memtable", false).await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (x)-[:MISSING]->(y) RETURN x, y LIMIT 1").unwrap()).unwrap();
+    let rows = execute_with_limits(&plan, &snap, &Params::new(), None, None)
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(cache.limited_node_scan_fallbacks(), 0);
 }
 
 #[tokio::test]

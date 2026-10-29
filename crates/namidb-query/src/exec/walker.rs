@@ -141,6 +141,17 @@ pub(crate) fn resolve_row_count(
 /// before the first candidate exists.
 const MAX_EAGER_QUERY_CAPACITY: usize = 64;
 
+/// Largest seed round an Expand pulls from a labelled or filtered node scan
+/// over overlapping SSTs. Such a scan can be served by the label postings,
+/// the numeric range index or the merge, and every round restarts it, so
+/// when the seeds rarely expand the rounds could add up to several passes
+/// over the label (a full reconcile each, if the merge falls back). Past
+/// this the remaining round is one full scan. The unlabelled, unfiltered
+/// scan only has the merge, whose rounds grow like on disjoint SSTs.
+// ponytail: fixed cut (64 + 256 + 1024 + 4096 seeds at most); resume each
+// round after the last seed id if selective seed pulls get common.
+const OVERLAP_SEED_PULL_MAX: usize = 4096;
+
 #[inline]
 fn query_initial_capacity(requested: usize, available: usize) -> usize {
     requested.min(available).min(MAX_EAGER_QUERY_CAPACITY)
@@ -279,26 +290,23 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 Ok(out)
             }
 
-            LogicalPlan::Apply { input, subplan } => {
-                // Correlated lateral join: for each outer row, run the subplan
-                // with that row as the correlation and emit the row combined
-                // with each subplan row.
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional,
+            } => {
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                let mut out = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let sub_rows =
-                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
-                            .await?;
-                    for s in sub_rows {
-                        let mut merged = row.clone();
-                        for (k, v) in &s.bindings {
-                            merged.set(k.clone(), v.clone());
-                        }
-                        out.push(merged);
-                    }
-                }
-                Ok(out)
+                apply_rows(
+                    rows,
+                    subplan,
+                    optional.as_deref(),
+                    snapshot,
+                    params,
+                    routing,
+                    None,
+                )
+                .await
             }
 
             LogicalPlan::Create { .. }
@@ -389,31 +397,15 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 predicates,
                 projection,
             } => {
-                let mut rows: Vec<Row> = Vec::new();
-                let nodes = match label.as_deref() {
-                    Some(label_name) => {
-                        snapshot
-                            .scan_label_with_predicates_and_projection(
-                                label_name,
-                                predicates,
-                                projection.as_deref(),
-                            )
-                            .await?
-                    }
-                    None => {
-                        snapshot
-                            .scan_all_nodes_with_predicates_and_projection(
-                                predicates,
-                                projection.as_deref(),
-                            )
-                            .await?
-                    }
-                };
-                for n in nodes {
-                    let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
-                    rows.push(Row::new().with(alias.clone(), value));
-                }
-                Ok(rows)
+                scan_nodes(
+                    snapshot,
+                    label.as_deref(),
+                    alias,
+                    predicates,
+                    projection.as_deref(),
+                    row_cap_scan_limit(snapshot, label.as_deref()),
+                )
+                .await
             }
 
             LogicalPlan::NodeById {
@@ -424,21 +416,24 @@ pub(crate) fn execute_inner_with_routing<'a>(
             } => {
                 let input_rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                let mut out = Vec::with_capacity(input_rows.len());
+                let mut keyed = Vec::with_capacity(input_rows.len());
                 for row in input_rows {
-                    let id_value = evaluate(id, &row, params)?;
-                    let node_id = node_id_from_value(&id_value, id.span)?;
-                    let found = match label {
-                        Some(l) => snapshot.lookup_node(l, node_id).await?,
-                        None => scan_node_for_id(snapshot, node_id).await?,
-                    };
-                    if let Some(view) = found {
-                        let mut new_row = row;
-                        new_row.set(
+                    if let Some(node_id) = seek_node_id(&evaluate(id, &row, params)?) {
+                        keyed.push((row, node_id));
+                    }
+                }
+                let ids: Vec<NodeId> = keyed.iter().map(|(_, node_id)| *node_id).collect();
+                let found = snapshot
+                    .batch_lookup_nodes(label.as_deref().unwrap_or(""), &ids)
+                    .await?;
+                let mut out = Vec::with_capacity(keyed.len());
+                for ((mut row, _), view) in keyed.into_iter().zip(found) {
+                    if let Some(view) = view {
+                        row.set(
                             alias.clone(),
                             RuntimeValue::Node(Box::new(NodeValue::from(view))),
                         );
-                        out.push(new_row);
+                        out.push(row);
                     }
                 }
                 Ok(out)
@@ -1058,6 +1053,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 back_reference,
                 shortest,
                 path_binding,
+                unique_rels,
             } => {
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
@@ -1075,6 +1071,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     *back_reference,
                     *shortest,
                     path_binding.as_deref(),
+                    unique_rels,
                     snapshot,
                     routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
@@ -1145,8 +1142,9 @@ pub(crate) fn execute_inner_with_routing<'a>(
 /// of the output is a valid prefix of the full result:
 ///   * non-`DISTINCT` `Project` — 1:1, order-preserving → pass cap through;
 ///   * `Expand` — 1:N, order-preserving → run its own input UNCAPPED (a
-///     zero-edge seed yields no rows and must not starve the budget) and
-///     stop the expansion at a seed boundary once `out.len() >= cap`;
+///     zero-edge seed yields no rows and must not starve the budget), or,
+///     over a `NodeScan`, pull growing seed prefixes until the budget
+///     fills; stop the expansion at a seed boundary once `out.len() >= cap`;
 ///   * `NodeScan` — leaf → stop after `cap` rows (counter is global across
 ///     labels; predicates are pre-applied so truncation is safe).
 /// EVERY other operator drops, reorders, dedups, expands-by-data, or
@@ -1217,36 +1215,102 @@ fn execute_capped<'a>(
                 back_reference,
                 shortest,
                 path_binding,
+                unique_rels,
             } => {
-                let rows =
-                    execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                let length = resolve_length(length, params)?;
-                execute_expand(
-                    rows,
-                    source,
-                    edge_type.as_deref(),
-                    *direction,
-                    rel_alias.as_deref(),
+                let resolved = resolve_length(length, params)?;
+                let edge_read_mode =
+                    routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref());
+                let skip_target_materialize = should_skip_target_materialize(
+                    routing,
                     target_alias,
-                    target_labels,
-                    length.clone(),
-                    *optional,
-                    *back_reference,
-                    *shortest,
                     path_binding.as_deref(),
-                    snapshot,
-                    routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
-                    should_skip_target_materialize(
-                        routing,
-                        target_alias,
-                        path_binding.as_deref(),
-                        length,
-                        *back_reference,
+                    resolved.clone(),
+                    *back_reference,
+                );
+                // A NodeScan seed source is pulled as a growing scan-order
+                // prefix instead of in full: `MATCH (x)-->(y) LIMIT 10` over
+                // millions of nodes must not materialise every node first.
+                // Each round expands only the seeds the previous one did not
+                // see, so `out` stays the same prefix as the uncapped result
+                // and edgeless seeds cannot starve the budget. Memtable nodes
+                // and overlapping SSTs are merged in id order by the limited
+                // scan, so they stop early too. Any other input, or the
+                // full-body diagnostic read mode, runs uncapped once.
+                // NOTE: when few seeds match, the rounds rescan the prefix
+                // (between about 1.33x and 2.33x a full scan) and end up
+                // holding every seed; only the row cap bounds that case.
+                // Over overlapping SSTs a labelled or filtered scan switches
+                // to one uncapped round past OVERLAP_SEED_PULL_MAX seeds.
+                let (mut want, overlapping) = match input.as_ref() {
+                    LogicalPlan::NodeScan {
+                        label, predicates, ..
+                    } if snapshot.node_scan_stops_early() => (
+                        Some(cap.max(64)),
+                        !snapshot.node_scan_is_disjoint()
+                            && (label.is_some() || !predicates.is_empty()),
                     ),
-                    Some(cap),
-                    false,
-                )
-                .await
+                    _ => (None, false),
+                };
+                let row_cap = crate::exec::limits::scoped_row_cap();
+                let mut out: Vec<Row> = Vec::new();
+                let mut seen = 0usize;
+                let mut scan_time = std::time::Duration::ZERO;
+                loop {
+                    let (rows, exhausted) = match want {
+                        Some(w) => {
+                            // One seed past the row cap is enough to tell
+                            // "more seeds" from "exhausted".
+                            let w = row_cap.map_or(w, |rc| w.min(rc.saturating_add(1)));
+                            crate::exec::limits::check_deadline()?;
+                            let start = std::time::Instant::now();
+                            let rows =
+                                execute_capped(input, snapshot, params, outer, routing, w).await?;
+                            scan_time += start.elapsed();
+                            crate::profile::record_op(input, scan_time, rows.len() as u64);
+                            let exhausted = rows.len() < w;
+                            (rows, exhausted)
+                        }
+                        None => (
+                            execute_inner_with_routing(input, snapshot, params, outer, routing)
+                                .await?,
+                            true,
+                        ),
+                    };
+                    let total = rows.len();
+                    let fresh: Vec<Row> = rows.into_iter().skip(seen).collect();
+                    seen = total;
+                    let mut expanded = execute_expand(
+                        fresh,
+                        source,
+                        edge_type.as_deref(),
+                        *direction,
+                        rel_alias.as_deref(),
+                        target_alias,
+                        target_labels,
+                        resolved.clone(),
+                        *optional,
+                        *back_reference,
+                        *shortest,
+                        path_binding.as_deref(),
+                        unique_rels,
+                        snapshot,
+                        edge_read_mode,
+                        skip_target_materialize,
+                        Some(cap - out.len()),
+                        false,
+                    )
+                    .await?;
+                    out.append(&mut expanded);
+                    if out.len() >= cap || exhausted {
+                        return Ok(out);
+                    }
+                    // The budget is still open and more seeds remain, so
+                    // the next round would hold more than this one.
+                    crate::exec::limits::check_row_cap(total)?;
+                    want = want
+                        .map(|w| w.saturating_mul(4))
+                        .filter(|w| !overlapping || *w <= OVERLAP_SEED_PULL_MAX);
+                }
             }
 
             LogicalPlan::NodeByPropertyValue {
@@ -1295,33 +1359,35 @@ fn execute_capped<'a>(
                 predicates,
                 projection,
             } => {
-                let mut rows: Vec<Row> = Vec::new();
-                let nodes = match label.as_deref() {
-                    Some(label_name) => {
-                        snapshot
-                            .scan_label_with_predicates_and_projection_limited(
-                                label_name,
-                                predicates,
-                                projection.as_deref(),
-                                cap,
-                            )
-                            .await?
-                    }
-                    None => {
-                        snapshot
-                            .scan_all_nodes_with_predicates_and_projection_limited(
-                                predicates,
-                                projection.as_deref(),
-                                cap,
-                            )
-                            .await?
-                    }
-                };
-                for n in nodes {
-                    let value = RuntimeValue::Node(Box::new(NodeValue::from(n)));
-                    rows.push(Row::new().with(alias.clone(), value));
-                }
-                Ok(rows)
+                scan_nodes(
+                    snapshot,
+                    label.as_deref(),
+                    alias,
+                    predicates,
+                    projection.as_deref(),
+                    Some(cap),
+                )
+                .await
+            }
+
+            // An OPTIONAL MATCH keeps every input row at least once (matched
+            // or padded), so `cap` input rows already fill the budget.
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional: Some(pad),
+            } => {
+                let rows = execute_capped(input, snapshot, params, outer, routing, cap).await?;
+                apply_rows(
+                    rows,
+                    subplan,
+                    Some(pad),
+                    snapshot,
+                    params,
+                    routing,
+                    Some(cap),
+                )
+                .await
             }
 
             // Cap unsafe to push through this operator — run it in full.
@@ -1329,6 +1395,116 @@ fn execute_capped<'a>(
         }
     }
     .boxed()
+}
+
+/// The per-row half of a correlated `Apply`: run `subplan` once per input
+/// row with that row as the correlation, and emit the row combined with
+/// each subplan row. With `optional` (a whole-pattern OPTIONAL MATCH) a row
+/// the subplan rejects is kept once with the `optional` aliases set to NULL.
+/// `cap` stops once that many rows are out, for a LIMIT above.
+pub(crate) async fn apply_rows(
+    rows: Vec<Row>,
+    subplan: &LogicalPlan,
+    optional: Option<&[String]>,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+    routing: &PlanRouting,
+    cap: Option<usize>,
+) -> Result<Vec<Row>, ExecError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if cap.is_some_and(|cap| out.len() >= cap) {
+            break;
+        }
+        let sub_rows =
+            execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
+        if sub_rows.is_empty() {
+            if let Some(pad) = optional {
+                let mut padded = row;
+                for name in pad {
+                    padded.set(name.clone(), RuntimeValue::Null);
+                }
+                out.push(padded);
+            }
+            continue;
+        }
+        for s in sub_rows {
+            let mut merged = row.clone();
+            for (k, v) in &s.bindings {
+                merged.set(k.clone(), v.clone());
+            }
+            out.push(merged);
+        }
+    }
+    Ok(out)
+}
+
+/// Scan limit that keeps a leaf node scan under the scoped row cap: one row
+/// past the cap, so the operator guard still reports RowCap but the scan never
+/// holds more than cap + 1 nodes. `None` without a cap, or when the manifest
+/// proves the scan cannot reach it: the plain scan keeps caching the SST body,
+/// which the ranged limited read does not.
+fn row_cap_scan_limit(snapshot: &Snapshot<'_>, label: Option<&str>) -> Option<usize> {
+    let cap = crate::exec::limits::scoped_row_cap()?;
+    let count = snapshot
+        .metadata_node_count(label)
+        .or_else(|| label.and_then(|_| snapshot.metadata_node_count(None)));
+    if count.is_some_and(|count| count <= cap as u64) {
+        return None;
+    }
+    Some(cap.saturating_add(1))
+}
+
+/// Leaf `NodeScan`: one row per live node, binding `alias`. With `limit`
+/// the storage scan stops after that many rows (a scan-order prefix).
+async fn scan_nodes(
+    snapshot: &Snapshot<'_>,
+    label: Option<&str>,
+    alias: &str,
+    predicates: &[namidb_storage::sst::predicates::ScanPredicate],
+    projection: Option<&[String]>,
+    limit: Option<usize>,
+) -> Result<Vec<Row>, ExecError> {
+    let nodes = scan_node_views(snapshot, label, predicates, projection, limit).await?;
+    Ok(nodes
+        .into_iter()
+        .map(|n| Row::new().with(alias, RuntimeValue::Node(Box::new(NodeValue::from(n)))))
+        .collect())
+}
+
+async fn scan_node_views(
+    snapshot: &Snapshot<'_>,
+    label: Option<&str>,
+    predicates: &[namidb_storage::sst::predicates::ScanPredicate],
+    projection: Option<&[String]>,
+    limit: Option<usize>,
+) -> Result<Vec<namidb_storage::NodeView>, ExecError> {
+    Ok(match (label, limit) {
+        (Some(label), Some(limit)) => {
+            snapshot
+                .scan_label_with_predicates_and_projection_limited(
+                    label, predicates, projection, limit,
+                )
+                .await?
+        }
+        (Some(label), None) => {
+            snapshot
+                .scan_label_with_predicates_and_projection(label, predicates, projection)
+                .await?
+        }
+        (None, Some(limit)) => {
+            snapshot
+                .scan_all_nodes_with_predicates_and_projection_limited(
+                    predicates, projection, limit,
+                )
+                .await?
+        }
+        (None, None) => {
+            snapshot
+                .scan_all_nodes_with_predicates_and_projection(predicates, projection)
+                .await?
+        }
+    })
 }
 
 // ───────────────────────── Expand ────────────────────────────────────
@@ -1383,6 +1559,7 @@ async fn try_execute_endpoint_distinct_project(
         back_reference: false,
         shortest: crate::plan::ShortestMode::None,
         path_binding: None,
+        unique_rels,
     } = input
     else {
         return Ok(None);
@@ -1426,6 +1603,7 @@ async fn try_execute_endpoint_distinct_project(
         false,
         crate::plan::ShortestMode::None,
         None,
+        unique_rels,
         snapshot,
         routing.edge_read_mode(rel_alias.as_deref(), None),
         should_skip_target_materialize(routing, target_alias, None, resolved, false),
@@ -1507,6 +1685,7 @@ pub(crate) async fn execute_expand(
     back_reference: bool,
     shortest: crate::plan::ShortestMode,
     path_binding: Option<&str>,
+    unique_rels: &[String],
     snapshot: &Snapshot<'_>,
     edge_read_mode: EdgeReadMode,
     skip_target_materialize: bool,
@@ -1594,6 +1773,20 @@ pub(crate) async fn execute_expand(
         }
         let starting = match row.get(source) {
             Some(RuntimeValue::Node(n)) => n.id,
+            // A NULL source (padded by an earlier OPTIONAL MATCH) matches
+            // nothing: OPTIONAL pads again, a plain MATCH drops the row.
+            Some(RuntimeValue::Null) => {
+                if optional {
+                    out.push(optional_null_row(
+                        row,
+                        rel_alias,
+                        target_alias,
+                        back_reference,
+                        path_binding,
+                    ));
+                }
+                continue;
+            }
             _ => {
                 return Err(ExecError::Runtime(format!(
                     "Expand source `{}` is not a Node",
@@ -1601,6 +1794,8 @@ pub(crate) async fn execute_expand(
                 )))
             }
         };
+
+        let bound_rels = bound_rel_keys(unique_rels.iter().map(|name| row.get(name)));
 
         // Back-reference: read the existing binding once. The
         // traversal explores the frontier freely; only paths whose
@@ -1890,6 +2085,9 @@ pub(crate) async fn execute_expand(
                                 out.len() + hop_results.len() + next_frontier.len(),
                             )?;
                         }
+                        if reuses_bound_rel(&bound_rels, edge) {
+                            continue;
+                        }
                         let target_id = partner_id(edge, direction, step.tail);
                         if prune_visits {
                             // Reached at an earlier level → any path through it now
@@ -1957,13 +2155,15 @@ pub(crate) async fn execute_expand(
                                 continue;
                             }
                             None
-                        } else if let ExpandTargets::Views(views) = &target_membership {
+                        } else if let ExpandTargets::Views(views, rejected) = &target_membership {
                             // The hop's own materialisation answers directly, so a
                             // large fan-out no longer depends on cache retention.
                             // The batch resolves by id across every descriptor, so
                             // it describes nodes of ANY label — which is what lets
                             // a multi-hop traversal use it too.
                             match views.get(&target_id) {
+                                // Proven not to carry the label (single hop).
+                                None if rejected.contains(&target_id) => continue,
                                 Some(v) => {
                                     if target_labels.iter().all(|l| v.labels.contains(l)) {
                                         Some(v.clone())
@@ -1997,6 +2197,10 @@ pub(crate) async fn execute_expand(
                                     None => continue,
                                 },
                             }
+                        } else if matches!(&target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
+                        {
+                            // Proven not to carry the label (single hop, over budget).
+                            continue;
                         } else if let Some(label) = target_labels.first() {
                             if max > 1 {
                                 // Multi-hop: traverse through any existing node; the
@@ -2207,17 +2411,38 @@ pub(crate) async fn execute_expand(
         if matched_any {
             out.append(&mut hop_results);
         } else if optional {
-            let mut empty = row.clone();
-            if let Some(name) = rel_alias {
-                empty.set(name, RuntimeValue::Null);
-            }
-            if !back_reference {
-                empty.set(target_alias.to_string(), RuntimeValue::Null);
-            }
-            out.push(empty);
+            out.push(optional_null_row(
+                row,
+                rel_alias,
+                target_alias,
+                back_reference,
+                path_binding,
+            ));
         }
     }
     Ok(out)
+}
+
+/// The row an OPTIONAL Expand emits for a seed with no match: the
+/// relationship, the target (unless it was already bound) and the path
+/// binding all become NULL.
+fn optional_null_row(
+    mut row: Row,
+    rel_alias: Option<&str>,
+    target_alias: &str,
+    back_reference: bool,
+    path_binding: Option<&str>,
+) -> Row {
+    if let Some(name) = rel_alias {
+        row.set(name, RuntimeValue::Null);
+    }
+    if !back_reference {
+        row.set(target_alias, RuntimeValue::Null);
+    }
+    if let Some(name) = path_binding {
+        row.set(name, RuntimeValue::Null);
+    }
+    row
 }
 
 /// Flip a pattern direction for the reverse side of a bidirectional BFS.
@@ -2448,6 +2673,19 @@ async fn execute_expand_shortest_grouped(
         crate::exec::limits::check_row_cap(out.len())?;
         let starting = match rows[i].get(source) {
             Some(RuntimeValue::Node(n)) => n.id,
+            Some(RuntimeValue::Null) => {
+                if optional {
+                    out.push(optional_null_row(
+                        rows[i].clone(),
+                        rel_alias,
+                        target_alias,
+                        true,
+                        path_binding,
+                    ));
+                }
+                i += 1;
+                continue;
+            }
             _ => {
                 return Err(ExecError::Runtime(format!(
                     "Expand source `{}` is not a Node",
@@ -2694,11 +2932,13 @@ async fn execute_expand_shortest_grouped(
                     }
                 }
                 _ if optional => {
-                    let mut empty = row.clone();
-                    if let Some(name) = rel_alias {
-                        empty.set(name, RuntimeValue::Null);
-                    }
-                    out.push(empty);
+                    out.push(optional_null_row(
+                        row.clone(),
+                        rel_alias,
+                        target_alias,
+                        true,
+                        path_binding,
+                    ));
                 }
                 _ => {}
             }
@@ -2783,14 +3023,15 @@ async fn flat_call_procedure(
     }
 
     // Shared projection options ({labels, edge_types, direction}) restrict the
-    // graph build; algorithm-specific keys are parsed per procedure below.
+    // graph build. Each arm parses its own options BEFORE building the graph,
+    // so a typo or an unknown procedure fails without a full-store scan.
     let projection = algo_projection(args, params)?;
-    let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
 
     // Canonical output: column names + one RuntimeValue per column per row.
     let (cols, raw): (Vec<&'static str>, Vec<Vec<RuntimeValue>>) = match name {
         "wcc" => {
             require_projection_only("wcc", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             // Poll the query deadline mid-computation so a runaway CALL on a
             // huge graph is interruptible, not just at the operator boundary.
             let comps = namidb_graph::algo::weakly_connected_components_cancellable(
@@ -2809,6 +3050,7 @@ async fn flat_call_procedure(
         }
         "pagerank" => {
             let opts = pagerank_options(args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let pr = namidb_graph::algo::pagerank_cancellable(
                 &graph,
                 &opts,
@@ -2830,6 +3072,7 @@ async fn flat_call_procedure(
         }
         "degree" => {
             require_projection_only("degree", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let deg = namidb_graph::algo::degrees_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -2853,6 +3096,7 @@ async fn flat_call_procedure(
         }
         "scc" => {
             require_projection_only("scc", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let comps = namidb_graph::algo::strongly_connected_components_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -2868,6 +3112,7 @@ async fn flat_call_procedure(
         }
         "triangle_count" => {
             require_projection_only("triangle_count", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let tri = namidb_graph::algo::triangle_count_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -2894,6 +3139,7 @@ async fn flat_call_procedure(
         }
         "label_propagation" => {
             let max_iters = label_propagation_options(args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let comm = namidb_graph::algo::label_propagation_cancellable(
                 &graph,
                 max_iters,
@@ -2909,14 +3155,60 @@ async fn flat_call_procedure(
             (vec!["node_id", "community"], raw)
         }
         "shortest_path" => {
-            let (source, weighted) = shortest_path_options(args, params)?;
+            let (source, target, weighted) = shortest_path_options(args, params)?;
+            let cols = vec!["node_id", "distance", "hops", "path"];
+            // With a target: one row (or none when unreachable) carrying the
+            // node sequence. It returns nodes only; for relationships use
+            // `MATCH p = shortestPath(...)` instead.
+            if let Some(target) = target {
+                // The natural direction searches the snapshot adjacency
+                // without building the projected graph. Reverse/undirected
+                // need in-edge probes, and an in-edge probe scans every
+                // unflushed edge of the type, once per settled node, so those
+                // build the graph once instead.
+                let found = if projection.direction == AlgoDirection::Natural {
+                    snapshot_shortest_path(snapshot, &projection, source, target, weighted).await?
+                } else {
+                    let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
+                    if weighted && graph.has_negative_weight() {
+                        return Err(proc_unsupported(NEGATIVE_WEIGHT_ERROR));
+                    }
+                    namidb_graph::algo::shortest_path_to_cancellable(
+                        &graph,
+                        source,
+                        target,
+                        weighted,
+                        &namidb_storage::cancel::deadline_exceeded,
+                    )
+                    .map_err(|_| ExecError::Timeout)?
+                };
+                let mut raw = Vec::new();
+                if let Some((dist, path)) = found {
+                    let hops = path.len() as i64 - 1;
+                    // The path is short and usually read for properties, so
+                    // hydrate its nodes (node_id stays an id-only node).
+                    let mut nodes = Vec::with_capacity(path.len());
+                    for id in path {
+                        nodes.push(match scan_node_for_id(snapshot, id).await? {
+                            Some(view) => RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                            None => node_runtime(id),
+                        });
+                    }
+                    raw.push(vec![
+                        node_runtime(target),
+                        RuntimeValue::Float(dist),
+                        RuntimeValue::Integer(hops),
+                        RuntimeValue::List(nodes),
+                    ]);
+                }
+                return project_proc_rows("algo.shortest_path", &cols, raw, yield_items);
+            }
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             // Dijkstra is unsound with negative weights; reject the query rather
             // than silently skipping those edges and returning wrong distances
             // (matches Neo4j GDS, which validates non-negative weights).
             if weighted && graph.has_negative_weight() {
-                return Err(proc_unsupported(
-                    "algo.shortest_path with weighted:true does not support negative edge weights",
-                ));
+                return Err(proc_unsupported(NEGATIVE_WEIGHT_ERROR));
             }
             let sp = namidb_graph::algo::shortest_paths_cancellable(
                 &graph,
@@ -2939,13 +3231,16 @@ async fn flat_call_procedure(
                         node_runtime(id),
                         RuntimeValue::Float(dist),
                         RuntimeValue::Integer(sp.hops.get(&id).copied().unwrap_or(0) as i64),
+                        // Paths are only built for a single `target`.
+                        RuntimeValue::Null,
                     ]
                 })
                 .collect();
-            (vec!["node_id", "distance", "hops"], raw)
+            (cols, raw)
         }
         "fastRP" | "fast_rp" | "fastrp" => {
             let opts = fastrp_options(args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let result = namidb_graph::algo::fast_rp_cancellable(
                 &graph,
                 &opts,
@@ -2964,6 +3259,7 @@ async fn flat_call_procedure(
         }
         "louvain" => {
             let opts = louvain_options(args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let res = namidb_graph::algo::louvain_cancellable(
                 &graph,
                 &opts,
@@ -2980,6 +3276,7 @@ async fn flat_call_procedure(
         }
         "betweenness" => {
             require_projection_only("betweenness", args, params)?;
+            let graph = snapshot_to_algo_graph(snapshot, &projection).await?;
             let res = namidb_graph::algo::betweenness_cancellable(
                 &graph,
                 &namidb_storage::cancel::deadline_exceeded,
@@ -4181,13 +4478,23 @@ fn proc_single_map(
     // A typo like `filtre` or `Filter` must not silently run UNFILTERED —
     // that is a data-exposure hazard, not a convenience. Reject any key the
     // procedure will not read.
+    reject_unknown_keys(proc, &map, allowed_keys)?;
+    Ok(map)
+}
+
+/// Fail a procedure call whose option map has a key outside `allowed_keys`.
+fn reject_unknown_keys(
+    proc: &str,
+    map: &std::collections::BTreeMap<String, RuntimeValue>,
+    allowed_keys: &[&str],
+) -> Result<(), ExecError> {
     if let Some(unknown) = map.keys().find(|key| !allowed_keys.contains(&key.as_str())) {
         return Err(proc_unsupported(format!(
             "{proc} does not recognise the option `{unknown}`; allowed options: {}",
             allowed_keys.join(", ")
         )));
     }
-    Ok(map)
+    Ok(())
 }
 
 /// A map value as an owned `String`, or `None` if it is not a string.
@@ -4364,8 +4671,7 @@ fn proc_filter_term(
             Ok(acc.expect("non-empty condition map"))
         }
         // A bare list → membership (`tenant_id: ['a', 'b']` ⇒ `n.tenant_id IN […]`).
-        // The ergonomic inline spelling of `in`, which can't be a bare map key
-        // (it is a reserved Cypher keyword that must be backtick-quoted).
+        // Shorthand for `{ in: [...] }`.
         RuntimeValue::List(_) => {
             let list = proc_value_expr(val, sp)?;
             Ok(mk_filter_expr(
@@ -4453,10 +4759,7 @@ fn proc_filter_op(
 /// - `{ score: { gte: 0.5 }, region: { ne: "eu" } }` → `n.score >= 0.5 AND n.region <> "eu"`
 ///
 /// A scalar value ⇒ equality, a list value ⇒ `IN`, a `{ op: value }` map ⇒ the
-/// AND of its operators (`eq|ne|gt|gte|lt|lte|in`). The explicit `in` operator is
-/// reachable only when the filter is supplied as a `$param` (a bare `in:` map key
-/// can't be parsed inline — it is a reserved keyword); inline queries use the
-/// list-value form.
+/// AND of its operators (`eq|ne|gt|gte|lt|lte|in`), inline or from a `$param`.
 fn proc_filter_expr(filter: &RuntimeValue, alias: &str) -> Result<Expression, ExecError> {
     use crate::parser::ast::{BinaryOp, ExpressionKind};
     let map = match filter {
@@ -5300,20 +5603,28 @@ fn require_projection_only(
                     )));
                 }
             };
-            for key in map.keys() {
-                if !matches!(key.as_str(), "labels" | "edge_types" | "direction") {
-                    return Err(proc_unsupported(format!(
-                        "algo.{name} accepts only projection options \
-                         (labels, edge_types, direction); unknown option `{key}`"
-                    )));
-                }
-            }
-            Ok(())
+            reject_unknown_algo_options(name, &map, &[])
         }
         _ => Err(proc_unsupported(format!(
             "algo.{name} takes at most one (map) argument"
         ))),
     }
+}
+
+/// Reject any key an `algo.*` option map neither projects on nor reads as one
+/// of the procedure's `own` options: a typo like `dampng` or `traget` must
+/// fail the call, not run silently with the default.
+fn reject_unknown_algo_options(
+    name: &str,
+    map: &std::collections::BTreeMap<String, RuntimeValue>,
+    own: &[&str],
+) -> Result<(), ExecError> {
+    let allowed: Vec<&str> = own
+        .iter()
+        .chain(&["labels", "edge_types", "direction"])
+        .copied()
+        .collect();
+    reject_unknown_keys(&format!("algo.{name}"), map, &allowed)
 }
 
 /// Build an in-memory `algo::Graph` from the snapshot: the projected nodes
@@ -5333,18 +5644,9 @@ async fn snapshot_to_algo_graph(
                 g.add_node(id);
             }
         }
-        // Requested labels are validated against the observed set so a typo
-        // errors instead of silently projecting an empty graph (GDS parity).
+        // A label with no nodes yet projects nothing rather than failing the
+        // call: a pipeline can name labels before the data lands.
         Some(ls) => {
-            let known = snapshot.observed_labels();
-            for l in ls {
-                if !known.iter().any(|k| k == l) {
-                    return Err(proc_unsupported(format!(
-                        "unknown label `{l}` in algo projection (known: {})",
-                        known.join(", ")
-                    )));
-                }
-            }
             for label in ls {
                 // Only the node ids are needed: an EMPTY property projection
                 // skips decoding every declared property column and the
@@ -5364,19 +5666,9 @@ async fn snapshot_to_algo_graph(
         .labels
         .as_ref()
         .map(|_| g.nodes().iter().copied().collect());
+    // Same for edge types: one with no edges scans empty and adds nothing.
     let edge_types = match &projection.edge_types {
-        Some(ts) => {
-            let known = snapshot.observed_edge_types();
-            for t in ts {
-                if !known.iter().any(|k| k == t) {
-                    return Err(proc_unsupported(format!(
-                        "unknown edge type `{t}` in algo projection (known: {})",
-                        known.join(", ")
-                    )));
-                }
-            }
-            ts.clone()
-        }
+        Some(ts) => ts.clone(),
         None => snapshot.observed_edge_types(),
     };
     for et in &edge_types {
@@ -5401,6 +5693,133 @@ async fn snapshot_to_algo_graph(
         }
     }
     Ok(g)
+}
+
+const NEGATIVE_WEIGHT_ERROR: &str =
+    "algo.shortest_path with weighted:true does not support negative edge weights";
+
+/// `algo.shortest_path` to one `target`, run straight against the snapshot
+/// adjacency instead of a projected `algo::Graph`: BFS (Dijkstra when
+/// `weighted`) that reads only the neighbourhoods it settles and stops at the
+/// target, so a nearby target costs a few edge lookups, not a scan of every
+/// node and edge. Same projection as [`snapshot_to_algo_graph`]: induced on
+/// `labels`, limited to `edge_types`, oriented by `direction`, weighted by a
+/// numeric `weight` (1.0 when absent). A negative weight errors only when the
+/// search reaches that edge. Returns the distance and the node sequence, both
+/// endpoints included, or `None` when the target is unreachable or either
+/// endpoint is outside the projection.
+// Known limit: the search is one-sided, so a far or unreachable target still
+// walks the whole reachable component one lookup at a time. Go bidirectional
+// if that shows up on real graphs. Only the natural direction routes here
+// (see the caller): in-edge probes over unflushed edges are linear scans.
+async fn snapshot_shortest_path(
+    snapshot: &Snapshot<'_>,
+    projection: &AlgoProjection,
+    source: NodeId,
+    target: NodeId,
+    weighted: bool,
+) -> Result<Option<(f64, Vec<NodeId>)>, ExecError> {
+    async fn projected(
+        snapshot: &Snapshot<'_>,
+        labels: Option<&[String]>,
+        id: NodeId,
+    ) -> Result<bool, ExecError> {
+        let Some(view) = scan_node_for_id(snapshot, id).await? else {
+            return Ok(false);
+        };
+        Ok(labels.is_none_or(|ls| view.labels.iter().any(|l| ls.contains(l))))
+    }
+    let labels = projection.labels.as_deref();
+    if !projected(snapshot, labels, source).await? || !projected(snapshot, labels, target).await? {
+        return Ok(None);
+    }
+    let edge_types = match &projection.edge_types {
+        Some(ts) => ts.clone(),
+        None => snapshot.observed_edge_types(),
+    };
+    let direction = match projection.direction {
+        AlgoDirection::Natural => RelationshipDirection::Right,
+        AlgoDirection::Reverse => RelationshipDirection::Left,
+        AlgoDirection::Undirected => RelationshipDirection::Both,
+    };
+    let mode = if weighted {
+        EdgeReadMode::Properties
+    } else {
+        EdgeReadMode::Topology
+    };
+
+    let mut dist: HashMap<NodeId, f64> = HashMap::from([(source, 0.0)]);
+    let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut outside: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    // Min-heap on distance. Distances are never negative, so the bit pattern
+    // of the f64 orders the same as the value. With unit weights this pops
+    // in BFS order.
+    let mut heap =
+        std::collections::BinaryHeap::from([std::cmp::Reverse((0f64.to_bits(), source))]);
+    'search: while let Some(std::cmp::Reverse((bits, u))) = heap.pop() {
+        let d = f64::from_bits(bits);
+        if d > dist[&u] {
+            continue; // stale entry
+        }
+        if u == target {
+            break; // popped means settled
+        }
+        namidb_storage::cancel::check()?;
+        for et in &edge_types {
+            for e in neighbours_of(snapshot, et, direction, u, mode).await? {
+                let v = if e.src == u { e.dst } else { e.src };
+                let w = if weighted {
+                    e.properties
+                        .get("weight")
+                        .and_then(numeric_weight)
+                        .unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                // Projection first: an edge leaving the projection is not
+                // part of the graph, so its weight must not fail the call.
+                if outside.contains(&v) {
+                    continue;
+                }
+                if labels.is_some()
+                    && !dist.contains_key(&v)
+                    && !projected(snapshot, labels, v).await?
+                {
+                    outside.insert(v);
+                    continue;
+                }
+                if w < 0.0 {
+                    return Err(proc_unsupported(NEGATIVE_WEIGHT_ERROR));
+                }
+                let nd = d + w;
+                // A non-finite distance never relaxes, as in the kernel: a NaN
+                // would let the parent map form a cycle. Stored weights are
+                // JSON, where NaN reads back as null, so this is a backstop.
+                if !nd.is_finite() || nd >= dist.get(&v).copied().unwrap_or(f64::INFINITY) {
+                    continue;
+                }
+                dist.insert(v, nd);
+                parent.insert(v, u);
+                // Unit weights: the first time BFS reaches the target is final.
+                if v == target && !weighted {
+                    break 'search;
+                }
+                heap.push(std::cmp::Reverse((nd.to_bits(), v)));
+            }
+        }
+    }
+
+    let Some(&d) = dist.get(&target) else {
+        return Ok(None);
+    };
+    let mut path = vec![target];
+    let mut at = target;
+    while let Some(&p) = parent.get(&at) {
+        path.push(p);
+        at = p;
+    }
+    path.reverse();
+    Ok(Some((d, path)))
 }
 
 fn numeric_weight(v: &namidb_core::Value) -> Option<f64> {
@@ -5431,6 +5850,11 @@ fn pagerank_options(
                     ));
                 }
             };
+            reject_unknown_algo_options(
+                "pagerank",
+                &map,
+                &["damping", "max_iterations", "tolerance"],
+            )?;
             if let Some(d) = map.get("damping") {
                 opts.damping = as_f64(d)
                     .ok_or_else(|| proc_unsupported("algo.pagerank `damping` must be a number"))?;
@@ -5477,6 +5901,17 @@ fn fastrp_options(
                     ))
                 }
             };
+            reject_unknown_algo_options(
+                "fastRP",
+                &map,
+                &[
+                    "dimension",
+                    "normalization_strength",
+                    "seed",
+                    "iterations",
+                    "iteration_weights",
+                ],
+            )?;
             if let Some(v) = map.get("dimension") {
                 opts.dimension = as_usize(v).ok_or_else(|| {
                     proc_unsupported("algo.fastRP `dimension` must be a non-negative integer")
@@ -5554,6 +5989,7 @@ fn label_propagation_options(args: &[Expression], params: &Params) -> Result<usi
                     ));
                 }
             };
+            reject_unknown_algo_options("label_propagation", &map, &["max_iterations"])?;
             if let Some(m) = map.get("max_iterations") {
                 max_iters = as_usize(m).ok_or_else(|| {
                     proc_unsupported(
@@ -5573,7 +6009,7 @@ fn label_propagation_options(args: &[Expression], params: &Params) -> Result<usi
 
 /// Resolve `algo.louvain` options from its optional single map argument:
 /// `CALL algo.louvain({max_levels: 5, max_iterations: 10, tolerance: 1e-4})`.
-/// The shared projection keys are parsed separately and ignored here.
+/// The shared projection keys are parsed separately.
 fn louvain_options(
     args: &[Expression],
     params: &Params,
@@ -5590,6 +6026,11 @@ fn louvain_options(
                     ));
                 }
             };
+            reject_unknown_algo_options(
+                "louvain",
+                &map,
+                &["max_levels", "max_iterations", "tolerance"],
+            )?;
             if let Some(v) = map.get("max_levels") {
                 opts.max_levels = as_usize(v).ok_or_else(|| {
                     proc_unsupported("algo.louvain `max_levels` must be a non-negative integer")
@@ -5615,13 +6056,14 @@ fn louvain_options(
 }
 
 /// Resolve `algo.shortest_path` options from its required single map arg:
-/// `CALL algo.shortest_path({source: "<uuid>", weighted: true})`. `source` is
-/// required (a node-id string or a node value); `weighted` defaults to false
-/// (BFS hop count) and, when true, runs Dijkstra over non-negative `weight`s.
+/// `CALL algo.shortest_path({source: "<uuid>", target: "<uuid>", weighted: true})`.
+/// `source` is required and `target` optional (each a node-id string or a node
+/// value); `weighted` defaults to false (BFS hop count) and, when true, runs
+/// Dijkstra over non-negative `weight`s.
 fn shortest_path_options(
     args: &[Expression],
     params: &Params,
-) -> Result<(NodeId, bool), ExecError> {
+) -> Result<(NodeId, Option<NodeId>, bool), ExecError> {
     let map = match args {
         [arg] => match evaluate(arg, &Row::new(), params)? {
             RuntimeValue::Map(m) => m,
@@ -5637,24 +6079,26 @@ fn shortest_path_options(
             ));
         }
     };
-    let source = match map.get("source") {
-        Some(RuntimeValue::String(s)) => s.parse::<NodeId>().map_err(|_| {
-            proc_unsupported(format!(
-                "algo.shortest_path `source` is not a valid node id: {s}"
-            ))
-        })?,
-        Some(RuntimeValue::Node(n)) => n.id,
-        Some(_) => {
-            return Err(proc_unsupported(
-                "algo.shortest_path `source` must be a node-id string or a node",
-            ));
-        }
-        None => {
-            return Err(proc_unsupported(
-                "algo.shortest_path requires a `source` (node-id string or node)",
-            ));
+    reject_unknown_algo_options("shortest_path", &map, &["source", "target", "weighted"])?;
+    let node_arg = |key: &str| -> Result<Option<NodeId>, ExecError> {
+        match map.get(key) {
+            // A null `$target` parameter means "no target", like an omitted key.
+            None | Some(RuntimeValue::Null) => Ok(None),
+            Some(RuntimeValue::String(s)) => s.parse::<NodeId>().map(Some).map_err(|_| {
+                proc_unsupported(format!(
+                    "algo.shortest_path `{key}` is not a valid node id: {s}"
+                ))
+            }),
+            Some(RuntimeValue::Node(n)) => Ok(Some(n.id)),
+            Some(_) => Err(proc_unsupported(format!(
+                "algo.shortest_path `{key}` must be a node-id string or a node"
+            ))),
         }
     };
+    let source = node_arg("source")?.ok_or_else(|| {
+        proc_unsupported("algo.shortest_path requires a `source` (node-id string or node)")
+    })?;
+    let target = node_arg("target")?;
     let weighted = match map.get("weighted") {
         None => false,
         Some(RuntimeValue::Bool(b)) => *b,
@@ -5664,7 +6108,7 @@ fn shortest_path_options(
             ));
         }
     };
-    Ok((source, weighted))
+    Ok((source, target, weighted))
 }
 
 fn as_f64(v: &RuntimeValue) -> Option<f64> {
@@ -5810,12 +6254,14 @@ async fn vector_search_rows(
     #[cfg(not(feature = "vector-index"))]
     let _ = (ef_search, prefilter.map(|plan| &plan.groups));
 
-    // Materialise the WHOLE node: the result binds it to `alias`, and a
-    // downstream projection (`RETURN d.title`) or a procedure's `YIELD node` may
-    // read any property — not just the embedding — and a source filter may too.
-    // (The index path likewise returns full nodes via `lookup_node`.) Projecting
-    // only the embedding column here would leave those properties null.
-    let projection: Option<Vec<String>> = None;
+    // The result binds the WHOLE node to `alias`: a downstream projection
+    // (`RETURN d.title`) or a procedure's `YIELD node` may read any property.
+    // Without a source filter nothing but the embedding is read before the
+    // top-k is known, so the scan reads only the embedding and the winners are
+    // loaded whole afterwards, like the index path does. A source filter may
+    // read any property, so it still needs whole nodes up front.
+    let score_only = source_filter.is_none();
+    let projection: Option<Vec<String>> = score_only.then(|| vec![property.to_string()]);
 
     // (sort_key, NodeId, score_value, row) — sort_key is "lower is better"
     // (higher-is-better metrics are negated), so an ascending sort yields the
@@ -5862,14 +6308,26 @@ async fn vector_search_rows(
     }
 
     scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    scored.truncate(limit);
+    if score_only {
+        let ids: Vec<NodeId> = scored.iter().map(|(_, id, _, _)| *id).collect();
+        let views = snapshot
+            .batch_lookup_nodes(label.unwrap_or(""), &ids)
+            .await?;
+        for ((_, _, _, row), view) in scored.iter_mut().zip(views) {
+            if let Some(view) = view {
+                row.set(
+                    alias.to_string(),
+                    RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                );
+            }
+        }
+    }
 
     // Build rows in rank order. The source filter already ran before scoring,
     // so truncation takes the top-k of the filtered source.
     let mut out = Vec::with_capacity(query_initial_capacity(limit, scored.len()));
     for (_sort_key, _id, score, mut row) in scored {
-        if out.len() >= limit {
-            break;
-        }
         row.set(score_alias.to_string(), RuntimeValue::Float(score));
         out.push(row);
     }
@@ -6538,6 +6996,34 @@ async fn identity_edges_via_sst(
         .collect())
 }
 
+/// Stored identities `(edge_type, src, dst)` of the relationships an
+/// Expand's `unique_rels` bindings hold: a relationship, or each element of
+/// a variable-length hop's list. NULL (an unmatched OPTIONAL hop) holds none.
+fn bound_rel_keys<'v>(
+    values: impl IntoIterator<Item = Option<&'v RuntimeValue>>,
+) -> Vec<(String, NodeId, NodeId)> {
+    fn push(v: &RuntimeValue, out: &mut Vec<(String, NodeId, NodeId)>) {
+        match v {
+            RuntimeValue::Rel(r) => out.push((r.edge_type.clone(), r.src, r.dst)),
+            RuntimeValue::List(items) => items.iter().for_each(|i| push(i, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for v in values.into_iter().flatten() {
+        push(v, &mut out);
+    }
+    out
+}
+
+/// Cypher relationship uniqueness across the hops of one MATCH clause:
+/// `edge` is one of the relationships an earlier hop already bound.
+fn reuses_bound_rel(bound: &[(String, NodeId, NodeId)], edge: &EdgeView) -> bool {
+    bound
+        .iter()
+        .any(|(t, s, d)| *s == edge.src && *d == edge.dst && *t == edge.edge_type)
+}
+
 fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId) -> NodeId {
     match direction {
         RelationshipDirection::Right => edge.dst,
@@ -6572,10 +7058,16 @@ pub(crate) enum ExpandTargets {
     /// entries before the per-edge loop reached them (sixth field report:
     /// instant at degree 3.8k, fatal at 53k — a step function at a capacity
     /// boundary, arriving EARLIER when the CSR cache is enabled because
-    /// that shrinks the node cache's share of the budget).
-    Views(HashMap<NodeId, namidb_storage::NodeView>),
-    /// Nothing prepared: each edge resolves its own endpoint.
-    Cold,
+    /// that shrinks the node cache's share of the budget). The set holds the
+    /// endpoints a single hop proved lack the target label, so their edges
+    /// are skipped without reading the node.
+    Views(
+        HashMap<NodeId, namidb_storage::NodeView>,
+        std::collections::HashSet<NodeId>,
+    ),
+    /// Nothing prepared: each edge resolves its own endpoint, except the
+    /// endpoints a single hop already proved lack the target label.
+    Cold(std::collections::HashSet<NodeId>),
 }
 
 /// Upper bound on endpoint views held for one hop. Beyond it the batch is
@@ -6601,7 +7093,7 @@ async fn prepare_expand_targets(
         return Ok(if skip_target_materialize {
             ExpandTargets::Membership(HashMap::new())
         } else {
-            ExpandTargets::Cold
+            ExpandTargets::Cold(Default::default())
         });
     }
     if skip_target_materialize {
@@ -6688,20 +7180,47 @@ async fn prepare_expand_targets(
     // returns every endpoint, a miss means genuinely absent, and the fallback
     // becomes the rare path it was written to be.
     let label = "";
-    let _ = multi_hop;
-    if !views_usable || unique_targets.len() > expand_target_view_budget() {
-        let _ = snapshot.batch_lookup_nodes(label, unique_targets).await?;
-        return Ok(ExpandTargets::Cold);
+    // A single hop's target label decides the edge, so prove it on the
+    // compact label sidecar first and hydrate only the members: a hub whose
+    // neighbours mostly carry other labels no longer decodes every one of
+    // them. Multi-hop traverses THROUGH non-members and needs them all.
+    let mut rejected = std::collections::HashSet::new();
+    let members: Vec<NodeId>;
+    let mut candidates = unique_targets;
+    if !multi_hop && !target_labels.is_empty() {
+        if let Some(matches) = snapshot
+            .try_batch_nodes_have_labels(target_labels, unique_targets)
+            .await?
+        {
+            if matches.len() != unique_targets.len() {
+                return Err(ExecError::Runtime(
+                    "batched endpoint membership returned a misaligned result".into(),
+                ));
+            }
+            let mut kept = Vec::new();
+            for (id, is_member) in unique_targets.iter().copied().zip(matches) {
+                if is_member {
+                    kept.push(id);
+                } else {
+                    rejected.insert(id);
+                }
+            }
+            members = kept;
+            candidates = &members;
+        }
     }
-    let views = snapshot.batch_lookup_nodes(label, unique_targets).await?;
-    Ok(ExpandTargets::Views(
-        unique_targets
-            .iter()
-            .copied()
-            .zip(views)
-            .filter_map(|(id, view)| view.map(|view| (id, view)))
-            .collect(),
-    ))
+    if !views_usable || candidates.len() > expand_target_view_budget() {
+        let _ = snapshot.batch_lookup_nodes(label, candidates).await?;
+        return Ok(ExpandTargets::Cold(rejected));
+    }
+    let fetched = snapshot.batch_lookup_nodes(label, candidates).await?;
+    let views = candidates
+        .iter()
+        .copied()
+        .zip(fetched)
+        .filter_map(|(id, view)| view.map(|view| (id, view)))
+        .collect();
+    Ok(ExpandTargets::Views(views, rejected))
 }
 
 /// Decide whether an Expand target may be represented by an id-only stub.
@@ -6729,7 +7248,7 @@ fn should_skip_target_materialize(
         // 2.2s against 0.55s for the labelled spelling at degree 160k.
         && (!routing.referenced_aliases.contains(target_alias)
             || routing.identity_only_aliases.contains(target_alias))
-        && !routing.zero_hop_sources.contains(target_alias)
+        && !routing.row_label_aliases.contains(target_alias)
         && length.as_ref().is_none_or(|length| length.max == 1)
 }
 
@@ -6744,13 +7263,16 @@ fn should_skip_target_materialize(
 /// Over-collecting into `full` is the safe direction — it costs a hydration,
 /// where under-collecting returns nulls for real values.
 ///
-/// The three admitted forms, and why each reads only the id:
+/// The admitted forms, and why each reads only the id:
 /// * `count(x)` — counts non-null occurrences; a stub is non-null exactly
 ///   where the node is.
 /// * `count(DISTINCT x)` — dedups on `fingerprint_value`, whose node arm is
 ///   `N{id};` (walker.rs, `fingerprint_into`): id alone, no properties, no
 ///   labels.
 /// * `count(id(x))` — `id()` reads the id, which the stub carries correctly.
+/// * a projected `id(x)` / `elementId(x)` item (`RETURN id(x)`), for the same
+///   reason. A bare `RETURN x` returns the whole node and stays a full
+///   reference.
 fn collect_identity_only_aliases(
     plan: &LogicalPlan,
     all_refs: &BTreeSet<String>,
@@ -6775,57 +7297,88 @@ fn identity_only_count_arg(expr: &Expression) -> Option<String> {
     use crate::parser::ExpressionKind;
     match &expr.kind {
         ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
-        // `id(<variable>)` and nothing else — any other function, or any
-        // argument that is not a bare variable, is a full-value reference.
-        ExpressionKind::FunctionCall {
-            name,
-            args,
-            distinct,
-        } => {
-            // Unqualified `id(...)` only: a namespaced call is a different
-            // function and must not inherit the fast path.
-            let is_id = name.segments.len() == 1
-                && name.segments[0].name.eq_ignore_ascii_case("id")
-                && args.len() == 1
-                && !*distinct;
-            if !is_id {
-                return None;
-            }
-            match &args[0].kind {
-                ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
-                _ => None,
-            }
-        }
+        _ => identity_call_arg(expr),
+    }
+}
+
+/// The alias `id(<variable>)` / `elementId(<variable>)` reads, and nothing
+/// else: any other function, or any argument that is not a bare variable, is
+/// a full-value reference.
+fn identity_call_arg(expr: &Expression) -> Option<String> {
+    use crate::parser::ExpressionKind;
+    let ExpressionKind::FunctionCall {
+        name,
+        args,
+        distinct,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    // Unqualified calls only: a namespaced call is a different function and
+    // must not inherit the fast path.
+    let is_id = name.segments.len() == 1
+        && (name.segments[0].name.eq_ignore_ascii_case("id")
+            || name.segments[0].name.eq_ignore_ascii_case("elementid"))
+        && args.len() == 1
+        && !*distinct;
+    if !is_id {
+        return None;
+    }
+    match &args[0].kind {
+        ExpressionKind::Variable(ident) => Some(ident.name.to_string()),
         _ => None,
     }
 }
 
-/// The aliases read by identity-only aggregate arguments.
+/// The aliases read by identity-only aggregate arguments and projections.
 fn collect_identity_count_args(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     use crate::plan::logical::AggregateExpr;
-    if let LogicalPlan::Aggregate { aggregations, .. } = plan {
-        for (_alias, agg) in aggregations {
-            if let AggregateExpr::Count { arg: Some(e), .. } = agg {
-                if let Some(alias) = identity_only_count_arg(e) {
-                    out.insert(alias);
+    match plan {
+        LogicalPlan::Aggregate { aggregations, .. } => {
+            for (_alias, agg) in aggregations {
+                if let AggregateExpr::Count { arg: Some(e), .. } = agg {
+                    if let Some(alias) = identity_only_count_arg(e) {
+                        out.insert(alias);
+                    }
                 }
             }
         }
+        LogicalPlan::Project { items, .. } => {
+            out.extend(
+                items
+                    .iter()
+                    .filter_map(|item| identity_call_arg(&item.expression)),
+            );
+        }
+        _ => {}
     }
     for child in plan.children() {
         collect_identity_count_args(child, out);
     }
 }
 
-/// Collect the source alias of every `*0..n` Expand in the plan.
-fn collect_zero_hop_expand_sources(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
-    if let LogicalPlan::Expand { source, length, .. } = plan {
+/// Collect every alias whose labels a later Expand reads off the bound row:
+/// the source of a `*0..n` Expand, and the target of a labelled
+/// back-reference Expand (`MATCH (m)-->(p) MATCH (c)-->(p:Person)`).
+fn collect_row_label_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+    if let LogicalPlan::Expand {
+        source,
+        length,
+        target_alias,
+        target_labels,
+        back_reference,
+        ..
+    } = plan
+    {
         if length.as_ref().is_some_and(|l| l.min == 0) {
             out.insert(source.clone());
         }
+        if *back_reference && !target_labels.is_empty() {
+            out.insert(target_alias.clone());
+        }
     }
     for child in plan.children() {
-        collect_zero_hop_expand_sources(child, out);
+        collect_row_label_aliases(child, out);
     }
 }
 
@@ -7565,6 +8118,19 @@ fn sum_values(vals: &[RuntimeValue]) -> Result<RuntimeValue, ExecError> {
 
 // ───────────────────────── NodeId conversion ─────────────────────────
 
+/// The id a `NodeById` seek looks up for `value`. It reads a key the way
+/// `CREATE (n {_id: ...})` does (a Node value, any UUID spelling), so the
+/// `{_id: ...}` sigil finds what it created. A null or a value that names no
+/// node matches nothing instead of failing the query. A seek planned from
+/// `WHERE id(n) = ...` keeps that comparison on top to stay exact.
+fn seek_node_id(value: &RuntimeValue) -> Option<NodeId> {
+    match value {
+        RuntimeValue::String(s) => uuid::Uuid::parse_str(s).ok().map(NodeId::from_uuid),
+        RuntimeValue::Node(n) => Some(n.id),
+        _ => None,
+    }
+}
+
 pub(crate) fn node_id_from_value(v: &RuntimeValue, span: SourceSpan) -> Result<NodeId, ExecError> {
     match v {
         RuntimeValue::String(s) => match uuid::Uuid::parse_str(s) {
@@ -7997,25 +8563,17 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let root = set.arena.root();
                 let alias_arc: Arc<str> = Arc::from(alias.as_str());
                 let mut leaves: Vec<crate::exec::FactorIdx> = Vec::new();
-                let nodes = match label.as_deref() {
-                    Some(label_name) => {
-                        snapshot
-                            .scan_label_with_predicates_and_projection(
-                                label_name,
-                                predicates,
-                                projection.as_deref(),
-                            )
-                            .await?
-                    }
-                    None => {
-                        snapshot
-                            .scan_all_nodes_with_predicates_and_projection(
-                                predicates,
-                                projection.as_deref(),
-                            )
-                            .await?
-                    }
-                };
+                let nodes = scan_node_views(
+                    snapshot,
+                    label.as_deref(),
+                    predicates,
+                    projection.as_deref(),
+                    row_cap_scan_limit(snapshot, label.as_deref()),
+                )
+                .await?;
+                // The factor path only checks the cap on its final rows, so a
+                // truncated scan must fail here rather than drop nodes.
+                crate::exec::limits::check_row_cap(nodes.len())?;
                 for n in nodes {
                     let slot = Slot {
                         name: alias_arc.clone(),
@@ -8045,15 +8603,19 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 // materialising the whole chain is correct now.
                 let arena_view = input_set.arena.clone();
                 let mut next_arena = input_set.arena;
+                let mut keyed = Vec::with_capacity(input_set.leaves.len());
                 for leaf in input_set.leaves {
                     let row = arena_view.materialize(leaf, None);
-                    let id_value = evaluate(id, &row, params)?;
-                    let node_id = node_id_from_value(&id_value, id.span)?;
-                    let found = match label {
-                        Some(l) => snapshot.lookup_node(l, node_id).await?,
-                        None => scan_node_for_id(snapshot, node_id).await?,
-                    };
-                    if let Some(view) = found {
+                    if let Some(node_id) = seek_node_id(&evaluate(id, &row, params)?) {
+                        keyed.push((leaf, node_id));
+                    }
+                }
+                let ids: Vec<NodeId> = keyed.iter().map(|(_, node_id)| *node_id).collect();
+                let found = snapshot
+                    .batch_lookup_nodes(label.as_deref().unwrap_or(""), &ids)
+                    .await?;
+                for ((leaf, _), view) in keyed.into_iter().zip(found) {
+                    if let Some(view) = view {
                         let slot = Slot {
                             name: alias_arc.clone(),
                             value: RuntimeValue::Node(Box::new(NodeValue::from(view))),
@@ -8222,6 +8784,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 back_reference,
                 shortest,
                 path_binding,
+                unique_rels,
             } => {
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
@@ -8252,6 +8815,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         *back_reference,
                         *shortest,
                         path_binding.as_deref(),
+                        unique_rels,
                         snapshot,
                         routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                         false,
@@ -8272,6 +8836,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     length.clone(),
                     *optional,
                     *back_reference,
+                    unique_rels,
                     snapshot,
                     routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
@@ -8655,24 +9220,25 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 Ok(FactorRowSet::from_flat(out))
             }
 
-            LogicalPlan::Apply { input, subplan } => {
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional,
+            } => {
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
                 let rows = input_set.materialize_all(None);
-                let mut out = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let sub_rows =
-                        execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
-                            .await?;
-                    for s in sub_rows {
-                        let mut merged = row.clone();
-                        for (k, v) in &s.bindings {
-                            merged.set(k.clone(), v.clone());
-                        }
-                        out.push(merged);
-                    }
-                }
+                let out = apply_rows(
+                    rows,
+                    subplan,
+                    optional.as_deref(),
+                    snapshot,
+                    params,
+                    routing,
+                    None,
+                )
+                .await?;
                 Ok(FactorRowSet::from_flat(out))
             }
 
@@ -8749,6 +9315,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 edges,
                 ordering,
                 factorize_required,
+                distinct_edges,
             } => {
                 if !*factorize_required {
                     return Err(ExecError::Runtime(
@@ -8762,7 +9329,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                             .to_string(),
                     ));
                 }
-                execute_multiway_join_factor(vars, edges, ordering, snapshot).await
+                execute_multiway_join_factor(vars, edges, ordering, distinct_edges, snapshot).await
             }
         }
     }
@@ -8795,6 +9362,7 @@ async fn execute_expand_factor(
     length: Option<crate::parser::RelationshipLength>,
     optional: bool,
     back_reference: bool,
+    unique_rels: &[String],
     snapshot: &Snapshot<'_>,
     edge_read_mode: EdgeReadMode,
     skip_target_materialize: bool,
@@ -8823,6 +9391,14 @@ async fn execute_expand_factor(
         // root-ward without materialising the whole row.
         let starting = match arena.lookup_binding(parent_leaf, source) {
             Some(RuntimeValue::Node(n)) => n.id,
+            // NULL source: same rule as the flat `execute_expand`.
+            Some(RuntimeValue::Null) => {
+                if optional {
+                    let slots = optional_null_slots(&rel_arc, &target_arc, back_reference);
+                    out_leaves.push(arena.push(parent_leaf, slots));
+                }
+                continue;
+            }
             Some(_) => {
                 return Err(ExecError::Runtime(format!(
                     "Expand source `{}` is not a Node",
@@ -8836,6 +9412,12 @@ async fn execute_expand_factor(
                 )))
             }
         };
+
+        let bound_rels = bound_rel_keys(
+            unique_rels
+                .iter()
+                .map(|name| arena.lookup_binding(parent_leaf, name)),
+        );
 
         // Back-reference: pull the existing target id once. Only paths
         // ending at this id survive emission.
@@ -8981,6 +9563,9 @@ async fn execute_expand_factor(
                                 + next_frontier.len(),
                         )?;
                     }
+                    if reuses_bound_rel(&bound_rels, &edge) {
+                        continue;
+                    }
                     let target_id = partner_id(&edge, direction, tail);
                     // Cypher relationship uniqueness (trail semantics): skip an
                     // edge already traversed on this path so `-[:R*2..2]-` can't
@@ -9011,13 +9596,15 @@ async fn execute_expand_factor(
                             continue;
                         }
                         None
-                    } else if let ExpandTargets::Views(views) = &target_membership {
+                    } else if let ExpandTargets::Views(views, rejected) = &target_membership {
                         // The hop's own materialisation answers directly, so a
                         // large fan-out no longer depends on cache retention.
                         // The batch resolves by id across every descriptor, so
                         // it describes nodes of ANY label — which is what lets
                         // a multi-hop traversal use it too.
                         match views.get(&target_id) {
+                            // Proven not to carry the label (single hop).
+                            None if rejected.contains(&target_id) => continue,
                             Some(v) => {
                                 if target_labels.iter().all(|l| v.labels.contains(l)) {
                                     Some(v.clone())
@@ -9051,6 +9638,10 @@ async fn execute_expand_factor(
                                 None => continue,
                             },
                         }
+                    } else if matches!(&target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
+                    {
+                        // Proven not to carry the label (single hop, over budget).
+                        continue;
                     } else if let Some(label) = target_labels.first() {
                         if max > 1 {
                             match scan_node_for_id(snapshot, target_id).await? {
@@ -9132,21 +9723,7 @@ async fn execute_expand_factor(
         if matched_any {
             out_leaves.append(&mut hop_outputs_for_this_input);
         } else if optional {
-            // Emit a leaf with NULL bindings for rel and target so OPTIONAL
-            // MATCH semantics survive.
-            let mut slots: Vec<Slot> = Vec::with_capacity(2);
-            if let Some(name) = &rel_arc {
-                slots.push(Slot {
-                    name: name.clone(),
-                    value: RuntimeValue::Null,
-                });
-            }
-            if !back_reference {
-                slots.push(Slot {
-                    name: target_arc.clone(),
-                    value: RuntimeValue::Null,
-                });
-            }
+            let slots = optional_null_slots(&rel_arc, &target_arc, back_reference);
             out_leaves.push(arena.push(parent_leaf, slots));
         }
     }
@@ -9155,6 +9732,29 @@ async fn execute_expand_factor(
         arena,
         leaves: out_leaves,
     })
+}
+
+/// Factor-path twin of [`optional_null_row`]: NULL slots for the rel and
+/// (unless already bound) the target, so OPTIONAL MATCH semantics survive.
+fn optional_null_slots(
+    rel_arc: &Option<Arc<str>>,
+    target_arc: &Arc<str>,
+    back_reference: bool,
+) -> Vec<Slot> {
+    let mut slots: Vec<Slot> = Vec::with_capacity(2);
+    if let Some(name) = rel_arc {
+        slots.push(Slot {
+            name: name.clone(),
+            value: RuntimeValue::Null,
+        });
+    }
+    if !back_reference {
+        slots.push(Slot {
+            name: target_arc.clone(),
+            value: RuntimeValue::Null,
+        });
+    }
+    slots
 }
 
 // Worst-case optimal multiway join (RFC-024).
@@ -9176,6 +9776,7 @@ fn execute_multiway_join_factor<'a>(
     vars: &'a [NodeBinding],
     edges: &'a [EdgeConstraint],
     ordering: &'a [usize],
+    distinct: &'a [(usize, usize)],
     snapshot: &'a Snapshot<'_>,
 ) -> BoxFuture<'a, Result<FactorRowSet, ExecError>> {
     async move {
@@ -9196,7 +9797,7 @@ fn execute_multiway_join_factor<'a>(
             bound: vec![None; vars.len()],
             materialised: vec![None; vars.len()],
         };
-        descend_multiway(&mut state, 0, vars, edges, ordering, snapshot).await?;
+        descend_multiway(&mut state, 0, vars, edges, ordering, distinct, snapshot).await?;
         Ok(FactorRowSet {
             arena: state.arena,
             leaves: state.leaves,
@@ -9218,6 +9819,7 @@ fn descend_multiway<'a>(
     vars: &'a [NodeBinding],
     edges: &'a [EdgeConstraint],
     ordering: &'a [usize],
+    distinct: &'a [(usize, usize)],
     snapshot: &'a Snapshot<'_>,
 ) -> BoxFuture<'a, Result<(), ExecError>> {
     async move {
@@ -9232,7 +9834,11 @@ fn descend_multiway<'a>(
             // set-semantics behaviour); with `[:A|:B]` or parallel
             // edges of the same type the row count tracks the binary
             // path's `Vec<EdgeView>` fan-out exactly.
+            // Under relationship uniqueness two constraints may not pick
+            // the same stored edge, so count the distinct choices instead
+            // of taking the plain product.
             let mut copies: usize = 1;
+            let mut choices: Vec<Vec<(&str, NodeId, NodeId)>> = Vec::new();
             for e in edges {
                 let from = state.bound[e.from_idx].ok_or_else(|| {
                     ExecError::Runtime("MultiwayJoin: from_idx not bound at leaf level".into())
@@ -9240,9 +9846,10 @@ fn descend_multiway<'a>(
                 let to = state.bound[e.to_idx].ok_or_else(|| {
                     ExecError::Runtime("MultiwayJoin: to_idx not bound at leaf level".into())
                 })?;
-                let m =
-                    count_edge_multiplicity(snapshot, from, to, &e.edge_types, e.direction).await?;
-                copies = copies.saturating_mul(m);
+                let found =
+                    existing_edges_between(snapshot, from, to, &e.edge_types, e.direction).await?;
+                copies = copies.saturating_mul(found.len());
+                choices.push(found);
                 if copies == 0 {
                     // The leapfrog said this constraint's partner list
                     // contained `to`, but a re-scan of the SST/CSR
@@ -9250,6 +9857,12 @@ fn descend_multiway<'a>(
                     // tombstone slipped between the two reads — drop
                     // the tuple, which matches what the binary path
                     // would do.
+                    return Ok(());
+                }
+            }
+            if !distinct.is_empty() {
+                copies = count_distinct_choices(&choices, distinct, &mut Vec::new());
+                if copies == 0 {
                     return Ok(());
                 }
             }
@@ -9333,7 +9946,8 @@ fn descend_multiway<'a>(
                 let id = view.id;
                 state.bound[var_idx] = Some(id);
                 state.materialised[var_idx] = Some(NodeValue::from(view));
-                descend_multiway(state, level + 1, vars, edges, ordering, snapshot).await?;
+                descend_multiway(state, level + 1, vars, edges, ordering, distinct, snapshot)
+                    .await?;
             }
         } else {
             // Per-constraint partner list. For single-type constraints
@@ -9392,7 +10006,8 @@ fn descend_multiway<'a>(
                 }
                 state.bound[var_idx] = Some(cand_id);
                 state.materialised[var_idx] = Some(NodeValue::from(view));
-                descend_multiway(state, level + 1, vars, edges, ordering, snapshot).await?;
+                descend_multiway(state, level + 1, vars, edges, ordering, distinct, snapshot)
+                    .await?;
             }
         }
 
@@ -9403,22 +10018,22 @@ fn descend_multiway<'a>(
     .boxed()
 }
 
-/// Count how many edges of any type in `edge_types` actually connect
-/// `from` to `to` in the given direction. Used by the WCOJ leaf
-/// emission to scale per-tuple set semantics back up to per-path
-/// multiset semantics (the binary executor's native shape).
+/// The edges of any type in `edge_types` that actually connect `from` to
+/// `to` in the given direction, as stored identities. Their count is used by
+/// the WCOJ leaf emission to scale per-tuple set semantics back up to
+/// per-path multiset semantics (the binary executor's native shape).
 ///
 /// The storage identity is `(edge_type, src, dst)`, hence each type contributes
 /// at most one relationship for the endpoint pair. Use exact existence probes
 /// rather than rescanning a full degree at every WCOJ leaf.
-async fn count_edge_multiplicity(
+async fn existing_edges_between<'t>(
     snapshot: &Snapshot<'_>,
     from: NodeId,
     to: NodeId,
-    edge_types: &[String],
+    edge_types: &'t [String],
     direction: RelationshipDirection,
-) -> Result<usize, ExecError> {
-    let mut total: usize = 0;
+) -> Result<Vec<(&'t str, NodeId, NodeId)>, ExecError> {
+    let mut found = Vec::new();
     for et in edge_types {
         let (src, dst) = match direction {
             RelationshipDirection::Right => (from, to),
@@ -9430,10 +10045,43 @@ async fn count_edge_multiplicity(
             }
         };
         if snapshot.contains_edge_via_sst(et, src, dst).await? {
-            total += 1;
+            found.push((et.as_str(), src, dst));
         }
     }
-    Ok(total)
+    Ok(found)
+}
+
+/// Ways to pick one edge per constraint from `choices` such that every
+/// `distinct` pair picks two different edges. `picked` holds the choices
+/// made for the constraints before `picked.len()`.
+fn count_distinct_choices<'t>(
+    choices: &[Vec<(&'t str, NodeId, NodeId)>],
+    distinct: &[(usize, usize)],
+    picked: &mut Vec<(&'t str, NodeId, NodeId)>,
+) -> usize {
+    let i = picked.len();
+    if i == choices.len() {
+        return 1;
+    }
+    let mut total = 0;
+    for &edge in &choices[i] {
+        let clashes = distinct.iter().any(|&(a, b)| {
+            let other = if a == i {
+                b
+            } else if b == i {
+                a
+            } else {
+                return false;
+            };
+            other < i && picked[other] == edge
+        });
+        if !clashes {
+            picked.push(edge);
+            total += count_distinct_choices(choices, distinct, picked);
+            picked.pop();
+        }
+    }
+    total
 }
 
 /// Translate the Cypher-side `RelationshipDirection` carried by an
@@ -9873,14 +10521,16 @@ pub(crate) struct PlanRouting {
     /// IDENTITY, never a property, a label or the whole value. Such a target
     /// can be bound as an id-only stub even though it IS referenced.
     identity_only_aliases: BTreeSet<String>,
-    /// Aliases a later Expand consumes as the SOURCE of a zero-length
-    /// variable-length pattern (`*0..n`). Such an Expand decides whether the
-    /// source itself is a result by reading the labels off the ROW, and an
-    /// id-only stub carries only the labels its own Expand asked for — not
-    /// the node's real set. A node labelled `:T:U` bound by `->(t:T)` would
-    /// therefore fail `-[:S*0..2]->(u:U)` at zero hops and silently lose the
-    /// row. These aliases must be materialised.
-    zero_hop_sources: BTreeSet<String>,
+    /// Aliases whose labels a later Expand reads off the ROW: the SOURCE of
+    /// a zero-length variable-length pattern (`*0..n`), which decides whether
+    /// the source itself is a result, and the TARGET of a labelled
+    /// back-reference, which checks the bound node against its labels. An
+    /// id-only stub carries only the labels its own Expand asked for, not the
+    /// node's real set. A node labelled `:T:U` bound by `->(t:T)` would
+    /// therefore fail `-[:S*0..2]->(u:U)` at zero hops, and `->(p)` followed
+    /// by `MATCH (c)-->(p:Person)` would fail the label check, silently losing
+    /// the row. These aliases must be materialised.
+    row_label_aliases: BTreeSet<String>,
     /// A node-mutating write invalidates the committed property cache at
     /// commit. Correlated indexed reads in such a statement must therefore
     /// use the writer-private transactional postings map so a sequence of
@@ -9896,14 +10546,14 @@ impl PlanRouting {
         collect_plan_referenced_variables(plan, &mut refs);
         let mut value_refs: BTreeSet<String> = BTreeSet::new();
         collect_plan_value_referenced_variables(plan, &mut value_refs);
-        let mut zero_hop_sources: BTreeSet<String> = BTreeSet::new();
-        collect_zero_hop_expand_sources(plan, &mut zero_hop_sources);
+        let mut row_label_aliases: BTreeSet<String> = BTreeSet::new();
+        collect_row_label_aliases(plan, &mut row_label_aliases);
         let identity_only_aliases = collect_identity_only_aliases(plan, &refs);
         Self {
             identity_only_aliases,
             referenced_aliases: refs,
             value_referenced_aliases: value_refs,
-            zero_hop_sources,
+            row_label_aliases,
             transactional_property_reads: plan_requires_transactional_property_reads(plan),
         }
     }
@@ -10157,7 +10807,7 @@ fn collect_plan_node_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     }
 }
 
-fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+pub(crate) fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     collect_plan_references(plan, out, true, false);
 }
 
@@ -10182,6 +10832,11 @@ fn collect_plan_references(
         }
         LogicalPlan::Project { items, .. } => {
             for it in items {
+                // A projected `id(x)` reads only the identity, like the
+                // identity-only counts below.
+                if skip_identity_counts && identity_call_arg(&it.expression).is_some() {
+                    continue;
+                }
                 collect_referenced_variables(&it.expression, out);
             }
         }
@@ -10531,6 +11186,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn factor_node_scan_stops_one_row_past_the_row_cap() {
+        let cache = namidb_storage::SstCache::new(8 * 1024 * 1024);
+        let mut caches = namidb_storage::SessionCaches::none();
+        caches.sst_cache = Some(cache.clone());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = NamespacePaths::new("tenants", NamespaceId::new("factor-row-cap").unwrap());
+        let mut writer = WriterSession::open_with_caches(store, paths, caches)
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            writer
+                .upsert_node("Item", NodeId::new(), &NodeWriteRecord::default())
+                .unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+        writer
+            .flush(namidb_core::schema::Schema::empty())
+            .await
+            .unwrap();
+        let snapshot = writer.snapshot();
+        let plan =
+            crate::plan::lower(&crate::parser::parse("MATCH (n) RETURN n").unwrap()).unwrap();
+
+        let err = crate::exec::limits::with_limits(
+            None,
+            Some(2),
+            execute_factor_path(&plan, &snapshot, &Params::new()),
+        )
+        .await
+        .expect_err("a factor scan over the row cap must abort");
+        assert!(matches!(err, ExecError::RowCap(2)), "got {err:?}");
+        assert_eq!(cache.limited_node_scan_output_rows(), 3);
+    }
+
+    #[tokio::test]
     async fn non_string_property_lookup_confirms_candidate_and_numeric_equality() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let paths = NamespacePaths::new(
@@ -10752,6 +11442,29 @@ mod identity_only_tests {
                 false,
             ),
             ("MATCH (a:P)-[:E]->(b:Q) RETURN b.n AS n", "b", false),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i", "b", true),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN elementId(b) AS i",
+                "b",
+                true,
+            ),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i, b.n AS n",
+                "b",
+                false,
+            ),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN b", "b", false),
+            ("MATCH (a:P)-[:E]->(b:Q) RETURN id(b) + '' AS i", "b", false),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) WITH b RETURN id(b) AS i",
+                "b",
+                false,
+            ),
+            (
+                "MATCH (a:P)-[:E]->(b:Q) RETURN id(b) AS i ORDER BY b.n",
+                "b",
+                false,
+            ),
         ] {
             let r = routing_for(q);
             assert_eq!(

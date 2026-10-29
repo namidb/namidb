@@ -220,10 +220,22 @@ async fn hybrid_filter_applies_to_both_legs() {
 }
 
 #[tokio::test]
+async fn vector_procedure_filter_in_inline() {
+    // `in` is a reserved word, but a map key can only be a name, so the
+    // explicit operator is written inline without backticks.
+    let w = seed("vec-filter-inline-in").await;
+    let cypher = "CALL search.vector({ label: 'Doc', property: 'embedding', \
+         query: $q, k: 3, filter: { title: { in: ['alpha', 'gamma'] } } }) \
+         YIELD node, score RETURN node.title AS title";
+    assert_eq!(
+        titles(&run(&w, cypher, vec![1.0, 0.0, 0.0]).await),
+        vec!["alpha".to_string(), "gamma".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn vector_procedure_filter_in_via_param_map() {
-    // The explicit `in` operator (a reserved keyword, unusable as a bare inline
-    // map key) is reachable when the filter is supplied as a $param — its runtime
-    // map keys are plain strings, never parsed.
+    // The same operator from a $param, whose map keys are plain strings.
     let w = seed("vec-filter-param-in").await;
     let cypher = "CALL search.vector({ label: 'Doc', property: 'embedding', \
          query: $q, k: 3, filter: $f }) \

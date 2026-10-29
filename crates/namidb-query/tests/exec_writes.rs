@@ -192,6 +192,32 @@ async fn set_and_remove_label_mutate_the_set() {
 }
 
 #[tokio::test]
+async fn keyword_property_keys_round_trip() {
+    let mut writer = WriterSession::open(store(), paths("w-keyword-keys"))
+        .await
+        .unwrap();
+    write_q(&mut writer, "CREATE (a:Evt {by: 'ana', order: 1})").await;
+    write_q(&mut writer, "MATCH (a:Evt) SET a.end = 2 REMOVE a.order").await;
+    let snap = writer.snapshot();
+    let plan = lower(&parse("MATCH (a:Evt) RETURN a.by, a.end AS end, a.order AS order").unwrap())
+        .unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("a.by"),
+        Some(&RuntimeValue::String("ana".into()))
+    );
+    assert_eq!(rows[0].get("end"), Some(&RuntimeValue::Integer(2)));
+    assert_eq!(rows[0].get("order"), Some(&RuntimeValue::Null));
+
+    // A keyword alias is referenced in backticks, but the column is still
+    // named without them.
+    let plan = lower(&parse("MATCH (a:Evt) WITH a.end AS order RETURN `order`").unwrap()).unwrap();
+    let rows = execute(&plan, &snap, &Params::new()).await.unwrap();
+    assert_eq!(rows[0].get("order"), Some(&RuntimeValue::Integer(2)));
+}
+
+#[tokio::test]
 async fn property_update_preserves_label_set() {
     let mut writer = WriterSession::open(store(), paths("w-propkeeplabels"))
         .await
@@ -5916,4 +5942,82 @@ async fn bare_delete_of_connected_node_errors_detach_succeeds() {
         "DETACH DELETE leaves no dangling edge"
     );
     assert_eq!(count(&writer, "MATCH (n:Person) RETURN n").await, 1);
+}
+
+/// A whole-pattern OPTIONAL MATCH (two hops, or a WHERE) after a write
+/// clause plans as an Apply whose input writes. It used to go to the read
+/// walker with that input and fail with "write operators require
+/// execute_write". The subplan must also see the statement's own writes.
+#[tokio::test]
+async fn write_then_whole_pattern_optional_match() {
+    let mut writer = WriterSession::open(store(), paths("w-write-optional-apply"))
+        .await
+        .unwrap();
+    let catalog = StatsCatalog::empty();
+    let plans = |text: &str| {
+        let lowered = lower(&parse(text).unwrap()).unwrap();
+        [lowered.clone(), optimize(lowered, &catalog)]
+    };
+    let int = |r: &namidb_query::Row, k: &str| match r.get(k) {
+        Some(RuntimeValue::Integer(i)) => Some(*i),
+        Some(RuntimeValue::Null) | None => None,
+        other => panic!("unexpected {k}: {other:?}"),
+    };
+
+    // MERGE then a two-hop OPTIONAL MATCH on an empty graph: one padded row.
+    for plan in plans(
+        "MERGE (a:X {k: 1}) WITH a OPTIONAL MATCH (a)-[:R]->(b)-[:S]->(c) \
+         RETURN a.k AS k, c.k AS ck",
+    ) {
+        let out = execute_write(&plan, &mut writer, &Params::new())
+            .await
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(
+            (int(&out.rows[0], "k"), int(&out.rows[0], "ck")),
+            (Some(1), None)
+        );
+    }
+    assert_eq!(writer.snapshot().scan_label("X").await.unwrap().len(), 1);
+
+    // CREATE then an OPTIONAL MATCH with a WHERE.
+    for plan in plans(
+        "CREATE (a:Y {k: 2}) WITH a OPTIONAL MATCH (a)-[:R]->(b) WHERE b.k = 1 \
+         RETURN a.k AS k, b.k AS bk",
+    ) {
+        let out = execute_write(&plan, &mut writer, &Params::new())
+            .await
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(
+            (int(&out.rows[0], "k"), int(&out.rows[0], "bk")),
+            (Some(2), None)
+        );
+    }
+
+    // MATCH ... SET ... then a two-hop OPTIONAL MATCH in an explicit
+    // transaction: the tail of the chain and the SET are only staged, and
+    // the subplan still sees both.
+    write_q(
+        &mut writer,
+        "CREATE (:P {n: 1})-[:K]->(:P {n: 2})-[:K]->(:P {n: 3})",
+    )
+    .await;
+    let [stage, _] = plans("MATCH (p:P {n: 3}) CREATE (p)-[:K]->(:P {n: 4})-[:K]->(:P {n: 5})");
+    execute_write_staged(&stage, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    for plan in plans(
+        "MATCH (p:P {n: 3}) SET p.v = 7 WITH p OPTIONAL MATCH (p)-[:K]->(b)-[:K]->(c) \
+         RETURN p.v AS v, c.n AS cn",
+    ) {
+        let out = execute_write_staged(&plan, &mut writer, &Params::new())
+            .await
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(
+            (int(&out.rows[0], "v"), int(&out.rows[0], "cn")),
+            (Some(7), Some(5))
+        );
+    }
 }

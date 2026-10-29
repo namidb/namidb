@@ -20,7 +20,7 @@ Container image (official, multi-arch amd64/arm64, from
 [Docker Hub](https://hub.docker.com/r/namidb/namidb-server)):
 
 ```bash
-docker pull namidb/namidb-server:2
+docker pull namidb/namidb-server:3
 ```
 
 The image runs as non-root (uid 65532) and pre-creates `/var/lib/namidb`
@@ -32,7 +32,7 @@ one-time `chown -R 65532:65532 <dir>` on the host first.
 Or build it yourself from the repo root:
 
 ```bash
-docker build -t namidb/namidb-server:2 -f crates/namidb-server/Dockerfile .
+docker build -t namidb/namidb-server:3 -f crates/namidb-server/Dockerfile .
 ```
 
 ## Run

@@ -1117,9 +1117,13 @@ struct CacheStats {
     /// full row-group decode in performance regressions.
     node_sparse_filter_scans: AtomicU64,
     node_sparse_filter_rows: AtomicU64,
-    /// Exact LIMIT pushdown over globally-disjoint node SSTs. These counters
-    /// distinguish a true lazy prefix scan from the legacy full scan followed
-    /// by `take(k)`.
+    /// Label rows whose properties a label scan read, in the second pass of
+    /// a two-phase scan or from property pages. Rows outside the label never
+    /// count.
+    node_label_selected_rows: AtomicU64,
+    /// Exact LIMIT pushdown over node SSTs (a disjoint prefix scan or merged
+    /// label postings). These counters distinguish a true lazy prefix scan
+    /// from the legacy full scan followed by `take(k)`.
     node_limited_scan_fast_paths: AtomicU64,
     node_limited_scan_fallbacks: AtomicU64,
     node_limited_scan_decoded_rows: AtomicU64,
@@ -1143,6 +1147,9 @@ struct CacheStats {
     label_membership_pages: AtomicU64,
     label_membership_entries_examined: AtomicU64,
     label_membership_bytes: AtomicU64,
+    /// Ids a membership proof over overlapping SSTs could not settle from
+    /// the postings and sent to the point reader.
+    label_membership_point_reads: AtomicU64,
     /// Range-readable exact-edge sidecar work. One probe may contain a whole
     /// UNWIND batch and visit each distinct B+tree page once.
     edge_point_probes: AtomicU64,
@@ -1284,6 +1291,10 @@ impl std::fmt::Debug for SstCache {
             .field(
                 "node_sparse_filter_rows",
                 &self.stats.node_sparse_filter_rows.load(Ordering::Relaxed),
+            )
+            .field(
+                "node_label_selected_rows",
+                &self.stats.node_label_selected_rows.load(Ordering::Relaxed),
             )
             .field(
                 "node_limited_scan_fast_paths",
@@ -2266,6 +2277,16 @@ impl SstCache {
         self.stats.node_sparse_filter_rows.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn record_label_selected_node_rows(&self, rows: usize) {
+        self.stats
+            .node_label_selected_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    pub fn label_selected_node_rows(&self) -> u64 {
+        self.stats.node_label_selected_rows.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn record_limited_node_scan_fast_path(&self) {
         self.stats
             .node_limited_scan_fast_paths
@@ -2449,6 +2470,18 @@ impl SstCache {
 
     pub fn label_membership_bytes(&self) -> u64 {
         self.stats.label_membership_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_label_membership_point_reads(&self, ids: usize) {
+        self.stats
+            .label_membership_point_reads
+            .fetch_add(ids as u64, Ordering::Relaxed);
+    }
+
+    pub fn label_membership_point_reads(&self) -> u64 {
+        self.stats
+            .label_membership_point_reads
+            .load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_edge_point_probe(&self, stats: crate::sst::paged_index::PagedProbeStats) {

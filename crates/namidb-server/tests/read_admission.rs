@@ -46,7 +46,7 @@ async fn read_admission_bounds_concurrency_and_rejects_retryably() {
         let q = namidb_query::parse("MATCH (n:X) RETURN count(n) AS n").unwrap();
         namidb_query::plan(&q, &namidb_query::StatsCatalog::empty()).unwrap()
     };
-    let held = namidb_server::acquire_read_admission(&plan)
+    let held = namidb_server::acquire_read_admission(&plan, None)
         .await
         .expect("first admission must succeed");
 

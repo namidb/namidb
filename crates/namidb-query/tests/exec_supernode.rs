@@ -9,7 +9,9 @@ use std::sync::Arc;
 use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::schema::{DataType, EdgeTypeDef, LabelDef, PropertyDef, Schema, SchemaBuilder};
 use namidb_core::value::Value as CoreValue;
-use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSession};
+use namidb_storage::{
+    EdgeWriteRecord, NamespacePaths, NodeViewCache, NodeWriteRecord, SessionCaches, WriterSession,
+};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -62,6 +64,22 @@ async fn count_value(writer: &WriterSession, query: &str) -> i64 {
         Some(RuntimeValue::Integer(count)) => *count,
         other => panic!("expected an integer count, got {other:?}"),
     }
+}
+
+/// The single column of every row, sorted.
+async fn sorted_column(writer: &WriterSession, query: &str) -> Vec<String> {
+    let snapshot = writer.snapshot();
+    let plan = lower(&parse(query).unwrap()).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    let mut out: Vec<String> = rows
+        .iter()
+        .map(|row| match row.bindings.values().next() {
+            Some(RuntimeValue::String(s)) => s.clone(),
+            other => panic!("expected a string column, got {other:?}"),
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -281,6 +299,100 @@ async fn mixed_label_neighbours_resolve_without_per_edge_reads() {
     )
     .await;
     assert_eq!(all, (FANIN * 2) as i64);
+
+    // `RETURN id(t)` reads only the identity, so it takes the same id-only
+    // route as `count(t)`; `WITH t` keeps the node hydrated.
+    let stub_ids = sorted_column(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Green) RETURN id(t) AS i",
+    )
+    .await;
+    assert_eq!(stub_ids.len(), FANIN);
+    assert_eq!(
+        stub_ids,
+        sorted_column(
+            &writer,
+            "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Green) WITH t RETURN id(t) AS i",
+        )
+        .await
+    );
+}
+
+/// A labelled target whose VALUE is read still needs its row, but only when
+/// it carries the label: a single hop proves membership on the label sidecar
+/// and hydrates the members alone. A multi-hop walk still traverses through
+/// the neighbours of other labels.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_read_labelled_target_hydrates_only_label_members() {
+    const DEEP: usize = 10;
+    let node_cache = Arc::new(NodeViewCache::new(256 << 20));
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("exec-member-hydrate").unwrap());
+    let mut writer = WriterSession::open_with_caches(
+        store,
+        paths,
+        SessionCaches {
+            sst_cache: None,
+            node_cache: Some(node_cache.clone()),
+            adjacency_cache: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let hub = NodeId::new();
+    writer.upsert_node("Person", hub, &person("hub")).unwrap();
+    for ordinal in 0..FANIN {
+        let green = NodeId::new();
+        writer
+            .upsert_node("Green", green, &person(&format!("green-{ordinal}")))
+            .unwrap();
+        writer.upsert_edge("KNOWS", hub, green, &edge()).unwrap();
+        let red = NodeId::new();
+        writer
+            .upsert_node("Red", red, &person(&format!("red-{ordinal}")))
+            .unwrap();
+        writer.upsert_edge("KNOWS", hub, red, &edge()).unwrap();
+        if ordinal < DEEP {
+            let deep = NodeId::new();
+            writer
+                .upsert_node("Green", deep, &person(&format!("deep-{ordinal}")))
+                .unwrap();
+            writer.upsert_edge("KNOWS", red, deep, &edge()).unwrap();
+        }
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+
+    let inserts = node_cache.inserts();
+    let names = sorted_column(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS]->(t:Green) RETURN t.name AS n",
+    )
+    .await;
+    let hydrated = node_cache.inserts() - inserts;
+    assert_eq!(names.len(), FANIN);
+    assert!(names.iter().all(|name| name.starts_with("green-")));
+    assert!(
+        hydrated < (FANIN + FANIN / 2) as u64,
+        "only the {FANIN} :Green neighbours may be hydrated, not the :Red ones too \
+         ({hydrated} node views resolved)"
+    );
+
+    // The :Red neighbours are not results, but the second hop goes through them.
+    let names = sorted_column(
+        &writer,
+        "MATCH (h:Person {name: 'hub'})-[:KNOWS*1..2]->(t:Green) RETURN t.name AS n",
+    )
+    .await;
+    assert_eq!(names.len(), FANIN + DEEP);
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.starts_with("deep-"))
+            .count(),
+        DEEP
+    );
 }
 
 /// An UNLABELLED expansion target must be proven to exist, and deleting a

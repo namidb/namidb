@@ -8,6 +8,7 @@ surface (which covers the same primitives indirectly).
 
 from __future__ import annotations
 
+import shutil
 import uuid
 
 import pytest
@@ -184,6 +185,193 @@ def test_scan_edge_type_returns_every_edge(client: tg.Client) -> None:
     assert seen == set(pairs)
 
 
+def test_scan_limit_caps_the_result(client: tg.Client) -> None:
+    for _ in range(10):
+        client.upsert_node("Person", _new_uuid(), {})
+        client.upsert_edge("KNOWS", _new_uuid(), _new_uuid(), {})
+    client.commit()
+    assert len(client.scan_label("Person", limit=3)) == 3
+    assert len(client.scan_label("Person", limit=100)) == 10
+    assert client.scan_label_arrow("Person", limit=4).num_rows == 4
+    assert len(client.scan_edge_type("KNOWS", limit=3)) == 3
+    assert client.scan_label("Person", limit=0) == []
+
+
+def test_iter_label_and_edge_type_yield_the_scan(client: tg.Client) -> None:
+    ids = {_new_uuid() for _ in range(5)}
+    for nid in ids:
+        client.upsert_node("Person", nid, {})
+    client.upsert_edge("KNOWS", *sorted(ids)[:2], {})
+    client.commit()
+
+    it = client.iter_label("Person")
+    assert iter(it) is it
+    first = next(it)
+    assert first["label"] == "Person"
+    assert {first["id"]} | {n["id"] for n in it} == ids
+    with pytest.raises(StopIteration):
+        next(it)
+
+    assert len(list(client.iter_label("Person", limit=2))) == 2
+    edges = list(client.iter_edge_type("KNOWS"))
+    assert [(e["src"], e["dst"]) for e in edges] == [tuple(sorted(ids)[:2])]
+
+
+def _overlapping_people(client: tg.Client, count: int) -> list[str]:
+    # Two flushes over the same random ids overlap in key range, which is
+    # the layout a uuid keyed graph has once it holds more than one SST.
+    ids = [_new_uuid() for _ in range(count)]
+    client.put_nodes("Person", [{"_id": i, "n": n} for n, i in enumerate(ids)])
+    client.upsert_edge("KNOWS", ids[0], ids[1], {"w": 1})
+    client.commit()
+    client.flush()
+    client.merge_nodes("Person", [{"_id": i, "n": -n} for n, i in enumerate(ids) if n % 3 == 0])
+    for n, i in enumerate(ids[1:]):
+        client.upsert_edge("KNOWS", ids[n], i, {"w": n})
+    client.commit()
+    client.flush()
+    return ids
+
+
+def test_iter_label_reads_from_one_snapshot(tmp_path) -> None:
+    client = tg.Client(
+        f"file://{tmp_path}?ns=iter_case",
+        cache_bytes=0,
+        auto_sweep_min_age_secs=0,
+        compaction_l0_trigger=0,
+    )
+    ids = _overlapping_people(client, 2500)
+    nodes = client.scan_label("Person")
+    edges = client.scan_edge_type("KNOWS")
+    assert len(nodes) == 2500 and len(edges) == 2499
+
+    node_it = client.iter_label("Person")
+    edge_it = client.iter_edge_type("KNOWS")
+    got_nodes = [next(node_it)]
+    got_edges = [next(edge_it)]
+    # Deletes, new nodes, a compaction and a sweep land while both
+    # iterators are open. They keep reading the version they started on,
+    # and the sweep keeps its files.
+    for n in range(0, len(ids), 2):
+        client.tombstone_node("Person", ids[n])
+        client.tombstone_edge("KNOWS", ids[n], ids[n + 1])
+    client.put_nodes("Person", [{"_id": _new_uuid(), "n": 0} for _ in range(100)])
+    client.commit()
+    client.flush()
+    assert client.compact()["applied"] is True
+    client.sweep(min_age_secs=0)
+    got_nodes += list(node_it)
+    got_edges += list(edge_it)
+
+    assert got_nodes == nodes
+    assert got_edges == edges
+    assert len(client.scan_label("Person")) == 1350
+    assert list(client.iter_label("Person")) == client.scan_label("Person")
+
+
+def test_iter_label_limit_spans_batches(client: tg.Client) -> None:
+    _overlapping_people(client, 2500)
+    nodes = client.scan_label("Person")
+    edges = client.scan_edge_type("KNOWS")
+    for limit in (0, 1, 1024, 1500, 5000):
+        assert list(client.iter_label("Person", limit=limit)) == nodes[:limit]
+        assert client.scan_label("Person", limit=limit) == nodes[:limit]
+        assert list(client.iter_edge_type("KNOWS", limit=limit)) == edges[:limit]
+        assert client.scan_edge_type("KNOWS", limit=limit) == edges[:limit]
+
+
+# ── read_only clients ──────────────────────────────────────────────────
+
+
+def _file_uri(tmp_path) -> str:
+    return f"file://{tmp_path}?ns=ns{uuid.uuid4().hex[:8]}"
+
+
+def test_read_only_client_does_not_fence_the_writer(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    writer = tg.Client(uri)
+    alice = _new_uuid()
+    writer.upsert_node("Person", alice, {"name": "Alice"})
+    writer.commit()
+
+    # The commit is only in the WAL; the reader replays it.
+    reader = tg.Client(uri, read_only=True)
+    assert reader.lookup_node("Person", alice)["properties"] == {"name": "Alice"}
+
+    # Opening the reader did not take the namespace from the writer.
+    bob = _new_uuid()
+    writer.upsert_node("Person", bob, {"name": "Bob"})
+    assert writer.commit() is not None
+    writer.flush()
+
+
+def test_read_only_client_rejects_writes(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    tg.Client(uri).commit()
+    reader = tg.Client(uri, read_only=True)
+    node_id = _new_uuid()
+    for call in (
+        lambda: reader.upsert_node("Person", node_id, {}),
+        lambda: reader.upsert_edge("KNOWS", node_id, node_id, {}),
+        lambda: reader.tombstone_node("Person", node_id),
+        lambda: reader.merge_nodes("Person", [{"id": node_id}]),
+        lambda: reader.put_nodes("Person", [{"_id": node_id}]),
+        reader.commit,
+        reader.flush,
+        reader.compact,
+        reader.sweep,
+        lambda: reader.cypher("CREATE (:Person {name: 'x'})"),
+        lambda: reader.cypher("CREATE INDEX FOR (p:Person) ON (p.name)"),
+    ):
+        with pytest.raises(PermissionError):
+            call()
+    # Reads still work.
+    assert reader.cypher("MATCH (p:Person) RETURN count(p) AS n").first() == {"n": 0}
+
+
+def test_read_only_refresh_sees_new_commits(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    writer = tg.Client(uri)
+    writer.commit()
+    reader = tg.Client(uri, read_only=True)
+    assert reader.refresh() is False
+
+    writer.cypher("CREATE (:Person {name: 'Alice'})")
+    query = "MATCH (p:Person) RETURN p.name AS name"
+    assert len(reader.cypher(query)) == 0
+    assert reader.refresh() is True
+    assert reader.cypher(query).first() == {"name": "Alice"}
+    assert writer.refresh() is False
+
+
+def test_read_only_close_drops_its_retention_lease(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    tg.Client(uri).commit()
+    with tg.Client(uri, read_only=True) as reader:
+        assert len(list(tmp_path.rglob("pins/*.json"))) == 1
+        assert reader.cypher("RETURN 1 AS x").first() == {"x": 1}
+    assert list(tmp_path.rglob("pins/*.json")) == []
+    # Still usable: the next read takes a new lease rather than reading
+    # files nothing protects. close() on a writer is a no-op.
+    assert reader.cypher("RETURN 1 AS x").first() == {"x": 1}
+    assert len(list(tmp_path.rglob("pins/*.json"))) == 1
+    reader.close()
+    tg.Client(uri).close()
+
+
+def test_read_only_ignores_maintenance_options(tmp_path) -> None:
+    uri = _file_uri(tmp_path)
+    tg.Client(uri, spool_dir=str(tmp_path / "writer-spool")).commit()
+    spool = tmp_path / "reader-spool"
+    tg.Client(uri, read_only=True, spool_dir=str(spool), compaction_l0_trigger=1)
+    assert not spool.exists()
+
+
+def test_read_only_requires_an_existing_namespace(tmp_path) -> None:
+    with pytest.raises(RuntimeError):
+        tg.Client(_file_uri(tmp_path), read_only=True)
+
+
 # ── property type round-trip (storage Value coverage) ──────────────────
 
 
@@ -235,3 +423,171 @@ def test_store_repr_is_string(client: tg.Client) -> None:
 def test_version_attr_exists() -> None:
     assert isinstance(tg.__version__, str)
     assert len(tg.__version__) > 0
+
+
+# ── embedded maintenance: spool dir, sweep, L0 trigger ─────────────────
+
+
+def _flush_rounds(client: tg.Client, rounds: int) -> None:
+    for i in range(rounds):
+        client.upsert_node("Person", _new_uuid(), {"i": i})
+        client.commit()
+        client.flush()
+
+
+def _file_count(directory) -> int:
+    return sum(1 for p in directory.rglob("*") if p.is_file())
+
+
+def test_spool_dir_defaults_inside_graph_root(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("NAMIDB_SPOOL_DIR", raising=False)
+    client = tg.Client(f"file://{tmp_path}?ns=spool")
+    _flush_rounds(client, 1)
+    assert (tmp_path / ".namidb-spool").is_dir()
+
+
+def test_deleted_graph_spool_does_not_break_later_clients(tmp_path, monkeypatch) -> None:
+    # The spool dir is process-wide. A file:// graph that is gone must not
+    # take the flushes of every client opened after it down with it.
+    monkeypatch.delenv("NAMIDB_SPOOL_DIR", raising=False)
+    graph = tmp_path / "graph"
+    tg.Client(f"file://{graph}?ns=a")
+    shutil.rmtree(graph)
+    other = tg.Client(f"memory://spool-{uuid.uuid4().hex[:8]}", compaction_l0_trigger=0)
+    _flush_rounds(other, 2)
+    assert other.compact()["applied"] is True
+    # Same when the gone graph's client is still the last one opened.
+    graph.mkdir()
+    tg.Client(f"file://{graph}?ns=a")
+    shutil.rmtree(graph)
+    _flush_rounds(other, 1)
+    assert len(other.scan_label("Person")) == 3
+
+
+def test_spool_dir_kwarg_wins(tmp_path) -> None:
+    spool = tmp_path / "scratch"
+    tg.Client(f"file://{tmp_path / 'graph'}?ns=spool", spool_dir=str(spool))
+    assert spool.is_dir()
+    assert not (tmp_path / "graph" / ".namidb-spool").exists()
+
+
+def test_compact_then_sweep_reclaims_wal_and_l0(tmp_path) -> None:
+    client = tg.Client(
+        f"file://{tmp_path}?ns=gc",
+        auto_sweep_min_age_secs=None,
+        compaction_l0_trigger=0,
+    )
+    _flush_rounds(client, 3)
+    wal = tmp_path / "gc" / "wal"
+    level0 = tmp_path / "gc" / "sst" / "level0"
+    l0_files = _file_count(level0)
+    assert _file_count(wal) > 0
+
+    assert client.compact()["applied"] is True
+    # Nothing is reclaimed until a sweep runs, and a dry run deletes nothing.
+    assert _file_count(level0) == l0_files
+    dry = client.sweep(min_age_secs=0, dry_run=True)
+    assert dry["wal_segments_reclaimed"] > 0
+    assert _file_count(wal) > 0
+
+    report = client.sweep(min_age_secs=0)
+    assert report["aborted_by_pin"] is False
+    assert report["pins_honoured"] == 0
+    assert report["wal_segments_reclaimed"] > 0
+    assert report["orphans_deleted"] > 0
+    assert _file_count(wal) == 0
+    assert _file_count(level0) < l0_files
+    assert len(client.scan_label("Person")) == 3
+
+
+def test_applied_compaction_sweeps_automatically(tmp_path) -> None:
+    client = tg.Client(
+        f"file://{tmp_path}?ns=gc",
+        auto_sweep_min_age_secs=0,
+        compaction_l0_trigger=0,
+    )
+    _flush_rounds(client, 3)
+    assert client.compact()["applied"] is True
+    assert _file_count(tmp_path / "gc" / "wal") == 0
+    assert len(client.scan_label("Person")) == 3
+
+
+def test_flush_auto_compacts_past_l0_trigger() -> None:
+    client = tg.Client(f"memory://trig-{uuid.uuid4().hex[:8]}", compaction_l0_trigger=2)
+    _flush_rounds(client, 3)
+    assert client.compact()["l0_before"] < 3
+    assert len(client.scan_label("Person")) == 3
+
+
+def test_flush_trigger_zero_disables() -> None:
+    client = tg.Client(f"memory://trig-{uuid.uuid4().hex[:8]}", compaction_l0_trigger=0)
+    _flush_rounds(client, 3)
+    assert client.compact()["l0_before"] == 3
+
+
+def test_failed_triggered_compaction_only_warns(tmp_path) -> None:
+    client = tg.Client(
+        f"file://{tmp_path}?ns=warn",
+        auto_sweep_min_age_secs=None,
+        compaction_l0_trigger=2,
+    )
+    _flush_rounds(client, 1)
+    # Compaction output goes to level1; make it unwritable so the pass the
+    # next flush triggers fails after the flush itself has landed.
+    level1 = tmp_path / "warn" / "sst" / "level1"
+    level1.mkdir(parents=True)
+    level1.chmod(0o500)
+    try:
+        with pytest.warns(RuntimeWarning, match="compaction it triggered failed"):
+            _flush_rounds(client, 1)
+    finally:
+        level1.chmod(0o700)
+    assert len(client.scan_label("Person")) == 2
+    assert client.compact()["applied"] is True
+
+
+def test_sweep_keeps_what_a_concurrent_read_holds(tmp_path) -> None:
+    # Reads run on a snapshot outside the writer lock, so a sweep in another
+    # thread must not delete the SSTs an older in-flight read still needs.
+    import threading
+
+    client = tg.Client(
+        f"file://{tmp_path}?ns=race",
+        cache_bytes=0,
+        auto_sweep_min_age_secs=0,
+        compaction_l0_trigger=0,
+    )
+    batch = [{"_id": _new_uuid(), "n": i, "pad": "x" * 200} for i in range(4000)]
+    for _ in range(3):
+        client.put_nodes("Person", batch)
+        client.commit()
+        client.flush()
+
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def read() -> None:
+        while not stop.is_set():
+            try:
+                assert len(client.scan_label("Person")) == 4000
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+                return
+
+    readers = [threading.Thread(target=read) for _ in range(8)]
+    for t in readers:
+        t.start()
+    try:
+        for _ in range(10):
+            if errors:
+                break
+            client.put_nodes("Person", batch)
+            client.commit()
+            client.flush()
+            client.compact()
+            client.sweep(min_age_secs=0)
+    finally:
+        stop.set()
+        for t in readers:
+            t.join()
+    assert errors == []

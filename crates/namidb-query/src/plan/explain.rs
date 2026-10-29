@@ -673,7 +673,7 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 "SemiApply"
             });
         }
-        LogicalPlan::Apply { .. } => out.push_str("Apply"),
+        LogicalPlan::Apply { .. } => out.push_str(plan.operator_name()),
         LogicalPlan::PatternList {
             projection, alias, ..
         } => {
@@ -1194,6 +1194,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let project = LogicalPlan::Project {
             input: Box::new(expand),
@@ -1243,6 +1244,7 @@ TopN keys=[b DESC] limit=10
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let s = explain(&p);
         assert!(s.starts_with("OptionalExpand"));
@@ -1302,6 +1304,7 @@ TopN keys=[b DESC] limit=10
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let s = explain_verbose(&plan, &cat);
         assert!(s.starts_with("# Estimated rows: 500"));
@@ -1436,6 +1439,7 @@ TopN keys=[b DESC] limit=10
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let tree = explain_tree(&expand);
         assert_eq!(
@@ -1469,6 +1473,7 @@ TopN keys=[b DESC] limit=10
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let tree = explain_tree_verbose(&plan, &cat);
         assert_eq!(tree.estimated_rows, Some(500));

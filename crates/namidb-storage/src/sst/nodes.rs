@@ -19,6 +19,12 @@
 //! | `prop_<p_i>` | `<T_i>` | per def |
 //! | `__overflow_json` | `Utf8` | yes |
 //! | `__schema_version` | `UInt64` | no |
+//! | `__binary_props` | `Binary` | yes |
+//!
+//! `__binary_props` holds the numeric arrays and byte strings that would
+//! otherwise ride in the overflow JSON as text (embeddings above all), as one
+//! canonical `Value::Map` per row. SSTs written before 3.0 lack the column
+//! and keep those values in `__overflow_json`; readers accept both layouts.
 //!
 //! The writer enforces:
 //!
@@ -28,7 +34,7 @@
 
 pub mod property_pages;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::ops::Range;
@@ -60,7 +66,7 @@ use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::file::statistics::Statistics as ParquetStatistics;
 
-use namidb_core::{DataType, LabelDef, PropertyDef};
+use namidb_core::{DataType, LabelDef, PropertyDef, Value};
 
 use crate::error::{Error, Result};
 use crate::range_cache::PinnedObjectRangeSource;
@@ -82,6 +88,13 @@ pub const SCHEMA_VERSION: &str = "__schema_version";
 /// single-label SSTs predate this column; [`NodeSstReader::open`] tolerates its
 /// absence and the read path then derives the label set from the SST scope.
 pub const COL_LABELS: &str = "__labels";
+/// Trailing column carrying vector-like ad-hoc properties in binary. Absent in
+/// SSTs written before 3.0.
+pub const BINARY_PROPS: &str = "__binary_props";
+/// Footer key listing, as a JSON array, every property name that appears in
+/// [`BINARY_PROPS`] anywhere in the SST. A projection that names none of them
+/// never reads the column.
+const BINARY_PROPS_KEYS_METADATA: &str = "namidb.binary_props";
 
 /// Tuning knobs for `NodeSstWriter`.
 #[derive(Debug, Clone)]
@@ -148,7 +161,221 @@ pub fn node_arrow_schema(label: &LabelDef) -> SchemaRef {
     }
     fields.push(Field::new(OVERFLOW_JSON, ArrowDataType::Utf8, true));
     fields.push(Field::new(SCHEMA_VERSION, ArrowDataType::UInt64, false));
+    fields.push(Field::new(BINARY_PROPS, ArrowDataType::Binary, true));
     Arc::new(ArrowSchema::new(fields))
+}
+
+/// The schema new node SSTs are written with: [`node_arrow_schema`], or the
+/// 2.x layout under the test switch [`LegacyNodeLayout`].
+pub(crate) fn writer_node_arrow_schema(label: &LabelDef) -> SchemaRef {
+    let schema = node_arrow_schema(label);
+    if !legacy_node_layout() {
+        return schema;
+    }
+    let fields = &schema.fields()[..schema.fields().len() - 1];
+    Arc::new(ArrowSchema::new(fields.to_vec()))
+}
+
+// Test switch: write node SSTs the way 2.x did, every ad-hoc property in the
+// overflow JSON and no `__binary_props` column, to test reading old stores.
+// It is per thread so parallel tests never see each other's layout; the
+// blocking pools of flush and compaction carry it over with
+// `with_legacy_node_layout`. Flip it through `LegacyNodeLayout`.
+#[cfg(test)]
+thread_local! {
+    static LEGACY_NODE_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Writes the 2.x node layout on this thread until dropped, even on panic.
+#[cfg(test)]
+pub(crate) struct LegacyNodeLayout(());
+
+#[cfg(test)]
+impl LegacyNodeLayout {
+    pub(crate) fn on() -> Self {
+        LEGACY_NODE_LAYOUT.with(|f| f.set(true));
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for LegacyNodeLayout {
+    fn drop(&mut self) {
+        LEGACY_NODE_LAYOUT.with(|f| f.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_node_layout() -> bool {
+    LEGACY_NODE_LAYOUT.with(|f| f.get())
+}
+
+/// Wrap a closure bound for another thread so it sees this thread's layout.
+#[cfg(test)]
+pub(crate) fn with_legacy_node_layout<T>(f: impl FnOnce() -> T) -> impl FnOnce() -> T {
+    let legacy = legacy_node_layout();
+    move || {
+        let _layout = legacy.then(LegacyNodeLayout::on);
+        f()
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn with_legacy_node_layout<T>(f: impl FnOnce() -> T) -> impl FnOnce() -> T {
+    f
+}
+
+#[cfg(not(test))]
+pub(crate) fn legacy_node_layout() -> bool {
+    false
+}
+
+/// Whether `got` is the node SST schema for `label`, either current or as
+/// written before [`BINARY_PROPS`] existed.
+pub(crate) fn check_node_schema(got: &ArrowSchema, label: &LabelDef) -> Result<()> {
+    let expected = node_arrow_schema(label);
+    let fields = got.fields();
+    let legacy = fields.len() + 1 == expected.fields().len();
+    if !(legacy || fields.len() == expected.fields().len())
+        || fields
+            .iter()
+            .zip(expected.fields().iter())
+            .any(|(got, want)| got.name() != want.name() || got.data_type() != want.data_type())
+    {
+        return Err(Error::Corrupted {
+            path: "<node-sst>".into(),
+            detail: format!(
+                "node SST schema {:?} does not match the declared node schema",
+                fields.iter().map(|f| f.name()).collect::<Vec<_>>()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Whether `value` is stored in [`BINARY_PROPS`] rather than the overflow
+/// JSON: vectors, byte strings and lists of numbers, whose JSON text is
+/// several times their binary size and slow to parse.
+pub(crate) fn is_binary_property_value(value: &Value) -> bool {
+    match value {
+        Value::Vec(_) | Value::VecI8 { .. } | Value::Bytes(_) => true,
+        Value::List(items) => {
+            !items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| matches!(item, Value::F64(_) | Value::I64(_)))
+        }
+        _ => false,
+    }
+}
+
+/// Encode the binary half of a row's ad-hoc properties for [`BINARY_PROPS`].
+pub(crate) fn encode_binary_properties(properties: BTreeMap<String, Value>) -> Result<Vec<u8>> {
+    property_pages::encode_canonical_value(&Value::Map(properties))
+}
+
+/// Decode one [`BINARY_PROPS`] cell.
+pub(crate) fn decode_binary_properties(bytes: &[u8]) -> Result<BTreeMap<String, Value>> {
+    #[cfg(test)]
+    BINARY_PROPS_DECODES.with(|n| n.set(n.get() + 1));
+    match property_pages::decode_canonical_value(bytes)? {
+        Value::Map(map) => Ok(map),
+        _ => Err(Error::Corrupted {
+            path: "<node-sst>".into(),
+            detail: "__binary_props cell is not a map".into(),
+        }),
+    }
+}
+
+// Test counter: [`BINARY_PROPS`] cells decoded on this thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BINARY_PROPS_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Ad-hoc properties of node row `row`: the overflow JSON plus, when the SST
+/// carries it, the binary column, kept to `keep` when set. A column that the
+/// projection mask left out is simply absent here. Under a projection the
+/// JSON parser skips every other key without building it.
+pub(crate) fn decode_node_extra_properties(
+    batch: &RecordBatch,
+    row: usize,
+    keep: Option<&BTreeSet<&str>>,
+) -> Result<BTreeMap<String, Value>> {
+    let mut out = BTreeMap::new();
+    if let Some(json) = batch
+        .column_by_name(OVERFLOW_JSON)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .filter(|c| !c.is_null(row))
+    {
+        out = match keep {
+            None => serde_json::from_str(json.value(row))?,
+            Some(keep) => decode_selected_json(json.value(row), keep)?,
+        };
+    }
+    if let Some(binary) = batch
+        .column_by_name(BINARY_PROPS)
+        .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+        .filter(|c| !c.is_null(row))
+    {
+        let decoded = decode_binary_properties(binary.value(row))?;
+        match keep {
+            None => out.extend(decoded),
+            Some(keep) => out.extend(
+                decoded
+                    .into_iter()
+                    .filter(|(name, _)| keep.contains(name.as_str())),
+            ),
+        }
+    }
+    Ok(out)
+}
+
+/// Parse only the `keep` entries of an overflow JSON object. The others are
+/// skipped as `IgnoredAny`, which never builds a `Value` for them.
+fn decode_selected_json(json: &str, keep: &BTreeSet<&str>) -> Result<BTreeMap<String, Value>> {
+    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
+
+    struct Selected<'a, 'k>(&'a BTreeSet<&'k str>);
+
+    impl<'de> Visitor<'de> for Selected<'_, '_> {
+        type Value = BTreeMap<String, Value>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an overflow JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if self.0.contains(key.as_ref()) {
+                    out.insert(key.into_owned(), map.next_value::<Value>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for Selected<'_, '_> {
+        type Value = BTreeMap<String, Value>;
+
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            d: D,
+        ) -> std::result::Result<Self::Value, D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(json);
+    let out = Selected(keep).deserialize(&mut de)?;
+    de.end()?;
+    Ok(out)
 }
 
 /// Arrow field name for a declared property (with the `prop_` prefix).
@@ -208,6 +435,8 @@ pub struct NodeSstWriter {
     /// Vector / JSON columns are skipped (HLL on vector embeddings has
     /// no meaningful interpretation).
     property_hlls: BTreeMap<String, Hll>,
+    /// Every name seen in [`BINARY_PROPS`], recorded in the footer.
+    binary_keys: BTreeSet<String>,
 }
 
 impl std::fmt::Debug for NodeSstWriter {
@@ -231,7 +460,7 @@ impl NodeSstWriter {
             })?;
         }
 
-        let schema = node_arrow_schema(&label);
+        let schema = writer_node_arrow_schema(&label);
         let writer_props = build_writer_properties(&options);
         let spool = crate::sst::paged_index::create_spool_file().map_err(|e| {
             Error::Io(std::io::Error::new(
@@ -267,6 +496,7 @@ impl NodeSstWriter {
             schema_version_min: u64::MAX,
             schema_version_max: 0,
             property_hlls,
+            binary_keys: BTreeSet::new(),
         })
     }
 
@@ -276,6 +506,25 @@ impl NodeSstWriter {
 
     /// Write one batch of rows. The batch's schema must equal `self.schema()`.
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let mut binary_keys = BTreeSet::new();
+        if let Some(binary) = batch
+            .column_by_name(BINARY_PROPS)
+            .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+        {
+            for i in (0..binary.len()).filter(|&i| !binary.is_null(i)) {
+                binary_keys.extend(decode_binary_properties(binary.value(i))?.into_keys());
+            }
+        }
+        self.write_batch_with_binary_keys(batch, binary_keys)
+    }
+
+    /// [`Self::write_batch`] for a caller that already knows the property
+    /// names in the batch's [`BINARY_PROPS`] cells, so they need no decode.
+    pub(crate) fn write_batch_with_binary_keys(
+        &mut self,
+        batch: &RecordBatch,
+        binary_keys: BTreeSet<String>,
+    ) -> Result<()> {
         if batch.schema() != self.schema {
             return Err(Error::invariant(format!(
                 "node SST batch schema mismatch: expected {:?}, got {:?}",
@@ -359,6 +608,7 @@ impl NodeSstWriter {
         }
 
         update_property_hlls(&self.label, &mut self.property_hlls, batch)?;
+        self.binary_keys.extend(binary_keys);
 
         self.inner
             .write(batch)
@@ -377,6 +627,11 @@ impl NodeSstWriter {
             self.schema_version_min = 0;
         }
 
+        self.inner
+            .append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                BINARY_PROPS_KEYS_METADATA.to_string(),
+                serde_json::to_string(&self.binary_keys)?,
+            ));
         let mut spool = self
             .inner
             .into_inner()
@@ -479,25 +734,7 @@ impl NodeSstReader {
         let schema = builder.schema().clone();
 
         // Sanity-check: every expected column is present.
-        let expected = node_arrow_schema(&label);
-        if schema.fields().len() != expected.fields().len() {
-            return Err(Error::Corrupted {
-                path: "<in-memory>".into(),
-                detail: format!(
-                    "node SST has {} columns, expected {}",
-                    schema.fields().len(),
-                    expected.fields().len()
-                ),
-            });
-        }
-        for (got, want) in schema.fields().iter().zip(expected.fields().iter()) {
-            if got.name() != want.name() || got.data_type() != want.data_type() {
-                return Err(Error::Corrupted {
-                    path: "<in-memory>".into(),
-                    detail: format!("node SST column mismatch: got {:?}, want {:?}", got, want),
-                });
-            }
-        }
+        check_node_schema(&schema, &label)?;
         Ok(Self {
             body,
             schema,
@@ -850,6 +1087,31 @@ fn node_scan_plan(
                 .columns()
                 .iter()
                 .position(|column| root_of(column).as_deref() == Some(OVERFLOW_JSON))
+            {
+                leaves.push(idx);
+            }
+        }
+        // The binary column holds the embeddings, so it is read only when a
+        // needed name is one the footer says it carries. Without that list
+        // (no writer omits it, but be safe) it is read like the JSON.
+        let binary_keys: Option<BTreeSet<String>> = md
+            .file_metadata()
+            .key_value_metadata()
+            .and_then(|kv| kv.iter().find(|kv| kv.key == BINARY_PROPS_KEYS_METADATA))
+            .and_then(|kv| serde_json::from_str(kv.value.as_deref()?).ok());
+        let needs_binary = cols
+            .iter()
+            .map(String::as_str)
+            .chain(predicates.iter().map(|predicate| predicate.column()))
+            .any(|name| {
+                !has_physical_property(name)
+                    && binary_keys.as_ref().is_none_or(|keys| keys.contains(name))
+            });
+        if needs_binary {
+            if let Some(idx) = schema_descr
+                .columns()
+                .iter()
+                .position(|column| root_of(column).as_deref() == Some(BINARY_PROPS))
             {
                 leaves.push(idx);
             }
@@ -1268,20 +1530,7 @@ pub async fn scan_with_predicates_and_projection_async(
     .map_err(|e| Error::invariant(format!("parquet limited open async {path}: {e}")))?;
     let md = builder.metadata().clone();
 
-    let expected = node_arrow_schema(label);
-    let got = builder.schema();
-    if got.fields().len() != expected.fields().len()
-        || got
-            .fields()
-            .iter()
-            .zip(expected.fields())
-            .any(|(got, want)| got.name() != want.name() || got.data_type() != want.data_type())
-    {
-        return Err(Error::Corrupted {
-            path: path.to_string(),
-            detail: "node SST schema does not match the declared node schema".into(),
-        });
-    }
+    check_node_schema(builder.schema(), label)?;
 
     let (keep, projection_mask) = node_scan_plan(&md, label, predicates, projection);
     let all_row_groups = keep.len() == md.row_groups().len();
@@ -1421,18 +1670,7 @@ pub async fn scan_rows_by_ordinals_async(
     )
     .await
     .map_err(|e| Error::invariant(format!("parquet ordinal open async {path}: {e}")))?;
-    let expected = node_arrow_schema(label);
-    let got = builder.schema();
-    if got.fields().len() != expected.fields().len() {
-        return Err(Error::Corrupted {
-            path: path.to_string(),
-            detail: format!(
-                "node SST has {} columns, expected {}",
-                got.fields().len(),
-                expected.fields().len()
-            ),
-        });
-    }
+    check_node_schema(builder.schema(), label)?;
     let total_rows = builder.metadata().file_metadata().num_rows() as u64;
     let selection = row_selection_for_ordinals(total_rows, &ordinals)?;
     let stream = builder
@@ -1469,18 +1707,7 @@ async fn ranged_scan_selected_row_groups(
 
     // Same schema sanity check the sync `open()` does. The async reader
     // wouldn't necessarily catch a column rename until decode time.
-    let expected = node_arrow_schema(label);
-    let got = builder.schema();
-    if got.fields().len() != expected.fields().len() {
-        return Err(Error::Corrupted {
-            path: path.to_string(),
-            detail: format!(
-                "node SST has {} columns, expected {}",
-                got.fields().len(),
-                expected.fields().len()
-            ),
-        });
-    }
+    check_node_schema(builder.schema(), label)?;
 
     let keep = select(&md)?;
     if keep.is_empty() {
@@ -2160,6 +2387,7 @@ mod tests {
             Arc::new(prop_age.finish()),
             Arc::new(overflow.finish()),
             Arc::new(sv.finish()),
+            Arc::new(BinaryArray::new_null(rows.len())),
         ];
         RecordBatch::try_new(schema, columns).unwrap()
     }
@@ -2228,6 +2456,10 @@ mod tests {
         )
         .unwrap();
         in_memory.write(&batch).unwrap();
+        in_memory.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+            BINARY_PROPS_KEYS_METADATA.to_string(),
+            "[]".to_string(),
+        ));
         let expected = in_memory.into_inner().unwrap();
 
         let mut spooled = NodeSstWriter::new(label, options).unwrap();
@@ -2250,6 +2482,149 @@ mod tests {
             Error::Invariant(msg) => assert!(msg.contains("sorted")),
             other => panic!("expected Invariant, got {other:?}"),
         }
+    }
+
+    /// The legacy layout switch stays on the thread that set it (and on the
+    /// closures it hands off), and goes back off even if the test panics.
+    #[test]
+    fn legacy_layout_switch_is_scoped_to_its_thread() {
+        let carried = {
+            let _layout = LegacyNodeLayout::on();
+            assert!(!std::thread::spawn(legacy_node_layout).join().unwrap());
+            with_legacy_node_layout(legacy_node_layout)
+        };
+        assert!(std::thread::spawn(carried).join().unwrap());
+        assert!(!legacy_node_layout());
+        let panicked = std::panic::catch_unwind(|| {
+            let _layout = LegacyNodeLayout::on();
+            panic!("test body failed");
+        });
+        assert!(panicked.is_err());
+        assert!(!legacy_node_layout());
+    }
+
+    #[test]
+    fn vectors_are_binary_and_other_projections_skip_them() {
+        use crate::flush::{build_node_sst, NodeRow, NodeWriteRecord};
+        use crate::memtable::MemOp;
+
+        let emb = Value::List((0..1024).map(|i| Value::F64(f64::from(i) / 7.0)).collect());
+        let rows: Vec<Vec<(&str, Value)>> = vec![
+            vec![("name", Value::Str("a".into())), ("emb", emb.clone())],
+            vec![
+                ("name", Value::Str("b".into())),
+                ("v", Value::Vec(vec![0.5, -1.25])),
+                (
+                    "q",
+                    Value::VecI8 {
+                        codes: vec![1, -2],
+                        scale: 0.5,
+                    },
+                ),
+                ("raw", Value::Bytes(vec![0, 1, 2])),
+                ("tags", Value::List(vec![Value::Str("x".into())])),
+            ],
+            vec![("name", Value::Str("c".into()))],
+        ];
+        let expected: Vec<BTreeMap<String, Value>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect()
+            })
+            .collect();
+        let node_rows: Vec<NodeRow> = expected
+            .iter()
+            .enumerate()
+            .map(|(i, properties)| {
+                let mut id = [0u8; 16];
+                id[15] = i as u8 + 1;
+                NodeRow {
+                    id,
+                    lsn: i as u64 + 1,
+                    op: MemOp::Upsert(
+                        NodeWriteRecord {
+                            properties: properties.clone(),
+                            schema_version: 1,
+                            labels: vec![],
+                        }
+                        .encode()
+                        .unwrap(),
+                    ),
+                }
+            })
+            .collect();
+        // The memtable payload is JSON; the SST must return exactly what the
+        // payload holds.
+        let expected: Vec<BTreeMap<String, Value>> = node_rows
+            .iter()
+            .map(|row| match &row.op {
+                MemOp::Upsert(payload) => NodeWriteRecord::decode(payload).unwrap().properties,
+                MemOp::Tombstone => unreachable!(),
+            })
+            .collect();
+        let label = LabelDef {
+            name: String::new(),
+            properties: vec![],
+        };
+        // The footer's binary key list comes from the build, not from
+        // decoding every vector the writer was just handed.
+        let before = BINARY_PROPS_DECODES.with(|n| n.get());
+        let body = build_node_sst(&label, &node_rows).unwrap().body;
+        assert_eq!(BINARY_PROPS_DECODES.with(|n| n.get()), before);
+        let reader = NodeSstReader::open(label, body.clone()).unwrap();
+
+        // The JSON keeps only what is not a numeric array or byte string.
+        let batch = &reader.scan().unwrap()[0];
+        let json = batch
+            .column_by_name(OVERFLOW_JSON)
+            .unwrap()
+            .as_string::<i32>();
+        assert_eq!(json.value(0), r#"{"name":"a"}"#);
+        assert_eq!(json.value(1), r#"{"name":"b","tags":{"$list":["x"]}}"#);
+        assert!(batch.column_by_name(BINARY_PROPS).unwrap().is_null(2));
+        for (row, want) in expected.iter().enumerate() {
+            assert_eq!(
+                &decode_node_extra_properties(batch, row, None).unwrap(),
+                want
+            );
+        }
+
+        // A projection that names no binary property never reads the column,
+        // and one that does reads it back exactly.
+        let name = reader
+            .scan_with_predicates_and_projection(&[], Some(&["name".into()]))
+            .unwrap();
+        assert!(name[0].column_by_name(BINARY_PROPS).is_none());
+        let keep = BTreeSet::from(["emb"]);
+        let embs = reader
+            .scan_with_predicates_and_projection(&[], Some(&["emb".into()]))
+            .unwrap();
+        assert_eq!(
+            decode_node_extra_properties(&embs[0], 0, Some(&keep)).unwrap(),
+            BTreeMap::from([("emb".to_string(), expected[0]["emb"].clone())])
+        );
+        let md = parse_node_sst_metadata(&body).unwrap();
+        let listed = md.file_metadata().key_value_metadata().unwrap();
+        let listed = listed
+            .iter()
+            .find(|kv| kv.key == BINARY_PROPS_KEYS_METADATA)
+            .and_then(|kv| kv.value.clone());
+        assert_eq!(listed.as_deref(), Some(r#"["emb","q","raw","v"]"#));
+    }
+
+    #[test]
+    fn projected_json_decode_skips_other_keys_without_parsing_them_as_values() {
+        // `emb` is valid JSON but not a valid tagged value: building it would
+        // fail, so the projected decode must never try.
+        let json = r#"{"emb":{"$list":1,"$map":2},"name":"a"}"#;
+        assert!(serde_json::from_str::<BTreeMap<String, Value>>(json).is_err());
+        let keep = BTreeSet::from(["name"]);
+        assert_eq!(
+            decode_selected_json(json, &keep).unwrap(),
+            BTreeMap::from([("name".to_string(), Value::Str("a".into()))])
+        );
     }
 
     #[test]
@@ -2533,6 +2908,7 @@ mod tests {
             Arc::new(labels.finish()),
             Arc::new(overflow.finish()),
             Arc::new(sv.finish()),
+            Arc::new(BinaryArray::new_null(1)),
         ];
         let batch = RecordBatch::try_new(schema, columns).unwrap();
         w.write_batch(&batch).unwrap();
