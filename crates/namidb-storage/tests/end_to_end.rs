@@ -169,3 +169,84 @@ async fn cas_loss_under_concurrent_commits() {
         other => panic!("expected ManifestCommitCas, got {other:?}"),
     }
 }
+
+/// Node payloads travel as JSON from the WAL to a flush and from the source
+/// rows to the Parquet body during compaction, while the exact record
+/// sidecar and the property pages keep the decoded values. Without an exact
+/// float parse the last bit of a 17-digit float moved on the JSON leg, so a
+/// point lookup and a scan could return different embeddings for one node.
+#[tokio::test]
+async fn floats_survive_flush_and_compaction_bit_exact_on_every_route() {
+    use std::collections::BTreeMap;
+
+    use namidb_core::id::NodeId;
+    use namidb_core::value::Value;
+    use namidb_storage::{NodeWriteRecord, WriterSession};
+
+    // Doubles that need all 17 significant digits, the shape of a real
+    // embedding. 0.10101787042252375 alone used to come back one ulp off.
+    let mut bits = 0x9e37_79b9_7f4a_7c15u64;
+    let mut floats = vec![0.10101787042252375, 0.30000000000000004];
+    for _ in 0..256 {
+        bits = bits
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        floats.push((bits >> 11) as f64 / (1u64 << 53) as f64);
+    }
+    let emb = Value::List(floats.iter().map(|f| Value::F64(*f)).collect());
+    let node = |n: i64| NodeWriteRecord {
+        properties: BTreeMap::from([
+            ("n".to_string(), Value::I64(n)),
+            ("emb".to_string(), emb.clone()),
+        ]),
+        schema_version: 1,
+        ..Default::default()
+    };
+
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("e2e-floats").unwrap());
+    let mut writer = WriterSession::open(store(), paths).await.unwrap();
+    let ids: Vec<NodeId> = (0..3).map(|_| NodeId::new()).collect();
+    for (n, id) in ids.iter().enumerate().take(2) {
+        writer.upsert_node("E", *id, &node(n as i64)).unwrap();
+        writer.commit_batch().await.unwrap();
+        let schema = writer.snapshot().manifest().manifest.schema.clone();
+        writer.flush(schema).await.unwrap();
+    }
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.compact_l0(&schema).await.unwrap();
+    // A memtable row sends a limited scan through the id-ordered merge.
+    writer.upsert_node("E", ids[2], &node(2)).unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let snap = writer.snapshot();
+    // How many floats came back with different bits.
+    let drifted = |v: Option<&Value>| match v {
+        Some(Value::List(items)) => {
+            assert_eq!(items.len(), floats.len());
+            items
+                .iter()
+                .zip(&floats)
+                .filter(|(item, want)| match item {
+                    Value::F64(f) => f.to_bits() != want.to_bits(),
+                    other => panic!("not a float: {other:?}"),
+                })
+                .count()
+        }
+        other => panic!("emb was {other:?}"),
+    };
+    for id in &ids {
+        let view = snap.lookup_node("E", *id).await.unwrap().unwrap();
+        assert_eq!(drifted(view.properties.get("emb")), 0, "lookup_node");
+    }
+    let scanned = snap.scan_label("E").await.unwrap();
+    let limited = snap
+        .scan_label_with_predicates_and_projection_limited("E", &[], None, 10)
+        .await
+        .unwrap();
+    for (route, views) in [("scan_label", scanned), ("limited merge", limited)] {
+        assert_eq!(views.len(), 3, "{route}");
+        for view in views {
+            assert_eq!(drifted(view.properties.get("emb")), 0, "{route}");
+        }
+    }
+}

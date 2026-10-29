@@ -1291,9 +1291,10 @@ fn lower_node_pattern_head(
     // Back-reference path: if `(a)` re-uses an already bound `a`, no new
     // scan is emitted and a label is not required. Labels and inline
     // properties written on it still filter the bound node, the same way
-    // they do on a back-referenced Expand target. Under OPTIONAL MATCH a
-    // filter would drop the outer row, so they are left out there, as the
-    // target's property filters are.
+    // they do on a back-referenced Expand target. `optional` is only set on
+    // the per-hop OPTIONAL MATCH path, where `optional_per_hop` already
+    // ruled out labels and properties on the head; any other OPTIONAL MATCH
+    // is lowered here as a plain MATCH inside an Apply that pads NULLs.
     if let Some(binding) = &head.binding {
         if ctx.bindings.contains(&binding.name) {
             let alias = &binding.name;

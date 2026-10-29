@@ -350,3 +350,88 @@ async fn anchored_undirected_optional_hop_reads_only_the_anchor_neighbourhood() 
         }
     }
 }
+
+/// An OPTIONAL MATCH with a WHERE runs its pattern once per outer row. The
+/// WHERE used to stay above the whole subplan, so an `id()` pin on the
+/// pattern's new start scanned that label for every outer row, and a plain
+/// property test on it never reached the scan.
+#[tokio::test]
+async fn optional_match_where_reaches_the_scan_of_its_new_start() {
+    let cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = namidb_storage::SessionCaches::none();
+    caches.sst_cache = Some(cache.clone());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("optional-where").unwrap());
+    let mut writer = WriterSession::open_with_caches(Arc::new(InMemory::new()), paths, caches)
+        .await
+        .unwrap();
+    let devices: Vec<NodeId> = (0..3).map(|d| random_id(1_000 + d)).collect();
+    for (d, id) in devices.iter().enumerate() {
+        writer
+            .upsert_node("Device", *id, &node(format!("dev{d}"), String::new()))
+            .unwrap();
+    }
+    let idents: Vec<NodeId> = (0..300).map(random_id).collect();
+    for (n, id) in idents.iter().enumerate() {
+        let kind = if n % 100 == 7 { "phone" } else { "mail" };
+        writer
+            .upsert_node("Identifier", *id, &node(kind.into(), String::new()))
+            .unwrap();
+        writer
+            .upsert_edge("CONTACTED", *id, devices[n % 2], &edge(String::new()))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+    let snapshot = writer.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+
+    let pinned = idents[4];
+    // The pinned identifier contacted one device and the phones (7, 107,
+    // 207) all contacted device 1; every other device is padded once.
+    for (filter, total) in [
+        (format!("id(i) = '{pinned}'"), 3usize),
+        ("i.name = 'phone'".to_string(), 5),
+    ] {
+        let query = format!(
+            "MATCH (d:Device) OPTIONAL MATCH (i:Identifier)-[:CONTACTED]->(d) \
+             WHERE {filter} RETURN id(d) AS d, id(i) AS i"
+        );
+        let lowered = lower(&parse(&query).unwrap()).unwrap();
+        let plan = optimize(lowered.clone(), &catalog);
+        let explain = namidb_query::explain(&plan);
+        let ids = |rows: Vec<namidb_query::Row>| {
+            let mut out: Vec<String> = rows
+                .iter()
+                .map(|r| format!("{:?}|{:?}", r.get("d"), r.get("i")))
+                .collect();
+            out.sort();
+            out
+        };
+        let expected = ids(execute_flat_path(&lowered, &snapshot, &Params::new())
+            .await
+            .unwrap());
+        assert_eq!(expected.len(), total, "{query}");
+        for factor in [false, true] {
+            let before = cache.label_selected_node_rows();
+            let rows = if factor {
+                execute_factor_path(&plan, &snapshot, &Params::new()).await
+            } else {
+                execute_flat_path(&plan, &snapshot, &Params::new()).await
+            }
+            .unwrap();
+            assert_eq!(ids(rows), expected, "{query} (factorized: {factor})");
+            if filter.starts_with("id(") {
+                // Only the three Device rows are scanned; the pin is a seek.
+                assert_eq!(cache.label_selected_node_rows() - before, 3, "{explain}");
+            }
+        }
+        let head_scan = if filter.starts_with("id(") {
+            "NodeById label=Identifier".to_string()
+        } else {
+            "NodeScan label=Identifier alias=i projection=[id, name] predicates=[i.name = \"phone\"]"
+                .to_string()
+        };
+        assert!(explain.contains(&head_scan), "{explain}");
+    }
+}

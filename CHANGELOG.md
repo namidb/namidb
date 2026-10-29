@@ -49,10 +49,16 @@ crates.io release will establish and document that API explicitly.
 
 - **Node SSTs and their exact record sidecars use a new format that 2.x
   cannot read.** Embeddings and other numeric arrays moved out of the
-  overflow JSON (see Changed). A store written or compacted by 3.0 cannot
-  be opened by a 2.x binary or wheel, so a downgrade needs a backup taken
-  before the upgrade. Stores written by 2.x open and read as before, and
-  compaction rewrites their SSTs in the new format.
+  overflow JSON (see Changed). Nothing in the manifest marks the change, so
+  a 2.x binary or wheel still opens a store that 3.0 has written to or
+  compacted, but any node read that touches an SST written or compacted by
+  3.0 fails with a `corrupted artefact at ...` error (a node SST schema or
+  column count mismatch, or `unknown exact node record encoding`), and its
+  compaction fails too. A downgrade therefore needs a backup taken before
+  the upgrade. Stores written by 2.x open and read as
+  before. Their SSTs move to the new format when compaction merges them
+  with newer data; a bucket that is already one fully compacted SST keeps
+  the old layout until then.
 - **A MATCH no longer binds one relationship twice.** Queries whose pattern
   could walk the same relationship more than once now return fewer rows.
   See the entry under Fixed.
@@ -182,7 +188,10 @@ crates.io release will establish and document that API explicitly.
   keys that were not asked for are skipped without building a value, which
   also speeds up SSTs written by 2.x that still hold embeddings there. Those
   SSTs keep reading as before, alongside new ones, with the newest version
-  of each node winning; compaction rewrites them in binary.
+  of each node winning. Compaction writes them in binary when it merges
+  them with newer SSTs; a lone, fully compacted 2.x SST is left as it is,
+  since rewriting a multi-gigabyte vector corpus only to change its layout
+  would cost more than it saves.
 
   On a 200k-node store with 4,096 1,024-float embeddings, reading the
   `name` of those 4,096 nodes through their exact records took 53 MB of
@@ -283,6 +292,15 @@ crates.io release will establish and document that API explicitly.
 
 ### Fixed
 
+- **A float could come back one bit off.** Node properties pass through
+  JSON on their way from the WAL to a flush and into the Parquet rows a
+  compaction writes, and the JSON parser could round a 17-digit double to
+  its neighbour. Point lookups and property pages keep the exact value, so
+  one embedding could read back with different bits on a lookup and on a
+  scan. Floats are now parsed exactly. The exact parser costs about 9 ns
+  more per float, which did not show up in a flush or a compaction of
+  4,096 nodes with 1,024-float embeddings (both about 15 s either way).
+
 - **A MATCH could bind the same relationship to two of its relationship
   variables.** Cypher requires every relationship in one MATCH pattern to
   be a different relationship, but each hop only kept its own variable
@@ -314,8 +332,11 @@ crates.io release will establish and document that API explicitly.
   and a pattern that starts at a new node (`OPTIONAL MATCH (z:Missing)`),
   which dropped the row. Such a pattern now runs as a plain MATCH for each
   incoming row, and the row is kept once with every new variable NULL when
-  it finds nothing. A single hop from a bound node with none of those still
-  runs as before.
+  it finds nothing. That works after a write clause too (`MERGE (a) WITH a
+  OPTIONAL MATCH ...`), its `WHERE` and an `id()` or index pin on its new
+  start are used as in a plain MATCH, and a bare `LIMIT` above it stops
+  reading its input once it has enough rows. A single hop from a bound node
+  with none of those still runs as before.
 
 - **A chained `OPTIONAL MATCH` failed when an earlier one found nothing.**
   `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (b)-[:S]->(c)` raised
@@ -398,7 +419,8 @@ crates.io release will establish and document that API explicitly.
   `count(*)` already did before this release. When the later pattern starts
   at that alias (`MATCH (m)-->(p) MATCH (p:Person)`), its labels and inline
   properties used to be ignored, so rows for nodes that are not a Person
-  came back. Outside `OPTIONAL MATCH` they now filter the bound node.
+  came back. They now filter the bound node; under `OPTIONAL MATCH` a node
+  that does not match keeps the row with the new variables NULL.
 
 - **A pattern pinned by `id()` on its last node started from the first.**
   `MATCH (i:Identifier)-[:R]->(d:Device) WHERE id(d) = $id` scanned every
@@ -468,9 +490,9 @@ crates.io release will establish and document that API explicitly.
   memtable included, since each candidate is a full record lookup and a
   filter may reject them all. That includes the hidden limit a row cap adds
   to a node scan, so a capped query over a dense label is not looked up one
-  record at a time. Counts and other unbounded id-only scans never take it:
-  the first pass of the two-pass scan answers them without reading any
-  property.
+  record at a time. Counts and other unbounded id-only scans take it only
+  for a label of at most 1/64 of the node rows; otherwise the first pass of
+  the two-pass scan answers them without reading any property.
 
   Still open: a flush that only deletes nodes carries no label counts, which
   turns this route off until compaction. Node SSTs are still not split by

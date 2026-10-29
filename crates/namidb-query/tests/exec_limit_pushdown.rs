@@ -540,6 +540,59 @@ async fn nodescan_limit_uses_prefix_on_multi_level_layout() {
     assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
 }
 
+/// A whole-pattern OPTIONAL MATCH keeps every input row at least once, so a
+/// bare LIMIT above it only needs that many input rows. It used to run the
+/// label scan in full and the subplan for every node before truncating.
+#[tokio::test]
+async fn limit_over_whole_pattern_optional_match_caps_its_input() {
+    let sst_cache = SstCache::new(64 * 1024 * 1024);
+    let mut caches = SessionCaches::none();
+    caches.sst_cache = Some(sst_cache.clone());
+    let mut writer = WriterSession::open_with_caches(store(), paths("lp-optional-apply"), caches)
+        .await
+        .unwrap();
+    let ids: Vec<NodeId> = (0..40).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        writer
+            .upsert_node("L", *id, &node_with("k", i as i64))
+            .unwrap();
+    }
+    for pair in ids.windows(3).step_by(5) {
+        writer.upsert_edge("R", pair[0], pair[1], &edge()).unwrap();
+        writer.upsert_edge("S", pair[1], pair[2], &edge()).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+
+    let snapshot = writer.snapshot();
+    for factorized in [false, true] {
+        let exec = |query: String| {
+            let plan = lower(&parse(&query).unwrap()).unwrap();
+            let snapshot = &snapshot;
+            async move {
+                if factorized {
+                    namidb_query::execute_factor_path(&plan, snapshot, &Params::new()).await
+                } else {
+                    execute_flat_path(&plan, snapshot, &Params::new()).await
+                }
+                .unwrap()
+            }
+        };
+        for pattern in ["(n)-[:R]->(m)-[:S]->(o)", "(n)-[:R]->(o {k: 1})"] {
+            let base = format!("MATCH (n:L) OPTIONAL MATCH {pattern} RETURN n.k AS k, o.k AS ok");
+            let full = exec(base.clone()).await;
+            assert_eq!(full.len(), 40, "{pattern}");
+            let fast_paths = sst_cache.limited_node_scan_fast_paths();
+            assert_eq!(exec(format!("{base} LIMIT 3")).await, full[..3].to_vec());
+            assert_eq!(
+                sst_cache.limited_node_scan_fast_paths(),
+                fast_paths + 1,
+                "{pattern}: the label scan must be the limited one"
+            );
+        }
+    }
+}
+
 /// `MATCH (a)-->(b) RETURN ... LIMIT k` on two overlapping node SSTs plus
 /// memtable rows, with updates, deletes and a relabel spread over all three.
 /// The seed pull used to run only on disjoint SSTs, so this layout scanned

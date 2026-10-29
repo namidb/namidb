@@ -2555,8 +2555,8 @@ mod tests {
                 }
             })
             .collect();
-        // The memtable payload is JSON, whose float parse may move the last
-        // bit; the SST must return exactly what the payload holds.
+        // The memtable payload is JSON; the SST must return exactly what the
+        // payload holds.
         let expected: Vec<BTreeMap<String, Value>> = node_rows
             .iter()
             .map(|row| match &row.op {

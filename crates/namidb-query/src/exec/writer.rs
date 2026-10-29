@@ -474,6 +474,30 @@ fn execute_write_inner_mode<'a>(
                 Ok(out)
             }
 
+            // A read-only Apply (a whole-pattern OPTIONAL MATCH or a read CALL
+            // subquery) over a writing input: `MERGE (a) WITH a OPTIONAL MATCH
+            // (a)-->(b)-->(c)`. Stage the input's writes first, then run the
+            // subplan per row against the read-your-own-writes overlay.
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional,
+            } if input.contains_write() => {
+                let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
+                let snap = snapshot_for_write_read(writer, routing);
+                let out = crate::exec::walker::apply_rows(
+                    rows,
+                    subplan,
+                    optional.as_deref(),
+                    &snap,
+                    params,
+                    routing,
+                    None,
+                )
+                .await?;
+                Ok(if retain_output { out } else { Vec::new() })
+            }
+
             // ─── Read operators that may wrap a write child: handle
             // row-wise here so the write semantics run on the child first.
             LogicalPlan::Project {

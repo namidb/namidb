@@ -781,8 +781,10 @@ The server also takes durability/backpressure knobs for critical workloads:
 | `--writer-lock-timeout` (`NAMIDB_WRITER_LOCK_TIMEOUT`) | 30s | Cap how long a foreground write/DDL waits for the writer; a stuck writer returns 503 fast instead of growing an unbounded queue. |
 | `--query-timeout` (`NAMIDB_QUERY_TIMEOUT`) | 30s | Wall-clock budget for a single read query (HTTP and Bolt); a runaway scan aborts with a timeout error instead of pinning a worker. `0s` = unbounded. |
 | `--write-timeout` (`NAMIDB_WRITE_TIMEOUT`) | 60s | Wall-clock budget for a single write statement — its own default, deliberately larger than the read budget. For a bulk load, set `NAMIDB_WRITE_TIMEOUT=0s` (unbounded) or chunk the writes into smaller statements. `0s` = unbounded. |
+| `--fence-policy` (`NAMIDB_FENCE_POLICY`) | `steal` | What a writer does when another process claims its namespace. `steal` reopens and takes it back, which suits a single server. `yield` leaves it to the new owner and keeps the writer degraded until the process (or, in multi-tenant mode, the namespace) is opened again; use it when a control plane decides which node owns each namespace. |
+| `NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` (env only) | 0 (off) | In `--multi-tenant` mode, cap the concurrent reads of each namespace inside the process-wide read gate (`NAMIDB_MAX_CONCURRENT_QUERIES`), so one busy tenant cannot take every permit. |
 
-A fenced or poisoned writer reopens itself automatically, and `/v0/health` reports `writer: degraded` (503) until it recovers — a rolling deploy or an accidental second replica on the same bucket drains cleanly instead of serving stale reads behind a green check.
+A poisoned writer, or a fenced one under the default `steal` policy, reopens itself automatically, and `/v0/health` reports `writer: degraded` (503) until it recovers. Under `--fence-policy=yield` a fenced writer does not reopen and stays degraded. Either way a rolling deploy or an accidental second replica on the same bucket drains cleanly instead of serving stale reads behind a green check.
 
 <br />
 

@@ -190,7 +190,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             optional,
         } => LogicalPlan::Apply {
             input: Box::new(normalize_filters(*input)),
-            subplan,
+            subplan: Box::new(normalize_filters(*subplan)),
             optional,
         },
         LogicalPlan::PatternList {
