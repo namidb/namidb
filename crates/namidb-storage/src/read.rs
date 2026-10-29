@@ -100,7 +100,8 @@ use crate::sst::nodes::property_pages::{
 };
 use crate::sst::nodes::{
     decode_node_extra_properties, load_node_sst_metadata_async, parse_node_sst_metadata,
-    prop_column_name, row_groups_for_keys, scan_row_groups_async as node_scan_row_groups_async,
+    prop_column_name, row_groups_for_keys, scan_after_async as node_scan_after_async,
+    scan_row_groups_async as node_scan_row_groups_async,
     scan_row_groups_for_keys_async as node_scan_row_groups_for_keys_async,
     scan_rows_by_ordinals_async as node_scan_rows_by_ordinals_async,
     scan_with_predicates_and_projection_async as node_scan_limited_async,
@@ -1332,7 +1333,14 @@ impl<'mt> Snapshot<'mt> {
         max_candidates: usize,
     ) -> Result<Option<Vec<NodeId>>> {
         Ok(self
-            .indexed_nodes_by_numeric_range(label, property, predicates, max_candidates, usize::MAX)
+            .indexed_nodes_by_numeric_range(
+                label,
+                property,
+                predicates,
+                max_candidates,
+                usize::MAX,
+                None,
+            )
             .await?
             .map(|views| views.into_iter().map(|view| view.id).collect()))
     }
@@ -1348,6 +1356,7 @@ impl<'mt> Snapshot<'mt> {
         predicates: &[crate::sst::ScanPredicate],
         max_candidates: usize,
         limit: usize,
+        after: Option<NodeId>,
     ) -> Result<Option<Vec<NodeView>>> {
         namidb_core::profile_scope!("Snapshot::indexed_node_ids_by_numeric_range");
         if predicates.is_empty() || max_candidates == 0 {
@@ -1527,6 +1536,9 @@ impl<'mt> Snapshot<'mt> {
 
         candidates.sort_unstable();
         candidates.dedup();
+        if let Some(after) = after {
+            candidates.retain(|id| *id > after);
+        }
 
         let mut confirmed = Vec::with_capacity(candidates.len().min(limit));
         const CONFIRM_BATCH: usize = 256;
@@ -5842,6 +5854,7 @@ impl<'mt> Snapshot<'mt> {
                 decode_projection: Some(projection),
                 requested_projection: Some(&requested_projection),
                 limit: usize::MAX,
+                after: None,
             };
 
             let cached_body = self.cache_get(&absolute);
@@ -5914,8 +5927,14 @@ impl<'mt> Snapshot<'mt> {
         projection: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<NodeView>> {
-        self.scan_nodes_with_optional_label_limited(Some(label), predicates, projection, limit)
-            .await
+        self.scan_nodes_with_optional_label_limited(
+            Some(label),
+            predicates,
+            projection,
+            limit,
+            None,
+        )
+        .await
     }
 
     /// Materialise every live node in one label-agnostic pass, with the same
@@ -5945,7 +5964,7 @@ impl<'mt> Snapshot<'mt> {
         projection: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<NodeView>> {
-        self.scan_nodes_with_optional_label_limited(None, predicates, projection, limit)
+        self.scan_nodes_with_optional_label_limited(None, predicates, projection, limit, None)
             .await
     }
 
@@ -6211,6 +6230,7 @@ impl<'mt> Snapshot<'mt> {
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
         limit: Option<usize>,
+        after: Option<NodeId>,
     ) -> Result<Option<Vec<NodeView>>> {
         const CANDIDATE_BATCH: usize = 512;
 
@@ -6237,10 +6257,14 @@ impl<'mt> Snapshot<'mt> {
         let mut out = Vec::with_capacity(result_limit.min(64));
 
         for &idx in descriptors {
-            if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
+            if !node_sst_can_contain_label(&self.manifest.manifest, idx, label)
+                || after.is_some_and(|after| {
+                    self.manifest.manifest.ssts[idx].max_key <= *after.as_bytes()
+                })
+            {
                 continue;
             }
-            let Some(mut cursor) = self.label_posting_cursor(idx, label_id).await? else {
+            let Some(mut cursor) = self.label_posting_cursor(idx, label_id, after).await? else {
                 return Ok(None);
             };
             loop {
@@ -6309,6 +6333,7 @@ impl<'mt> Snapshot<'mt> {
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
         limit: Option<usize>,
+        after: Option<NodeId>,
     ) -> Result<Option<Vec<NodeView>>> {
         const CANDIDATE_BATCH: usize = 512;
 
@@ -6362,6 +6387,7 @@ impl<'mt> Snapshot<'mt> {
         if !bounded && !sparse {
             return Ok(None);
         }
+        memtable_ids.retain(|id| after.is_none_or(|after| *id > after));
         memtable_ids.sort_unstable();
 
         let label_id = dict.id(label);
@@ -6373,7 +6399,7 @@ impl<'mt> Snapshot<'mt> {
             let Some(label_id) = label_id else {
                 return Ok(None);
             };
-            let Some(cursor) = self.label_posting_cursor(idx, label_id).await? else {
+            let Some(cursor) = self.label_posting_cursor(idx, label_id, after).await? else {
                 return Ok(None);
             };
             cursors.push(cursor);
@@ -6473,15 +6499,21 @@ impl<'mt> Snapshot<'mt> {
         }
     }
 
-    /// Open the paged label postings of node SST `idx`. `None` means the
-    /// sidecar cannot prove completeness and the caller must keep its Parquet
-    /// scan.
+    /// Open the paged label postings of node SST `idx`, past `after` when
+    /// given. `None` means the sidecar cannot prove completeness and the
+    /// caller must keep its Parquet scan.
     async fn label_posting_cursor(
         &self,
         idx: usize,
         label_id: LabelId,
+        after: Option<NodeId>,
     ) -> Result<Option<LabelPostingCursor>> {
         let desc = &self.manifest.manifest.ssts[idx];
+        // Seek only into an SST that holds ids at or below `after`, so the
+        // others still check their count against the manifest.
+        let after = after
+            .map(|id| *id.as_bytes())
+            .filter(|after| desc.min_key <= *after);
         let Some(index) = &desc.label_index else {
             return Ok(None);
         };
@@ -6517,7 +6549,8 @@ impl<'mt> Snapshot<'mt> {
             source,
             expected,
             observed: 0,
-            after: None,
+            after,
+            from_start: after.is_none(),
             done: false,
         }))
     }
@@ -6569,7 +6602,7 @@ impl<'mt> Snapshot<'mt> {
                 cursor.after = Some(next);
             }
             None => {
-                if cursor.observed != cursor.expected {
+                if cursor.from_start && cursor.observed != cursor.expected {
                     return Ok(None);
                 }
                 cursor.done = true;
@@ -6608,13 +6641,17 @@ impl<'mt> Snapshot<'mt> {
             <= rows
     }
 
-    /// Shared exact implementation for the two public limited node scans.
-    async fn scan_nodes_with_optional_label_limited(
+    /// Shared exact implementation for the limited node scans, typeless when
+    /// `label` is `None`. With `after`, only ids above it count and every
+    /// route starts past it, so a caller pulling a scan in rounds passes the
+    /// last id it got and no round reads the earlier rows again.
+    pub async fn scan_nodes_with_optional_label_limited(
         &self,
         label: Option<&str>,
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
         limit: usize,
+        after: Option<NodeId>,
     ) -> Result<Vec<NodeView>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -6626,7 +6663,7 @@ impl<'mt> Snapshot<'mt> {
         // order the scan produces, and stops at `limit`, so it picks the same
         // rows the scan would have.
         if let Some(rows) = self
-            .try_scan_numeric_range_index(label, predicates, projection, limit)
+            .try_scan_numeric_range_index(label, predicates, projection, limit, after)
             .await?
         {
             return Ok(rows);
@@ -6652,7 +6689,13 @@ impl<'mt> Snapshot<'mt> {
         let Some(descriptors) = self.disjoint_node_descriptors() else {
             if let Some(label) = label {
                 if let Some(rows) = self
-                    .try_scan_overlapping_label_sidecars(label, predicates, projection, Some(limit))
+                    .try_scan_overlapping_label_sidecars(
+                        label,
+                        predicates,
+                        projection,
+                        Some(limit),
+                        after,
+                    )
                     .await?
                 {
                     if let Some(cache) = &self.cache {
@@ -6662,7 +6705,7 @@ impl<'mt> Snapshot<'mt> {
                 }
             }
             if let Some(rows) = self
-                .try_scan_overlapping_nodes_limited(label, predicates, projection, limit)
+                .try_scan_overlapping_nodes_limited(label, predicates, projection, limit, after)
                 .await?
             {
                 if let Some(cache) = &self.cache {
@@ -6676,6 +6719,9 @@ impl<'mt> Snapshot<'mt> {
             let mut rows = self
                 .scan_nodes_with_optional_label(label, predicates, decode_projection)
                 .await?;
+            if let Some(after) = after {
+                rows.retain(|row| row.id > after);
+            }
             if let Some(requested) = &requested_projection {
                 for row in &mut rows {
                     row.properties
@@ -6694,6 +6740,7 @@ impl<'mt> Snapshot<'mt> {
                     predicates,
                     projection,
                     Some(limit),
+                    after,
                 )
                 .await?
             {
@@ -6714,6 +6761,7 @@ impl<'mt> Snapshot<'mt> {
         let mut row_groups = 0usize;
         let mut range_bytes = 0u64;
 
+        let after_bytes = after.map(|id| *id.as_bytes());
         for idx in descriptors {
             if label.is_some_and(|label| {
                 !node_sst_can_contain_label(&self.manifest.manifest, idx, label)
@@ -6721,6 +6769,9 @@ impl<'mt> Snapshot<'mt> {
                 continue;
             }
             let desc = &self.manifest.manifest.ssts[idx];
+            if after_bytes.is_some_and(|after| desc.max_key <= after) {
+                continue;
+            }
             let sst_label_def = self.label_def_for_node_sst(desc);
             let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
             let batch_context = LimitedNodeBatchContext {
@@ -6732,6 +6783,7 @@ impl<'mt> Snapshot<'mt> {
                 decode_projection,
                 requested_projection: requested_projection.as_ref(),
                 limit,
+                after,
             };
 
             if let Some(projected_properties) = decode_projection {
@@ -6741,7 +6793,7 @@ impl<'mt> Snapshot<'mt> {
                         .as_ref()
                         .and_then(|cache| cache.get_metadata(&absolute));
                     let metadata_was_cached = cached_metadata.is_some();
-                    let (mut stream, metadata) = node_scan_limited_async(
+                    let (mut stream, metadata) = node_scan_after_async(
                         self.store.clone(),
                         Path::from(absolute.clone()),
                         desc.size_bytes,
@@ -6749,6 +6801,7 @@ impl<'mt> Snapshot<'mt> {
                         &[],
                         Some(&[]),
                         cached_metadata,
+                        after_bytes,
                     )
                     .await?;
                     if !metadata_was_cached {
@@ -6760,7 +6813,7 @@ impl<'mt> Snapshot<'mt> {
                     let out_before = out.len();
                     let decoded_before = decoded_rows;
                     let examined_before = examined_rows;
-                    let mut next_ordinal = 0_u64;
+                    let mut next_ordinal = stream.skipped_rows();
                     let mut sidecar_failed = false;
                     'property_rows: while out.len() < limit {
                         let Some(batches) = stream.next_row_group().await? else {
@@ -6792,9 +6845,12 @@ impl<'mt> Snapshot<'mt> {
                                 .ok_or_else(|| {
                                     Error::invariant("node property ordinal exceeds u64")
                                 })?;
-                            for (_, _, view) in candidates {
+                            for (id, _, view) in candidates {
                                 if out.len() == limit {
                                     break;
+                                }
+                                if after.is_some_and(|after| id <= after) {
+                                    continue;
                                 }
                                 examined_rows = examined_rows.saturating_add(1);
                                 let Some(mut view) = view else {
@@ -6845,8 +6901,7 @@ impl<'mt> Snapshot<'mt> {
                     None => self.get_sst_body(desc).await?,
                 };
                 let reader = NodeSstReader::open(sst_label_def.clone(), body)?;
-                let batches = reader
-                    .scan_iter_with_predicates_and_projection(predicates, decode_projection)?;
+                let batches = reader.scan_iter_after(predicates, decode_projection, after_bytes)?;
                 let work = consume_limited_node_batches(batches, &batch_context, &mut out)?;
                 decoded_rows = decoded_rows.saturating_add(work.decoded_rows);
                 examined_rows = examined_rows.saturating_add(work.examined_rows);
@@ -6859,7 +6914,7 @@ impl<'mt> Snapshot<'mt> {
                     .as_ref()
                     .and_then(|cache| cache.get_metadata(&absolute));
                 let metadata_was_cached = cached_metadata.is_some();
-                let (mut stream, metadata) = node_scan_limited_async(
+                let (mut stream, metadata) = node_scan_after_async(
                     self.store.clone(),
                     Path::from(absolute.clone()),
                     desc.size_bytes,
@@ -6867,6 +6922,7 @@ impl<'mt> Snapshot<'mt> {
                     predicates,
                     decode_projection,
                     cached_metadata,
+                    after_bytes,
                 )
                 .await?;
                 if !metadata_was_cached {
@@ -6943,6 +6999,10 @@ impl<'mt> Snapshot<'mt> {
     fn live_row_estimate(&self, label: &str) -> u64 {
         let mut live: u64 = 0;
         for idx in self.manifest.index.node_descriptors() {
+            if !label.is_empty() && !node_sst_can_contain_label(&self.manifest.manifest, idx, label)
+            {
+                continue;
+            }
             let desc = &self.manifest.manifest.ssts[idx];
             if !desc.scope.is_empty() {
                 if desc.scope == label || label.is_empty() {
@@ -6989,6 +7049,7 @@ impl<'mt> Snapshot<'mt> {
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
         limit: usize,
+        after: Option<NodeId>,
     ) -> Result<Option<Vec<NodeView>>> {
         if predicates.is_empty() {
             return Ok(None);
@@ -7011,6 +7072,7 @@ impl<'mt> Snapshot<'mt> {
                 predicates,
                 self.numeric_range_candidate_cap(),
                 limit,
+                after,
             )
             .await?
         else {
@@ -7055,9 +7117,6 @@ impl<'mt> Snapshot<'mt> {
 
         // id -> (winning lsn, the winner's structural view and physical row
         // when it carries `label`). Anything else is only a shadow.
-        // ponytail: one entry per stored id, shadows included, so memory is
-        // corpus-sized even for a tiny label; collect the label's ids first
-        // and check shadows only for those if that ever matters.
         let mut latest: BTreeMap<NodeId, (u64, Option<Box<LabelScanRow>>)> = BTreeMap::new();
         for (key, entry) in self.node_entries() {
             let MemKey::Node { id } = key else {
@@ -7078,6 +7137,11 @@ impl<'mt> Snapshot<'mt> {
             };
             update_node_winner(&mut latest, *id, entry.lsn, row);
         }
+        // The label's postings plus its memtable members name every id whose
+        // winner can carry `label`. A row of any other id can neither be a
+        // member nor hide one, so it skips the reconciliation, which would
+        // otherwise hold every stored id.
+        let candidates = self.label_candidate_ids(label, label_id, &latest).await?;
 
         for idx in self.manifest.index.node_descriptors() {
             let desc = &self.manifest.manifest.ssts[idx];
@@ -7108,6 +7172,12 @@ impl<'mt> Snapshot<'mt> {
                         .try_into()
                         .map_err(|_| Error::invariant("node_id row length != 16"))?;
                     let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
+                    if candidates
+                        .as_ref()
+                        .is_some_and(|ids| ids.binary_search(&id).is_err())
+                    {
+                        continue;
+                    }
                     let lsn = lsn_col.value(row);
                     let carries = !tomb_col.value(row)
                         && row_carries_label(&batch, row, label, label_id, dict, &desc.scope);
@@ -7165,6 +7235,9 @@ impl<'mt> Snapshot<'mt> {
                 return Ok(None);
             }
         }
+        if let Some(cache) = &self.cache {
+            cache.record_label_reconciled_node_ids(latest.len());
+        }
 
         // Phase 2. Winners come out in id order, which within one SST is also
         // physical order, so each SST's row list is sorted by ordinal.
@@ -7197,6 +7270,52 @@ impl<'mt> Snapshot<'mt> {
             true
         });
         Ok(Some(out))
+    }
+
+    /// Sorted ids of every SST posting of `label` plus its memtable members
+    /// in `latest`. `None` when some SST that can hold the label has no
+    /// usable postings, or when the label is too dense for the postings to
+    /// be worth reading.
+    async fn label_candidate_ids(
+        &self,
+        label: &str,
+        label_id: Option<LabelId>,
+        latest: &BTreeMap<NodeId, (u64, Option<Box<LabelScanRow>>)>,
+    ) -> Result<Option<Vec<NodeId>>> {
+        let Some(label_id) = label_id else {
+            return Ok(None);
+        };
+        let mut ids: Vec<NodeId> = latest
+            .iter()
+            .filter(|(_, (_, row))| row.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        // Around half the rows, reading the postings costs what the skipped
+        // reconciliation saves: a label of 53% of 220k nodes counted in 73 ms
+        // with them and 72 ms without.
+        if !self.label_share_at_most(label, ids.len(), 2) {
+            return Ok(None);
+        }
+        for idx in self.manifest.index.node_descriptors() {
+            if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
+                continue;
+            }
+            let Some(mut cursor) = self.label_posting_cursor(idx, label_id, None).await? else {
+                return Ok(None);
+            };
+            loop {
+                let Some(page) = self.next_label_postings(&mut cursor, 4096).await? else {
+                    return Ok(None);
+                };
+                if page.is_empty() {
+                    break;
+                }
+                ids.extend(page);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(Some(ids))
     }
 
     /// Phase 2 of [`Self::try_scan_label_two_phase`]: properties for the
@@ -7338,7 +7457,7 @@ impl<'mt> Snapshot<'mt> {
         projection: Option<&[String]>,
     ) -> Result<Vec<NodeView>> {
         if let Some(rows) = self
-            .try_scan_numeric_range_index(label, predicates, projection, usize::MAX)
+            .try_scan_numeric_range_index(label, predicates, projection, usize::MAX, None)
             .await?
         {
             return Ok(rows);
@@ -7375,11 +7494,12 @@ impl<'mt> Snapshot<'mt> {
                     predicates,
                     projection,
                     None,
+                    None,
                 )
                 .await?
             } else {
                 let mut rows = self
-                    .try_scan_overlapping_label_sidecars(label, predicates, projection, None)
+                    .try_scan_overlapping_label_sidecars(label, predicates, projection, None, None)
                     .await?;
                 if rows.is_none() {
                     rows = self
@@ -10397,6 +10517,8 @@ struct LimitedNodeBatchContext<'a> {
     decode_projection: Option<&'a [String]>,
     requested_projection: Option<&'a BTreeSet<&'a str>>,
     limit: usize,
+    /// Rows at or below this id are skipped.
+    after: Option<NodeId>,
 }
 
 type ProjectedNodeCandidate = (NodeId, u64, Option<NodeView>);
@@ -10418,6 +10540,8 @@ struct LabelPostingCursor {
     expected: u64,
     observed: u64,
     after: Option<[u8; 16]>,
+    /// The walk began at the label's first id, so its total can be checked.
+    from_start: bool,
     done: bool,
 }
 
@@ -10485,6 +10609,12 @@ fn append_limited_node_batch(
     for row in 0..batch.num_rows() {
         if out.len() == limit {
             break;
+        }
+        if context
+            .after
+            .is_some_and(|after| id_col.value(row) <= after.as_bytes().as_slice())
+        {
+            continue;
         }
         examined = examined.saturating_add(1);
         if tomb_col.value(row) {
@@ -11162,6 +11292,7 @@ fn string_property_sidecar<'a>(
 ///   one the namespace dictionary never interned — has no live row in the
 ///   SST. Pre-counts manifests (`per_label_counts` empty) and pre-label-index
 ///   SSTs stay `true`.
+/// - An SST whose rows are all tombstones holds no live row of any label.
 ///
 /// Excluding tombstone-only coverage is safe: sidecar winners are re-confirmed
 /// through `lookup_node`, which resolves last-LSN-wins across EVERY SST.
@@ -11169,6 +11300,12 @@ fn node_sst_can_contain_label(manifest: &Manifest, idx: usize, label: &str) -> b
     let desc = &manifest.ssts[idx];
     if !desc.scope.is_empty() {
         return desc.scope == label;
+    }
+    // A flush that only deletes nodes has no postings, so no label index.
+    if let crate::manifest::KindSpecificStats::Nodes { tombstone_count } = desc.kind_specific {
+        if tombstone_count == desc.row_count {
+            return false;
+        }
     }
     if let Some(li) = &desc.label_index {
         if !li.per_label_counts.is_empty() {
@@ -16651,6 +16788,110 @@ mod tests {
         }
     }
 
+    /// Measurement for mid-sized labels, too dense for the record lookups of
+    /// the postings route: 220k nodes over two overlapping node SSTs (a
+    /// tenth rewritten), labels of 1/32, 1/16, 1/8 and 1/4 of the nodes and
+    /// one of the rest. Each label is read id-only (a count) and with one
+    /// property. Run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "measurement, prints numbers"]
+    async fn measure_mid_sized_label_reads_over_overlapping_node_ssts() {
+        const NODES: usize = 220_000;
+        const UPDATES: usize = 22_000;
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let ids: Vec<NodeId> = (0..NODES)
+            .map(|_| {
+                let raw = (u128::from(next()) << 64) | u128::from(next());
+                NodeId::from_uuid(Uuid::from_u128(raw))
+            })
+            .collect();
+        let label_of = |i: usize| -> u32 {
+            match i % 64 {
+                0..=1 => 0,
+                2..=5 => 1,
+                6..=13 => 2,
+                14..=29 => 3,
+                _ => 4,
+            }
+        };
+        let payload = |i: usize, version: u64| {
+            MemOp::Upsert(
+                NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("name".to_string(), Value::Str(format!("n{i}-{version}"))),
+                        ("note".to_string(), Value::Str(format!("{:0>80}", i))),
+                    ]),
+                    schema_version: 1,
+                    labels: vec![label_of(i)],
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+        let store = make_store();
+        let paths = make_paths("measure-mid-labels");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        for label in 0..5 {
+            base.manifest.label_dict.intern(&format!("L{label}"));
+        }
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().build();
+        let rows = (0..NODES)
+            .map(|i| (ids[i], i as u64 + 1, payload(i, 0)))
+            .collect();
+        let first =
+            flush_batch_with_row_group_rows(128 * 1024, &ms, &fence, &base, &schema, rows).await;
+        let mut touched: Vec<usize> = (0..UPDATES).map(|k| (k * 7919 + 3) % NODES).collect();
+        touched.sort_unstable_by_key(|i| ids[*i]);
+        touched.dedup();
+        let rows = touched
+            .iter()
+            .map(|&i| (ids[i], (NODES + i) as u64 + 1, payload(i, 1)))
+            .collect();
+        let committed =
+            flush_batch_with_row_group_rows(128 * 1024, &ms, &fence, &first, &schema, rows).await;
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        for (label, share) in [
+            ("L0", "1/32"),
+            ("L1", "1/16"),
+            ("L2", "1/8"),
+            ("L3", "1/4"),
+            ("L4", "rest"),
+        ] {
+            for projection in [vec![], vec!["name".to_string()]] {
+                // Best of three, each on a fresh cache.
+                let mut best = std::time::Duration::MAX;
+                let mut seen = (0, 0);
+                for _ in 0..3 {
+                    let cache = SstCache::new(256 * 1024 * 1024);
+                    let snap =
+                        Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
+                            .with_cache(cache.clone());
+                    let started = std::time::Instant::now();
+                    let rows = snap
+                        .scan_label_with_predicates_and_projection(label, &[], Some(&projection))
+                        .await
+                        .unwrap();
+                    best = best.min(started.elapsed());
+                    seen = (rows.len(), cache.label_reconciled_node_ids());
+                }
+                println!(
+                    "  {label} ({share:<4}) {projection:<10?} rows={:<6} reconciled ids={:<6} {best:?}",
+                    seen.0, seen.1,
+                );
+            }
+        }
+    }
+
     /// Measurement for the forensic report's label locality issue, scaled
     /// down: 200k nodes over 18 labels with two overlapping node SSTs of
     /// 128 Ki-row groups, a 9-node label and a dense label carrying
@@ -17077,6 +17318,9 @@ mod tests {
         assert_eq!(counted, 1);
         assert_eq!(cache.node_locator_probes(), 0);
         assert_eq!(cache.label_selected_node_rows(), 0);
+        // That pass reconciles only the three ids the Device postings name,
+        // not all 22 stored ones.
+        assert_eq!(cache.label_reconciled_node_ids(), 3);
 
         // A label that lives mostly in the memtable is not sparse, even when
         // the manifest has never seen it.
@@ -17151,6 +17395,61 @@ mod tests {
         let devices = snap.scan_label("Device").await.unwrap();
         assert_eq!(view_ids(&devices), sorted_ids(&[5, 21]));
         assert_eq!(devices[1].properties["name"], Value::Str("m".into()));
+    }
+
+    #[tokio::test]
+    async fn delete_only_flush_keeps_label_postings_route() {
+        let store = make_store();
+        let paths = make_paths("delete-only-flush");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+        let mut rows: Vec<_> = (1..=20)
+            .map(|id| (sorted_node_id(id), id as u64, upsert("o", vec![OTHER])))
+            .collect();
+        rows.push((sorted_node_id(21), 21, upsert("d21", vec![DEVICE])));
+        rows.push((sorted_node_id(22), 22, upsert("d22", vec![DEVICE])));
+        let first = flush_batch(&ms, &fence, &base, &schema, rows).await;
+        let committed = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (sorted_node_id(5), 40, MemOp::Tombstone),
+                (sorted_node_id(22), 41, MemOp::Tombstone),
+            ],
+        )
+        .await;
+        let deletes = committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|desc| desc.kind == SstKind::Nodes && desc.max_lsn == 41)
+            .unwrap();
+        assert!(deletes.label_index.is_none());
+
+        // With every node Parquet body gone only the postings route can
+        // answer, so the delete-only SST must not switch it off.
+        for desc in committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), desc.path);
+            store.delete(&Path::from(absolute)).await.unwrap();
+        }
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(committed, &empty_view, store, paths);
+        assert!(snap.disjoint_node_descriptors().is_none());
+        let devices = snap.scan_label("Device").await.unwrap();
+        assert_eq!(view_ids(&devices), sorted_ids(&[21]));
     }
 
     #[tokio::test]

@@ -155,8 +155,14 @@ fn note(src: u64, slot: u64) -> String {
     text
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cold_partner_lookup_reads_a_sliver_of_a_multi_mb_edge_sst() {
+/// The committed multi-MB `CITES` fixture, plus the forward SST bytes.
+async fn multi_mb_fixture() -> (
+    Arc<CountingStore>,
+    Arc<dyn ObjectStore>,
+    NamespacePaths,
+    namidb_storage::manifest::LoadedManifest,
+    u64,
+) {
     // This pins the RANGED-HYDRATION contract, so measure the raw read
     // path: the shared range cache rounds every fetch up to its 256 KiB
     // pages (an amortization TRADE, deliberately excluded from this
@@ -220,6 +226,12 @@ async fn cold_partner_lookup_reads_a_sliver_of_a_multi_mb_edge_sst() {
         fwd_bytes > 10_000_000,
         "the fixture must build a multi-MB forward edge SST, got {fwd_bytes} bytes"
     );
+    (counting, store, paths, loaded, fwd_bytes)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_partner_lookup_reads_a_sliver_of_a_multi_mb_edge_sst() {
+    let (counting, store, paths, loaded, fwd_bytes) = multi_mb_fixture().await;
 
     // Reader-node snapshot: committed manifest + empty memtable, cold caches.
     let memtable = Memtable::new();
@@ -280,4 +292,37 @@ async fn cold_partner_lookup_reads_a_sliver_of_a_multi_mb_edge_sst() {
         inverse_delta < ceiling,
         "cold inverse lookup read {inverse_delta} bytes (ceiling {ceiling})"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_edge_cursor_batch_reads_a_sliver_of_a_multi_mb_edge_sst() {
+    let (counting, store, paths, loaded, fwd_bytes) = multi_mb_fixture().await;
+    let memtable = Memtable::new();
+    let view = memtable.snapshot_view();
+    let snapshot = Snapshot::new(loaded, &view, store.clone(), paths.clone());
+
+    let before = counting.read_bytes();
+    let mut cursor = snapshot.edge_scan_cursor("CITES").await.unwrap();
+    let mut walked = cursor.next_batch(1024).await.unwrap();
+    let first_delta = counting.read_bytes() - before;
+    assert_eq!(walked.len(), 1024);
+    // The cursor used to read every forward SST in full before the first
+    // batch. Now it reads the reader metadata and one chunk of about 1024
+    // edges, about 0.6 MB of this 16 MB SST.
+    let ceiling = fwd_bytes / 20;
+    assert!(
+        first_delta < ceiling,
+        "first batch read {first_delta} bytes of a {fwd_bytes}-byte edge SST \
+         (ceiling {ceiling})"
+    );
+
+    loop {
+        let rows = cursor.next_batch(1000).await.unwrap();
+        if rows.is_empty() {
+            break;
+        }
+        walked.extend(rows);
+    }
+    assert_eq!(walked.len(), (KEYS * DEGREE) as usize);
+    assert_eq!(walked, snapshot.scan_edge_type("CITES").await.unwrap());
 }

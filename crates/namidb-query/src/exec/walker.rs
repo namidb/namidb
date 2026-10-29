@@ -141,17 +141,6 @@ pub(crate) fn resolve_row_count(
 /// before the first candidate exists.
 const MAX_EAGER_QUERY_CAPACITY: usize = 64;
 
-/// Largest seed round an Expand pulls from a labelled or filtered node scan
-/// over overlapping SSTs. Such a scan can be served by the label postings,
-/// the numeric range index or the merge, and every round restarts it, so
-/// when the seeds rarely expand the rounds could add up to several passes
-/// over the label (a full reconcile each, if the merge falls back). Past
-/// this the remaining round is one full scan. The unlabelled, unfiltered
-/// scan only has the merge, whose rounds grow like on disjoint SSTs.
-// ponytail: fixed cut (64 + 256 + 1024 + 4096 seeds at most); resume each
-// round after the last seed id if selective seed pulls get common.
-const OVERLAP_SEED_PULL_MAX: usize = 4096;
-
 #[inline]
 fn query_initial_capacity(requested: usize, available: usize) -> usize {
     requested.min(available).min(MAX_EAGER_QUERY_CAPACITY)
@@ -1227,58 +1216,75 @@ fn execute_capped<'a>(
                     resolved.clone(),
                     *back_reference,
                 );
-                // A NodeScan seed source is pulled as a growing scan-order
-                // prefix instead of in full: `MATCH (x)-->(y) LIMIT 10` over
-                // millions of nodes must not materialise every node first.
-                // Each round expands only the seeds the previous one did not
-                // see, so `out` stays the same prefix as the uncapped result
-                // and edgeless seeds cannot starve the budget. Memtable nodes
-                // and overlapping SSTs are merged in id order by the limited
+                // A NodeScan seed source is pulled in growing rounds instead
+                // of in full: `MATCH (x)-->(y) LIMIT 10` over millions of
+                // nodes must not materialise every node first. Each round
+                // resumes the id-ordered scan after the last seed of the one
+                // before, so `out` stays the same prefix as the uncapped
+                // result, edgeless seeds cannot starve the budget, and the
+                // rounds read every seed once in all. Memtable nodes and
+                // overlapping SSTs are merged in id order by the limited
                 // scan, so they stop early too. Any other input, or the
                 // full-body diagnostic read mode, runs uncapped once.
-                // NOTE: when few seeds match, the rounds rescan the prefix
-                // (between about 1.33x and 2.33x a full scan) and end up
-                // holding every seed; only the row cap bounds that case.
-                // Over overlapping SSTs a labelled or filtered scan switches
-                // to one uncapped round past OVERLAP_SEED_PULL_MAX seeds.
-                let (mut want, overlapping) = match input.as_ref() {
+                let seed_scan = match input.as_ref() {
                     LogicalPlan::NodeScan {
-                        label, predicates, ..
-                    } if snapshot.node_scan_stops_early() => (
-                        Some(cap.max(64)),
-                        !snapshot.node_scan_is_disjoint()
-                            && (label.is_some() || !predicates.is_empty()),
-                    ),
-                    _ => (None, false),
+                        label,
+                        alias,
+                        predicates,
+                        projection,
+                    } if snapshot.node_scan_stops_early() => {
+                        Some((label.as_deref(), alias, predicates, projection.as_deref()))
+                    }
+                    _ => None,
                 };
+                // Seeds pulled once the round is done.
+                let mut want = seed_scan.map(|_| cap.max(64));
                 let row_cap = crate::exec::limits::scoped_row_cap();
                 let mut out: Vec<Row> = Vec::new();
                 let mut seen = 0usize;
+                let mut last_seed: Option<NodeId> = None;
                 let mut scan_time = std::time::Duration::ZERO;
                 loop {
-                    let (rows, exhausted) = match want {
-                        Some(w) => {
+                    let (fresh, exhausted) = match (seed_scan, want) {
+                        (Some((label, alias, predicates, projection)), Some(w)) => {
                             // One seed past the row cap is enough to tell
                             // "more seeds" from "exhausted".
                             let w = row_cap.map_or(w, |rc| w.min(rc.saturating_add(1)));
                             crate::exec::limits::check_deadline()?;
                             let start = std::time::Instant::now();
-                            let rows =
-                                execute_capped(input, snapshot, params, outer, routing, w).await?;
+                            let nodes = snapshot
+                                .scan_nodes_with_optional_label_limited(
+                                    label,
+                                    predicates,
+                                    projection,
+                                    w - seen,
+                                    last_seed,
+                                )
+                                .await?;
                             scan_time += start.elapsed();
-                            crate::profile::record_op(input, scan_time, rows.len() as u64);
-                            let exhausted = rows.len() < w;
+                            let exhausted = nodes.len() < w - seen;
+                            seen += nodes.len();
+                            crate::profile::record_op(input, scan_time, seen as u64);
+                            if let Some(node) = nodes.last() {
+                                last_seed = Some(node.id);
+                            }
+                            let rows = nodes
+                                .into_iter()
+                                .map(|n| {
+                                    Row::new().with(
+                                        alias,
+                                        RuntimeValue::Node(Box::new(NodeValue::from(n))),
+                                    )
+                                })
+                                .collect();
                             (rows, exhausted)
                         }
-                        None => (
+                        _ => (
                             execute_inner_with_routing(input, snapshot, params, outer, routing)
                                 .await?,
                             true,
                         ),
                     };
-                    let total = rows.len();
-                    let fresh: Vec<Row> = rows.into_iter().skip(seen).collect();
-                    seen = total;
                     let mut expanded = execute_expand(
                         fresh,
                         source,
@@ -1305,11 +1311,9 @@ fn execute_capped<'a>(
                         return Ok(out);
                     }
                     // The budget is still open and more seeds remain, so
-                    // the next round would hold more than this one.
-                    crate::exec::limits::check_row_cap(total)?;
-                    want = want
-                        .map(|w| w.saturating_mul(4))
-                        .filter(|w| !overlapping || *w <= OVERLAP_SEED_PULL_MAX);
+                    // the next round would pull past the seeds so far.
+                    crate::exec::limits::check_row_cap(seen)?;
+                    want = want.map(|w| w.saturating_mul(4));
                 }
             }
 
@@ -1401,7 +1405,8 @@ fn execute_capped<'a>(
 /// row with that row as the correlation, and emit the row combined with
 /// each subplan row. With `optional` (a whole-pattern OPTIONAL MATCH) a row
 /// the subplan rejects is kept once with the `optional` aliases set to NULL.
-/// `cap` stops once that many rows are out, for a LIMIT above.
+/// `cap` stops once that many rows are out, for a LIMIT above. A subplan
+/// that reads nothing from the row runs once and its rows are reused.
 pub(crate) async fn apply_rows(
     rows: Vec<Row>,
     subplan: &LogicalPlan,
@@ -1412,12 +1417,32 @@ pub(crate) async fn apply_rows(
     cap: Option<usize>,
 ) -> Result<Vec<Row>, ExecError> {
     let mut out = Vec::with_capacity(rows.len());
+    let correlated = reads_outer_row(subplan);
+    let mut shared: Option<Vec<Row>> = None;
     for row in rows {
         if cap.is_some_and(|cap| out.len() >= cap) {
             break;
         }
-        let sub_rows =
-            execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
+        let fresh;
+        let sub_rows: &[Row] = if correlated {
+            fresh =
+                execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing).await?;
+            &fresh
+        } else {
+            if shared.is_none() {
+                shared = Some(
+                    execute_inner_with_routing(
+                        subplan,
+                        snapshot,
+                        params,
+                        Some(&Row::new()),
+                        routing,
+                    )
+                    .await?,
+                );
+            }
+            shared.as_deref().unwrap_or_default()
+        };
         if sub_rows.is_empty() {
             if let Some(pad) = optional {
                 let mut padded = row;
@@ -1437,6 +1462,18 @@ pub(crate) async fn apply_rows(
         }
     }
     Ok(out)
+}
+
+/// Whether `plan` reads its correlation row: only a non-empty `Argument`
+/// does. A nested apply's subplan gets its own row, so only its input counts.
+fn reads_outer_row(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Argument { bindings } => !bindings.is_empty(),
+        LogicalPlan::SemiApply { input, .. }
+        | LogicalPlan::Apply { input, .. }
+        | LogicalPlan::PatternList { input, .. } => reads_outer_row(input),
+        _ => plan.children().into_iter().any(reads_outer_row),
+    }
 }
 
 /// Scan limit that keeps a leaf node scan under the scoped row cap: one row

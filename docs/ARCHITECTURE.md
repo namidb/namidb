@@ -105,7 +105,7 @@ Record  ::= length:u32 | crc32:u32 | lsn:u64 | payload:[length]
 Footer  ::= "TGEL"(4) | crc32(header+records):u32
 ```
 
-`FORMAT_VERSION = 1` (the multi-label era). Framing is version-independent, so `decode` accepts any `version <= FORMAT_VERSION` and rejects only a strictly newer one (`Error::Corrupted`); an older binary refuses a v1 segment outright rather than silently dropping the label field. Each record carries a per-record CRC over `lsn ‖ payload`, and the footer carries a segment-wide CRC over header+records, so both torn writes and intra-record corruption are caught. `append_segment` maps `AlreadyExists` to `Error::Precondition` — a seq collision means a competitor (or an orphan from a prior attempt) already claimed that slot; the loser is fenced. `lsn` (log sequence number) is assigned monotonically per namespace and is the durable order of operations. Each `payload` is a bincode-encoded `WalEntry { key: MemKey, op: WalOp, lsn }` (`recovery.rs`).
+`FORMAT_VERSION = 2` (v1 was the multi-label era, v2 adds binary node payloads). Framing is version-independent, so `decode` accepts any `version <= FORMAT_VERSION` and rejects only a strictly newer one (`Error::Corrupted`); an older binary refuses a newer segment outright rather than silently dropping the label field or failing later on a payload it cannot parse. Each record carries a per-record CRC over `lsn ‖ payload`, and the footer carries a segment-wide CRC over header+records, so both torn writes and intra-record corruption are caught. `append_segment` maps `AlreadyExists` to `Error::Precondition` — a seq collision means a competitor (or an orphan from a prior attempt) already claimed that slot; the loser is fenced. `lsn` (log sequence number) is assigned monotonically per namespace and is the durable order of operations. Each `payload` is a bincode-encoded `WalEntry { key: MemKey, op: WalOp, lsn }` (`recovery.rs`). The node bytes inside an upsert, which are also the memtable value, are the JSON `NodeWriteRecord` unless the record carries a vector, bytes or a list of numbers; that one is a `0x00` byte followed by the binary exact record the `.nloc2` sidecar uses, so a 1,024-float embedding costs about 4 KB instead of about 11 KB of text and is never parsed as text.
 
 ### The memtable
 
@@ -774,7 +774,7 @@ Read from the source at 2.0.6. Runtime-tunable values give their environment var
 
 | Subsystem | Constant | Value |
 |---|---|---|
-| WAL | format version; segment/footer magic | 1; `TGWL` / `TGEL` |
+| WAL | format version; segment/footer magic | 2; `TGWL` / `TGEL` |
 | Manifest | stall signature; repair passes; pointer forward-probe bound | 8 rounds; 4; 8192 |
 | Node SST | compression; row-group target; page size; write batch | ZSTD-6; 128 Ki rows (`NAMIDB_NODE_SST_ROW_GROUP_ROWS`); 1 MiB; 8192 rows |
 | Exact node locator | suffix; paged magic; page size | `.nloc2`; `NAMIPG02`; 4 KiB |

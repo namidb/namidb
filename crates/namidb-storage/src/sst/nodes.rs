@@ -796,10 +796,23 @@ impl NodeSstReader {
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
     ) -> Result<ParquetRecordBatchReader> {
+        self.scan_iter_after(predicates, projection, None)
+    }
+
+    /// [`Self::scan_iter_with_predicates_and_projection`] without the leading
+    /// row groups that hold only ids at or below `after`.
+    pub fn scan_iter_after(
+        &self,
+        predicates: &[ScanPredicate],
+        projection: Option<&[String]>,
+        after: Option<[u8; 16]>,
+    ) -> Result<ParquetRecordBatchReader> {
         let builder = ParquetRecordBatchReaderBuilder::try_new(self.body.clone())
             .map_err(|e| Error::invariant(format!("parquet open: {e}")))?;
         let md = builder.metadata().clone();
-        let (keep, projection_mask) = node_scan_plan(&md, &self.label, predicates, projection);
+        let (mut keep, projection_mask) = node_scan_plan(&md, &self.label, predicates, projection);
+        let (skipped, _) = row_groups_through(&md, after)?;
+        keep.retain(|rg| *rg >= skipped);
 
         // Optimisation: full row-group set + no projection ⇒ avoid the
         // overhead of `with_row_groups` / `with_projection`.
@@ -1188,6 +1201,37 @@ fn node_id_row_filter(md: &ParquetMetaData, keys: Arc<HashSet<[u8; 16]>>) -> Res
     Ok(RowFilter::new(vec![Box::new(predicate)]))
 }
 
+/// How many leading row groups, and rows in them, hold only ids at or below
+/// `after`. `node_id` ascends across the SST, so those row groups are a
+/// leading run; one without stats ends it.
+fn row_groups_through(md: &ParquetMetaData, after: Option<[u8; 16]>) -> Result<(usize, u64)> {
+    let Some(after) = after else {
+        return Ok((0, 0));
+    };
+    let leaf_idx = md
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|c| c.name() == COL_NODE_ID)
+        .ok_or_else(|| Error::invariant("node_id column not in parquet schema"))?;
+    let skipped = md
+        .row_groups()
+        .iter()
+        .take_while(|rg| {
+            rg.column(leaf_idx)
+                .statistics()
+                .and_then(|stats| stats.max_bytes_opt())
+                .is_some_and(|max| max <= after.as_slice())
+        })
+        .count();
+    let rows = md.row_groups()[..skipped]
+        .iter()
+        .map(|rg| rg.num_rows() as u64)
+        .sum();
+    Ok((skipped, rows))
+}
+
 /// Row groups whose `node_id` min/max range can contain at least one of
 /// `sorted_keys` (ascending). The writer keeps `node_id` strictly
 /// ascending across the SST, so per-row-group stats partition the key
@@ -1479,6 +1523,9 @@ impl AsyncFileReader for ObjectStoreRangedReader {
 pub struct RangedNodeBatchStream {
     inner: parquet::arrow::async_reader::ParquetRecordBatchStream<ObjectStoreRangedReader>,
     stats: Arc<RangedNodeScanStats>,
+    /// Rows in the leading row groups an `after` bound skipped, so the
+    /// physical ordinal of the first row this stream yields.
+    skipped_rows: u64,
 }
 
 impl std::fmt::Debug for RangedNodeBatchStream {
@@ -1501,6 +1548,10 @@ impl RangedNodeBatchStream {
     pub fn stats(&self) -> &Arc<RangedNodeScanStats> {
         &self.stats
     }
+
+    pub fn skipped_rows(&self) -> u64 {
+        self.skipped_rows
+    }
 }
 
 /// Open a row-group-pruned, column-projected node scan over byte-range GETs.
@@ -1519,6 +1570,34 @@ pub async fn scan_with_predicates_and_projection_async(
     projection: Option<&[String]>,
     cached_metadata: Option<Arc<ParquetMetaData>>,
 ) -> Result<(RangedNodeBatchStream, Arc<ParquetMetaData>)> {
+    scan_after_async(
+        store,
+        path,
+        file_size,
+        label,
+        predicates,
+        projection,
+        cached_metadata,
+        None,
+    )
+    .await
+}
+
+/// [`scan_with_predicates_and_projection_async`] that also skips the leading
+/// row groups whose `node_id` stats prove every row is at or below `after`,
+/// so a scan resumed after an id does not read its prefix again. Rows at or
+/// below `after` in the first kept row group are still yielded.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_after_async(
+    store: Arc<dyn ObjectStore>,
+    path: ObjectPath,
+    file_size: u64,
+    label: &LabelDef,
+    predicates: &[ScanPredicate],
+    projection: Option<&[String]>,
+    cached_metadata: Option<Arc<ParquetMetaData>>,
+    after: Option<[u8; 16]>,
+) -> Result<(RangedNodeBatchStream, Arc<ParquetMetaData>)> {
     let source = pin_node_sst_source(store, path.clone(), file_size).await?;
     let stats = Arc::new(RangedNodeScanStats::new(source.clone()));
     let reader = ObjectStoreRangedReader::from_source(source, cached_metadata);
@@ -1532,7 +1611,9 @@ pub async fn scan_with_predicates_and_projection_async(
 
     check_node_schema(builder.schema(), label)?;
 
-    let (keep, projection_mask) = node_scan_plan(&md, label, predicates, projection);
+    let (mut keep, projection_mask) = node_scan_plan(&md, label, predicates, projection);
+    let (skipped, skipped_rows) = row_groups_through(&md, after)?;
+    keep.retain(|rg| *rg >= skipped);
     let all_row_groups = keep.len() == md.row_groups().len();
     let mut builder = builder;
     if !all_row_groups {
@@ -1544,7 +1625,14 @@ pub async fn scan_with_predicates_and_projection_async(
     let inner = builder
         .build()
         .map_err(|e| Error::invariant(format!("parquet limited build async {path}: {e}")))?;
-    Ok((RangedNodeBatchStream { inner, stats }, md))
+    Ok((
+        RangedNodeBatchStream {
+            inner,
+            stats,
+            skipped_rows,
+        },
+        md,
+    ))
 }
 
 /// Ranged-read variant of [`NodeSstReader::targeted_scan`] (RFC-003).
@@ -2555,8 +2643,7 @@ mod tests {
                 }
             })
             .collect();
-        // The memtable payload is JSON; the SST must return exactly what the
-        // payload holds.
+        // The SST must return exactly what the memtable payload holds.
         let expected: Vec<BTreeMap<String, Value>> = node_rows
             .iter()
             .map(|row| match &row.op {
@@ -2569,10 +2656,11 @@ mod tests {
             properties: vec![],
         };
         // The footer's binary key list comes from the build, not from
-        // decoding every vector the writer was just handed.
+        // decoding every vector the writer was just handed. The two binary
+        // payloads (rows a and b) are each decoded once on the way in.
         let before = BINARY_PROPS_DECODES.with(|n| n.get());
         let body = build_node_sst(&label, &node_rows).unwrap().body;
-        assert_eq!(BINARY_PROPS_DECODES.with(|n| n.get()), before);
+        assert_eq!(BINARY_PROPS_DECODES.with(|n| n.get()), before + 2);
         let reader = NodeSstReader::open(label, body.clone()).unwrap();
 
         // The JSON keeps only what is not a numeric array or byte string.

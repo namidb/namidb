@@ -656,8 +656,15 @@ fn lower_match(
         // MATCH over the outer row and keep the row with NULLs when it
         // yields nothing.
         let outer: Vec<String> = ctx.bindings.iter().cloned().collect();
+        // A pattern that names no outer variable gets an empty Argument,
+        // which `apply_rows` reads as "run once for every row".
+        let named = crate::optimize::match_clause_aliases(&patterns, m.where_.as_ref());
         let argument = LogicalPlan::Argument {
-            bindings: outer.clone(),
+            bindings: if outer.iter().any(|b| named.contains(b)) {
+                outer.clone()
+            } else {
+                Vec::new()
+            },
         };
         let subplan = lower_match_body(m, &patterns, Some(argument), false, ctx)?;
         let pad = ctx

@@ -15,6 +15,70 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-10-29
+
+### Changed
+
+- **Vectors, bytes and number lists go through the WAL and the memtable in
+  binary.** A node record that carries one is now written as the binary
+  exact record that `__binary_props` and the `.nloc2` tags 3/4 already use,
+  instead of JSON text. Float bits are kept exactly, NaN payloads included.
+  For 2,000 nodes with 1,024-float embeddings, WAL bytes went from 23.07 MB
+  to 8.43 MB, upsert plus commit from 117 ms to 11 ms and flush from about
+  610 ms to 315 ms. Records without such values stay JSON. The WAL format
+  version is now 2: older JSON payloads and v0/v1 segments still decode,
+  and 3.0.0 refuses the new segments (and ignores a memtable snapshot of
+  this version), so flush before going back to 3.0.0.
+
+- **A bare `LIMIT` over an expand no longer re-reads its seeds.** The seed
+  pull grows its rounds (64 nodes, then four times more each round), and
+  each round used to restart the node scan from the first id, so when few
+  seeds expanded the rounds read 1.33 to 2.33 times a full pass. The
+  limited node scan now takes the last seed id and starts after it:
+  disjoint SSTs and leading row groups at or below it are skipped, the
+  merge of overlapping SSTs and the memtable start past it, and label
+  postings seek to it. On 6,000 nodes with one matching edge, the pull over
+  overlapping SSTs went from 11,440 seed rows to 6,000. The cutoff that
+  turned a labelled or filtered pull over overlapping SSTs into one full
+  scan after 4,096 seeds is gone.
+
+- **An `OPTIONAL MATCH` that names no outer variable runs once.**
+  `MATCH (a:A) OPTIONAL MATCH (z:Z)-[:R]->(w) RETURN a, z` ran its pattern
+  once per `a`; it now runs it once and gives its rows, or the NULL row,
+  to every `a`. With 50 `a` rows and 4 `:Z` nodes the label rows read went
+  from 250 to 54. A pattern or `WHERE` that reads an outer variable still
+  runs per row.
+
+- **`iter_edge_type` and `scan_edge_type(limit=)` no longer read the whole
+  edge type first.** The edge cursor reads each forward SST about 1,024
+  edges at a time, with just those rows' property pages. On a 16 MB edge
+  SST the first batch of 1,024 edges reads 0.6 MB instead of 16 MB, and
+  memory stays at about one chunk per SST. A full walk still reads each
+  byte once with the default page cache (about 4 times with the RAM page
+  cache off, since each chunk rounds its reads to 64 KiB pages). Edge SSTs
+  written before 2.1.0 keep their single full read. The edge iterator now
+  keeps its snapshot's files alive until it is dropped, like the node
+  iterator.
+
+- **Mid-sized label scans reconcile only the label's ids.** The first pass
+  of the two-pass label scan put every stored node id into its
+  last-writer-wins map. It now reads the label postings first and skips
+  rows of ids no posting names. It still decodes the structural columns of
+  every row. On 220k nodes over two overlapping SSTs, counting a 1/32 label
+  went from 48 ms to 15 ms, a 1/8 label from 52 ms to 26 ms and a 1/4
+  label from 57 ms to 40 ms; reading one property of a 1/4 label went from
+  108 ms to 89 ms. Labels over half the rows keep the old pass, since
+  there the postings cost what they save.
+
+### Fixed
+
+- **Deleting nodes turned the label postings route off until compaction.**
+  A flush that only deletes nodes writes no label index, so the reader
+  could not tell whether that SST held a member, and every postings route
+  fell back to the structural scan. An SST whose rows are all tombstones
+  is now known from its manifest stats to hold no live node, and its
+  tombstones no longer count toward the label share that picks the route.
+
 ## [3.0.0] - 2026-10-29
 
 ### Breaking
@@ -4162,7 +4226,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/namidb/namidb/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/namidb/namidb/compare/v2.6.19...v3.0.0
 [2.6.19]: https://github.com/namidb/namidb/compare/v2.6.18...v2.6.19
 [2.6.18]: https://github.com/namidb/namidb/compare/v2.6.17...v2.6.18
