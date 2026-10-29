@@ -2,9 +2,10 @@
 //!
 //! [`Snapshot::scan_edge_type`] merges every forward SST of the type into
 //! one map of decoded edges before it returns. The cursor merges the same
-//! sources in `(src, dst)` order as it goes and decodes the properties of
-//! the edges it returns only, so a caller walking a large type holds one
-//! batch of edges at a time.
+//! sources in `(src, dst)` order as it goes and builds the views of the
+//! edges it returns only. It still holds every SST body and its decoded
+//! property strings until it is dropped, so it saves the views and the
+//! JSON parsing, not the read.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -15,7 +16,7 @@ use namidb_core::NodeId;
 use super::{
     decode_edge_properties, load_declared_streams, update_edge_winner, EdgeView, Snapshot,
 };
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::flush::EdgeWriteRecord;
 use crate::manifest::SstKind;
 use crate::memtable::{MemKey, MemOp};
@@ -67,6 +68,8 @@ pub struct EdgeScanCursor {
     edge_type: String,
     memtable: std::iter::Peekable<<EdgeWinners as IntoIterator>::IntoIter>,
     ssts: Vec<EdgeSstCursor>,
+    /// An earlier batch failed.
+    failed: bool,
 }
 
 impl std::fmt::Debug for EdgeScanCursor {
@@ -139,13 +142,26 @@ impl Snapshot<'_> {
             edge_type: edge_type.to_string(),
             memtable: memtable.into_iter().peekable(),
             ssts,
+            failed: false,
         })
     }
 }
 
 impl EdgeScanCursor {
-    /// Up to `max` more edges; empty once the type is exhausted.
+    /// Up to `max` more edges; empty once the type is exhausted. After an
+    /// error every later call fails too, so no edge is skipped silently.
     pub fn next_batch(&mut self, max: usize) -> Result<Vec<EdgeView>> {
+        if self.failed {
+            return Err(Error::precondition(
+                "an earlier batch of this edge scan failed; open a new cursor",
+            ));
+        }
+        let batch = self.read_batch(max);
+        self.failed = batch.is_err();
+        batch
+    }
+
+    fn read_batch(&mut self, max: usize) -> Result<Vec<EdgeView>> {
         let mut out = Vec::new();
         while out.len() < max {
             let mut next = self.memtable.peek().map(|(key, _)| *key);

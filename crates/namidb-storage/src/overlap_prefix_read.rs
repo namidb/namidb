@@ -22,8 +22,8 @@ use uuid::Uuid;
 use namidb_core::{LabelId, NodeId};
 
 use super::{
-    node_scan_limited_async, node_view_from_payload, row_carries_label, NodeView, RangedMode,
-    Snapshot,
+    node_scan_limited_async, node_sst_can_contain_label, node_view_from_payload, row_carries_label,
+    NodeView, RangedMode, Snapshot,
 };
 use crate::error::{Error, Result};
 use crate::memtable::{MemKey, MemOp};
@@ -106,6 +106,7 @@ impl Snapshot<'_> {
             merge: self.open_node_merge(Some(label)).await?,
             fallback: None,
             last: None,
+            failed: false,
         })
     }
 
@@ -142,6 +143,14 @@ impl Snapshot<'_> {
 
         let mut cursors = Vec::new();
         for idx in self.manifest.index.node_descriptors() {
+            // An SST that cannot hold the label has no candidates. A newer
+            // version there that dropped the label is caught by the point
+            // read, which resolves every candidate over all SSTs.
+            if label.is_some_and(|label| {
+                !node_sst_can_contain_label(&self.manifest.manifest, idx, label)
+            }) {
+                continue;
+            }
             let desc = &self.manifest.manifest.ssts[idx];
             let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
             let metadata = self.node_sst_metadata(desc, &absolute).await?;
@@ -228,6 +237,7 @@ impl NodeMerge {
         loop {
             for (idx, cursor) in &mut self.cursors {
                 while cursor.rows.is_empty() && !cursor.done {
+                    crate::cancel::check()?;
                     let desc = &snap.manifest.manifest.ssts[*idx];
                     let Some(reader) = cursor.stream.next_row_group().await? else {
                         cursor.done = true;
@@ -326,8 +336,10 @@ pub struct NodeScanCursor {
     merge: Option<NodeMerge>,
     /// Rows left from a full reconciliation, once the merge gave up.
     fallback: Option<std::vec::IntoIter<NodeView>>,
-    /// The last id returned, so a fallback resumes after it.
+    /// The last id returned.
     last: Option<NodeId>,
+    /// An earlier batch failed.
+    failed: bool,
 }
 
 impl std::fmt::Debug for NodeScanCursor {
@@ -342,8 +354,21 @@ impl std::fmt::Debug for NodeScanCursor {
 
 impl NodeScanCursor {
     /// Up to `max` more nodes; empty once the label is exhausted. `snap`
-    /// must be the snapshot that opened the cursor.
+    /// must be the snapshot that opened the cursor. After an error every
+    /// later call fails too, since the failed batch's rows are lost and
+    /// going on would skip them.
     pub async fn next_batch(&mut self, snap: &Snapshot<'_>, max: usize) -> Result<Vec<NodeView>> {
+        if self.failed {
+            return Err(Error::precondition(
+                "an earlier batch of this label scan failed; open a new cursor",
+            ));
+        }
+        let batch = self.read_batch(snap, max).await;
+        self.failed = batch.is_err();
+        batch
+    }
+
+    async fn read_batch(&mut self, snap: &Snapshot<'_>, max: usize) -> Result<Vec<NodeView>> {
         loop {
             if let Some(rest) = &mut self.fallback {
                 return Ok(rest.by_ref().take(max).collect());
@@ -355,13 +380,20 @@ impl NodeScanCursor {
                     }
                     return Ok(rows);
                 }
+                // The merge may have settled an id below `last` from a stale
+                // version before it saw the SST out of order, and rows it
+                // already returned cannot be taken back.
+                if self.last.is_some() {
+                    return Err(Error::invariant(format!(
+                        "a node SST is not in id order, so the scan of `{}` cannot go on; \
+                         use scan_label",
+                        self.label
+                    )));
+                }
             }
             // ponytail: an SST out of id order (or no ranged reads) costs one
             // full reconcile here, like the limited scan's fallback.
-            let after = self.last;
-            let mut rows = snap.scan_label(&self.label).await?;
-            rows.retain(|row| after.is_none_or(|after| row.id > after));
-            self.fallback = Some(rows.into_iter());
+            self.fallback = Some(snap.scan_label(&self.label).await?.into_iter());
         }
     }
 

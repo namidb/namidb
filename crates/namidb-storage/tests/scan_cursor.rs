@@ -3,6 +3,7 @@
 //! its own rows instead of the whole label.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use object_store::memory::InMemory;
@@ -214,4 +215,92 @@ async fn edge_cursor_matches_scan_edge_type_on_overlapping_ssts() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn sparse_label_cursor_skips_ssts_without_it() {
+    std::env::set_var("NAMIDB_NODE_SST_ROW_GROUP_ROWS", "64");
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("sparse").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+    let ids: Vec<NodeId> = (0..ROWS).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        writer.upsert_node("A", *id, &node(i as i64)).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    // A few reports written after the big load, plus rewrites of some old
+    // nodes so the second SST overlaps the first.
+    for i in 0..10 {
+        writer.upsert_node("R", NodeId::new(), &node(i)).unwrap();
+    }
+    for id in ids.iter().step_by(100) {
+        writer.upsert_node("A", *id, &node(-1)).unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Schema::empty()).await.unwrap();
+    assert!(!writer.snapshot().node_scan_is_disjoint());
+
+    let cache = SstCache::new(64 * 1024 * 1024);
+    let snap = writer.snapshot().with_cache(cache.clone());
+    let mut cursor = snap.label_scan_cursor("R").await.unwrap();
+    let rows = cursor.next_batch(&snap, 100).await.unwrap();
+    assert_eq!(rows, snap.scan_label("R").await.unwrap());
+    assert_eq!(rows.len(), 10);
+    // Only the 40-row second SST is walked, not the 47 groups of the first.
+    assert!(
+        cache.limited_node_scan_row_groups() <= 1,
+        "row groups: {}",
+        cache.limited_node_scan_row_groups()
+    );
+}
+
+#[tokio::test]
+async fn node_cursor_stops_after_a_failed_batch() {
+    let (writer, _) = overlapping_writer().await;
+    let snap = writer.snapshot();
+    let mut cursor = snap.label_scan_cursor("A").await.unwrap();
+    assert_eq!(cursor.next_batch(&snap, 10).await.unwrap().len(), 10);
+
+    // A timed out batch, say: it gives up after the merge consumed ids.
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let failed =
+        namidb_storage::cancel::with_cancel_flag(cancelled, cursor.next_batch(&snap, 1000)).await;
+    assert!(failed.is_err());
+    // Going on would resume after the rows the failed batch lost.
+    assert!(cursor.next_batch(&snap, 1000).await.is_err());
+}
+
+#[tokio::test]
+async fn edge_cursor_stops_after_a_failed_batch() {
+    let (writer, _) = overlapping_writer().await;
+    let snap = writer.snapshot();
+    let mut cursor = snap.edge_scan_cursor("TO").await.unwrap();
+    assert_eq!(cursor.next_batch(10).unwrap().len(), 10);
+
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let failed =
+        namidb_storage::cancel::with_cancel_flag(cancelled, async { cursor.next_batch(10) }).await;
+    assert!(failed.is_err());
+    assert!(cursor.next_batch(10).is_err());
+}
+
+#[tokio::test]
+async fn full_node_walk_reads_each_record_about_once() {
+    let (writer, _) = overlapping_writer().await;
+    let cache = SstCache::new(64 * 1024 * 1024);
+    let snap = writer.snapshot().with_cache(cache.clone());
+    let walked = drain_nodes(&snap, "A", 1024).await;
+    assert_eq!(walked, snap.scan_label("A").await.unwrap());
+    // The point reads of all batches together examine about one node
+    // locator entry per SST row, like a single lookup of every member,
+    // not one probe of every SST per row.
+    let sst_rows = cache.limited_node_scan_decoded_rows();
+    assert!(sst_rows > 4000, "{sst_rows}");
+    assert!(
+        cache.node_locator_entries_examined() <= sst_rows * 5 / 4,
+        "entries {} for {sst_rows} SST rows",
+        cache.node_locator_entries_examined()
+    );
+    assert_eq!(cache.decoded_node_row_group_misses(), 0);
 }
