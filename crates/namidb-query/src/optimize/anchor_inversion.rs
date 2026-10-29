@@ -7,14 +7,18 @@
 //! unique lookup. Found live during the 200k-node S3 validation: the first
 //! form took ~18s warm and timed out cold; the second answered instantly.
 //!
-//! This pass rewrites the first shape into the second: when a single-hop,
-//! non-optional Expand reads from a BARE NodeScan and a Filter directly
-//! above it pins the expand TARGET with an index-answerable equality, anchor
-//! at the target (`NodeByPropertyValue`) and walk the edge in the inverse
-//! direction. Row bindings are unchanged — the relationship value carries
-//! the stored `(src, dst)` regardless of traversal direction, and the old
-//! source's label constraint moves into the inverted Expand's
-//! `target_labels`, where the executor enforces it conjunctively.
+//! This pass rewrites the first shape into the second: when a chain of
+//! single-hop, non-optional Expands reads from a BARE NodeScan and a Filter
+//! directly above its last hop pins that hop's TARGET with an
+//! index-answerable equality, anchor at the target (`NodeByPropertyValue`)
+//! and walk the chain back to the scan, each edge in the inverse direction.
+//! Row bindings are unchanged — the relationship value carries the stored
+//! `(src, dst)` regardless of traversal direction, and each node's label
+//! constraint moves into the inverted Expand that now reaches it, where the
+//! executor enforces it conjunctively. Filters between the hops ride on top
+//! and pushdown sinks them again; relationship uniqueness is re-linked to
+//! the new hop order. A pin on a middle node re-anchors the part of the
+//! chain below it, and the hops above it keep walking forward.
 //!
 //! Deliberately narrow:
 //! - `length: None` only — a starred alias binds the path's relationship
@@ -114,6 +118,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(rewrite(*input, catalog)),
             source,
@@ -127,6 +132,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Project {
             input,
@@ -212,9 +218,14 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             subplan: Box::new(rewrite(*subplan, catalog)),
             negated,
         },
-        LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
+        LogicalPlan::Apply {
+            input,
+            subplan,
+            optional,
+        } => LogicalPlan::Apply {
             input: Box::new(rewrite(*input, catalog)),
             subplan: Box::new(rewrite(*subplan, catalog)),
+            optional,
         },
         LogicalPlan::PatternList {
             input,
@@ -275,42 +286,92 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     }
 }
 
+/// One hop of the chain being inverted, as written.
+struct Hop<'p> {
+    source: &'p String,
+    edge_type: &'p Option<Vec<String>>,
+    direction: RelationshipDirection,
+    rel_alias: &'p Option<String>,
+    target_alias: &'p String,
+    target_labels: &'p Vec<String>,
+    unique_rels: &'p Vec<String>,
+}
+
 fn try_invert(
     predicate: &crate::parser::Expression,
     input: &LogicalPlan,
     catalog: &StatsCatalog,
 ) -> Option<LogicalPlan> {
-    let LogicalPlan::Expand {
-        input: expand_input,
-        source,
-        edge_type,
-        direction,
-        rel_alias,
-        target_alias,
-        target_labels,
-        length,
-        optional,
-        back_reference,
-        shortest,
-        path_binding,
-    } = input
-    else {
-        return None;
-    };
-    if length.is_some()
-        || *optional
-        || *back_reference
-        || !matches!(shortest, crate::plan::ShortestMode::None)
-        || path_binding.is_some()
+    // Collect the chain top-down: the pinned hop first, then each hop below
+    // it whose target is the source of the one above, with any Filter
+    // between two hops set aside to re-attach on top.
+    let mut hops: Vec<Hop<'_>> = Vec::new();
+    let mut between: Vec<crate::parser::Expression> = Vec::new();
+    let mut cursor = input;
+    loop {
+        match cursor {
+            LogicalPlan::Expand {
+                input: expand_input,
+                source,
+                edge_type,
+                direction,
+                rel_alias,
+                target_alias,
+                target_labels,
+                length,
+                optional,
+                back_reference,
+                shortest,
+                path_binding,
+                unique_rels,
+            } => {
+                if length.is_some()
+                    || *optional
+                    || *back_reference
+                    || !matches!(shortest, crate::plan::ShortestMode::None)
+                    || path_binding.is_some()
+                    || hops
+                        .last()
+                        .is_some_and(|above| above.source != target_alias)
+                {
+                    return None;
+                }
+                hops.push(Hop {
+                    source,
+                    edge_type,
+                    direction: *direction,
+                    rel_alias,
+                    target_alias,
+                    target_labels,
+                    unique_rels,
+                });
+                cursor = expand_input;
+            }
+            LogicalPlan::Filter {
+                predicate,
+                input: inner,
+            } if !hops.is_empty() && matches!(inner.as_ref(), LogicalPlan::Expand { .. }) => {
+                between.push(predicate.clone());
+                cursor = inner;
+            }
+            _ => break,
+        }
+    }
+    let pinned = hops.first()?;
+    let (source, target_alias, target_labels) = (
+        hops.last()?.source,
+        pinned.target_alias,
+        pinned.target_labels,
+    );
+    // Every relationship a hop must differ from has to be one of the chain's,
+    // so the pairs can be re-linked to the new order below.
+    let chain_rels: Vec<&String> = hops.iter().filter_map(|h| h.rel_alias.as_ref()).collect();
+    if hops
+        .iter()
+        .any(|h| h.unique_rels.iter().any(|r| !chain_rels.contains(&r)))
     {
         return None;
     }
-    // The stored-edge orientation must stay decidable after the swap.
-    let inverted_direction = match direction {
-        RelationshipDirection::Right => RelationshipDirection::Left,
-        RelationshipDirection::Left => RelationshipDirection::Right,
-        RelationshipDirection::Both => RelationshipDirection::Both,
-    };
     // Source side must be a completely unselective scan; anything filtered
     // would need a real cost comparison to pick a side. A projection is not a
     // filter: it only narrows decoding, and the inverted Expand loads the old
@@ -329,35 +390,34 @@ fn try_invert(
         Option<String>,
         Option<(crate::parser::Expression, Vec<String>)>,
     );
-    let (source_alias, source_label, source_disjunction): SourceShape<'_> =
-        match expand_input.as_ref() {
-            LogicalPlan::NodeScan {
-                label,
+    let (source_alias, source_label, source_disjunction): SourceShape<'_> = match cursor {
+        LogicalPlan::NodeScan {
+            label,
+            alias,
+            predicates,
+            ..
+        } if predicates.is_empty() => (alias, label.clone(), None),
+        LogicalPlan::Filter {
+            predicate: label_pred,
+            input: scan,
+        } => {
+            let LogicalPlan::NodeScan {
+                label: None,
                 alias,
                 predicates,
                 ..
-            } if predicates.is_empty() => (alias, label.clone(), None),
-            LogicalPlan::Filter {
-                predicate: label_pred,
-                input: scan,
-            } => {
-                let LogicalPlan::NodeScan {
-                    label: None,
-                    alias,
-                    predicates,
-                    ..
-                } = scan.as_ref()
-                else {
-                    return None;
-                };
-                if !predicates.is_empty() {
-                    return None;
-                }
-                let labels = crate::optimize::extract_label_disjunction(label_pred, alias)?;
-                (alias, None, Some((label_pred.clone(), labels)))
+            } = scan.as_ref()
+            else {
+                return None;
+            };
+            if !predicates.is_empty() {
+                return None;
             }
-            _ => return None,
-        };
+            let labels = crate::optimize::extract_label_disjunction(label_pred, alias)?;
+            (alias, None, Some((label_pred.clone(), labels)))
+        }
+        _ => return None,
+    };
     debug_assert_eq!(source, source_alias);
     // The equality must pin the expand TARGET under its declared label. A
     // multi-label (conjunctive) target keeps the scan-side plan: the lookup
@@ -395,26 +455,60 @@ fn try_invert(
             catalog,
         )?,
     };
-    let inverted = LogicalPlan::Expand {
-        input: Box::new(anchor),
-        source: target_alias.clone(),
-        edge_type: edge_type.clone(),
-        direction: inverted_direction,
-        rel_alias: rel_alias.clone(),
-        target_alias: source_alias.clone(),
-        // A disjunction cannot ride the conjunctive target_labels field; its
-        // OR-filter re-attaches below and now runs over the anchor's small
-        // neighbourhood instead of the whole namespace.
-        target_labels: match &source_disjunction {
-            Some(_) => Vec::new(),
-            None => source_label.iter().cloned().collect(),
-        },
-        length: None,
-        optional: false,
-        back_reference: false,
-        shortest: crate::plan::ShortestMode::None,
-        path_binding: None,
-    };
+    let mut inverted = anchor;
+    for (i, hop) in hops.iter().enumerate() {
+        // The hop now reaches the node the hop below it reached, or the scan
+        // at the bottom.
+        let reached_labels = match hops.get(i + 1) {
+            Some(below) => below.target_labels.clone(),
+            // A disjunction cannot ride the conjunctive target_labels field;
+            // its OR-filter re-attaches below and now runs over the anchor's
+            // small neighbourhood instead of the whole namespace.
+            None => match &source_disjunction {
+                Some(_) => Vec::new(),
+                None => source_label.iter().cloned().collect(),
+            },
+        };
+        // Relationship uniqueness: the hops that now run before this one.
+        let unique_rels = hops[..i]
+            .iter()
+            .filter_map(|earlier| {
+                let name = earlier.rel_alias.as_ref()?;
+                let paired = hop.unique_rels.contains(name)
+                    || hop
+                        .rel_alias
+                        .as_ref()
+                        .is_some_and(|mine| earlier.unique_rels.contains(mine));
+                paired.then(|| name.clone())
+            })
+            .collect();
+        inverted = LogicalPlan::Expand {
+            input: Box::new(inverted),
+            source: hop.target_alias.clone(),
+            edge_type: hop.edge_type.clone(),
+            // The stored-edge orientation must stay decidable after the swap.
+            direction: match hop.direction {
+                RelationshipDirection::Right => RelationshipDirection::Left,
+                RelationshipDirection::Left => RelationshipDirection::Right,
+                RelationshipDirection::Both => RelationshipDirection::Both,
+            },
+            rel_alias: hop.rel_alias.clone(),
+            target_alias: hop.source.clone(),
+            target_labels: reached_labels,
+            length: None,
+            optional: false,
+            back_reference: false,
+            shortest: crate::plan::ShortestMode::None,
+            path_binding: None,
+            unique_rels,
+        };
+    }
+    for predicate in between.into_iter().rev() {
+        inverted = LogicalPlan::Filter {
+            input: Box::new(inverted),
+            predicate,
+        };
+    }
     let mut result = match source_disjunction {
         Some((label_pred, _)) => LogicalPlan::Filter {
             input: Box::new(inverted),

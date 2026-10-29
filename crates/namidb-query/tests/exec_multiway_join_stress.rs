@@ -224,12 +224,12 @@ async fn four_cycle_rewrites_and_executes_against_complete_graph() {
     // consecutive equal vertices fails to close. Counting tuples
     // that DO close:
     //   * all four distinct: 4! = 24
-    //   * exactly one non-consecutive pair equal (a=c xor b=d): each
-    //     contributes 4 * 3 * 3 = 36; with overlap (a=c AND b=d) of
-    //     4*3 = 12 collapsed by inclusion-exclusion → 60
-    //   * total = 24 + 60 = 84
+    //   * a=c with b!=d, or b=d with a!=c: 4 * 3 * 2 = 24 each
+    //   * a=c and b=d walks a->b->a->b->a, which uses a->b and b->a
+    //     twice each, so relationship uniqueness rejects it
+    //   * total = 24 + 48 = 72
     assert_eq!(
-        bin_count, 84,
+        bin_count, 72,
         "binary path missed expected K_4 4-cycle count"
     );
     assert_eq!(wcoj_count, bin_count, "4-cycle counts diverge");
@@ -521,6 +521,9 @@ async fn disconnected_two_triangles_agree_between_paths() {
     // pattern parts). The planner should rewrite both chains and
     // CrossProduct them; WCOJ vs binary must agree on the total row
     // count regardless of the exact semantic (per-tuple vs per-path).
+    // The parts use different edge types: with one type they could match
+    // the same relationships, the second part has to check the first
+    // one's, and the chains stay binary.
     let mut w = WriterSession::open(store(), paths("mwj-two-triangles"))
         .await
         .unwrap();
@@ -536,14 +539,14 @@ async fn disconnected_two_triangles_agree_between_paths() {
         w.upsert_edge("KNOWS", s, t, &rel()).unwrap();
     }
     for (s, t) in [(t2[0], t2[1]), (t2[1], t2[2]), (t2[2], t2[0])] {
-        w.upsert_edge("KNOWS", s, t, &rel()).unwrap();
+        w.upsert_edge("LIKES", s, t, &rel()).unwrap();
     }
     w.commit_batch().await.unwrap();
     let snap = w.snapshot();
 
     let q = parse(
         "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a), \
-                (x:Person)-[:KNOWS]->(y:Person)-[:KNOWS]->(z:Person)-[:KNOWS]->(x) \
+                (x:Person)-[:LIKES]->(y:Person)-[:LIKES]->(z:Person)-[:LIKES]->(x) \
          RETURN count(*) AS n",
     )
     .unwrap();

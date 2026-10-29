@@ -347,7 +347,7 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
         LogicalPlan::DiscardResult { .. } => {}
         // Apply emits the outer row combined with each subplan row, so it
         // produces both sides' bindings.
-        LogicalPlan::Apply { input, subplan } => {
+        LogicalPlan::Apply { input, subplan, .. } => {
             collect_produced(input, out);
             collect_produced(subplan, out);
         }
@@ -797,6 +797,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let s = produced_aliases(&plan);
         assert!(s.contains("a"));

@@ -290,7 +290,11 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 Ok(out)
             }
 
-            LogicalPlan::Apply { input, subplan } => {
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional,
+            } => {
                 // Correlated lateral join: for each outer row, run the subplan
                 // with that row as the correlation and emit the row combined
                 // with each subplan row.
@@ -301,6 +305,16 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     let sub_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
                             .await?;
+                    if sub_rows.is_empty() {
+                        if let Some(pad) = optional {
+                            let mut padded = row;
+                            for name in pad {
+                                padded.set(name.clone(), RuntimeValue::Null);
+                            }
+                            out.push(padded);
+                        }
+                        continue;
+                    }
                     for s in sub_rows {
                         let mut merged = row.clone();
                         for (k, v) in &s.bindings {
@@ -1056,6 +1070,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 back_reference,
                 shortest,
                 path_binding,
+                unique_rels,
             } => {
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
@@ -1073,6 +1088,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     *back_reference,
                     *shortest,
                     path_binding.as_deref(),
+                    unique_rels,
                     snapshot,
                     routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
@@ -1216,6 +1232,7 @@ fn execute_capped<'a>(
                 back_reference,
                 shortest,
                 path_binding,
+                unique_rels,
             } => {
                 let resolved = resolve_length(length, params)?;
                 let edge_read_mode =
@@ -1292,6 +1309,7 @@ fn execute_capped<'a>(
                         *back_reference,
                         *shortest,
                         path_binding.as_deref(),
+                        unique_rels,
                         snapshot,
                         edge_read_mode,
                         skip_target_materialize,
@@ -1496,6 +1514,7 @@ async fn try_execute_endpoint_distinct_project(
         back_reference: false,
         shortest: crate::plan::ShortestMode::None,
         path_binding: None,
+        unique_rels,
     } = input
     else {
         return Ok(None);
@@ -1539,6 +1558,7 @@ async fn try_execute_endpoint_distinct_project(
         false,
         crate::plan::ShortestMode::None,
         None,
+        unique_rels,
         snapshot,
         routing.edge_read_mode(rel_alias.as_deref(), None),
         should_skip_target_materialize(routing, target_alias, None, resolved, false),
@@ -1620,6 +1640,7 @@ pub(crate) async fn execute_expand(
     back_reference: bool,
     shortest: crate::plan::ShortestMode,
     path_binding: Option<&str>,
+    unique_rels: &[String],
     snapshot: &Snapshot<'_>,
     edge_read_mode: EdgeReadMode,
     skip_target_materialize: bool,
@@ -1728,6 +1749,8 @@ pub(crate) async fn execute_expand(
                 )))
             }
         };
+
+        let bound_rels = bound_rel_keys(unique_rels.iter().map(|name| row.get(name)));
 
         // Back-reference: read the existing binding once. The
         // traversal explores the frontier freely; only paths whose
@@ -2016,6 +2039,9 @@ pub(crate) async fn execute_expand(
                             crate::exec::limits::check_row_cap(
                                 out.len() + hop_results.len() + next_frontier.len(),
                             )?;
+                        }
+                        if reuses_bound_rel(&bound_rels, edge) {
+                            continue;
                         }
                         let target_id = partner_id(edge, direction, step.tail);
                         if prune_visits {
@@ -6925,6 +6951,34 @@ async fn identity_edges_via_sst(
         .collect())
 }
 
+/// Stored identities `(edge_type, src, dst)` of the relationships an
+/// Expand's `unique_rels` bindings hold: a relationship, or each element of
+/// a variable-length hop's list. NULL (an unmatched OPTIONAL hop) holds none.
+fn bound_rel_keys<'v>(
+    values: impl IntoIterator<Item = Option<&'v RuntimeValue>>,
+) -> Vec<(String, NodeId, NodeId)> {
+    fn push(v: &RuntimeValue, out: &mut Vec<(String, NodeId, NodeId)>) {
+        match v {
+            RuntimeValue::Rel(r) => out.push((r.edge_type.clone(), r.src, r.dst)),
+            RuntimeValue::List(items) => items.iter().for_each(|i| push(i, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for v in values.into_iter().flatten() {
+        push(v, &mut out);
+    }
+    out
+}
+
+/// Cypher relationship uniqueness across the hops of one MATCH clause:
+/// `edge` is one of the relationships an earlier hop already bound.
+fn reuses_bound_rel(bound: &[(String, NodeId, NodeId)], edge: &EdgeView) -> bool {
+    bound
+        .iter()
+        .any(|(t, s, d)| *s == edge.src && *d == edge.dst && *t == edge.edge_type)
+}
+
 fn partner_id(edge: &EdgeView, direction: RelationshipDirection, source: NodeId) -> NodeId {
     match direction {
         RelationshipDirection::Right => edge.dst,
@@ -8685,6 +8739,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 back_reference,
                 shortest,
                 path_binding,
+                unique_rels,
             } => {
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
@@ -8715,6 +8770,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         *back_reference,
                         *shortest,
                         path_binding.as_deref(),
+                        unique_rels,
                         snapshot,
                         routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                         false,
@@ -8735,6 +8791,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     length.clone(),
                     *optional,
                     *back_reference,
+                    unique_rels,
                     snapshot,
                     routing.edge_read_mode(rel_alias.as_deref(), path_binding.as_deref()),
                     should_skip_target_materialize(
@@ -9118,7 +9175,11 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 Ok(FactorRowSet::from_flat(out))
             }
 
-            LogicalPlan::Apply { input, subplan } => {
+            LogicalPlan::Apply {
+                input,
+                subplan,
+                optional,
+            } => {
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
@@ -9128,6 +9189,16 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     let sub_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
                             .await?;
+                    if sub_rows.is_empty() {
+                        if let Some(pad) = optional {
+                            let mut padded = row;
+                            for name in pad {
+                                padded.set(name.clone(), RuntimeValue::Null);
+                            }
+                            out.push(padded);
+                        }
+                        continue;
+                    }
                     for s in sub_rows {
                         let mut merged = row.clone();
                         for (k, v) in &s.bindings {
@@ -9212,6 +9283,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 edges,
                 ordering,
                 factorize_required,
+                distinct_edges,
             } => {
                 if !*factorize_required {
                     return Err(ExecError::Runtime(
@@ -9225,7 +9297,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                             .to_string(),
                     ));
                 }
-                execute_multiway_join_factor(vars, edges, ordering, snapshot).await
+                execute_multiway_join_factor(vars, edges, ordering, distinct_edges, snapshot).await
             }
         }
     }
@@ -9258,6 +9330,7 @@ async fn execute_expand_factor(
     length: Option<crate::parser::RelationshipLength>,
     optional: bool,
     back_reference: bool,
+    unique_rels: &[String],
     snapshot: &Snapshot<'_>,
     edge_read_mode: EdgeReadMode,
     skip_target_materialize: bool,
@@ -9307,6 +9380,12 @@ async fn execute_expand_factor(
                 )))
             }
         };
+
+        let bound_rels = bound_rel_keys(
+            unique_rels
+                .iter()
+                .map(|name| arena.lookup_binding(parent_leaf, name)),
+        );
 
         // Back-reference: pull the existing target id once. Only paths
         // ending at this id survive emission.
@@ -9451,6 +9530,9 @@ async fn execute_expand_factor(
                                 + hop_outputs_for_this_input.len()
                                 + next_frontier.len(),
                         )?;
+                    }
+                    if reuses_bound_rel(&bound_rels, &edge) {
+                        continue;
                     }
                     let target_id = partner_id(&edge, direction, tail);
                     // Cypher relationship uniqueness (trail semantics): skip an
@@ -9662,6 +9744,7 @@ fn execute_multiway_join_factor<'a>(
     vars: &'a [NodeBinding],
     edges: &'a [EdgeConstraint],
     ordering: &'a [usize],
+    distinct: &'a [(usize, usize)],
     snapshot: &'a Snapshot<'_>,
 ) -> BoxFuture<'a, Result<FactorRowSet, ExecError>> {
     async move {
@@ -9682,7 +9765,7 @@ fn execute_multiway_join_factor<'a>(
             bound: vec![None; vars.len()],
             materialised: vec![None; vars.len()],
         };
-        descend_multiway(&mut state, 0, vars, edges, ordering, snapshot).await?;
+        descend_multiway(&mut state, 0, vars, edges, ordering, distinct, snapshot).await?;
         Ok(FactorRowSet {
             arena: state.arena,
             leaves: state.leaves,
@@ -9704,6 +9787,7 @@ fn descend_multiway<'a>(
     vars: &'a [NodeBinding],
     edges: &'a [EdgeConstraint],
     ordering: &'a [usize],
+    distinct: &'a [(usize, usize)],
     snapshot: &'a Snapshot<'_>,
 ) -> BoxFuture<'a, Result<(), ExecError>> {
     async move {
@@ -9718,7 +9802,11 @@ fn descend_multiway<'a>(
             // set-semantics behaviour); with `[:A|:B]` or parallel
             // edges of the same type the row count tracks the binary
             // path's `Vec<EdgeView>` fan-out exactly.
+            // Under relationship uniqueness two constraints may not pick
+            // the same stored edge, so count the distinct choices instead
+            // of taking the plain product.
             let mut copies: usize = 1;
+            let mut choices: Vec<Vec<(&str, NodeId, NodeId)>> = Vec::new();
             for e in edges {
                 let from = state.bound[e.from_idx].ok_or_else(|| {
                     ExecError::Runtime("MultiwayJoin: from_idx not bound at leaf level".into())
@@ -9726,9 +9814,10 @@ fn descend_multiway<'a>(
                 let to = state.bound[e.to_idx].ok_or_else(|| {
                     ExecError::Runtime("MultiwayJoin: to_idx not bound at leaf level".into())
                 })?;
-                let m =
-                    count_edge_multiplicity(snapshot, from, to, &e.edge_types, e.direction).await?;
-                copies = copies.saturating_mul(m);
+                let found =
+                    existing_edges_between(snapshot, from, to, &e.edge_types, e.direction).await?;
+                copies = copies.saturating_mul(found.len());
+                choices.push(found);
                 if copies == 0 {
                     // The leapfrog said this constraint's partner list
                     // contained `to`, but a re-scan of the SST/CSR
@@ -9736,6 +9825,12 @@ fn descend_multiway<'a>(
                     // tombstone slipped between the two reads — drop
                     // the tuple, which matches what the binary path
                     // would do.
+                    return Ok(());
+                }
+            }
+            if !distinct.is_empty() {
+                copies = count_distinct_choices(&choices, distinct, &mut Vec::new());
+                if copies == 0 {
                     return Ok(());
                 }
             }
@@ -9819,7 +9914,8 @@ fn descend_multiway<'a>(
                 let id = view.id;
                 state.bound[var_idx] = Some(id);
                 state.materialised[var_idx] = Some(NodeValue::from(view));
-                descend_multiway(state, level + 1, vars, edges, ordering, snapshot).await?;
+                descend_multiway(state, level + 1, vars, edges, ordering, distinct, snapshot)
+                    .await?;
             }
         } else {
             // Per-constraint partner list. For single-type constraints
@@ -9878,7 +9974,8 @@ fn descend_multiway<'a>(
                 }
                 state.bound[var_idx] = Some(cand_id);
                 state.materialised[var_idx] = Some(NodeValue::from(view));
-                descend_multiway(state, level + 1, vars, edges, ordering, snapshot).await?;
+                descend_multiway(state, level + 1, vars, edges, ordering, distinct, snapshot)
+                    .await?;
             }
         }
 
@@ -9889,22 +9986,22 @@ fn descend_multiway<'a>(
     .boxed()
 }
 
-/// Count how many edges of any type in `edge_types` actually connect
-/// `from` to `to` in the given direction. Used by the WCOJ leaf
-/// emission to scale per-tuple set semantics back up to per-path
-/// multiset semantics (the binary executor's native shape).
+/// The edges of any type in `edge_types` that actually connect `from` to
+/// `to` in the given direction, as stored identities. Their count is used by
+/// the WCOJ leaf emission to scale per-tuple set semantics back up to
+/// per-path multiset semantics (the binary executor's native shape).
 ///
 /// The storage identity is `(edge_type, src, dst)`, hence each type contributes
 /// at most one relationship for the endpoint pair. Use exact existence probes
 /// rather than rescanning a full degree at every WCOJ leaf.
-async fn count_edge_multiplicity(
+async fn existing_edges_between<'t>(
     snapshot: &Snapshot<'_>,
     from: NodeId,
     to: NodeId,
-    edge_types: &[String],
+    edge_types: &'t [String],
     direction: RelationshipDirection,
-) -> Result<usize, ExecError> {
-    let mut total: usize = 0;
+) -> Result<Vec<(&'t str, NodeId, NodeId)>, ExecError> {
+    let mut found = Vec::new();
     for et in edge_types {
         let (src, dst) = match direction {
             RelationshipDirection::Right => (from, to),
@@ -9916,10 +10013,43 @@ async fn count_edge_multiplicity(
             }
         };
         if snapshot.contains_edge_via_sst(et, src, dst).await? {
-            total += 1;
+            found.push((et.as_str(), src, dst));
         }
     }
-    Ok(total)
+    Ok(found)
+}
+
+/// Ways to pick one edge per constraint from `choices` such that every
+/// `distinct` pair picks two different edges. `picked` holds the choices
+/// made for the constraints before `picked.len()`.
+fn count_distinct_choices<'t>(
+    choices: &[Vec<(&'t str, NodeId, NodeId)>],
+    distinct: &[(usize, usize)],
+    picked: &mut Vec<(&'t str, NodeId, NodeId)>,
+) -> usize {
+    let i = picked.len();
+    if i == choices.len() {
+        return 1;
+    }
+    let mut total = 0;
+    for &edge in &choices[i] {
+        let clashes = distinct.iter().any(|&(a, b)| {
+            let other = if a == i {
+                b
+            } else if b == i {
+                a
+            } else {
+                return false;
+            };
+            other < i && picked[other] == edge
+        });
+        if !clashes {
+            picked.push(edge);
+            total += count_distinct_choices(choices, distinct, picked);
+            picked.pop();
+        }
+    }
+    total
 }
 
 /// Translate the Cypher-side `RelationshipDirection` carried by an
@@ -10645,7 +10775,7 @@ fn collect_plan_node_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     }
 }
 
-fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
+pub(crate) fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     collect_plan_references(plan, out, true, false);
 }
 

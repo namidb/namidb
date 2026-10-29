@@ -175,6 +175,15 @@ pub enum LogicalPlan {
         /// variable so `length(p)` etc. work. `None` for ordinary
         /// expands.
         path_binding: Option<String>,
+        /// Relationship bindings from the same MATCH clause, bound before
+        /// this hop, whose relationships this hop must not reuse (Cypher
+        /// relationship uniqueness). Each names a relationship or, for a
+        /// variable-length hop, a list of them; NULL binds nothing. An
+        /// anonymous relationship that takes part gets an internal
+        /// `__anonr<N>` alias so the row carries it. Separate MATCH clauses
+        /// never constrain each other, so this only ever names relationships
+        /// of the clause that produced the hop.
+        unique_rels: Vec<String>,
     },
 
     /// Selection predicate.
@@ -313,9 +322,16 @@ pub enum LogicalPlan {
     /// the input row combined with each subplan row. An input row whose subplan
     /// yields nothing contributes no output (inner join). Emitted for a
     /// correlated `CALL { WITH … }` subquery.
+    ///
+    /// With `optional: Some(bindings)` it is a left outer join instead: an
+    /// input row whose subplan yields nothing is kept once, with those
+    /// bindings set to NULL. Emitted for an `OPTIONAL MATCH` whose pattern
+    /// has to match as a whole (several hops, a `WHERE`, inline
+    /// properties), which per-hop optional Expands cannot express.
     Apply {
         input: Box<LogicalPlan>,
         subplan: Box<LogicalPlan>,
+        optional: Option<Vec<String>>,
     },
 
     /// Materialise a pattern comprehension `[(a)-[]->(b) WHERE p | proj]`
@@ -414,6 +430,11 @@ pub enum LogicalPlan {
         /// `Vec<Row>`-shaped fallback). Reserved for a follow-up
         /// flat-path WCOJ.
         factorize_required: bool,
+        /// Pairs of indices into `edges` whose relationships must differ
+        /// (Cypher relationship uniqueness within one MATCH clause; see
+        /// `Expand::unique_rels`). Empty when no two constraints can share a
+        /// relationship.
+        distinct_edges: Vec<(usize, usize)>,
     },
 
     /// Direct global count of edges by type, bypassing `NodeScan +
@@ -554,7 +575,7 @@ impl LogicalPlan {
             LogicalPlan::SemiApply { input, subplan, .. } => {
                 vec![input.as_ref(), subplan.as_ref()]
             }
-            LogicalPlan::Apply { input, subplan } => {
+            LogicalPlan::Apply { input, subplan, .. } => {
                 vec![input.as_ref(), subplan.as_ref()]
             }
             LogicalPlan::PatternList { input, subplan, .. } => {
@@ -638,7 +659,13 @@ impl LogicalPlan {
                     "SemiApply"
                 }
             }
-            LogicalPlan::Apply { .. } => "Apply",
+            LogicalPlan::Apply { optional, .. } => {
+                if optional.is_some() {
+                    "OptionalApply"
+                } else {
+                    "Apply"
+                }
+            }
             LogicalPlan::PatternList { .. } => "PatternList",
             LogicalPlan::Create { .. } => "Create",
             LogicalPlan::Merge { .. } => "Merge",

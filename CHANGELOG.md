@@ -53,6 +53,14 @@ crates.io release will establish and document that API explicitly.
   be opened by a 2.x binary or wheel, so a downgrade needs a backup taken
   before the upgrade. Stores written by 2.x open and read as before, and
   compaction rewrites their SSTs in the new format.
+- **A MATCH no longer binds one relationship twice.** Queries whose pattern
+  could walk the same relationship more than once now return fewer rows.
+  See the entry under Fixed.
+
+- **An OPTIONAL MATCH matches its whole pattern or nothing.** A pattern with
+  more than one hop, a `WHERE`, or inline properties used to keep the part
+  that matched and pad the rest, or drop the row. Such queries now return
+  the rows Cypher does. See the entry under Fixed.
 
 ### Added
 
@@ -275,6 +283,40 @@ crates.io release will establish and document that API explicitly.
 
 ### Fixed
 
+- **A MATCH could bind the same relationship to two of its relationship
+  variables.** Cypher requires every relationship in one MATCH pattern to
+  be a different relationship, but each hop only kept its own variable
+  length walk from repeating an edge. `MATCH (a)-[:K]-(b)-[:K]-(c)` walked
+  every edge out and straight back, so a 2-hop chain counted each `a = c`
+  return trip, and `MATCH (a)-[:K]->(b), (x)-[:K]->(y)` paired every edge
+  with itself. Every relationship of a MATCH clause, named or anonymous and
+  across its comma-separated parts, now differs from the others, in the
+  flat and factorized executors and in the WCOJ join, including
+  variable-length hops mixed with fixed ones. An `OPTIONAL MATCH` applies
+  the rule inside its own pattern and pads NULLs when it rules out every
+  match, and so does a pattern in `WHERE`, `EXISTS(...)` or a pattern
+  comprehension. Separate MATCH clauses still do not constrain each other,
+  as in Cypher.
+
+  This changes results: such queries now return fewer rows, the ones a
+  Cypher database returns. Hops whose types cannot overlap are not
+  compared. With `NAMIDB_WCOJ=1`, two comma-separated cyclic parts that
+  share an edge type now run on the regular join, since the second has to
+  check the first part's relationships.
+
+- **An `OPTIONAL MATCH` kept half a match.** Each hop of the pattern was
+  optional on its own, so `MATCH (a) OPTIONAL MATCH (a)<-[:K]-(b)-[:K]->(x)`
+  returned `b` with a NULL `x` for every `b` that had no second hop, next to
+  the full matches, instead of the full matches alone or one row with `b`
+  and `x` both NULL. The same split hit a `WHERE` on the OPTIONAL MATCH,
+  which dropped the row when it ruled out every match instead of padding
+  it, inline properties on the far node (`(b {n: 1})`), which were ignored,
+  and a pattern that starts at a new node (`OPTIONAL MATCH (z:Missing)`),
+  which dropped the row. Such a pattern now runs as a plain MATCH for each
+  incoming row, and the row is kept once with every new variable NULL when
+  it finds nothing. A single hop from a bound node with none of those still
+  runs as before.
+
 - **A chained `OPTIONAL MATCH` failed when an earlier one found nothing.**
   `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (b)-[:S]->(c)` raised
   "Expand source `b` is not a Node" for every row where `b` was NULL. A NULL
@@ -365,10 +407,13 @@ crates.io release will establish and document that API explicitly.
   an indexed property; it now does the same for `id(d) = ...` and
   `id(d) IN ...`, with or without a label on the target, unless a literal
   id list is longer than the label it would replace scanning. A longer chain
-  pinned on its second node is re-anchored there too, so
-  `MATCH (i)-[:R]->(d)-[:S]->(p) WHERE id(d) = $id` starts at `d`, also when
-  only `id(...)` or `labels(...)` are returned. A chain pinned further along
-  (`WHERE id(p) = $id` above) still keeps its written order.
+  of single hops is re-anchored at whichever node is pinned:
+  `MATCH (i)-[:R]->(d)-[:S]->(p) WHERE id(p) = $id` starts at `p` and walks
+  both hops backwards, and with `WHERE id(d) = $id` it starts at `d`, walks
+  back to `i` and forward to `p`, also when only `id(...)` or `labels(...)`
+  are returned. Labels, relationship filters, relationship uniqueness and a
+  named path (`MATCH q = ...`) give the same rows as the written order. A
+  chain with a variable-length or `OPTIONAL` hop keeps its written order.
 
 - **A labelled hop decoded every neighbour to check its label.** When the
   query read a property of the target (`-[:R]->(t:Device) RETURN t.name`),
