@@ -107,15 +107,23 @@ crates.io release will establish and document that API explicitly.
   the id-ordered merge of the memtable and every node SST where the last
   one stopped, so a batch reads the id, tombstone, lsn and label columns
   of the row groups it reaches and point-reads only the rows it returns.
-  This holds on overlapping SSTs too. An iterator reads from the version
-  that was current when it was created, and keeps that version's files
-  alive against compaction and sweeps until it is dropped, so writes that
-  land meanwhile do not show up half way through. The `scan_*` calls stay
-  lists. An edge iterator, and `scan_edge_type(limit=)`, decode properties
-  for the edges they return only, but still read the type's SST files in
-  full when they start, since edge SSTs have no ranged scan yet. Storage
-  callers get the same through `Snapshot::label_scan_cursor` and
-  `Snapshot::edge_scan_cursor`.
+  This holds on overlapping SSTs too, and SSTs whose label counts rule the
+  label out are skipped, so a small label written after a big load does
+  not walk the big one first. Walking the whole label reads each stored
+  record about once. An iterator reads from the version that was current
+  when it was created, and keeps that version's files alive against
+  compaction and sweeps until it is dropped (on a `read_only` client,
+  `close()` drops those leases too), so writes that land meanwhile do not
+  show up half way through. A step that fails ends the iterator: later
+  steps raise again instead of resuming after the lost batch. The `scan_*`
+  calls stay lists. An edge iterator, and `scan_edge_type(limit=)`, still
+  read the type's SST files and decode their property strings in full
+  when they start, since edge SSTs have no ranged scan yet, and the
+  iterator holds them until it is dropped; only the JSON parsing and the
+  dicts are done per batch. Storage callers get the same through
+  `Snapshot::label_scan_cursor` and `Snapshot::edge_scan_cursor`. The
+  limited scan over overlapping SSTs that these share now also stops on a
+  query timeout between row groups.
 
 - **`--fence-policy` (`NAMIDB_FENCE_POLICY`) decides what a fenced writer
   does.** Until now a server whose namespace was claimed by another process
@@ -171,9 +179,11 @@ crates.io release will establish and document that API explicitly.
   sweep of objects written more than `auto_sweep_min_age_secs` ago (default
   60, `None` turns it off). The age counts from when a file was written, so
   it is no grace period for a reader in another process. A
-  `read_only=True` client is safe anyway, since every sweep honours its
-  retention lease, but a server or the CLI reading the same directory is
-  not: turn the auto sweep off while one of those reads the graph.
+  `read_only=True` client is safe while it can write its retention lease
+  under `manifest/pins/`, since every sweep honours it. One on read-only
+  credentials gets no lease, and a server or the CLI reading the same
+  directory holds none: turn the auto sweep off while one of those reads
+  the graph.
 
 - **Compaction scratch for a `file://` Python client goes under
   `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless

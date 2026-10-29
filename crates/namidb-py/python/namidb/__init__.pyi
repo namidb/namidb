@@ -67,7 +67,7 @@ class NodeIter(Iterator[dict[str, Any]]):
 
 class EdgeIter(Iterator[dict[str, Any]]):
     """Returned by [`Client.iter_edge_type`]: one edge dict per step,
-    decoded a batch at a time."""
+    built a batch at a time."""
 
     def __iter__(self) -> EdgeIter: ...
     def __next__(self) -> dict[str, Any]: ...
@@ -145,7 +145,8 @@ class Client:
         URIs. An applied compaction sweeps retired objects older than
         `auto_sweep_min_age_secs` (`None` disables; the age counts from
         the write, so turn it off while a server or the CLI reads the
-        same graph; a `read_only` client holds a lease and is safe).
+        same graph; a `read_only` client is safe while it can write its
+        lease under `manifest/pins/`).
         `flush()` compacts
         once a bucket holds `compaction_l0_trigger` L0 SSTs (`0`
         disables). A `read_only` client never compacts or sweeps, so
@@ -316,14 +317,17 @@ class Client:
     def iter_label(self, label: str, limit: Optional[int] = ...) -> NodeIter:
         """Like [`Client.scan_label`], but lazy: it reads 1,024 nodes per
         step with the GIL released, all from the version current when it
-        was created, whose files it keeps alive until it is dropped."""
+        was created, whose files it keeps alive until it is dropped (or
+        until `close()` on a `read_only` client). After a step raises,
+        every later step raises too."""
 
     def iter_edge_type(
         self, edge_type: str, limit: Optional[int] = ...
     ) -> EdgeIter:
-        """Like [`Client.scan_edge_type`], but decodes 1,024 edges per
+        """Like [`Client.scan_edge_type`], but builds 1,024 edges per
         step, all from the version current when it was created. The
-        type's SST files are read when the iterator is created."""
+        type's SST files and property strings are read when the iterator
+        is created and held until it is dropped."""
 
     def scan_label_arrow(self, label: str, limit: Optional[int] = ...) -> _Table:
         """Like [`Client.scan_label`] but returns a `pyarrow.Table`
