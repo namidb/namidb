@@ -6943,6 +6943,10 @@ impl<'mt> Snapshot<'mt> {
     fn live_row_estimate(&self, label: &str) -> u64 {
         let mut live: u64 = 0;
         for idx in self.manifest.index.node_descriptors() {
+            if !label.is_empty() && !node_sst_can_contain_label(&self.manifest.manifest, idx, label)
+            {
+                continue;
+            }
             let desc = &self.manifest.manifest.ssts[idx];
             if !desc.scope.is_empty() {
                 if desc.scope == label || label.is_empty() {
@@ -11162,6 +11166,7 @@ fn string_property_sidecar<'a>(
 ///   one the namespace dictionary never interned — has no live row in the
 ///   SST. Pre-counts manifests (`per_label_counts` empty) and pre-label-index
 ///   SSTs stay `true`.
+/// - An SST whose rows are all tombstones holds no live row of any label.
 ///
 /// Excluding tombstone-only coverage is safe: sidecar winners are re-confirmed
 /// through `lookup_node`, which resolves last-LSN-wins across EVERY SST.
@@ -11169,6 +11174,12 @@ fn node_sst_can_contain_label(manifest: &Manifest, idx: usize, label: &str) -> b
     let desc = &manifest.ssts[idx];
     if !desc.scope.is_empty() {
         return desc.scope == label;
+    }
+    // A flush that only deletes nodes has no postings, so no label index.
+    if let crate::manifest::KindSpecificStats::Nodes { tombstone_count } = desc.kind_specific {
+        if tombstone_count == desc.row_count {
+            return false;
+        }
     }
     if let Some(li) = &desc.label_index {
         if !li.per_label_counts.is_empty() {
@@ -17151,6 +17162,61 @@ mod tests {
         let devices = snap.scan_label("Device").await.unwrap();
         assert_eq!(view_ids(&devices), sorted_ids(&[5, 21]));
         assert_eq!(devices[1].properties["name"], Value::Str("m".into()));
+    }
+
+    #[tokio::test]
+    async fn delete_only_flush_keeps_label_postings_route() {
+        let store = make_store();
+        let paths = make_paths("delete-only-flush");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+        let mut rows: Vec<_> = (1..=20)
+            .map(|id| (sorted_node_id(id), id as u64, upsert("o", vec![OTHER])))
+            .collect();
+        rows.push((sorted_node_id(21), 21, upsert("d21", vec![DEVICE])));
+        rows.push((sorted_node_id(22), 22, upsert("d22", vec![DEVICE])));
+        let first = flush_batch(&ms, &fence, &base, &schema, rows).await;
+        let committed = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (sorted_node_id(5), 40, MemOp::Tombstone),
+                (sorted_node_id(22), 41, MemOp::Tombstone),
+            ],
+        )
+        .await;
+        let deletes = committed
+            .manifest
+            .ssts
+            .iter()
+            .find(|desc| desc.kind == SstKind::Nodes && desc.max_lsn == 41)
+            .unwrap();
+        assert!(deletes.label_index.is_none());
+
+        // With every node Parquet body gone only the postings route can
+        // answer, so the delete-only SST must not switch it off.
+        for desc in committed
+            .manifest
+            .ssts
+            .iter()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), desc.path);
+            store.delete(&Path::from(absolute)).await.unwrap();
+        }
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snap = Snapshot::new(committed, &empty_view, store, paths);
+        assert!(snap.disjoint_node_descriptors().is_none());
+        let devices = snap.scan_label("Device").await.unwrap();
+        assert_eq!(view_ids(&devices), sorted_ids(&[21]));
     }
 
     #[tokio::test]
