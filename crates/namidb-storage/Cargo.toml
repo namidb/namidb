@@ -14,6 +14,9 @@ readme = "README.md"
 # allowed crate-wide (covers lib + benches + tests) rather than reflowing ~120
 # comments. Applied via [lints] so `--all-targets` is clean too.
 [lints.clippy]
+# async_trait marks each generated trait method #[must_use] on top of the
+# already must_use boxed future, which clippy 1.99 reports as double_must_use.
+double_must_use = "allow"
 doc_lazy_continuation = "allow"
 
 [dependencies]

@@ -16,6 +16,11 @@ default = []
 # Off by default so the base crate stays free of an HTTP/TLS/serde stack.
 remote-embedder = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 
+# async_trait marks each generated trait method #[must_use] on top of the
+# already must_use boxed future, which clippy 1.99 reports as double_must_use.
+[lints.clippy]
+double_must_use = "allow"
+
 [dependencies]
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }

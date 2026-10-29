@@ -40,6 +40,11 @@ pdp = ["dep:reqwest"]
 name = "namidb-server"
 path = "src/main.rs"
 
+# async_trait marks each generated trait method #[must_use] on top of the
+# already must_use boxed future, which clippy 1.99 reports as double_must_use.
+[lints.clippy]
+double_must_use = "allow"
+
 [dependencies]
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }

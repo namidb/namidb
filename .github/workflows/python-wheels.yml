@@ -243,6 +243,19 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           architecture: ${{ matrix.arch }}
+      # The macOS Python is a universal2 build, which starts as arm64 on
+      # macos-14 unless told otherwise. Put a wrapper first on PATH so every
+      # later `python` runs the x86_64 slice under Rosetta.
+      - name: Run Python under Rosetta
+        if: matrix.arch == 'x64'
+        shell: bash
+        run: |
+          real="$(command -v python)"
+          mkdir -p "$RUNNER_TEMP/x64bin"
+          printf '#!/bin/bash\nexec arch -x86_64 "%s" "$@"\n' "$real" > "$RUNNER_TEMP/x64bin/python"
+          chmod +x "$RUNNER_TEMP/x64bin/python"
+          echo "$RUNNER_TEMP/x64bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/x64bin/python" -c "import platform; assert platform.machine() == 'x86_64', platform.machine()"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ matrix.artifact }}
