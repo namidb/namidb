@@ -1121,6 +1121,9 @@ struct CacheStats {
     /// a two-phase scan or from property pages. Rows outside the label never
     /// count.
     node_label_selected_rows: AtomicU64,
+    /// Ids whose versions the structural pass of a two-phase label scan
+    /// reconciled. The label's postings keep it near the label's size.
+    node_label_reconciled_ids: AtomicU64,
     /// Exact LIMIT pushdown over node SSTs (a disjoint prefix scan or merged
     /// label postings). These counters distinguish a true lazy prefix scan
     /// from the legacy full scan followed by `take(k)`.
@@ -1295,6 +1298,10 @@ impl std::fmt::Debug for SstCache {
             .field(
                 "node_label_selected_rows",
                 &self.stats.node_label_selected_rows.load(Ordering::Relaxed),
+            )
+            .field(
+                "node_label_reconciled_ids",
+                &self.stats.node_label_reconciled_ids.load(Ordering::Relaxed),
             )
             .field(
                 "node_limited_scan_fast_paths",
@@ -2285,6 +2292,16 @@ impl SstCache {
 
     pub fn label_selected_node_rows(&self) -> u64 {
         self.stats.node_label_selected_rows.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_label_reconciled_node_ids(&self, ids: usize) {
+        self.stats
+            .node_label_reconciled_ids
+            .fetch_add(ids as u64, Ordering::Relaxed);
+    }
+
+    pub fn label_reconciled_node_ids(&self) -> u64 {
+        self.stats.node_label_reconciled_ids.load(Ordering::Relaxed)
     }
 
     pub(crate) fn record_limited_node_scan_fast_path(&self) {
