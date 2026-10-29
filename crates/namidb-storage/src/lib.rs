@@ -100,7 +100,8 @@ pub use range_cache::{
 #[cfg(feature = "vector-index")]
 pub use read::VectorFilterSearch;
 pub use read::{
-    EdgeListView, EdgeView, NodeView, OwnedSnapshot, PinnedSnapshot, Snapshot, SnapshotCell,
+    EdgeListView, EdgeScanCursor, EdgeView, NodeScanCursor, NodeView, OwnedSnapshot,
+    PinnedSnapshot, Snapshot, SnapshotCell,
 };
 pub use reader::ReaderSession;
 pub use recovery::{

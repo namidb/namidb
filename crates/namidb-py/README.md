@@ -328,11 +328,13 @@ it inline:
   folded into SSTs, old manifest versions. Only objects written more than
   `auto_sweep_min_age_secs` ago (default 60) go. That age counts from when
   the file was written, not from when it stopped being used, so it is no
-  grace period for a reader in another process: a server, the CLI or a
-  read-only client that loaded the manifest before the pass can find its
-  files gone. If another process reads the graph while this client
-  writes, pass `None` to turn the auto sweep off and call `sweep()` when
-  the readers are done.
+  grace period for a reader in another process. A `read_only=True` client
+  is safe as long as it can write its lease under `manifest/pins/`, since
+  every sweep honours it. A reader on read-only credentials or a read-only
+  filesystem gets no lease, and a server or the CLI reading the same
+  directory holds none, so either can find its files gone. While one of
+  those reads the graph, pass `None` to turn the auto sweep off and call
+  `sweep()` when it is done.
 - `client.sweep(min_age_secs=60, dry_run=False)` runs the same sweep on
   demand and returns counts of what it removed (or would remove). The
   auto sweep runs right after the pass, so that pass's own leftovers are
@@ -401,9 +403,21 @@ table = client.scan_label_arrow("Person")
 
 On a large label, pass `limit=` to `scan_label`, `scan_label_arrow` or
 `scan_edge_type` to look at a sample, or walk the scan with
-`iter_label(label)` / `iter_edge_type(edge_type)`. The iterators build one
-dict per step instead of a list of every row, so Python memory stays flat.
-The scan itself is still read in full before the first row comes back.
+`iter_label(label)` / `iter_edge_type(edge_type)`. A node iterator reads
+1,024 rows per step with the GIL released, so the first row comes back
+after one batch, not the whole label, and memory stays at about one batch.
+Walking a whole label reads each stored record about once, like
+`scan_label` does. Every row comes from the version that was current when
+the iterator was created, even if writes, compactions or sweeps land while
+you walk it; the iterator keeps that version's files alive until it is
+dropped, or until `close()` on a `read_only` client, which drops the leases
+of iterators still open too. An edge iterator reads the type's SST files
+and decodes their property strings when it is created and keeps them until
+it is dropped, so its memory grows with the type like `scan_edge_type`;
+only the per-edge parsing and the dicts are built a batch at a time. If a
+step raises, the iterator is done: every later `next()` raises too, rather
+than skip the rows of the failed batch. The `scan_*` calls keep returning
+lists.
 
 ## Storage backends
 

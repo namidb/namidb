@@ -108,9 +108,30 @@ crates.io release will establish and document that API explicitly.
 
 - **Python: `limit=` on `scan_label`, `scan_label_arrow` and
   `scan_edge_type`, plus `iter_label` / `iter_edge_type`.** The iterators
-  build one dict per step, so walking a 2M-node label no longer needs 2M
-  dicts alive at once. Edge scans still read the whole type before
-  applying the limit.
+  are lazy: `next(iter(c.iter_label("Artifact")))` used to decode all
+  1.87M rows before the first one came back, and now reads one batch of
+  1,024. Each step pulls the next batch with the GIL released, resuming
+  the id-ordered merge of the memtable and every node SST where the last
+  one stopped, so a batch reads the id, tombstone, lsn and label columns
+  of the row groups it reaches and point-reads only the rows it returns.
+  This holds on overlapping SSTs too. An SST whose label counts rule the
+  label out, and whose versions are all older than any of the label's, is
+  skipped, so a small label written after a big load does not walk the big
+  one first. Walking the whole label reads each stored
+  record about once. An iterator reads from the version that was current
+  when it was created, and keeps that version's files alive against
+  compaction and sweeps until it is dropped (on a `read_only` client,
+  `close()` drops those leases too), so writes that land meanwhile do not
+  show up half way through. A step that fails ends the iterator: later
+  steps raise again instead of resuming after the lost batch. The `scan_*`
+  calls stay lists. An edge iterator, and `scan_edge_type(limit=)`, still
+  read the type's SST files and decode their property strings in full
+  when they start, since edge SSTs have no ranged scan yet, and the
+  iterator holds them until it is dropped; only the JSON parsing and the
+  dicts are done per batch. Storage callers get the same through
+  `Snapshot::label_scan_cursor` and `Snapshot::edge_scan_cursor`. The
+  limited scan over overlapping SSTs that these share now also stops on a
+  query timeout between row groups.
 
 - **`--fence-policy` (`NAMIDB_FENCE_POLICY`) decides what a fenced writer
   does.** Until now a server whose namespace was claimed by another process
@@ -212,9 +233,12 @@ crates.io release will establish and document that API explicitly.
   (default 8, `0` turns it off), and every applied pass is followed by a
   sweep of objects written more than `auto_sweep_min_age_secs` ago (default
   60, `None` turns it off). The age counts from when a file was written, so
-  it does not protect a reader in another process that loaded the manifest
-  before the pass. Turn the auto sweep off while another process reads the
-  graph.
+  it is no grace period for a reader in another process. A
+  `read_only=True` client is safe while it can write its retention lease
+  under `manifest/pins/`, since every sweep honours it. One on read-only
+  credentials gets no lease, and a server or the CLI reading the same
+  directory holds none: turn the auto sweep off while one of those reads
+  the graph.
 
 - **Compaction scratch for a `file://` Python client goes under
   `<root>/.namidb-spool`.** It used to land in `/var/tmp` unless

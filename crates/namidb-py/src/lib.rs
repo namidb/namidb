@@ -31,9 +31,9 @@ use namidb_query::{
     ParseError, Query, Row, RuntimeValue, StatsCatalog,
 };
 use namidb_storage::{
-    sweep_orphans, CommitOutcome, EdgeListView, EdgeView, EdgeWriteRecord, JanitorReport,
-    ManifestStore, NodeView, NodeWriteRecord, OwnedSnapshot, PinnedSnapshot, ReaderSession,
-    SnapshotCell, SstCache, WriterSession,
+    sweep_orphans, CommitOutcome, EdgeListView, EdgeScanCursor, EdgeView, EdgeWriteRecord,
+    JanitorReport, ManifestStore, NodeScanCursor, NodeView, NodeWriteRecord, OwnedSnapshot,
+    PinnedSnapshot, ReaderSession, SnapshotCell, SstCache, WriterSession,
 };
 
 // pyo3 0.22's macro expands a `gil-refs` feature check this crate does not
@@ -737,17 +737,41 @@ impl Client {
         Ok(list.into())
     }
 
-    /// Like [`Client::scan_label`], but returns an iterator that builds one
-    /// dict per step instead of a list holding every node at once.
+    /// Like [`Client::scan_label`], but lazy: the iterator reads the label
+    /// [`ITER_BATCH`] nodes at a time as it is consumed, all from the
+    /// snapshot current when it was created.
     #[pyo3(signature = (label, limit=None))]
-    fn iter_label(&self, py: Python<'_>, label: &str, limit: Option<usize>) -> PyResult<NodeIter> {
+    fn iter_label(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        label: &str,
+        limit: Option<usize>,
+    ) -> PyResult<NodeIter> {
+        let this: &Client = &slf;
+        let (snapshot, cursor) = py.allow_threads(|| {
+            this.runtime.block_on(async {
+                let owned = this.session.snapshot(None).await?;
+                let cursor = owned
+                    .borrow()
+                    .with_cache(this.cache.clone())
+                    .label_scan_cursor(label)
+                    .await
+                    .map_err(map_storage_err)?;
+                Ok::<_, PyErr>((owned, cursor))
+            })
+        })?;
         Ok(NodeIter {
-            views: self.scan_nodes(py, label, limit)?.into_iter(),
+            client: slf.into(),
+            snapshot,
+            cursor,
+            batch: Vec::new().into_iter(),
+            remaining: limit,
         })
     }
 
-    /// Like [`Client::scan_edge_type`], but returns an iterator that builds
-    /// one dict per step.
+    /// Like [`Client::scan_edge_type`], but lazy: the iterator decodes the
+    /// type [`ITER_BATCH`] edges at a time as it is consumed, all from the
+    /// snapshot current when it was created.
     #[pyo3(signature = (edge_type, limit=None))]
     fn iter_edge_type(
         &self,
@@ -755,8 +779,19 @@ impl Client {
         edge_type: &str,
         limit: Option<usize>,
     ) -> PyResult<EdgeIter> {
+        let cursor = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let owned = self.session.snapshot(None).await?;
+                let snap = owned.borrow().with_cache(self.cache.clone());
+                snap.edge_scan_cursor(edge_type)
+                    .await
+                    .map_err(map_storage_err)
+            })
+        })?;
         Ok(EdgeIter {
-            views: self.scan_edges(py, edge_type, limit)?.into_iter(),
+            cursor,
+            batch: Vec::new().into_iter(),
+            remaining: limit,
         })
     }
 
@@ -1289,30 +1324,38 @@ impl Client {
         edge_type: &str,
         limit: Option<usize>,
     ) -> PyResult<Vec<EdgeView>> {
-        let mut views = py.allow_threads(|| {
+        py.allow_threads(|| {
             self.runtime.block_on(async {
                 let owned = self.session.snapshot(None).await?;
                 let snap = owned.borrow().with_cache(self.cache.clone());
-                snap.scan_edge_type(edge_type)
-                    .await
-                    .map_err(map_storage_err)
+                match limit {
+                    // The cursor decodes only the edges it returns.
+                    Some(limit) => snap
+                        .edge_scan_cursor(edge_type)
+                        .await
+                        .and_then(|mut cursor| cursor.next_batch(limit)),
+                    None => snap.scan_edge_type(edge_type).await,
+                }
+                .map_err(map_storage_err)
             })
-        })?;
-        // ponytail: storage has no limited edge scan, so `limit` bounds what
-        // reaches Python, not what is read. Add a limited merge in read.rs
-        // when edge scans need to stop early.
-        if let Some(limit) = limit {
-            views.truncate(limit);
-        }
-        Ok(views)
+        })
     }
 }
 
-/// Iterator returned by [`Client::iter_label`]. Each step converts one
-/// node to a dict, so Python never holds the whole scan as dicts.
+/// How many rows `iter_label` / `iter_edge_type` read per storage call.
+const ITER_BATCH: usize = 1024;
+
+/// Iterator returned by [`Client::iter_label`]. It reads the label one
+/// batch at a time with the GIL released, from the snapshot it was
+/// created on, which it keeps alive (and its files with it) until it is
+/// dropped.
 #[pyclass(module = "namidb")]
 pub struct NodeIter {
-    views: std::vec::IntoIter<NodeView>,
+    client: Py<Client>,
+    snapshot: ReadSnapshot,
+    cursor: NodeScanCursor,
+    batch: std::vec::IntoIter<NodeView>,
+    remaining: Option<usize>,
 }
 
 #[pymethods]
@@ -1322,17 +1365,43 @@ impl NodeIter {
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.views
-            .next()
-            .map(|v| node_view_to_py(py, &v))
-            .transpose()
+        if self.remaining == Some(0) {
+            return Ok(None);
+        }
+        if self.batch.len() == 0 {
+            let want = self.remaining.map_or(ITER_BATCH, |r| r.min(ITER_BATCH));
+            let client = self.client.borrow(py);
+            let client: &Client = &client;
+            let (snapshot, cursor) = (&self.snapshot, &mut self.cursor);
+            let rows = py.allow_threads(|| {
+                client.runtime.block_on(async {
+                    let snap = snapshot.borrow().with_cache(client.cache.clone());
+                    cursor
+                        .next_batch(&snap, want)
+                        .await
+                        .map_err(map_storage_err)
+                })
+            })?;
+            self.batch = rows.into_iter();
+        }
+        let Some(view) = self.batch.next() else {
+            self.remaining = Some(0);
+            return Ok(None);
+        };
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= 1;
+        }
+        node_view_to_py(py, &view).map(Some)
     }
 }
 
-/// Iterator returned by [`Client::iter_edge_type`].
+/// Iterator returned by [`Client::iter_edge_type`]. It decodes the type
+/// one batch at a time with the GIL released.
 #[pyclass(module = "namidb")]
 pub struct EdgeIter {
-    views: std::vec::IntoIter<EdgeView>,
+    cursor: EdgeScanCursor,
+    batch: std::vec::IntoIter<EdgeView>,
+    remaining: Option<usize>,
 }
 
 #[pymethods]
@@ -1342,10 +1411,23 @@ impl EdgeIter {
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.views
-            .next()
-            .map(|v| edge_view_to_py(py, &v))
-            .transpose()
+        if self.remaining == Some(0) {
+            return Ok(None);
+        }
+        if self.batch.len() == 0 {
+            let want = self.remaining.map_or(ITER_BATCH, |r| r.min(ITER_BATCH));
+            let cursor = &mut self.cursor;
+            let rows = py.allow_threads(|| cursor.next_batch(want).map_err(map_storage_err))?;
+            self.batch = rows.into_iter();
+        }
+        let Some(view) = self.batch.next() else {
+            self.remaining = Some(0);
+            return Ok(None);
+        };
+        if let Some(remaining) = &mut self.remaining {
+            *remaining -= 1;
+        }
+        edge_view_to_py(py, &view).map(Some)
     }
 }
 
