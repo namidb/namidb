@@ -35,6 +35,12 @@
 //! version it cannot understand. The point of the bump is the other
 //! direction: an older binary will now refuse a v1 segment outright instead of
 //! silently dropping the labels field its JSON decoder doesn't know about.
+//!
+//! `version = 2` marks node payloads that may be binary
+//! ([`NodeWriteRecord::encode`](crate::flush::NodeWriteRecord::encode)): a
+//! record with a vector, bytes or a list of numbers no longer goes through as
+//! JSON. A 3.0.0 binary refuses the segment instead of failing later on a
+//! payload it cannot parse.
 
 use std::sync::Arc;
 
@@ -49,9 +55,9 @@ use crate::paths::NamespacePaths;
 const MAGIC_HEADER: &[u8; 4] = b"TGWL";
 const MAGIC_FOOTER: &[u8; 4] = b"TGEL";
 /// Version stamped into every segment this build writes (see module docs).
-/// v1 = multi-label era. The framing is identical across versions, so decode
-/// accepts anything `<= FORMAT_VERSION`.
-const FORMAT_VERSION: u16 = 1;
+/// v1 = multi-label era, v2 = binary node payloads. The framing is identical
+/// across versions, so decode accepts anything `<= FORMAT_VERSION`.
+const FORMAT_VERSION: u16 = 2;
 
 /// A single WAL record. `lsn` is assigned by the writer monotonically and
 /// becomes the durable order of operations within a namespace.
