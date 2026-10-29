@@ -267,20 +267,29 @@ crates.io release will establish and document that API explicitly.
   before. This also works while nodes sit in the memtable or node SSTs
   overlap (with random ids, such as uuid5, any store with more than one node
   SST): a limited scan there merges the SSTs in id order, reading only the
-  id, tombstone, lsn and label columns, keeps the newest version of each id,
-  and loads only the nodes it returns. A labelled scan still tries the label
-  postings first. Two cases there still read in full: a scan with a pushed
-  down filter, which the merge could only test node by node, and a seed pull
-  whose first 4,096 seeds do not fill the limit, whose last round is one
-  full scan instead of more point reads.
+  id, tombstone, lsn and label columns plus the columns a pushed down filter
+  tests (from property pages when the SST has them, so a filter on a small
+  property does not read the embeddings), keeps the newest version of each
+  id, tests the filter on that version, and stops once it has the rows it
+  needs. It then reads the properties of those rows only, from the SST row
+  that won, so a node the filter rejects costs no point read. A labelled
+  scan still tries the label postings first, and a filter on an indexed
+  number the range index, which now confirms candidates in id order and
+  stops at the limit instead of looking up the whole matching window. Each
+  round of the seed pull restarts the scan from the first id, so when few
+  seeds expand the rounds read between about 1.3 and 2.3 times what one
+  full pass would. A labelled or filtered seed pull over overlapping SSTs
+  still makes its round after 4,096 seeds one full scan, since the postings
+  and the range index redo their whole prefix each round. Resuming each
+  round after the last seed would avoid both but is not done yet.
 
 - **The query row cap did not bound memory for a node scan.** With a row cap
   in scope (`NAMIDB_QUERY_ROW_CAP` on the server), `MATCH (n) RETURN n`
   loaded every node and only then reported the cap. The scan now stops one
   row past the cap and fails with the same error, in the flat and factorized
-  executors. On node SSTs that overlap, a scan with a pushed down filter or a
-  label still reads in full first (a labelled one through the two-pass scan,
-  which is cheaper there than one point read per member). When the manifest
+  executors. On node SSTs that overlap, filtered and labelled scans go
+  through the same id-ordered merge as a `LIMIT`, so they also stop one row
+  past the cap and hold no more rows than that. When the manifest
   shows the scan cannot reach the cap, it keeps the plain read, so the SST
   body is still cached across queries. A `LIMIT` that the first seeds of an
   expand already fill no longer trips a row cap smaller than the seed batch.
@@ -384,8 +393,8 @@ crates.io release will establish and document that API explicitly.
   skipped. A LIMIT stops as soon as it has its rows and no longer fetches a
   full page of candidates first. Each skipped candidate makes the next batch
   of lookups larger, and on a dense label a LIMIT that keeps hitting stale
-  postings (say after a bulk relabel) gives up and uses the two-pass scan
-  below. Scans, filtered LIMITs and LIMITs above 4,096 rows take this route
+  postings (say after a bulk relabel) gives up and uses the id-ordered merge
+  described above. Scans, filtered LIMITs and LIMITs above 4,096 rows take this route
   only when the label is at most a quarter of the node rows, memtable
   included, since each candidate is a full record lookup and a filter may
   reject them all. That includes the hidden limit a row cap adds to a node

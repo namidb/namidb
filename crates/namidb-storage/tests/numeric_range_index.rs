@@ -379,3 +379,51 @@ async fn shapes_this_route_must_refuse() {
         "an unindexed property must decline"
     );
 }
+
+/// A `LIMIT` served by this route used to confirm every candidate in the
+/// window, then look the confirmed ones up again, and only then truncate.
+/// A seed pull runs one such scan per round, so a wide window paid for the
+/// whole of it every round. Confirmation now stops at the limit.
+#[tokio::test]
+async fn a_limited_range_scan_confirms_about_limit_candidates() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("range-limit").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+    for ordinal in 0..4_000_i64 {
+        writer
+            .upsert_node(
+                "T",
+                NodeId::new(),
+                &node(vec![("idx", Value::I64(ordinal))]),
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.create_property_index("T", "idx").await.unwrap();
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+
+    // 400 matches, inside the route's budget of an eighth of the label.
+    let predicates = [gte(1_000), lt(1_400)];
+    let snapshot = writer.snapshot();
+    let expected = by_scan(&writer, &predicates).await;
+    assert_eq!(expected.len(), 400);
+    let counter = writer.property_index_cache().clone();
+    for limit in [5, 300, 1_000] {
+        let before = counter.equality_confirmation_candidates();
+        let rows = snapshot
+            .scan_label_with_predicates_and_projection_limited("T", &predicates, None, limit)
+            .await
+            .unwrap();
+        let ids: Vec<NodeId> = rows.iter().map(|view| view.id).collect();
+        assert_eq!(ids, expected[..limit.min(expected.len())], "LIMIT {limit}");
+        let confirmed = counter.equality_confirmation_candidates() - before;
+        // Candidates are confirmed 256 at a time; the window holds a few more
+        // than the 400 matches, since its key bounds are inclusive.
+        if limit <= 256 {
+            assert_eq!(confirmed, 256, "LIMIT {limit}");
+        } else {
+            assert!(confirmed >= 400, "LIMIT {limit}: {confirmed}");
+        }
+    }
+}

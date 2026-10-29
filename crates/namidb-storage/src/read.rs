@@ -1327,6 +1327,24 @@ impl<'mt> Snapshot<'mt> {
         predicates: &[crate::sst::ScanPredicate],
         max_candidates: usize,
     ) -> Result<Option<Vec<NodeId>>> {
+        Ok(self
+            .indexed_nodes_by_numeric_range(label, property, predicates, max_candidates, usize::MAX)
+            .await?
+            .map(|views| views.into_iter().map(|view| view.id).collect()))
+    }
+
+    /// The confirmed nodes behind [`Self::indexed_node_ids_by_numeric_range`],
+    /// in id order. Confirmation walks the candidates in id order and stops
+    /// once it has `limit` nodes, so a `LIMIT` (or a seed pull round) looks up
+    /// about `limit` candidates instead of the whole window.
+    async fn indexed_nodes_by_numeric_range(
+        &self,
+        label: &str,
+        property: &str,
+        predicates: &[crate::sst::ScanPredicate],
+        max_candidates: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<NodeView>>> {
         namidb_core::profile_scope!("Snapshot::indexed_node_ids_by_numeric_range");
         if predicates.is_empty() || max_candidates == 0 {
             return Ok(None);
@@ -1506,24 +1524,27 @@ impl<'mt> Snapshot<'mt> {
         candidates.sort_unstable();
         candidates.dedup();
 
-        let mut confirmed = Vec::with_capacity(candidates.len());
+        let mut confirmed = Vec::with_capacity(candidates.len().min(limit));
         const CONFIRM_BATCH: usize = 256;
         for batch in candidates.chunks(CONFIRM_BATCH) {
+            if confirmed.len() >= limit {
+                break;
+            }
             if let Some(cache) = &self.property_index_cache {
                 cache.record_equality_confirmation_candidates(batch.len());
             }
             let views = self.batch_lookup_nodes(label, batch).await?;
-            for (id, view) in batch.iter().zip(views) {
-                let Some(view) = view else { continue };
+            for view in views.into_iter().flatten() {
                 let value = view.properties.get(property);
                 if predicates
                     .iter()
                     .all(|predicate| crate::sst::eval_against_value(predicate, value))
                 {
-                    confirmed.push(*id);
+                    confirmed.push(view);
                 }
             }
         }
+        confirmed.truncate(limit);
         crate::route_telemetry::record_property(true);
         Ok(Some(confirmed))
     }
@@ -5924,9 +5945,10 @@ impl<'mt> Snapshot<'mt> {
             .await
     }
 
-    /// Whether the `_limited` node scans can stop early. When this is false
-    /// they reconcile every node first and truncate, so a caller pulling
-    /// growing prefixes would pay a full reconcile per call.
+    /// Whether every persisted node id has one version and the memtable holds
+    /// no nodes, so each SST is a run of the id-ordered scan on its own.
+    /// Otherwise the `_limited` scans merge the SSTs instead; see
+    /// [`Self::node_scan_stops_early`].
     pub fn node_scan_is_disjoint(&self) -> bool {
         self.disjoint_node_descriptors().is_some()
     }
@@ -6595,14 +6617,13 @@ impl<'mt> Snapshot<'mt> {
 
         // A bare `LIMIT` over a selective range still benefits: the scan has
         // to walk until it has found `limit` matches, which for a rare value
-        // is the whole label. The route returns the confirmed set in id order
-        // — the same order the scan produces — so truncating here picks the
-        // same rows the scan would have.
-        if let Some(mut rows) = self
-            .try_scan_numeric_range_index(label, predicates, projection)
+        // is the whole label. The route confirms candidates in id order, the
+        // order the scan produces, and stops at `limit`, so it picks the same
+        // rows the scan would have.
+        if let Some(rows) = self
+            .try_scan_numeric_range_index(label, predicates, projection, limit)
             .await?
         {
-            rows.truncate(limit);
             return Ok(rows);
         }
 
@@ -6635,20 +6656,14 @@ impl<'mt> Snapshot<'mt> {
                     return Ok(rows);
                 }
             }
-            // A labelled scan past the bound (the row cap's guard) reads
-            // cheaper through the two-phase scan than one point read per
-            // member.
-            if label.is_none() || limit <= BOUNDED_LIMIT {
-                if let Some(rows) = self
-                    .try_scan_overlapping_nodes_limited(label, predicates, projection, limit)
-                    .await?
-                {
-                    if let Some(cache) = &self.cache {
-                        cache.record_limited_node_scan_fast_path();
-                        cache.record_limited_node_scan_work(0, 0, rows.len(), 0, 0);
-                    }
-                    return Ok(rows);
+            if let Some(rows) = self
+                .try_scan_overlapping_nodes_limited(label, predicates, projection, limit)
+                .await?
+            {
+                if let Some(cache) = &self.cache {
+                    cache.record_limited_node_scan_fast_path();
                 }
+                return Ok(rows);
             }
             if let Some(cache) = &self.cache {
                 cache.record_limited_node_scan_fallback();
@@ -6968,6 +6983,7 @@ impl<'mt> Snapshot<'mt> {
         label: Option<&str>,
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
+        limit: usize,
     ) -> Result<Option<Vec<NodeView>>> {
         if predicates.is_empty() {
             return Ok(None);
@@ -6980,21 +6996,21 @@ impl<'mt> Snapshot<'mt> {
             return Ok(None);
         }
         let label = label.unwrap_or("");
-        let Some(ids) = self
-            .indexed_node_ids_by_numeric_range(
+        // Already confirmed against the predicate and sorted by id, which is
+        // the order the scan returns rows in, so the first `limit` are the
+        // rows the scan would have returned.
+        let Some(mut rows) = self
+            .indexed_nodes_by_numeric_range(
                 label,
                 property,
                 predicates,
                 self.numeric_range_candidate_cap(),
+                limit,
             )
             .await?
         else {
             return Ok(None);
         };
-        // Already confirmed against the predicate and sorted by id, which is
-        // the order the scan returns rows in.
-        let views = self.batch_lookup_nodes(label, &ids).await?;
-        let mut rows: Vec<NodeView> = views.into_iter().flatten().collect();
         if let Some(requested) = projection {
             let keep: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
             for row in &mut rows {
@@ -7158,24 +7174,11 @@ impl<'mt> Snapshot<'mt> {
             }
             out.push(row.view);
         }
-        if decode_projection.is_none_or(|columns| !columns.is_empty()) {
-            let mut selected = 0;
-            for (idx, rows) in &by_sst {
-                let desc = &self.manifest.manifest.ssts[*idx];
-                selected += rows.len();
-                if !self
-                    .fill_label_rows_from_property_pages(desc, decode_projection, rows, &mut out)
-                    .await?
-                    && !self
-                        .fill_label_rows_from_parquet(desc, decode_projection, rows, &mut out)
-                        .await?
-                {
-                    return Ok(None);
-                }
-            }
-            if let Some(cache) = &self.cache {
-                cache.record_label_selected_node_rows(selected);
-            }
+        if !self
+            .fill_label_rows(&by_sst, decode_projection, &mut out)
+            .await?
+        {
+            return Ok(None);
         }
 
         out.retain_mut(|view| {
@@ -7189,6 +7192,39 @@ impl<'mt> Snapshot<'mt> {
             true
         });
         Ok(Some(out))
+    }
+
+    /// Phase 2 of [`Self::try_scan_label_two_phase`]: properties for the
+    /// winning rows in `by_sst` (SST index to `(position in out, ordinal)`,
+    /// ordinals ascending), from property pages or else Parquet. An id-only
+    /// projection reads nothing. `false` means an SST disagrees with phase 1.
+    async fn fill_label_rows(
+        &self,
+        by_sst: &BTreeMap<usize, Vec<(usize, u64)>>,
+        projection: Option<&[String]>,
+        out: &mut [NodeView],
+    ) -> Result<bool> {
+        if projection.is_some_and(|columns| columns.is_empty()) {
+            return Ok(true);
+        }
+        let mut selected = 0;
+        for (idx, rows) in by_sst {
+            let desc = &self.manifest.manifest.ssts[*idx];
+            selected += rows.len();
+            if !self
+                .fill_label_rows_from_property_pages(desc, projection, rows, out)
+                .await?
+                && !self
+                    .fill_label_rows_from_parquet(desc, projection, rows, out)
+                    .await?
+            {
+                return Ok(false);
+            }
+        }
+        if let Some(cache) = &self.cache {
+            cache.record_label_selected_node_rows(selected);
+        }
+        Ok(true)
     }
 
     /// Phase 2 of [`Self::try_scan_label_two_phase`] through property pages.
@@ -7297,7 +7333,7 @@ impl<'mt> Snapshot<'mt> {
         projection: Option<&[String]>,
     ) -> Result<Vec<NodeView>> {
         if let Some(rows) = self
-            .try_scan_numeric_range_index(label, predicates, projection)
+            .try_scan_numeric_range_index(label, predicates, projection, usize::MAX)
             .await?
         {
             return Ok(rows);
@@ -16027,11 +16063,12 @@ mod tests {
             vec![sorted_node_id(4), sorted_node_id(5), sorted_node_id(6)]
         );
         // Every node is a Doc, so a filter could reject every candidate and
-        // the filtered LIMIT scans instead: point-reading candidates one by
-        // one until the filter passes would cost more than one projected
-        // pass. A bare LIMIT uses the postings.
-        assert_eq!(cache.limited_node_scan_fast_paths(), 0);
-        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
+        // the filtered LIMIT takes the structural merge instead, which tests
+        // the filter on each winner without a point read. A bare LIMIT uses
+        // the postings.
+        assert_eq!(cache.limited_node_scan_fast_paths(), 1);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+        assert_eq!(cache.node_locator_probes(), 0);
         let bare = snap
             .scan_label_with_predicates_and_projection_limited("Doc", &[], None, 3)
             .await
@@ -16040,8 +16077,8 @@ mod tests {
             bare.iter().map(|node| node.id).collect::<Vec<_>>(),
             vec![sorted_node_id(1), sorted_node_id(3), sorted_node_id(4)]
         );
-        assert_eq!(cache.limited_node_scan_fast_paths(), 1);
-        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
+        assert_eq!(cache.limited_node_scan_fast_paths(), 2);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 0);
 
         // A second L0 range updates existing ids. With overlapping ranges a
         // posting may name a superseded version; it must be skipped, not
@@ -16087,8 +16124,9 @@ mod tests {
             limited.iter().map(|node| node.id).collect::<Vec<_>>(),
             vec![sorted_node_id(6), sorted_node_id(8), sorted_node_id(10)]
         );
-        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 0);
-        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 1);
+        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 1);
+        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 0);
+        assert_eq!(overlap_cache.node_locator_probes(), 0);
         let bare = overlap
             .scan_label_with_predicates_and_projection_limited("Doc", &[], None, 3)
             .await
@@ -16098,8 +16136,8 @@ mod tests {
             vec![sorted_node_id(1), sorted_node_id(2), sorted_node_id(3)]
         );
         assert_eq!(bare[1].properties["vigente"], Value::Bool(false));
-        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 1);
-        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 1);
+        assert_eq!(overlap_cache.limited_node_scan_fast_paths(), 2);
+        assert_eq!(overlap_cache.limited_node_scan_fallbacks(), 0);
     }
 
     #[tokio::test]
@@ -17053,8 +17091,9 @@ mod tests {
         assert_eq!(heavy.scan_label("Device").await.unwrap().len(), 22);
 
         // A filtered LIMIT takes the postings only for the sparse label: on a
-        // dense one a filter can reject every candidate, so it is a full scan.
-        for (label, predicate, ids, fast) in [
+        // dense one a filter can reject every candidate, so the structural
+        // merge tests it on each winner instead, with no point reads.
+        for (label, predicate, ids, sparse) in [
             ("Device", &name_is_d3, &[3][..], true),
             ("Other", &name_is_o10, &[10][..], false),
         ] {
@@ -17070,8 +17109,11 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(view_ids(&rows), sorted_ids(ids), "{label}");
-            assert_eq!(cache.limited_node_scan_fast_paths(), u64::from(fast));
-            assert_eq!(cache.limited_node_scan_fallbacks(), u64::from(!fast));
+            assert_eq!(cache.limited_node_scan_fast_paths(), 1);
+            assert_eq!(cache.limited_node_scan_fallbacks(), 0);
+            if !sparse {
+                assert_eq!(cache.node_locator_probes(), 0);
+            }
         }
 
         let with_memtable =
@@ -17174,7 +17216,7 @@ mod tests {
         assert_eq!(cache.limited_node_scan_fallbacks(), 0);
 
         // The row cap's guard limit (cap + 1) is not a LIMIT: a capped scan
-        // of a dense label goes to the two-phase scan without walking the
+        // of a dense label goes to the structural merge without walking the
         // postings, instead of looking up every stale one under a skip
         // budget as large as the cap.
         let cache = SstCache::new(16 * 1024 * 1024);
@@ -17185,8 +17227,8 @@ mod tests {
             .unwrap();
         assert!(rows.is_empty());
         assert_eq!(cache.node_locator_probes(), 0);
-        assert_eq!(cache.limited_node_scan_fast_paths(), 0);
-        assert_eq!(cache.limited_node_scan_fallbacks(), 1);
+        assert_eq!(cache.limited_node_scan_fast_paths(), 1);
+        assert_eq!(cache.limited_node_scan_fallbacks(), 0);
     }
 
     #[tokio::test]
@@ -17470,6 +17512,382 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(rows, legacy, "{projection:?}");
+        }
+    }
+
+    /// Filtered and row-capped limited scans over two overlapping node SSTs
+    /// plus memtable rows, with updates, deletes and relabels spread over all
+    /// three. They used to reconcile every node and truncate; the structural
+    /// merge must stop early, test the filter on the winning version only,
+    /// and still return exactly the uncapped prefix.
+    #[tokio::test]
+    async fn filtered_limited_scan_over_overlap_returns_the_full_prefix_without_reconciling() {
+        let store = make_store();
+        let paths = make_paths("overlap-filtered-limit");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        // `name` is a declared column, `tag` lives in the overflow JSON.
+        let upsert = |name: String, tag: i64, labels: Vec<u32>| {
+            MemOp::Upsert(
+                NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("name".into(), Value::Str(name)),
+                        ("tag".into(), Value::I64(tag)),
+                    ]),
+                    schema_version: 1,
+                    labels,
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+        let label_of = |i: u16| if i % 2 == 0 { DEVICE } else { OTHER };
+        let first = flush_batch_with_row_group_rows(
+            32,
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            (0..600_u16)
+                .map(|i| {
+                    (
+                        spread_node_id(i),
+                        u64::from(i) + 1,
+                        upsert(format!("n{i}"), i64::from(i % 3), vec![label_of(i)]),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        // Second SST over the same id range: rewrites, relabels, deletes.
+        let second = flush_batch_with_row_group_rows(
+            32,
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            (0..600_u16)
+                .filter(|i| i % 5 == 0)
+                .map(|i| {
+                    let op = if i % 25 == 0 {
+                        MemOp::Tombstone
+                    } else if i % 10 == 0 {
+                        upsert(format!("r{i}"), 7, vec![OTHER])
+                    } else {
+                        upsert(format!("u{i}"), 7, vec![DEVICE])
+                    };
+                    (spread_node_id(i), 5000 + u64::from(i), op)
+                })
+                .collect(),
+        )
+        .await;
+        // Without label postings the label routes cannot answer, so every
+        // scan below is the structural merge.
+        let mut manifest = second.manifest.clone();
+        for desc in manifest
+            .ssts
+            .iter_mut()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            desc.label_index = None;
+        }
+        let with_pages = LoadedManifest::new(
+            second.pointer.clone(),
+            second.pointer_etag.clone(),
+            second.pointer_version.clone(),
+            manifest.clone(),
+        );
+        for desc in manifest
+            .ssts
+            .iter_mut()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            desc.node_locator.as_mut().unwrap().property_pages = None;
+        }
+        let without_pages = LoadedManifest::new(
+            second.pointer,
+            second.pointer_etag,
+            second.pointer_version,
+            manifest,
+        );
+        // Memtable: more rewrites and deletes, some undoing the SST ones.
+        let mut live = Memtable::new();
+        for i in (0..600_u16).filter(|i| i % 7 == 0) {
+            let op = if i % 14 == 0 {
+                MemOp::Tombstone
+            } else {
+                upsert(format!("m{i}"), 1, vec![DEVICE, OTHER])
+            };
+            live.apply(
+                MemKey::Node {
+                    id: spread_node_id(i),
+                },
+                9000 + u64::from(i),
+                op,
+            );
+        }
+        let live_view = live.snapshot_view();
+
+        let eq = |column: &str, value: crate::sst::stats::StatScalar| ScanPredicate::Eq {
+            column: column.into(),
+            value,
+        };
+        let predicates = [
+            // One winner, near the end of the id range.
+            vec![eq(
+                "name",
+                crate::sst::stats::StatScalar::Utf8("n599".into()),
+            )],
+            // An overflow property, a third of the nodes.
+            vec![eq("tag", crate::sst::stats::StatScalar::Int64(1))],
+            // Matches superseded versions too, which must not resurface.
+            vec![eq("tag", crate::sst::stats::StatScalar::Int64(7))],
+            // Nothing.
+            vec![eq("tag", crate::sst::stats::StatScalar::Int64(99))],
+            vec![
+                ScanPredicate::IsNotNull {
+                    column: "name".into(),
+                },
+                eq("tag", crate::sst::stats::StatScalar::Int64(2)),
+            ],
+            Vec::new(),
+        ];
+        let name = vec!["name".to_string()];
+        let projections: [Option<&[String]>; 3] = [None, Some(&name), Some(&[])];
+        for (pages, committed) in [(true, &with_pages), (false, &without_pages)] {
+            for label in [Some("Device"), Some("Other"), None] {
+                for predicates in &predicates {
+                    for projection in projections {
+                        let snap = Snapshot::new(
+                            committed.clone(),
+                            &live_view,
+                            store.clone(),
+                            paths.clone(),
+                        );
+                        assert!(snap.disjoint_node_descriptors().is_none());
+                        let full = match label {
+                            Some(label) => snap
+                                .scan_label_with_predicates_and_projection(
+                                    label, predicates, projection,
+                                )
+                                .await
+                                .unwrap(),
+                            None => snap
+                                .scan_all_nodes_with_predicates_and_projection(
+                                    predicates, projection,
+                                )
+                                .await
+                                .unwrap(),
+                        };
+                        // 1_000_001 is the row cap's guard on a labelled scan.
+                        for limit in [1, 3, 50, 1000, 1_000_001] {
+                            let cache = SstCache::new(16 * 1024 * 1024);
+                            let snap = Snapshot::new(
+                                committed.clone(),
+                                &live_view,
+                                store.clone(),
+                                paths.clone(),
+                            )
+                            .with_cache(cache.clone());
+                            let limited = match label {
+                                Some(label) => snap
+                                    .scan_label_with_predicates_and_projection_limited(
+                                        label, predicates, projection, limit,
+                                    )
+                                    .await
+                                    .unwrap(),
+                                None => snap
+                                    .scan_all_nodes_with_predicates_and_projection_limited(
+                                        predicates, projection, limit,
+                                    )
+                                    .await
+                                    .unwrap(),
+                            };
+                            let case = format!(
+                                "pages={pages} {label:?} {predicates:?} {projection:?} {limit}"
+                            );
+                            assert_eq!(limited, &full[..limit.min(full.len())], "{case}");
+                            assert_eq!(cache.limited_node_scan_fallbacks(), 0, "{case}");
+                            assert_eq!(cache.limited_node_scan_fast_paths(), 1, "{case}");
+                            assert_eq!(cache.node_locator_probes(), 0, "{case}");
+                            if !pages {
+                                // Properties are read for the returned rows
+                                // only, never for a row the filter rejected.
+                                assert!(
+                                    cache.label_selected_node_rows() <= limited.len() as u64,
+                                    "{case}"
+                                );
+                            }
+                            if limit == 1 && full.first().is_some_and(|n| n.id < spread_node_id(64))
+                            {
+                                // The merge stopped within the first row
+                                // groups of each SST.
+                                assert!(
+                                    cache.limited_node_scan_decoded_rows() <= 4 * 32,
+                                    "{case}: {} rows decoded",
+                                    cache.limited_node_scan_decoded_rows()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The merge over a legacy label-scoped node SST, typed by its scope with
+    /// `name` in a column of its own, overlapping an id-primary one that keeps
+    /// every property in the overflow JSON. A filter on `name` must read that
+    /// column from the legacy SST (whose overflow it does not project) and the
+    /// JSON from the other, and still return the uncapped prefix.
+    #[tokio::test]
+    async fn filtered_limited_scan_over_a_legacy_scoped_sst_reads_its_declared_column() {
+        let store = make_store();
+        let paths = make_paths("overlap-filtered-legacy");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: String, tag: i64, labels: Vec<u32>| {
+            MemOp::Upsert(
+                NodeWriteRecord {
+                    properties: BTreeMap::from([
+                        ("name".into(), Value::Str(name)),
+                        ("tag".into(), Value::I64(tag)),
+                    ]),
+                    schema_version: 1,
+                    labels,
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+        let first = flush_batch(
+            &ms,
+            &fence,
+            &base,
+            &schema,
+            (0..300_u16)
+                .map(|i| {
+                    let name = format!("n{}", i % 4);
+                    (
+                        spread_node_id(i),
+                        u64::from(i) + 1,
+                        upsert(name, 1, vec![DEVICE]),
+                    )
+                })
+                .collect(),
+        )
+        .await;
+        // Every third id is rewritten (with no label ids, as the per-label
+        // layout wrote it) or deleted.
+        let legacy: Vec<(NodeId, u64, MemOp)> = (0..300_u16)
+            .filter(|i| i % 3 == 0)
+            .map(|i| {
+                let op = if i % 9 == 0 {
+                    MemOp::Tombstone
+                } else {
+                    upsert(format!("n{}", (i + 1) % 4), 7, Vec::new())
+                };
+                (spread_node_id(i), 1000 + u64::from(i), op)
+            })
+            .collect();
+        let second = flush_batch(&ms, &fence, &first, &schema, legacy.clone()).await;
+
+        // Rewrite the second SST as a label-scoped body: same rows in the same
+        // order, `name` declared, no property pages.
+        let mut manifest = second.manifest.clone();
+        let idx = manifest
+            .ssts
+            .iter()
+            .position(|desc| desc.kind == SstKind::Nodes && desc.min_lsn >= 1000)
+            .unwrap();
+        let mut rows: Vec<crate::flush::NodeRow> = legacy
+            .into_iter()
+            .map(|(id, lsn, op)| crate::flush::NodeRow {
+                id: *id.as_bytes(),
+                lsn,
+                op,
+            })
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        let body = crate::flush::build_node_sst(&device_label(), &rows)
+            .unwrap()
+            .body;
+        let desc = &mut manifest.ssts[idx];
+        store
+            .put(
+                &object_store::path::Path::from(format!(
+                    "{}/{}",
+                    paths.namespace_prefix().as_ref(),
+                    desc.path
+                )),
+                body.clone().into(),
+            )
+            .await
+            .unwrap();
+        desc.scope = "Device".into();
+        desc.size_bytes = body.len() as u64;
+        desc.node_locator.as_mut().unwrap().property_pages = None;
+        for desc in manifest
+            .ssts
+            .iter_mut()
+            .filter(|desc| desc.kind == SstKind::Nodes)
+        {
+            desc.label_index = None;
+        }
+        let committed = LoadedManifest::new(
+            second.pointer,
+            second.pointer_etag,
+            second.pointer_version,
+            manifest,
+        );
+
+        let empty = Memtable::new();
+        let view = empty.snapshot_view();
+        let name_is = |name: &str| ScanPredicate::Eq {
+            column: "name".into(),
+            value: crate::sst::stats::StatScalar::Utf8(name.into()),
+        };
+        let tag_is = |tag: i64| ScanPredicate::Eq {
+            column: "tag".into(),
+            value: crate::sst::stats::StatScalar::Int64(tag),
+        };
+        let name = vec!["name".to_string()];
+        let projections: [Option<&[String]>; 3] = [None, Some(&name), Some(&[])];
+        for predicates in [vec![name_is("n2")], vec![name_is("n1"), tag_is(7)]] {
+            for projection in projections {
+                let snap = Snapshot::new(committed.clone(), &view, store.clone(), paths.clone());
+                assert!(snap.disjoint_node_descriptors().is_none());
+                let full = snap
+                    .scan_label_with_predicates_and_projection("Device", &predicates, projection)
+                    .await
+                    .unwrap();
+                assert!(full.len() > 10, "{predicates:?}: {}", full.len());
+                for limit in [1, 10, 1_000] {
+                    let cache = SstCache::new(16 * 1024 * 1024);
+                    let snap =
+                        Snapshot::new(committed.clone(), &view, store.clone(), paths.clone())
+                            .with_cache(cache.clone());
+                    let limited = snap
+                        .scan_label_with_predicates_and_projection_limited(
+                            "Device",
+                            &predicates,
+                            projection,
+                            limit,
+                        )
+                        .await
+                        .unwrap();
+                    let case = format!("{predicates:?} {projection:?} {limit}");
+                    assert_eq!(limited, &full[..limit.min(full.len())], "{case}");
+                    assert_eq!(cache.limited_node_scan_fallbacks(), 0, "{case}");
+                }
+            }
         }
     }
 

@@ -141,12 +141,15 @@ pub(crate) fn resolve_row_count(
 /// before the first candidate exists.
 const MAX_EAGER_QUERY_CAPACITY: usize = 64;
 
-/// Largest seed round an Expand pulls from a node scan over overlapping SSTs.
-/// Every round restarts the merge and point-reads its whole prefix, so when
-/// the seeds rarely expand the rounds would add up to more point reads than
-/// the store has nodes. Past this the remaining round is one full scan.
-// ponytail: fixed cut (64 + 256 + 1024 + 4096 point reads at most); resume
-// the merge from the last seed id if selective seed pulls get common.
+/// Largest seed round an Expand pulls from a labelled or filtered node scan
+/// over overlapping SSTs. Such a scan can be served by the label postings,
+/// the numeric range index or the merge, and every round restarts it, so
+/// when the seeds rarely expand the rounds could add up to several passes
+/// over the label (a full reconcile each, if the merge falls back). Past
+/// this the remaining round is one full scan. The unlabelled, unfiltered
+/// scan only has the merge, whose rounds grow like on disjoint SSTs.
+// ponytail: fixed cut (64 + 256 + 1024 + 4096 seeds at most); resume each
+// round after the last seed id if selective seed pulls get common.
 const OVERLAP_SEED_PULL_MAX: usize = 4096;
 
 #[inline]
@@ -1230,24 +1233,24 @@ fn execute_capped<'a>(
                 // Each round expands only the seeds the previous one did not
                 // see, so `out` stays the same prefix as the uncapped result
                 // and edgeless seeds cannot starve the budget. Memtable nodes
-                // and overlapping SSTs are merged in id order by an unfiltered
-                // limited scan, so they stop early too. Any other input, a
-                // filtered scan over overlapping SSTs, or the full-body
-                // diagnostic read mode, runs uncapped once.
+                // and overlapping SSTs are merged in id order by the limited
+                // scan, so they stop early too. Any other input, or the
+                // full-body diagnostic read mode, runs uncapped once.
                 // NOTE: when few seeds match, the rounds rescan the prefix
-                // (about 1.33x a full scan) and end up holding every seed;
-                // only the row cap bounds that case. Over overlapping SSTs
-                // each seed is a point read, so past OVERLAP_SEED_PULL_MAX
-                // seeds the next round is the uncapped scan.
-                let mut want = match input.as_ref() {
-                    LogicalPlan::NodeScan { predicates, .. }
-                        if snapshot.node_scan_stops_early(predicates) =>
-                    {
-                        Some(cap.max(64))
-                    }
-                    _ => None,
+                // (between about 1.33x and 2.33x a full scan) and end up
+                // holding every seed; only the row cap bounds that case.
+                // Over overlapping SSTs a labelled or filtered scan switches
+                // to one uncapped round past OVERLAP_SEED_PULL_MAX seeds.
+                let (mut want, overlapping) = match input.as_ref() {
+                    LogicalPlan::NodeScan {
+                        label, predicates, ..
+                    } if snapshot.node_scan_stops_early() => (
+                        Some(cap.max(64)),
+                        !snapshot.node_scan_is_disjoint()
+                            && (label.is_some() || !predicates.is_empty()),
+                    ),
+                    _ => (None, false),
                 };
-                let overlapping = want.is_some() && !snapshot.node_scan_is_disjoint();
                 let row_cap = crate::exec::limits::scoped_row_cap();
                 let mut out: Vec<Row> = Vec::new();
                 let mut seen = 0usize;
