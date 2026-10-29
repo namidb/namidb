@@ -297,6 +297,20 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
         } => {
             let preserved = identity_projection_aliases(&items);
             let (mut pushable, stay) = partition_by_alias_subset(pending, &preserved);
+            // A named path (`MATCH q = (a)-->(b) WHERE id(b) = $x`) is built
+            // by a Project that only ADDS `q` and keeps every pattern
+            // binding, so a conjunct that does not read `q` belongs under it,
+            // where the anchor passes can see the pattern it pins.
+            let (path_free, stay) = if items.iter().all(|it| is_path_constructor(&it.expression))
+                && !discard_input_bindings
+                && !distinct
+            {
+                let built: BTreeSet<String> = items.iter().map(|it| it.alias.clone()).collect();
+                partition_by_alias_disjoint(stay, &built)
+            } else {
+                (Vec::new(), stay)
+            };
+            pushable.extend(path_free);
             // A WITH that RENAMES a property (`WITH v, p.cod_item AS c
             // WHERE c = '…'`) used to strand the predicate above this
             // Project, so the index anchor on `p` was never visible to
@@ -692,6 +706,10 @@ fn identity_projection_aliases(items: &[crate::plan::logical::ProjectionItem]) -
         }
     }
     out
+}
+
+fn is_path_constructor(expr: &Expression) -> bool {
+    matches!(&expr.kind, ExpressionKind::FunctionCall { name, .. } if name.joined() == "__path")
 }
 
 // Make the `and_chain` and `CreateElement` imports retain a use across

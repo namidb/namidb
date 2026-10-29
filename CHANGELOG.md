@@ -302,10 +302,13 @@ crates.io release will establish and document that API explicitly.
   an indexed property; it now does the same for `id(d) = ...` and
   `id(d) IN ...`, with or without a label on the target, unless a literal
   id list is longer than the label it would replace scanning. A longer chain
-  pinned on its second node is re-anchored there too, so
-  `MATCH (i)-[:R]->(d)-[:S]->(p) WHERE id(d) = $id` starts at `d`, also when
-  only `id(...)` or `labels(...)` are returned. A chain pinned further along
-  (`WHERE id(p) = $id` above) still keeps its written order.
+  of single hops is re-anchored at whichever node is pinned:
+  `MATCH (i)-[:R]->(d)-[:S]->(p) WHERE id(p) = $id` starts at `p` and walks
+  both hops backwards, and with `WHERE id(d) = $id` it starts at `d`, walks
+  back to `i` and forward to `p`, also when only `id(...)` or `labels(...)`
+  are returned. Labels, relationship filters, relationship uniqueness and a
+  named path (`MATCH q = ...`) give the same rows as the written order. A
+  chain with a variable-length or `OPTIONAL` hop keeps its written order.
 
 - **A labelled hop decoded every neighbour to check its label.** When the
   query read a property of the target (`-[:R]->(t:Device) RETURN t.name`),
