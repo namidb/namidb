@@ -141,14 +141,26 @@ impl Snapshot<'_> {
             memtable.insert(*id, (entry.lsn, keep));
         }
 
+        let ssts = &self.manifest.manifest.ssts;
+        let descriptors = self.manifest.index.node_descriptors();
+        let can_hold = |idx: usize| {
+            label
+                .is_none_or(|label| node_sst_can_contain_label(&self.manifest.manifest, idx, label))
+        };
+        let oldest_candidate = descriptors
+            .iter()
+            .filter(|idx| can_hold(**idx))
+            .map(|idx| ssts[*idx].min_lsn)
+            .min();
         let mut cursors = Vec::new();
-        for idx in self.manifest.index.node_descriptors() {
-            // An SST that cannot hold the label has no candidates. A newer
-            // version there that dropped the label is caught by the point
-            // read, which resolves every candidate over all SSTs.
-            if label.is_some_and(|label| {
-                !node_sst_can_contain_label(&self.manifest.manifest, idx, label)
-            }) {
+        for idx in descriptors {
+            // An SST that cannot hold the label has no candidates, only
+            // versions that may hide one. When all of them are older than
+            // every candidate they hide nothing, so the merge skips it.
+            // Skipping is always safe, since the point read resolves each
+            // candidate over all SSTs; keeping a newer one saves that read
+            // for every member it relabelled or deleted.
+            if !can_hold(idx) && oldest_candidate.is_none_or(|oldest| ssts[idx].max_lsn < oldest) {
                 continue;
             }
             let desc = &self.manifest.manifest.ssts[idx];

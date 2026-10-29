@@ -107,9 +107,10 @@ crates.io release will establish and document that API explicitly.
   the id-ordered merge of the memtable and every node SST where the last
   one stopped, so a batch reads the id, tombstone, lsn and label columns
   of the row groups it reaches and point-reads only the rows it returns.
-  This holds on overlapping SSTs too, and SSTs whose label counts rule the
-  label out are skipped, so a small label written after a big load does
-  not walk the big one first. Walking the whole label reads each stored
+  This holds on overlapping SSTs too. An SST whose label counts rule the
+  label out, and whose versions are all older than any of the label's, is
+  skipped, so a small label written after a big load does not walk the big
+  one first. Walking the whole label reads each stored
   record about once. An iterator reads from the version that was current
   when it was created, and keeps that version's files alive against
   compaction and sweeps until it is dropped (on a `read_only` client,
