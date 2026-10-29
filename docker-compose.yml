@@ -6,7 +6,7 @@
 #   curl -s http://localhost:8080/v0/health | jq .
 #
 # To run a locally built image instead:
-#   docker build -t namidb/namidb-server:2 -f crates/namidb-server/Dockerfile .
+#   docker build -t namidb/namidb-server:3 -f crates/namidb-server/Dockerfile .
 #
 # After it boots, the graph database is reachable on :8080 with bearer
 # token = $NAMIDB_AUTH_TOKEN. The MinIO console is on :9001
@@ -41,7 +41,7 @@ services:
       "
 
   namidb-server:
-    image: namidb/namidb-server:2
+    image: namidb/namidb-server:3
     depends_on:
       bucket-init:
         condition: service_completed_successfully

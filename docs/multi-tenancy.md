@@ -4,7 +4,7 @@
 **Author(s):** NamiDB team
 **Created:** 2026-06-26
 **Updated:** 2026-10-28
-**Applies to:** v2.6
+**Applies to:** v3.0
 **Related:** RFC-032 (filtered ANN pre-filtering), RFC-030 (vector index),
 RFC-015 (auth / external PDP)
 

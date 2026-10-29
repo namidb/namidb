@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-10-29
+
 ### Breaking
 
 - **`CALL algo.*` rejects option keys it does not read.** `algo.pagerank`,
@@ -4160,7 +4162,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v2.6.19...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/namidb/namidb/compare/v2.6.19...v3.0.0
 [2.6.19]: https://github.com/namidb/namidb/compare/v2.6.18...v2.6.19
 [2.6.18]: https://github.com/namidb/namidb/compare/v2.6.17...v2.6.18
 [2.6.17]: https://github.com/namidb/namidb/compare/v2.6.16...v2.6.17

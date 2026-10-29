@@ -422,7 +422,7 @@ The official image is on [Docker Hub](https://hub.docker.com/r/namidb/namidb-ser
 docker run --rm -p 8080:8080 \
   -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
   -e NAMIDB_AUTH_TOKEN="$(openssl rand -hex 32)" \
-  namidb/namidb-server:2 --store "s3://my-bucket?ns=prod&region=us-west-2"
+  namidb/namidb-server:3 --store "s3://my-bucket?ns=prod&region=us-west-2"
 ```
 
 A token (or `--no-auth`) is required: since 2.2.0 the server refuses to boot
@@ -436,7 +436,7 @@ root-owned by images before 2.2.0):
 ```bash
 docker run --rm -p 8080:8080 -v namidb-data:/var/lib/namidb \
   -e NAMIDB_AUTH_TOKEN=... \
-  namidb/namidb-server:2 --store "file:///var/lib/namidb?ns=prod"
+  namidb/namidb-server:3 --store "file:///var/lib/namidb?ns=prod"
 ```
 
 FUSE-backed bind mounts (macOS Docker Desktop's gRPC-FUSE, some network
