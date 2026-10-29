@@ -252,9 +252,13 @@ async fn anchored_undirected_optional_hop_reads_only_the_anchor_neighbourhood() 
     let memtable = Memtable::new();
     let view = memtable.snapshot_view();
 
+    // The first two read `r` as a value, so the hop loads edge properties;
+    // the others only need the topology.
     let shapes = [
-        "RETURN r.note AS note, id(d) AS d, d.name AS name",
-        "RETURN i, r, d",
+        "(i)-[r:ON_DEVICE]-(d:Device) RETURN r.note AS note, id(d) AS d, d.name AS name",
+        "(i)-[r:ON_DEVICE]-(d:Device) RETURN i, r, d",
+        "(i)-[:ON_DEVICE]-(d:Device) RETURN id(d) AS d",
+        "(i)-[r:ON_DEVICE]-(d:Device) RETURN id(d) AS d, d.name AS name",
     ];
     for (anchor, expected) in [
         (
@@ -265,10 +269,8 @@ async fn anchored_undirected_optional_hop_reads_only_the_anchor_neighbourhood() 
     ] {
         for shape in shapes {
             for factor in [false, true] {
-                let query = format!(
-                    "MATCH (i:Identifier) WHERE id(i) = '{anchor}' \
-                     OPTIONAL MATCH (i)-[r:ON_DEVICE]-(d:Device) {shape}"
-                );
+                let query =
+                    format!("MATCH (i:Identifier) WHERE id(i) = '{anchor}' OPTIONAL MATCH {shape}");
                 let plan = optimize(lower(&parse(&query).unwrap()).unwrap(), &catalog);
                 // A cold reader each time, so nothing an earlier query cached
                 // helps this one.
@@ -294,15 +296,25 @@ async fn anchored_undirected_optional_hop_reads_only_the_anchor_neighbourhood() 
                         (_, Some(RuntimeValue::String(note)), Some(RuntimeValue::String(d))) => {
                             format!("{note}|{d}")
                         }
+                        (None, None, Some(RuntimeValue::String(d))) => d.clone(),
                         (Some(RuntimeValue::Null), _, Some(RuntimeValue::Null))
-                        | (_, Some(RuntimeValue::Null), Some(RuntimeValue::Null)) => {
-                            "NULL".to_string()
-                        }
+                        | (_, Some(RuntimeValue::Null), Some(RuntimeValue::Null))
+                        | (None, None, Some(RuntimeValue::Null)) => "NULL".to_string(),
                         other => panic!("unexpected row {other:?}"),
                     })
                     .collect();
                 got.sort();
                 let what = format!("{query} (factorized: {factor})");
+                let expected: Vec<String> = if shape.contains("note") || shape.contains(" r,") {
+                    expected.clone()
+                } else {
+                    let mut ids: Vec<String> = expected
+                        .iter()
+                        .map(|e| e.rsplit('|').next().unwrap().to_string())
+                        .collect();
+                    ids.sort();
+                    ids
+                };
                 assert_eq!(got, expected, "{what}");
 
                 // No label or node scan ran, and no edge property stream was
@@ -313,15 +325,23 @@ async fn anchored_undirected_optional_hop_reads_only_the_anchor_neighbourhood() 
                 assert_eq!(cache.limited_node_scan_examined_rows(), 0, "{what}");
                 assert_eq!(cache.edge_streams_misses(), 0, "{what}");
                 // And no SST file was read in full: the anchor, its adjacency
-                // and its neighbours' labels are a slice of every file. The
-                // slice is coarse at this size, since an edge's properties
-                // come in pages of up to 1024 rows.
+                // and its neighbours' labels are a slice of every file. Node
+                // files get a fixed budget of a few pages. Edge files are read
+                // at a coarser grain (an edge's properties come in pages of up
+                // to 1024 rows), so at this size they keep a relative bound.
+                // With NAMIDB_ADJACENCY set, a topology-only hop builds the
+                // CSR of the whole type instead; that mode is not covered here.
                 let read = counting.read.lock().unwrap().clone();
                 for (path, ranges) in &read {
                     if let Some(size) = sizes.get(path) {
                         let bytes = covered(ranges);
+                        let budget = if path.contains("-edges-") {
+                            size / 2
+                        } else {
+                            64 * 1024
+                        };
                         assert!(
-                            bytes * 2 < *size,
+                            bytes < budget,
                             "{what}: read {bytes} of the {size} bytes of {path}"
                         );
                     }
