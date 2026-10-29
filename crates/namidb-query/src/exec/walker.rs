@@ -6180,12 +6180,14 @@ async fn vector_search_rows(
     #[cfg(not(feature = "vector-index"))]
     let _ = (ef_search, prefilter.map(|plan| &plan.groups));
 
-    // Materialise the WHOLE node: the result binds it to `alias`, and a
-    // downstream projection (`RETURN d.title`) or a procedure's `YIELD node` may
-    // read any property — not just the embedding — and a source filter may too.
-    // (The index path likewise returns full nodes via `lookup_node`.) Projecting
-    // only the embedding column here would leave those properties null.
-    let projection: Option<Vec<String>> = None;
+    // The result binds the WHOLE node to `alias`: a downstream projection
+    // (`RETURN d.title`) or a procedure's `YIELD node` may read any property.
+    // Without a source filter nothing but the embedding is read before the
+    // top-k is known, so the scan reads only the embedding and the winners are
+    // loaded whole afterwards, like the index path does. A source filter may
+    // read any property, so it still needs whole nodes up front.
+    let score_only = source_filter.is_none();
+    let projection: Option<Vec<String>> = score_only.then(|| vec![property.to_string()]);
 
     // (sort_key, NodeId, score_value, row) — sort_key is "lower is better"
     // (higher-is-better metrics are negated), so an ascending sort yields the
@@ -6232,14 +6234,26 @@ async fn vector_search_rows(
     }
 
     scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    scored.truncate(limit);
+    if score_only {
+        let ids: Vec<NodeId> = scored.iter().map(|(_, id, _, _)| *id).collect();
+        let views = snapshot
+            .batch_lookup_nodes(label.unwrap_or(""), &ids)
+            .await?;
+        for ((_, _, _, row), view) in scored.iter_mut().zip(views) {
+            if let Some(view) = view {
+                row.set(
+                    alias.to_string(),
+                    RuntimeValue::Node(Box::new(NodeValue::from(view))),
+                );
+            }
+        }
+    }
 
     // Build rows in rank order. The source filter already ran before scoring,
     // so truncation takes the top-k of the filtered source.
     let mut out = Vec::with_capacity(query_initial_capacity(limit, scored.len()));
     for (_sort_key, _id, score, mut row) in scored {
-        if out.len() >= limit {
-            break;
-        }
         row.set(score_alias.to_string(), RuntimeValue::Float(score));
         out.push(row);
     }

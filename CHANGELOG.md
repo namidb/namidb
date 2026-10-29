@@ -47,6 +47,13 @@ crates.io release will establish and document that API explicitly.
   property, so `n.id` and `WHERE n.id = $id` find the node instead of
   returning null.
 
+- **Node SSTs and their exact record sidecars use a new format that 2.x
+  cannot read.** Embeddings and other numeric arrays moved out of the
+  overflow JSON (see Changed). A store written or compacted by 3.0 cannot
+  be opened by a 2.x binary or wheel, so a downgrade needs a backup taken
+  before the upgrade. Stores written by 2.x open and read as before, and
+  compaction rewrites their SSTs in the new format.
+
 ### Added
 
 - **macOS x86_64 Python wheel.** Intel Macs and x86_64 Pythons on Apple
@@ -129,6 +136,53 @@ crates.io release will establish and document that API explicitly.
   rejection names whichever of the two gates was full.
 
 ### Changed
+
+- **Embeddings are stored in binary, not as JSON text.** A vector, an int8
+  vector, a byte string or a list of numbers (what a Python list of floats
+  becomes through a Cypher parameter) used to be written into the node's
+  `__overflow_json` column, so a 1,024-float embedding was about 20 KB of
+  decimal text that every read of the row parsed, whether or not it asked
+  for the embedding. Node SSTs now carry those values in a new
+  `__binary_props` column, in the same binary encoding the property pages
+  use, and the footer lists which names the column holds. A projection that
+  names none of them (`RETURN c.kind`) never reads the column, and one that
+  does reads the floats without parsing text. The exact records behind point
+  lookups and label postings (`.nloc2`) moved to the same binary encoding.
+
+  The overflow JSON itself is now parsed selectively under a projection:
+  keys that were not asked for are skipped without building a value, which
+  also speeds up SSTs written by 2.x that still hold embeddings there. Those
+  SSTs keep reading as before, alongside new ones, with the newest version
+  of each node winning; compaction rewrites them in binary.
+
+  On a 200k-node store with 4,096 1,024-float embeddings, reading the
+  `name` of those 4,096 nodes through their exact records took 53 MB of
+  reads and 193 ms in the 2.x layout and takes 45 MB and 58 ms now. Through
+  the property pages, the default when they exist, it was already 60 ms.
+
+- **An unindexed vector search reads only the embedding until it has its
+  top k.** `search.vector`, `search.hybrid`, `db.index.vector.queryNodes`
+  and an `ORDER BY cosine_similarity(...) LIMIT k` query without a usable
+  vector index used to load every node of the label in full before
+  ranking. Without a filter they now read only the vector property and load
+  the k winners whole afterwards. With a filter they still load every node,
+  since the filter may read any property. On 400 nodes with 32 KB of text
+  each, a k of 1 went from 8 MB read to under 3.3 MB.
+
+- **A projected scan of a small label over overlapping node SSTs no longer
+  reads every node SST.** `MATCH (d:Device) RETURN d.name` and
+  `RETURN id(d)` took the two-pass label scan, whose first pass reads the
+  id, lsn and label columns of every node in the store. A label holding at
+  most 1/64 of the node rows now resolves its members through the label
+  postings and reads only their records. Measured on 220k nodes in two
+  overlapping SSTs with 128 Ki-row groups and 9 devices: `RETURN d.name`
+  went from 48 ms to 0.5 ms and `RETURN id(d)` from 41 ms to 0.5 ms, both now
+  reading one block per device per SST. `scan_label('Device')` was already
+  on that route and takes 0.6 ms. Larger labels keep the two-pass scan,
+  whose second pass decodes properties for the label's own rows only.
+  That is why node SSTs are still not split by label: on these numbers the
+  remaining cost of a label read is the structural pass of a mid-sized
+  label, about 40 ms per 220k nodes, not other labels' properties.
 
 - **Namespace names can contain `_`.** `forensic_case` used to be rejected
   as an invalid namespace. The first character still has to be `[a-z0-9]`.
@@ -341,9 +395,9 @@ crates.io release will establish and document that API explicitly.
   them without reading any property.
 
   Still open: a flush that only deletes nodes carries no label counts, which
-  turns this route off until compaction. Splitting node SSTs by label and
-  storing embeddings in a binary column would cut the remaining work, but
-  both change the on-disk format and are left for later.
+  turns this route off until compaction. Node SSTs are still not split by
+  label (see the label scan entry under Changed for why that was not
+  needed).
 
 - **Keywords work as property keys, map keys and aliases.** `RETURN e.by`,
   `SET n.end = 1`, `{order: 1}`, `RETURN x AS by` and

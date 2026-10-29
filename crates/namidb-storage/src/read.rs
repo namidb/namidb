@@ -99,13 +99,13 @@ use crate::sst::nodes::property_pages::{
     NODE_PROPERTY_PAGES_FORMAT_VERSION,
 };
 use crate::sst::nodes::{
-    load_node_sst_metadata_async, parse_node_sst_metadata, prop_column_name, row_groups_for_keys,
-    scan_row_groups_async as node_scan_row_groups_async,
+    decode_node_extra_properties, load_node_sst_metadata_async, parse_node_sst_metadata,
+    prop_column_name, row_groups_for_keys, scan_row_groups_async as node_scan_row_groups_async,
     scan_row_groups_for_keys_async as node_scan_row_groups_for_keys_async,
     scan_rows_by_ordinals_async as node_scan_rows_by_ordinals_async,
     scan_with_predicates_and_projection_async as node_scan_limited_async,
     split_batches_by_row_group, targeted_scan_async as node_targeted_scan_async, NodeSstReader,
-    COL_LABELS, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
+    COL_LABELS, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, SCHEMA_VERSION,
 };
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
 
@@ -4665,18 +4665,19 @@ impl<'mt> Snapshot<'mt> {
                             let decoded = records
                                 .into_iter()
                                 .map(|(id_bytes, encoded)| {
-                                    let (lsn, op) = decode_exact_node_record(&encoded)?;
+                                    let (lsn, record) = decode_exact_node_record(&encoded)?;
                                     let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
-                                    let view = match op {
-                                        MemOp::Tombstone => None,
-                                        MemOp::Upsert(payload) => Some(node_view_from_payload(
-                                            id,
-                                            lsn,
-                                            &payload,
+                                    let view = record.map(|record| NodeView {
+                                        id,
+                                        labels: labels_from_ids(
+                                            &record.labels,
                                             &self.manifest.manifest.label_dict,
                                             &desc.scope,
-                                        )?),
-                                    };
+                                        ),
+                                        properties: record.properties,
+                                        lsn,
+                                        schema_version: record.schema_version,
+                                    });
                                     Ok((id_bytes, lsn, view))
                                 })
                                 .collect::<Result<Vec<_>>>();
@@ -6291,8 +6292,12 @@ impl<'mt> Snapshot<'mt> {
         // An unbounded projected scan is better served by the two-phase scan:
         // an id-only one (a count) never leaves its structural pass, and a
         // projected one reads property pages. Full exact records would decode
-        // every wide value of every member only to trim it.
-        if !bounded
+        // every wide value of every member only to trim it. Not for a tiny
+        // label, though: its few record reads cost far less than a structural
+        // pass over every node SST (9 nodes out of 220k: 0.6 ms against 48 ms).
+        // ponytail: fixed 1/64 cut; measure the crossover per record size if
+        // mid-sized labels pick the wrong side.
+        let prefer_two_phase = !bounded
             && projection.is_some_and(|columns| {
                 (columns.is_empty() && predicates.is_empty())
                     || self
@@ -6306,11 +6311,13 @@ impl<'mt> Snapshot<'mt> {
                             )
                             .is_some()
                         })
-            })
-        {
+            });
+        // Memtable members only add to a label's share, so a label already
+        // past the cut on the SSTs alone leaves before every memtable payload
+        // is decoded, which the two-phase scan would only do again.
+        if !bounded && !self.label_share_at_most(label, 0, if prefer_two_phase { 64 } else { 4 }) {
             return Ok(None);
         }
-
         let dict = &self.manifest.manifest.label_dict;
         let mut memtable_ids = Vec::new();
         for (key, entry) in self.node_entries() {
@@ -6320,6 +6327,10 @@ impl<'mt> Snapshot<'mt> {
                 }
             }
         }
+        if prefer_two_phase && !self.label_share_at_most(label, memtable_ids.len(), 64) {
+            return Ok(None);
+        }
+
         let sparse = self.label_is_sparse(label, memtable_ids.len());
         if !bounded && !sparse {
             return Ok(None);
@@ -6551,6 +6562,11 @@ impl<'mt> Snapshot<'mt> {
     fn label_is_sparse(&self, label: &str, memtable_members: usize) -> bool {
         // ponytail: fixed 25% cut on manifest counts; measure the crossover
         // if dense labels start choosing the wrong route.
+        self.label_share_at_most(label, memtable_members, 4)
+    }
+
+    /// Whether `label` holds at most `1 / divisor` of the node rows.
+    fn label_share_at_most(&self, label: &str, memtable_members: usize, divisor: u64) -> bool {
         let rows: u64 = self
             .manifest
             .index
@@ -6561,7 +6577,7 @@ impl<'mt> Snapshot<'mt> {
             .saturating_add(self.node_entries().count() as u64);
         self.live_row_estimate(label)
             .saturating_add(memtable_members as u64)
-            .saturating_mul(4)
+            .saturating_mul(divisor)
             <= rows
     }
 
@@ -10421,9 +10437,6 @@ fn append_limited_node_batch(
         .column_by_name(SCHEMA_VERSION)
         .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
         .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
-    let overflow_col = batch
-        .column_by_name(OVERFLOW_JSON)
-        .and_then(|column| column.as_any().downcast_ref::<StringArray>());
     let decode_set: Option<BTreeSet<&str>> =
         decode_projection.map(|columns| columns.iter().map(String::as_str).collect());
 
@@ -10462,18 +10475,11 @@ fn append_limited_node_batch(
             }
         }
         if decode_set.as_ref().is_none_or(|keep| !keep.is_empty()) {
-            if let Some(overflow_col) = overflow_col.filter(|column| !column.is_null(row)) {
-                let extra: BTreeMap<String, Value> = serde_json::from_str(overflow_col.value(row))?;
-                if let Some(keep) = &decode_set {
-                    properties.extend(
-                        extra
-                            .into_iter()
-                            .filter(|(property, _)| keep.contains(property.as_str())),
-                    );
-                } else {
-                    properties.extend(extra);
-                }
-            }
+            properties.extend(decode_node_extra_properties(
+                batch,
+                row,
+                decode_set.as_ref(),
+            )?);
         }
 
         let mut view = NodeView {
@@ -11227,19 +11233,7 @@ fn decode_node_row_properties(
     if projection.is_some_and(|keep| keep.is_empty()) {
         return Ok(properties);
     }
-    let overflow = batch
-        .column_by_name(OVERFLOW_JSON)
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .filter(|column| !column.is_null(row));
-    if let Some(overflow) = overflow {
-        let extra: BTreeMap<String, Value> = serde_json::from_str(overflow.value(row))?;
-        match projection {
-            Some(keep) => {
-                properties.extend(extra.into_iter().filter(|(k, _)| keep.contains(k.as_str())))
-            }
-            None => properties.extend(extra),
-        }
-    }
+    properties.extend(decode_node_extra_properties(batch, row, projection)?);
     Ok(properties)
 }
 
@@ -11368,15 +11362,7 @@ fn find_node_row_in_batches(
                     properties.insert(p.name.clone(), v);
                 }
             }
-            let ovf_col = batch
-                .column_by_name(OVERFLOW_JSON)
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| Error::invariant("__overflow_json column missing"))?;
-            if !ovf_col.is_null(row) {
-                let json_str = ovf_col.value(row);
-                let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
-                properties.extend(extra);
-            }
+            properties.extend(decode_node_extra_properties(batch, row, None)?);
             let sv_col = batch
                 .column_by_name(SCHEMA_VERSION)
                 .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
@@ -11424,10 +11410,6 @@ fn batch_harvest_node_rows(
             .column_by_name(COL_LSN)
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| Error::invariant("lsn column missing"))?;
-        let ovf_col = batch
-            .column_by_name(OVERFLOW_JSON)
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| Error::invariant("__overflow_json column missing"))?;
         let sv_col = batch
             .column_by_name(SCHEMA_VERSION)
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
@@ -11462,11 +11444,7 @@ fn batch_harvest_node_rows(
                         properties.insert(p.name.clone(), v);
                     }
                 }
-                if !ovf_col.is_null(row) {
-                    let json_str = ovf_col.value(row);
-                    let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
-                    properties.extend(extra);
-                }
+                properties.extend(decode_node_extra_properties(batch, row, None)?);
                 let schema_version = sv_col.value(row);
                 let id = NodeId::from_uuid(Uuid::from_bytes(row_id));
                 Some(NodeView {
@@ -16270,6 +16248,550 @@ mod tests {
             ],
         )
         .await
+    }
+
+    /// A 2.x node SST keeps embeddings in the overflow JSON; a newer one puts
+    /// them in `__binary_props`. Overlapping, the two must reconcile by LWW on
+    /// every read route, and compaction must rewrite the old rows as binary.
+    #[tokio::test]
+    async fn vectors_from_json_and_binary_node_ssts_reconcile_and_compact_to_binary() {
+        use crate::sst::nodes::LegacyNodeLayout;
+        use crate::sst::{BINARY_PROPS, OVERFLOW_JSON};
+        use arrow_array::cast::AsArray;
+
+        let store = make_store();
+        let paths = make_paths("binary-vectors-mixed");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        // Whole-number floats survive the JSON memtable payload bit for bit.
+        let emb = |seed: u8| {
+            Value::List(
+                (0..64)
+                    .map(|j| Value::F64(f64::from(seed) * 100.0 + f64::from(j)))
+                    .collect(),
+            )
+        };
+        let record = |name: &str, emb: Option<Value>| {
+            let mut properties = BTreeMap::from([("name".to_string(), Value::Str(name.into()))]);
+            properties.extend(emb.map(|emb| ("emb".to_string(), emb)));
+            MemOp::Upsert(
+                NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    labels: vec![DEVICE],
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+
+        let layout = LegacyNodeLayout::on();
+        let old = (1..=4)
+            .map(|i| (sorted_node_id(i), u64::from(i), record("old", Some(emb(i)))))
+            .collect();
+        let first = flush_batch(&ms, &fence, &base, &schema, old).await;
+        drop(layout);
+        let second = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (sorted_node_id(2), 10, record("new", Some(emb(20)))),
+                (sorted_node_id(3), 11, record("new", None)),
+                (sorted_node_id(5), 12, record("new", Some(emb(50)))),
+            ],
+        )
+        .await;
+        let expected: Vec<(NodeId, &str, Option<Value>)> = vec![
+            (sorted_node_id(1), "old", Some(emb(1))),
+            (sorted_node_id(2), "new", Some(emb(20))),
+            (sorted_node_id(3), "new", None),
+            (sorted_node_id(4), "old", Some(emb(4))),
+            (sorted_node_id(5), "new", Some(emb(50))),
+        ];
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        // `true` when the binary column is expected on every node SST.
+        let check = |committed: LoadedManifest, all_binary: bool| {
+            let store = store.clone();
+            let paths = paths.clone();
+            let expected = expected.clone();
+            let empty_view = &empty_view;
+            async move {
+                let snap =
+                    Snapshot::new(committed.clone(), empty_view, store.clone(), paths.clone());
+                let mut layouts = Vec::new();
+                for idx in snap.manifest.index.node_descriptors() {
+                    let desc = &snap.manifest.manifest.ssts[idx];
+                    let body = snap.get_sst_body(desc).await.unwrap();
+                    let reader =
+                        NodeSstReader::open(snap.label_def_for_node_sst(desc), body).unwrap();
+                    for batch in reader.scan().unwrap() {
+                        let json = batch
+                            .column_by_name(OVERFLOW_JSON)
+                            .unwrap()
+                            .as_string::<i32>();
+                        let json_has_emb =
+                            (0..batch.num_rows()).any(|row| json.value(row).contains("emb"));
+                        layouts.push((batch.column_by_name(BINARY_PROPS).is_some(), json_has_emb));
+                    }
+                }
+                if all_binary {
+                    assert!(
+                        layouts.iter().all(|layout| *layout == (true, false)),
+                        "{layouts:?}"
+                    );
+                } else {
+                    assert!(layouts.contains(&(false, true)), "{layouts:?}");
+                    assert!(layouts.contains(&(true, false)), "{layouts:?}");
+                }
+
+                for ranged in [true, false] {
+                    let snap =
+                        Snapshot::new(committed.clone(), empty_view, store.clone(), paths.clone())
+                            .with_ranged_reads(ranged);
+                    let full = snap.scan_label("Device").await.unwrap();
+                    let embs = snap
+                        .scan_label_with_predicates_and_projection(
+                            "Device",
+                            &[],
+                            Some(&["emb".into()]),
+                        )
+                        .await
+                        .unwrap();
+                    let names = snap
+                        .scan_label_with_predicates_and_projection(
+                            "Device",
+                            &[],
+                            Some(&["name".into()]),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(full.len(), expected.len());
+                    for (i, (id, name, emb)) in expected.iter().enumerate() {
+                        let name = Value::Str(name.to_string());
+                        let mut whole = BTreeMap::from([("name".to_string(), name.clone())]);
+                        whole.extend(emb.clone().map(|emb| ("emb".to_string(), emb)));
+                        assert_eq!(
+                            (full[i].id, &full[i].properties),
+                            (*id, &whole),
+                            "ranged={ranged}"
+                        );
+                        assert_eq!(
+                            embs[i].properties.get("emb"),
+                            emb.as_ref(),
+                            "ranged={ranged}"
+                        );
+                        assert_eq!(
+                            names[i].properties,
+                            BTreeMap::from([("name".to_string(), name)])
+                        );
+                        let point = snap.lookup_node("Device", *id).await.unwrap().unwrap();
+                        assert_eq!(point.properties, whole, "ranged={ranged}");
+                    }
+                    // A batched lookup resolves through the exact records.
+                    let ids: Vec<NodeId> = expected.iter().map(|(id, _, _)| *id).collect();
+                    let batched = snap.batch_lookup_nodes("Device", &ids).await.unwrap();
+                    for (view, row) in batched.iter().zip(&full) {
+                        assert_eq!(view.as_ref(), Some(row), "ranged={ranged}");
+                    }
+                }
+            }
+        };
+        check(second.clone(), false).await;
+        let compacted = crate::compact::compact_l0_to_l1(&ms, &fence, &second, &schema)
+            .await
+            .unwrap()
+            .committed;
+        assert_eq!(compacted.index.node_descriptors().len(), 1);
+        check(compacted, true).await;
+    }
+
+    /// A projected scan of a label with a handful of members over overlapping
+    /// node SSTs resolves its members through the label postings, not through
+    /// a structural pass that opens every node SST's Parquet body.
+    #[tokio::test]
+    async fn tiny_label_projected_scan_over_overlapping_ssts_skips_the_parquet_pass() {
+        let store = make_store();
+        let paths = make_paths("tiny-label-projected");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+        let rows = (0..1000_u16)
+            .map(|i| {
+                let label = if i % 200 == 0 { DEVICE } else { OTHER };
+                (
+                    spread_node_id(i),
+                    u64::from(i) + 1,
+                    upsert(&format!("n{i}"), vec![label]),
+                )
+            })
+            .collect();
+        let first = flush_batch(&ms, &fence, &base, &schema, rows).await;
+        let second = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (spread_node_id(200), 2000, upsert("renamed", vec![DEVICE])),
+                (spread_node_id(400), 2001, upsert("gone", vec![OTHER])),
+                (spread_node_id(401), 2002, upsert("joined", vec![DEVICE])),
+            ],
+        )
+        .await;
+        assert!(second.manifest.ssts.iter().all(
+            |desc| crate::manifest::node_property_pages_sidecar(desc).is_some()
+                || desc.kind != SstKind::Nodes
+        ));
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        for projection in [vec!["name".to_string()], vec![]] {
+            let cache = SstCache::new(16 * 1024 * 1024);
+            let snap = Snapshot::new(second.clone(), &empty_view, store.clone(), paths.clone())
+                .with_cache(cache.clone());
+            assert!(snap.disjoint_node_descriptors().is_none());
+            let rows = snap
+                .scan_label_with_predicates_and_projection("Device", &[], Some(&projection))
+                .await
+                .unwrap();
+            assert_eq!(
+                view_ids(&rows),
+                [0, 200, 401, 600, 800].map(spread_node_id).to_vec(),
+                "{projection:?}"
+            );
+            if !projection.is_empty() {
+                assert_eq!(rows[1].properties["name"], Value::Str("renamed".into()));
+            }
+            assert_eq!(cache.metadata_inserts(), 0, "{projection:?}");
+        }
+    }
+
+    /// A projected scan of a dense label over overlapping node SSTs goes to
+    /// the two-phase scan, which parses each memtable payload once. The
+    /// postings route must not parse them all first only to step aside.
+    #[tokio::test]
+    async fn dense_label_projected_scan_parses_each_memtable_payload_once() {
+        use crate::flush::NODE_RECORD_DECODES;
+
+        let store = make_store();
+        let paths = make_paths("dense-label-memtable-decodes");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+        let rows = (0..100_u16)
+            .map(|i| {
+                (
+                    spread_node_id(i),
+                    u64::from(i) + 1,
+                    upsert("n", vec![OTHER]),
+                )
+            })
+            .collect();
+        let first = flush_batch(&ms, &fence, &base, &schema, rows).await;
+        let second = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![(spread_node_id(5), 500, upsert("n", vec![OTHER]))],
+        )
+        .await;
+
+        let mut mt = Memtable::new();
+        for i in 100..120_u16 {
+            mt.apply(
+                MemKey::Node {
+                    id: spread_node_id(i),
+                },
+                1000 + u64::from(i),
+                upsert("m", vec![OTHER]),
+            );
+        }
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(second, &view, store, paths);
+        assert!(snap.disjoint_node_descriptors().is_none());
+        let before = NODE_RECORD_DECODES.with(|n| n.get());
+        let rows = snap
+            .scan_label_with_predicates_and_projection("Other", &[], Some(&["name".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 120);
+        assert_eq!(NODE_RECORD_DECODES.with(|n| n.get()) - before, 20);
+    }
+
+    /// Byte-counting store for the label locality measurement below.
+    #[derive(Debug)]
+    struct FetchCountingStore {
+        inner: Arc<dyn ObjectStore>,
+        bytes: std::sync::atomic::AtomicU64,
+    }
+
+    impl std::fmt::Display for FetchCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("FetchCountingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FetchCountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, options).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let head = options.head;
+            let result = self.inner.get_opts(location, options).await?;
+            if !head {
+                self.bytes.fetch_add(
+                    result.range.end - result.range.start,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            Ok(result)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    /// Measurement for the forensic report's label locality issue, scaled
+    /// down: 200k nodes over 18 labels with two overlapping node SSTs of
+    /// 128 Ki-row groups, a 9-node label and a dense label carrying
+    /// 1,024-float vectors, written once in the 2.x layout and once in the
+    /// current one. Run with `--ignored --nocapture`; it prints what each read
+    /// fetched and how many label rows had properties decoded.
+    #[tokio::test]
+    #[ignore = "measurement, prints numbers"]
+    async fn measure_sparse_label_reads_over_overlapping_node_ssts() {
+        use crate::sst::nodes::LegacyNodeLayout;
+        use futures::TryStreamExt;
+        use std::sync::atomic::Ordering;
+
+        const NODES: usize = 200_000;
+        const CONTENT: usize = 4_096;
+        const DEVICES: usize = 9;
+        const UPDATES: usize = 20_000;
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let ids: Vec<NodeId> = (0..NODES)
+            .map(|_| {
+                let raw = (u128::from(next()) << 64) | u128::from(next());
+                NodeId::from_uuid(Uuid::from_u128(raw))
+            })
+            .collect();
+        // Label 0 is Device, 1 is Content, 2..18 share the rest.
+        let label_of = |i: usize| -> u32 {
+            if i < DEVICES {
+                0
+            } else if i < DEVICES + CONTENT {
+                1
+            } else {
+                2 + (i % 16) as u32
+            }
+        };
+        let names: Vec<String> = (0..18).map(|l| format!("L{l}")).collect();
+        let payload = |i: usize, version: u64| {
+            let mut properties = BTreeMap::from([
+                ("name".to_string(), Value::Str(format!("n{i}-{version}"))),
+                ("note".to_string(), Value::Str(format!("{:0>80}", i))),
+            ]);
+            if label_of(i) == 1 {
+                // Random enough that zstd cannot shrink it, like real ones.
+                let mut x = (i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let emb = (0..1024)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                    })
+                    .collect();
+                properties.insert("emb".to_string(), Value::Vec(emb));
+            }
+            MemOp::Upsert(
+                NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    labels: vec![label_of(i)],
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+
+        for legacy in [true, false] {
+            let counting = Arc::new(FetchCountingStore {
+                inner: make_store(),
+                bytes: Default::default(),
+            });
+            let store: Arc<dyn ObjectStore> = counting.clone();
+            let paths = make_paths(if legacy {
+                "measure-legacy"
+            } else {
+                "measure-binary"
+            });
+            let ms = ManifestStore::new(store.clone(), paths.clone());
+            let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+            for name in &names {
+                base.manifest.label_dict.intern(name);
+            }
+            let fence = WriterFence::new(base.manifest.epoch);
+            let schema = SchemaBuilder::new().build();
+            let layout = legacy.then(LegacyNodeLayout::on);
+            let rows = (0..NODES)
+                .map(|i| (ids[i], i as u64 + 1, payload(i, 0)))
+                .collect();
+            let first =
+                flush_batch_with_row_group_rows(128 * 1024, &ms, &fence, &base, &schema, rows)
+                    .await;
+            // The second SST rewrites a random tenth, one device included.
+            let mut touched: Vec<usize> = (0..UPDATES).map(|k| (k * 7919 + 3) % NODES).collect();
+            touched.push(4);
+            touched.sort_unstable_by_key(|i| ids[*i]);
+            touched.dedup();
+            let rows = touched
+                .iter()
+                .map(|&i| (ids[i], (NODES + i) as u64 + 1, payload(i, 1)))
+                .collect();
+            let second =
+                flush_batch_with_row_group_rows(128 * 1024, &ms, &fence, &first, &schema, rows)
+                    .await;
+            drop(layout);
+            let sizes: Vec<(u64, u64)> = second
+                .manifest
+                .ssts
+                .iter()
+                .filter(|d| d.kind == SstKind::Nodes)
+                .map(|d| (d.row_count, d.size_bytes))
+                .collect();
+            println!("layout legacy={legacy}: node SSTs (rows, bytes) {sizes:?}");
+
+            let empty = Memtable::new();
+            let empty_view = empty.snapshot_view();
+            let cases: [(&str, &str, Option<Vec<String>>); 5] = [
+                ("scan_label(Device)", "L0", None),
+                ("Device RETURN d.name", "L0", Some(vec!["name".into()])),
+                ("Device RETURN id(d)", "L0", Some(vec![])),
+                ("Content RETURN c.emb", "L1", Some(vec!["emb".into()])),
+                ("Content RETURN c.name", "L1", Some(vec!["name".into()])),
+            ];
+            for (what, label, projection) in cases {
+                for parquet_only in [false, true] {
+                    let mut committed = second.clone();
+                    if parquet_only {
+                        // The SSTs without their property pages.
+                        let mut manifest = committed.manifest.clone();
+                        for desc in &mut manifest.ssts {
+                            if let Some(locator) = desc.node_locator.as_mut() {
+                                locator.property_pages = None;
+                            }
+                        }
+                        committed = LoadedManifest::new(
+                            committed.pointer,
+                            committed.pointer_etag,
+                            committed.pointer_version,
+                            manifest,
+                        );
+                    }
+                    // A fresh copy of the store per read, so nothing an
+                    // earlier read pinned or cached is reused.
+                    let copy: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                    let objects: Vec<_> = counting.inner.list(None).try_collect().await.unwrap();
+                    for object in objects {
+                        let body = counting.inner.get(&object.location).await.unwrap();
+                        copy.put(&object.location, body.bytes().await.unwrap().into())
+                            .await
+                            .unwrap();
+                    }
+                    let fresh = Arc::new(FetchCountingStore {
+                        inner: copy,
+                        bytes: Default::default(),
+                    });
+                    let cache = SstCache::new(64 * 1024 * 1024);
+                    let snap = Snapshot::new(committed, &empty_view, fresh.clone(), paths.clone())
+                        .with_cache(cache.clone());
+                    let before = 0;
+                    let started = std::time::Instant::now();
+                    let rows = snap
+                        .scan_label_with_predicates_and_projection(
+                            label,
+                            &[],
+                            projection.as_deref(),
+                        )
+                        .await
+                        .unwrap();
+                    let elapsed = started.elapsed();
+                    println!(
+                        "  {what:<24} pages={:<5} rows={:<6} fetched={:>10} B  \
+                         label rows decoded={:<6} {:?}",
+                        !parquet_only,
+                        rows.len(),
+                        fresh.bytes.load(Ordering::SeqCst) - before,
+                        cache.label_selected_node_rows(),
+                        elapsed,
+                    );
+                }
+            }
+        }
     }
 
     fn view_ids(rows: &[NodeView]) -> Vec<NodeId> {

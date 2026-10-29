@@ -30,7 +30,7 @@ pub use edges::{
 pub use hll::{Hll, DEFAULT_PRECISION as HLL_DEFAULT_PRECISION};
 pub use nodes::{
     targeted_scan_async as node_targeted_scan_async, NodeSstReader, NodeSstWriter,
-    NodeSstWriterOptions, OVERFLOW_JSON, SCHEMA_VERSION,
+    NodeSstWriterOptions, BINARY_PROPS, OVERFLOW_JSON, SCHEMA_VERSION,
 };
 pub use predicates::{eval_against_value, eval_row_group, RowGroupVerdict, ScanPredicate};
 pub use stats::{DegreeHistogram, HllSketchBytes, PropertyColumnStats, StatScalar};

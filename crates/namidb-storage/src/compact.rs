@@ -134,12 +134,12 @@ use crate::sst::edges::property_pages::{
 use crate::sst::edges::reader::EdgeSstReader;
 use crate::sst::edges::writer::{EdgeRecord, EdgeSstBuild, EdgeSstWriter, EdgeSstWriterOptions};
 use crate::sst::edges::EdgeDirection;
-use crate::sst::nodes::{
-    node_arrow_schema, prop_column_name, NodeSstFinish, NodeSstWriterOptions, COL_LABELS, COL_LSN,
-    COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
-};
 #[cfg(test)]
 use crate::sst::nodes::{parse_node_sst_metadata, NodeSstReader};
+use crate::sst::nodes::{
+    prop_column_name, NodeSstFinish, NodeSstWriterOptions, COL_LABELS, COL_LSN, COL_NODE_ID,
+    COL_TOMBSTONE, SCHEMA_VERSION,
+};
 
 #[path = "search_lsm_compact.rs"]
 mod search_lsm_compact;
@@ -379,7 +379,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    tokio::task::spawn_blocking(crate::sst::nodes::with_legacy_node_layout(f))
         .await
         .map_err(|e| Error::invariant(format!("compaction CPU task panicked: {e}")))
 }
@@ -2649,7 +2649,6 @@ struct NodeBatchView {
     ids: FixedSizeBinaryArray,
     tombstones: BooleanArray,
     lsns: UInt64Array,
-    overflow: StringArray,
     schema_versions: UInt64Array,
 }
 
@@ -2666,7 +2665,6 @@ impl NodeBatchView {
             ids: col(&batch, COL_NODE_ID)?,
             tombstones: col(&batch, COL_TOMBSTONE)?,
             lsns: col(&batch, COL_LSN)?,
-            overflow: col(&batch, OVERFLOW_JSON)?,
             schema_versions: col(&batch, SCHEMA_VERSION)?,
             batch,
         })
@@ -2716,10 +2714,11 @@ impl NodeBatchView {
                 properties.insert(p.name.clone(), v);
             }
         }
-        if !self.overflow.is_null(row) {
-            let extra: BTreeMap<String, Value> = serde_json::from_str(self.overflow.value(row))?;
-            properties.extend(extra);
-        }
+        properties.extend(crate::sst::nodes::decode_node_extra_properties(
+            &self.batch,
+            row,
+            None,
+        )?);
         let rec = NodeWriteRecord {
             properties,
             schema_version: self.schema_versions.value(row),
@@ -2794,20 +2793,7 @@ impl NodeSourceCursor {
             ArrowReaderOptions::new().with_page_index(true),
         )
         .map_err(|e| Error::invariant(format!("parquet open: {e}")))?;
-        let expected = node_arrow_schema(label_def);
-        let got = builder.schema();
-        if got.fields().len() != expected.fields().len()
-            || got
-                .fields()
-                .iter()
-                .zip(expected.fields())
-                .any(|(got, want)| got.name() != want.name() || got.data_type() != want.data_type())
-        {
-            return Err(Error::Corrupted {
-                path: "<compaction-input>".into(),
-                detail: "node SST schema does not match the declared node schema".into(),
-            });
-        }
+        crate::sst::nodes::check_node_schema(builder.schema(), label_def)?;
         let total_rows = builder.metadata().file_metadata().num_rows().max(0) as u64;
         let batches = builder
             .with_batch_size(batch_rows.max(1))
@@ -2910,7 +2896,7 @@ fn build_node_access_sidecars_from_source(
     let mut ordinal = 0_u64;
     while cursor.peek().is_some() {
         let (row, record) = cursor.materialize_current(label_def)?;
-        let exact_record = encode_exact_node_record(&row)?;
+        let exact_record = encode_exact_node_record(&row, record.as_ref())?;
         locator.push(&row.id, &exact_record)?;
         match record {
             Some(record) => properties.push_sorted(row.id, ordinal, &record.properties)?,
@@ -3197,7 +3183,7 @@ fn merge_node_sources(
             last_id = Some(entry.id);
             let (row, rec) = cursor.materialize_current(label_def)?;
             if !(gc_tombstones && matches!(row.op, MemOp::Tombstone)) {
-                let exact_record = encode_exact_node_record(&row)?;
+                let exact_record = encode_exact_node_record(&row, rec.as_ref())?;
                 node_locator_records.push(&row.id, &exact_record)?;
                 if let Some(rec) = &rec {
                     unique.observe(row.id, rec)?;
