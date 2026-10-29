@@ -432,18 +432,21 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
 
         // Apply exposes the subquery's RETURN bindings above it, so a pending
         // predicate may reference them — keep all pending filters above the
-        // Apply and recurse into the input with none. The subplan is a
-        // separate (correlated) scope and is not visited.
+        // Apply and recurse into the input with none. The subplan is pushed
+        // down as its own scope: its Argument leaf is where the outer row
+        // comes in, so its filters stay inside it, and the WHERE of a
+        // whole-pattern OPTIONAL MATCH reaches the scan of its new start.
         LogicalPlan::Apply {
             input,
             subplan,
             optional,
         } => {
             let new_input = pushdown_at(*input, Vec::new());
+            let new_subplan = pushdown_at(*subplan, Vec::new());
             apply_filters(
                 LogicalPlan::Apply {
                     input: Box::new(new_input),
-                    subplan,
+                    subplan: Box::new(new_subplan),
                     optional,
                 },
                 pending,
