@@ -534,3 +534,24 @@ def test_cypher_max_rows_raises_query_row_cap_error(client: tg.Client) -> None:
         client.cypher(query, max_rows=5)
     assert isinstance(exc_info.value, RuntimeError)
     assert len(client.cypher(query, max_rows=20)) == 20
+
+
+def test_read_only_client_honours_timeout_and_row_cap(tmp_path) -> None:
+    uri = f"file://{tmp_path}?ns=ro_limits"
+    writer = tg.Client(uri)
+    writer.cypher("UNWIND range(1, 20) AS i CREATE (:Person {i: i})")
+    reader = tg.Client(uri, read_only=True)
+    query = "MATCH (p:Person) RETURN p.i AS i"
+    with pytest.raises(tg.QueryRowCapError):
+        reader.cypher(query, max_rows=5)
+    with pytest.raises(tg.QueryTimeoutError):
+        reader.cypher(SLOW_READ, timeout_ms=1)
+    assert len(reader.cypher(query, max_rows=20)) == 20
+
+
+def test_keywords_after_dot_and_as(client: tg.Client) -> None:
+    client.cypher("CREATE (:Doc)-[:MENTIONS {by: 'ana', order: 2}]->(:Doc)")
+    row = client.cypher(
+        "MATCH ()-[e:MENTIONS]->() RETURN e.by AS by, e.order AS order"
+    ).first()
+    assert row == {"by": "ana", "order": 2}
