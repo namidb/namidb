@@ -67,7 +67,7 @@ class NodeIter(Iterator[dict[str, Any]]):
 
 class EdgeIter(Iterator[dict[str, Any]]):
     """Returned by [`Client.iter_edge_type`]: one edge dict per step,
-    built a batch at a time."""
+    read from storage a batch at a time."""
 
     def __iter__(self) -> EdgeIter: ...
     def __next__(self) -> dict[str, Any]: ...
@@ -324,10 +324,11 @@ class Client:
     def iter_edge_type(
         self, edge_type: str, limit: Optional[int] = ...
     ) -> EdgeIter:
-        """Like [`Client.scan_edge_type`], but builds 1,024 edges per
-        step, all from the version current when it was created. The
-        type's SST files and property strings are read when the iterator
-        is created and held until it is dropped."""
+        """Like [`Client.scan_edge_type`], but lazy: it reads 1,024 edges
+        per step with the GIL released, all from the version current when
+        it was created, whose files it keeps alive until it is dropped (or
+        until `close()` on a `read_only` client). After a step raises,
+        every later step raises too."""
 
     def scan_label_arrow(self, label: str, limit: Optional[int] = ...) -> _Table:
         """Like [`Client.scan_label`] but returns a `pyarrow.Table`

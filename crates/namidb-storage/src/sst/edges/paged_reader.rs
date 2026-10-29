@@ -41,7 +41,7 @@ use crate::sst::edges::format::{
 use crate::sst::edges::property_pages::{
     decode_property_page, PropertyPageIndex, PROPERTY_PAGES_HEADER_LEN,
 };
-use crate::sst::edges::reader::{EdgeLookup, EdgePointLookup, EdgeSstReader};
+use crate::sst::edges::reader::{EdgeLookup, EdgePointLookup, EdgeRowProjection, EdgeSstReader};
 use crate::sst::edges::EdgeDirection;
 
 /// Initial suffix request. Normal edge footers are a few hundred bytes; a
@@ -708,6 +708,118 @@ impl PagedEdgeReader {
             tombstones,
             edge_offset,
         }))
+    }
+
+    /// The edges of the keys from `first_key` on, in stored order, for a
+    /// scan that walks the SST a chunk at a time. It reads keys while their
+    /// edges fit in `max_edges`, and always at least one key. Returns the
+    /// edges, the ordinal of the first one, and the next key to read.
+    pub async fn read_key_chunk(
+        &self,
+        first_key: u64,
+        max_edges: u64,
+    ) -> Result<(Vec<EdgeRowProjection>, u64, u64)> {
+        let key_count = self.footer.key_count;
+        if first_key >= key_count {
+            return Ok((Vec::new(), self.footer.edge_count, key_count));
+        }
+        if !self.range_complete {
+            let eager = self.eager_reader().await?;
+            let first_edge = eager.cumulative_edges()[first_key as usize];
+            let mut rows = Vec::new();
+            let mut key = first_key;
+            while key < key_count
+                && (key == first_key
+                    || eager.cumulative_edges()[key as usize + 1] - first_edge <= max_edges)
+            {
+                rows.extend(eager.key_edges(key as usize)?);
+                key += 1;
+            }
+            return Ok((rows, first_edge, key));
+        }
+
+        // Edge ordinals of a window of keys pick how many of them fit.
+        let window_end = first_key.saturating_add(max_edges.max(1)).min(key_count);
+        let ordinals = required_section(&self.object, &self.footer, SECTION_EDGE_ORDINALS)?;
+        let ordinal_bytes = self
+            .object
+            .read_section_range(ordinals, first_key * 8..(window_end + 1) * 8)
+            .await?;
+        let ordinals: Vec<u64> = ordinal_bytes
+            .chunks_exact(8)
+            .map(|row| u64::from_le_bytes(row.try_into().unwrap()))
+            .collect();
+        if ordinals.windows(2).any(|pair| pair[0] >= pair[1])
+            || ordinals[ordinals.len() - 1] > self.footer.edge_count
+        {
+            return Err(self.object.corrupted(format!(
+                "edge ordinals of keys [{first_key}, {window_end}] are not increasing"
+            )));
+        }
+        let mut keys = 1;
+        while first_key + keys < window_end
+            && ordinals[keys as usize + 1] - ordinals[0] <= max_edges
+        {
+            keys += 1;
+        }
+        let end_key = first_key + keys;
+        let first_edge = ordinals[0];
+        let edge_count = ordinals[keys as usize] - first_edge;
+
+        let key_ids = required_section(&self.object, &self.footer, SECTION_KEY_IDS)?;
+        let offsets = required_section(&self.object, &self.footer, SECTION_OFFSETS)?;
+        let stride = self.offset_width.bytes() as u64;
+        let (key_bytes, offset_bytes) = tokio::try_join!(
+            self.object
+                .read_section_range(key_ids, first_key * 16..end_key * 16),
+            self.object
+                .read_section_range(offsets, first_key * stride..(end_key + 1) * stride)
+        )?;
+        let offsets: Vec<u64> = (0..=keys as usize)
+            .map(|i| read_offset(&offset_bytes, i * stride as usize, self.offset_width))
+            .collect::<Result<_>>()?;
+        let partners_entry = required_section(&self.object, &self.footer, SECTION_PARTNERS)?;
+        if offsets.windows(2).any(|pair| pair[0] >= pair[1])
+            || offsets[keys as usize] > partners_entry.length
+        {
+            return Err(self.object.corrupted(format!(
+                "partner offsets of keys [{first_key}, {end_key}) are out of range"
+            )));
+        }
+        let degree = usize::try_from(edge_count)
+            .map_err(|_| Error::invariant("edge chunk does not fit usize"))?;
+        let (partners, (lsns, tombstones)) = tokio::try_join!(
+            self.object
+                .read_section_range(partners_entry, offsets[0]..offsets[keys as usize]),
+            self.read_edge_metadata(first_edge, degree)
+        )?;
+
+        let mut rows = Vec::with_capacity(degree);
+        for i in 0..keys as usize {
+            let key_id: [u8; 16] = key_bytes[i * 16..(i + 1) * 16].try_into().unwrap();
+            let start = (offsets[i] - offsets[0]) as usize;
+            let block_len = (offsets[i + 1] - offsets[i]) as usize;
+            let expected = (ordinals[i + 1] - ordinals[i]) as usize;
+            validate_partner_block_read_bounds(expected, block_len as u64)
+                .map_err(|error| with_object_path(error, self.object.path()))?;
+            let (block, consumed) = read_partner_block_expected(&partners, start, expected)
+                .map_err(|error| with_object_path(error, self.object.path()))?;
+            if consumed != block_len {
+                return Err(self.object.corrupted(format!(
+                    "partner block consumed {consumed} bytes, expected {block_len}"
+                )));
+            }
+            for partner_id in block {
+                let edge = rows.len();
+                rows.push(EdgeRowProjection {
+                    key_id,
+                    partner_id,
+                    lsn: lsns[edge],
+                    tombstone: tombstones[edge],
+                });
+            }
+        }
+        Ok((rows, first_edge, end_key))
     }
 
     /// Exact endpoint probe. It reads the selected partner block but only the
@@ -1778,6 +1890,36 @@ mod tests {
             1,
             "OnceCell must retain the exact legacy reader"
         );
+    }
+
+    #[tokio::test]
+    async fn key_chunks_walk_every_edge_on_ranged_and_legacy_bodies() {
+        let modern = write_body(32, 3, 8);
+        let legacy = remove_section(modern.clone(), SECTION_EDGE_ORDINALS, 0);
+        for body in [modern, legacy] {
+            let expected = EdgeSstReader::open(body.clone())
+                .unwrap()
+                .scan_all_edges()
+                .unwrap();
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let path = Path::from("edge/chunks.sst");
+            put_body(&store, &path, body).await;
+            let reader = PagedEdgeReader::open(store, path).await.unwrap();
+            // 2 is below the degree, so a chunk still takes one whole key.
+            for max_edges in [2, 7, 1000] {
+                let mut walked = Vec::new();
+                let mut key = 0;
+                while key < reader.key_count() {
+                    let (rows, first_edge, next) =
+                        reader.read_key_chunk(key, max_edges).await.unwrap();
+                    assert_eq!(first_edge, walked.len() as u64);
+                    assert!(rows.len() as u64 <= max_edges.max(3));
+                    walked.extend(rows);
+                    key = next;
+                }
+                assert_eq!(walked, expected, "max_edges {max_edges}");
+            }
+        }
     }
 
     #[tokio::test]
