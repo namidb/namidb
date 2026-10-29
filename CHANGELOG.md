@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-10-29
+
 ### Changed
 
 - **Vectors, bytes and number lists go through the WAL and the memtable in
@@ -4224,7 +4226,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/namidb/namidb/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/namidb/namidb/compare/v2.6.19...v3.0.0
 [2.6.19]: https://github.com/namidb/namidb/compare/v2.6.18...v2.6.19
 [2.6.18]: https://github.com/namidb/namidb/compare/v2.6.17...v2.6.18
