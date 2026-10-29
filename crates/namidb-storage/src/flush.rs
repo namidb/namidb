@@ -89,7 +89,8 @@ use crate::sst::edges::writer::{
 use crate::sst::edges::EdgeDirection;
 use crate::sst::hll::{Hll, DEFAULT_PRECISION};
 use crate::sst::nodes::{
-    max_scalar, min_scalar, node_arrow_schema, NodeSstFinish, NodeSstWriter, NodeSstWriterOptions,
+    encode_binary_properties, is_binary_property_value, legacy_node_layout, max_scalar, min_scalar,
+    writer_node_arrow_schema, NodeSstFinish, NodeSstWriter, NodeSstWriterOptions,
 };
 use crate::sst::stats::StatScalar;
 
@@ -709,7 +710,7 @@ impl IncrementalNodeSstWriter {
     ) -> Result<Self> {
         Ok(Self {
             writer: NodeSstWriter::new(label.clone(), options)?,
-            arrow_schema: node_arrow_schema(label),
+            arrow_schema: writer_node_arrow_schema(label),
             label: label.clone(),
             chunk: Vec::new(),
             chunk_rows: chunk_rows.max(1),
@@ -778,6 +779,7 @@ fn build_node_record_batch(
         .collect::<Result<Vec<_>>>()?;
     let mut overflow_b = StringBuilder::with_capacity(n, 32 * n.max(1));
     let mut schema_version_b = UInt64Builder::with_capacity(n);
+    let mut binary_b = BinaryBuilder::new();
 
     let declared_names: Vec<&str> = label.properties.iter().map(|p| p.name.as_str()).collect();
 
@@ -799,11 +801,30 @@ fn build_node_record_batch(
                     let value = rec.properties.get(&p.name);
                     prop_builders[idx].append(value, p)?;
                 }
-                let overflow: BTreeMap<&String, &Value> = rec
-                    .properties
-                    .iter()
-                    .filter(|(k, _)| !declared_names.contains(&k.as_str()))
-                    .collect();
+                let mut overflow: BTreeMap<&String, &Value> = BTreeMap::new();
+                let mut binary: BTreeMap<String, Value> = BTreeMap::new();
+                for (k, v) in &rec.properties {
+                    if declared_names.contains(&k.as_str()) {
+                        continue;
+                    }
+                    if is_binary_property_value(v) && !legacy_node_layout() {
+                        binary.insert(k.clone(), v.clone());
+                    } else {
+                        overflow.insert(k, v);
+                    }
+                }
+                // A value too large for the binary decoder's ceilings stays
+                // in the JSON, where it was always readable.
+                let encoded_binary = if binary.is_empty() {
+                    None
+                } else {
+                    encode_binary_properties(binary.clone()).ok()
+                };
+                if encoded_binary.is_none() {
+                    for (k, v) in &binary {
+                        overflow.insert(k, v);
+                    }
+                }
                 if overflow.is_empty() {
                     overflow_b.append_null();
                 } else {
@@ -811,6 +832,7 @@ fn build_node_record_batch(
                         .map_err(|e| Error::invariant(format!("overflow encode: {e}")))?;
                     overflow_b.append_value(&json);
                 }
+                binary_b.append_option(encoded_binary);
                 schema_version_b.append_value(rec.schema_version);
             }
             MemOp::Tombstone => {
@@ -822,6 +844,7 @@ fn build_node_record_batch(
                 }
                 overflow_b.append_null();
                 schema_version_b.append_value(0);
+                binary_b.append_null();
             }
         }
     }
@@ -836,6 +859,9 @@ fn build_node_record_batch(
     }
     columns.push(Arc::new(overflow_b.finish()));
     columns.push(Arc::new(schema_version_b.finish()));
+    if !legacy_node_layout() {
+        columns.push(Arc::new(binary_b.finish()));
+    }
 
     RecordBatch::try_new(arrow_schema.clone(), columns)
         .map_err(|e| Error::invariant(format!("node batch build: {e}")))

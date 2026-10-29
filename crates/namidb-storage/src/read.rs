@@ -99,13 +99,13 @@ use crate::sst::nodes::property_pages::{
     NODE_PROPERTY_PAGES_FORMAT_VERSION,
 };
 use crate::sst::nodes::{
-    load_node_sst_metadata_async, parse_node_sst_metadata, prop_column_name, row_groups_for_keys,
-    scan_row_groups_async as node_scan_row_groups_async,
+    decode_node_extra_properties, load_node_sst_metadata_async, parse_node_sst_metadata,
+    prop_column_name, row_groups_for_keys, scan_row_groups_async as node_scan_row_groups_async,
     scan_row_groups_for_keys_async as node_scan_row_groups_for_keys_async,
     scan_rows_by_ordinals_async as node_scan_rows_by_ordinals_async,
     scan_with_predicates_and_projection_async as node_scan_limited_async,
     split_batches_by_row_group, targeted_scan_async as node_targeted_scan_async, NodeSstReader,
-    COL_LABELS, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, OVERFLOW_JSON, SCHEMA_VERSION,
+    COL_LABELS, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, SCHEMA_VERSION,
 };
 use crate::sst::predicates::{eval_against_value, ScanPredicate};
 
@@ -10421,9 +10421,6 @@ fn append_limited_node_batch(
         .column_by_name(SCHEMA_VERSION)
         .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
         .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
-    let overflow_col = batch
-        .column_by_name(OVERFLOW_JSON)
-        .and_then(|column| column.as_any().downcast_ref::<StringArray>());
     let decode_set: Option<BTreeSet<&str>> =
         decode_projection.map(|columns| columns.iter().map(String::as_str).collect());
 
@@ -10462,18 +10459,11 @@ fn append_limited_node_batch(
             }
         }
         if decode_set.as_ref().is_none_or(|keep| !keep.is_empty()) {
-            if let Some(overflow_col) = overflow_col.filter(|column| !column.is_null(row)) {
-                let extra: BTreeMap<String, Value> = serde_json::from_str(overflow_col.value(row))?;
-                if let Some(keep) = &decode_set {
-                    properties.extend(
-                        extra
-                            .into_iter()
-                            .filter(|(property, _)| keep.contains(property.as_str())),
-                    );
-                } else {
-                    properties.extend(extra);
-                }
-            }
+            properties.extend(decode_node_extra_properties(
+                batch,
+                row,
+                decode_set.as_ref(),
+            )?);
         }
 
         let mut view = NodeView {
@@ -11227,19 +11217,7 @@ fn decode_node_row_properties(
     if projection.is_some_and(|keep| keep.is_empty()) {
         return Ok(properties);
     }
-    let overflow = batch
-        .column_by_name(OVERFLOW_JSON)
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .filter(|column| !column.is_null(row));
-    if let Some(overflow) = overflow {
-        let extra: BTreeMap<String, Value> = serde_json::from_str(overflow.value(row))?;
-        match projection {
-            Some(keep) => {
-                properties.extend(extra.into_iter().filter(|(k, _)| keep.contains(k.as_str())))
-            }
-            None => properties.extend(extra),
-        }
-    }
+    properties.extend(decode_node_extra_properties(batch, row, projection)?);
     Ok(properties)
 }
 
@@ -11368,15 +11346,7 @@ fn find_node_row_in_batches(
                     properties.insert(p.name.clone(), v);
                 }
             }
-            let ovf_col = batch
-                .column_by_name(OVERFLOW_JSON)
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| Error::invariant("__overflow_json column missing"))?;
-            if !ovf_col.is_null(row) {
-                let json_str = ovf_col.value(row);
-                let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
-                properties.extend(extra);
-            }
+            properties.extend(decode_node_extra_properties(batch, row, None)?);
             let sv_col = batch
                 .column_by_name(SCHEMA_VERSION)
                 .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
@@ -11424,10 +11394,6 @@ fn batch_harvest_node_rows(
             .column_by_name(COL_LSN)
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| Error::invariant("lsn column missing"))?;
-        let ovf_col = batch
-            .column_by_name(OVERFLOW_JSON)
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| Error::invariant("__overflow_json column missing"))?;
         let sv_col = batch
             .column_by_name(SCHEMA_VERSION)
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
@@ -11462,11 +11428,7 @@ fn batch_harvest_node_rows(
                         properties.insert(p.name.clone(), v);
                     }
                 }
-                if !ovf_col.is_null(row) {
-                    let json_str = ovf_col.value(row);
-                    let extra: BTreeMap<String, Value> = serde_json::from_str(json_str)?;
-                    properties.extend(extra);
-                }
+                properties.extend(decode_node_extra_properties(batch, row, None)?);
                 let schema_version = sv_col.value(row);
                 let id = NodeId::from_uuid(Uuid::from_bytes(row_id));
                 Some(NodeView {
@@ -16270,6 +16232,166 @@ mod tests {
             ],
         )
         .await
+    }
+
+    /// A 2.x node SST keeps embeddings in the overflow JSON; a newer one puts
+    /// them in `__binary_props`. Overlapping, the two must reconcile by LWW on
+    /// every read route, and compaction must rewrite the old rows as binary.
+    #[tokio::test]
+    async fn vectors_from_json_and_binary_node_ssts_reconcile_and_compact_to_binary() {
+        use crate::sst::nodes::{LEGACY_NODE_LAYOUT, LEGACY_NODE_LAYOUT_LOCK};
+        use crate::sst::{BINARY_PROPS, OVERFLOW_JSON};
+        use arrow_array::cast::AsArray;
+        use std::sync::atomic::Ordering;
+
+        let _layout = LEGACY_NODE_LAYOUT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let store = make_store();
+        let paths = make_paths("binary-vectors-mixed");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        // Whole-number floats survive the JSON memtable payload bit for bit.
+        let emb = |seed: u8| {
+            Value::List(
+                (0..64)
+                    .map(|j| Value::F64(f64::from(seed) * 100.0 + f64::from(j)))
+                    .collect(),
+            )
+        };
+        let record = |name: &str, emb: Option<Value>| {
+            let mut properties = BTreeMap::from([("name".to_string(), Value::Str(name.into()))]);
+            properties.extend(emb.map(|emb| ("emb".to_string(), emb)));
+            MemOp::Upsert(
+                NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    labels: vec![DEVICE],
+                }
+                .encode()
+                .unwrap(),
+            )
+        };
+
+        LEGACY_NODE_LAYOUT.store(true, Ordering::SeqCst);
+        let old = (1..=4)
+            .map(|i| (sorted_node_id(i), u64::from(i), record("old", Some(emb(i)))))
+            .collect();
+        let first = flush_batch(&ms, &fence, &base, &schema, old).await;
+        LEGACY_NODE_LAYOUT.store(false, Ordering::SeqCst);
+        let second = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (sorted_node_id(2), 10, record("new", Some(emb(20)))),
+                (sorted_node_id(3), 11, record("new", None)),
+                (sorted_node_id(5), 12, record("new", Some(emb(50)))),
+            ],
+        )
+        .await;
+        let expected: Vec<(NodeId, &str, Option<Value>)> = vec![
+            (sorted_node_id(1), "old", Some(emb(1))),
+            (sorted_node_id(2), "new", Some(emb(20))),
+            (sorted_node_id(3), "new", None),
+            (sorted_node_id(4), "old", Some(emb(4))),
+            (sorted_node_id(5), "new", Some(emb(50))),
+        ];
+
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        // `true` when the binary column is expected on every node SST.
+        let check = |committed: LoadedManifest, all_binary: bool| {
+            let store = store.clone();
+            let paths = paths.clone();
+            let expected = expected.clone();
+            let empty_view = &empty_view;
+            async move {
+                let snap =
+                    Snapshot::new(committed.clone(), empty_view, store.clone(), paths.clone());
+                let mut layouts = Vec::new();
+                for idx in snap.manifest.index.node_descriptors() {
+                    let desc = &snap.manifest.manifest.ssts[idx];
+                    let body = snap.get_sst_body(desc).await.unwrap();
+                    let reader =
+                        NodeSstReader::open(snap.label_def_for_node_sst(desc), body).unwrap();
+                    for batch in reader.scan().unwrap() {
+                        let json = batch
+                            .column_by_name(OVERFLOW_JSON)
+                            .unwrap()
+                            .as_string::<i32>();
+                        let json_has_emb =
+                            (0..batch.num_rows()).any(|row| json.value(row).contains("emb"));
+                        layouts.push((batch.column_by_name(BINARY_PROPS).is_some(), json_has_emb));
+                    }
+                }
+                if all_binary {
+                    assert!(
+                        layouts.iter().all(|layout| *layout == (true, false)),
+                        "{layouts:?}"
+                    );
+                } else {
+                    assert!(layouts.contains(&(false, true)), "{layouts:?}");
+                    assert!(layouts.contains(&(true, false)), "{layouts:?}");
+                }
+
+                for ranged in [true, false] {
+                    let snap =
+                        Snapshot::new(committed.clone(), empty_view, store.clone(), paths.clone())
+                            .with_ranged_reads(ranged);
+                    let full = snap.scan_label("Device").await.unwrap();
+                    let embs = snap
+                        .scan_label_with_predicates_and_projection(
+                            "Device",
+                            &[],
+                            Some(&["emb".into()]),
+                        )
+                        .await
+                        .unwrap();
+                    let names = snap
+                        .scan_label_with_predicates_and_projection(
+                            "Device",
+                            &[],
+                            Some(&["name".into()]),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(full.len(), expected.len());
+                    for (i, (id, name, emb)) in expected.iter().enumerate() {
+                        let name = Value::Str(name.to_string());
+                        let mut whole = BTreeMap::from([("name".to_string(), name.clone())]);
+                        whole.extend(emb.clone().map(|emb| ("emb".to_string(), emb)));
+                        assert_eq!(
+                            (full[i].id, &full[i].properties),
+                            (*id, &whole),
+                            "ranged={ranged}"
+                        );
+                        assert_eq!(
+                            embs[i].properties.get("emb"),
+                            emb.as_ref(),
+                            "ranged={ranged}"
+                        );
+                        assert_eq!(
+                            names[i].properties,
+                            BTreeMap::from([("name".to_string(), name)])
+                        );
+                        let point = snap.lookup_node("Device", *id).await.unwrap().unwrap();
+                        assert_eq!(point.properties, whole, "ranged={ranged}");
+                    }
+                }
+            }
+        };
+        check(second.clone(), false).await;
+        let compacted = crate::compact::compact_l0_to_l1(&ms, &fence, &second, &schema)
+            .await
+            .unwrap()
+            .committed;
+        assert_eq!(compacted.index.node_descriptors().len(), 1);
+        check(compacted, true).await;
     }
 
     fn view_ids(rows: &[NodeView]) -> Vec<NodeId> {
