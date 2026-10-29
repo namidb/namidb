@@ -223,7 +223,7 @@ pub(crate) fn check_node_schema(got: &ArrowSchema, label: &LabelDef) -> Result<(
 /// Whether `value` is stored in [`BINARY_PROPS`] rather than the overflow
 /// JSON: vectors, byte strings and lists of numbers, whose JSON text is
 /// several times their binary size and slow to parse.
-pub fn is_binary_property_value(value: &Value) -> bool {
+pub(crate) fn is_binary_property_value(value: &Value) -> bool {
     match value {
         Value::Vec(_) | Value::VecI8 { .. } | Value::Bytes(_) => true,
         Value::List(items) => {
@@ -237,7 +237,7 @@ pub fn is_binary_property_value(value: &Value) -> bool {
 }
 
 /// Encode the binary half of a row's ad-hoc properties for [`BINARY_PROPS`].
-pub fn encode_binary_properties(properties: BTreeMap<String, Value>) -> Result<Vec<u8>> {
+pub(crate) fn encode_binary_properties(properties: BTreeMap<String, Value>) -> Result<Vec<u8>> {
     property_pages::encode_canonical_value(&Value::Map(properties))
 }
 

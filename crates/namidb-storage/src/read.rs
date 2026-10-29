@@ -16249,6 +16249,7 @@ mod tests {
     /// them in `__binary_props`. Overlapping, the two must reconcile by LWW on
     /// every read route, and compaction must rewrite the old rows as binary.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn vectors_from_json_and_binary_node_ssts_reconcile_and_compact_to_binary() {
         use crate::sst::nodes::{LEGACY_NODE_LAYOUT, LEGACY_NODE_LAYOUT_LOCK};
         use crate::sst::{BINARY_PROPS, OVERFLOW_JSON};
@@ -16558,6 +16559,7 @@ mod tests {
     /// fetched and how many label rows had properties decoded.
     #[tokio::test]
     #[ignore = "measurement, prints numbers"]
+    #[allow(clippy::await_holding_lock)]
     async fn measure_sparse_label_reads_over_overlapping_node_ssts() {
         use crate::sst::nodes::{LEGACY_NODE_LAYOUT, LEGACY_NODE_LAYOUT_LOCK};
         use futures::TryStreamExt;
