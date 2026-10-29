@@ -141,7 +141,10 @@ pub struct MemtableSnapshotEntry {
     pub op: WalOp,
 }
 
-pub(crate) const MEMTABLE_SNAPSHOT_VERSION: u32 = 2;
+/// 3 since node payloads can be binary (WAL format 2): an older reader then
+/// ignores the snapshot and replays the WAL, which it refuses, instead of
+/// loading payloads it would parse as JSON. The wire layout is still v2's.
+pub(crate) const MEMTABLE_SNAPSHOT_VERSION: u32 = 3;
 const MEMTABLE_SNAPSHOT_MAGIC: &[u8; 8] = b"NAMIMS02";
 const MEMTABLE_SNAPSHOT_HEADER_BYTES: usize = 8 + 8;
 const MEMTABLE_SNAPSHOT_FOOTER_BYTES: usize = 8;

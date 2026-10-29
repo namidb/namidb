@@ -25,7 +25,8 @@ crates.io release will establish and document that API explicitly.
   to 8.43 MB, upsert plus commit from 117 ms to 11 ms and flush from about
   610 ms to 315 ms. Records without such values stay JSON. The WAL format
   version is now 2: older JSON payloads and v0/v1 segments still decode,
-  and 3.0.0 refuses the new segments, so flush before going back to 3.0.0.
+  and 3.0.0 refuses the new segments (and ignores a memtable snapshot of
+  this version), so flush before going back to 3.0.0.
 
 - **A bare `LIMIT` over an expand no longer re-reads its seeds.** The seed
   pull grows its rounds (64 nodes, then four times more each round), and
