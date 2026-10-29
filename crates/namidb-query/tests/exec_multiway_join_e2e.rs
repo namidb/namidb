@@ -236,3 +236,45 @@ async fn wcoj_skipped_without_factorize() {
         "WCOJ=1 without FACTORIZE should fall back to the binary plan"
     );
 }
+
+#[tokio::test]
+async fn wcoj_never_binds_one_relationship_twice() {
+    // A triangle on top of two self-loops of different types on one node.
+    // Walking a self-loop three times is not a triangle: Cypher needs three
+    // different relationships, and there are only two on that node.
+    let mut writer = WriterSession::open(store(), paths("wcoj-uniq"))
+        .await
+        .unwrap();
+    let ids = build_triangle_graph(&mut writer).await;
+    writer
+        .upsert_edge("KNOWS", ids[0], ids[0], &edge())
+        .unwrap();
+    writer
+        .upsert_edge("LIKES", ids[0], ids[0], &edge())
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    let snapshot = writer.snapshot();
+    let cat = StatsCatalog::default();
+    for query in [
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(a) \
+         RETURN a.name AS an, b.name AS bn, c.name AS cn",
+        "MATCH (a:Person)-[:KNOWS|LIKES]->(b:Person)-[:KNOWS|LIKES]->(c:Person)\
+         -[:KNOWS|LIKES]->(a) RETURN a.name AS an, b.name AS bn, c.name AS cn",
+    ] {
+        let q = parse(query).unwrap();
+        let binary = {
+            let _env = EnvGuard::set(&[("NAMIDB_WCOJ", "0")]);
+            let p = plan_query(&q, &cat).unwrap();
+            execute(&p, &snapshot, &Params::new()).await.unwrap()
+        };
+        let wcoj = {
+            let _env = EnvGuard::set(&[("NAMIDB_WCOJ", "1"), ("NAMIDB_FACTORIZE", "1")]);
+            let p = plan_query(&q, &cat).unwrap();
+            assert!(contains_multiway_join(&p), "{query}: no MultiwayJoin");
+            execute(&p, &snapshot, &Params::new()).await.unwrap()
+        };
+        // The three rotations of the real triangle, nothing from the loops.
+        assert_eq!(binary.len(), 3, "{query}: binary path");
+        assert_eq!(wcoj.len(), 3, "{query}: WCOJ path");
+    }
+}

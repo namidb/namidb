@@ -114,6 +114,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(rewrite(*input, catalog)),
             source,
@@ -127,6 +128,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Project {
             input,
@@ -293,6 +295,7 @@ fn try_invert(
         back_reference,
         shortest,
         path_binding,
+        unique_rels,
     } = input
     else {
         return None;
@@ -414,6 +417,7 @@ fn try_invert(
         back_reference: false,
         shortest: crate::plan::ShortestMode::None,
         path_binding: None,
+        unique_rels: unique_rels.clone(),
     };
     let mut result = match source_disjunction {
         Some((label_pred, _)) => LogicalPlan::Filter {

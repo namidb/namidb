@@ -47,6 +47,10 @@ crates.io release will establish and document that API explicitly.
   property, so `n.id` and `WHERE n.id = $id` find the node instead of
   returning null.
 
+- **A MATCH no longer binds one relationship twice.** Queries whose pattern
+  could walk the same relationship more than once now return fewer rows.
+  See the entry under Fixed.
+
 ### Added
 
 - **macOS x86_64 Python wheel.** Intel Macs and x86_64 Pythons on Apple
@@ -196,6 +200,26 @@ crates.io release will establish and document that API explicitly.
   ignores the mode, so other backends keep working as before.
 
 ### Fixed
+
+- **A MATCH could bind the same relationship to two of its relationship
+  variables.** Cypher requires every relationship in one MATCH pattern to
+  be a different relationship, but each hop only kept its own variable
+  length walk from repeating an edge. `MATCH (a)-[:K]-(b)-[:K]-(c)` walked
+  every edge out and straight back, so a 2-hop chain counted each `a = c`
+  return trip, and `MATCH (a)-[:K]->(b), (x)-[:K]->(y)` paired every edge
+  with itself. Every relationship of a MATCH clause, named or anonymous and
+  across its comma-separated parts, now differs from the others, in the
+  flat and factorized executors and in the WCOJ join, including
+  variable-length hops mixed with fixed ones. An `OPTIONAL MATCH` applies
+  the rule inside its own pattern and pads NULLs when it rules out every
+  match. Separate MATCH clauses still do not constrain each other, as in
+  Cypher.
+
+  This changes results: such queries now return fewer rows, the ones a
+  Cypher database returns. Hops whose types cannot overlap are not
+  compared. With `NAMIDB_WCOJ=1`, two comma-separated cyclic parts that
+  share an edge type now run on the regular join, since the second has to
+  check the first part's relationships.
 
 - **A chained `OPTIONAL MATCH` failed when an earlier one found nothing.**
   `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (b)-[:S]->(c)` raised

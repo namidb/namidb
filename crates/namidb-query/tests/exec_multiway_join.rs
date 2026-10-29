@@ -91,6 +91,7 @@ fn triangle_plan() -> LogicalPlan {
         edges,
         ordering: vec![0, 1, 2],
         factorize_required: true,
+        distinct_edges: vec![],
     }
 }
 

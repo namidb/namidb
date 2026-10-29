@@ -797,6 +797,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let s = produced_aliases(&plan);
         assert!(s.contains("a"));

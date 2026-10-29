@@ -1233,6 +1233,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let c = estimate(&expand, &cat);
         // 1000 * 5.0 = 5000.
@@ -1261,6 +1262,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let c = estimate(&expand, &cat);
         assert!(c.rows <= 1000.0 * MAX_VARLEN_BRANCH);
@@ -1475,6 +1477,7 @@ mod tests {
             edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
             ordering: vec![0, 1, 2],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let c = estimate(&plan, &cat);
         let expected = (5_000f64.powi(3)).sqrt();
@@ -1511,6 +1514,7 @@ mod tests {
             ],
             ordering: vec![0, 1, 2, 3],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let c = estimate(&plan, &cat);
         let expected = 5_000f64.powi(6).powf(1.0 / 3.0);
@@ -1544,6 +1548,7 @@ mod tests {
             ],
             ordering: vec![0, 1, 2, 3],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let c = estimate(&plan, &cat);
         let expected = 5_000f64 * 5_000f64;
@@ -1580,6 +1585,7 @@ mod tests {
             ],
             ordering: vec![0, 1, 2],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let c = estimate(&plan, &cat);
         let expected = (8_000f64.powi(3)).sqrt();
@@ -1613,6 +1619,7 @@ mod tests {
             ],
             ordering: vec![0, 1, 2, 3],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let c = estimate(&plan, &cat);
         // sqrt(5000^3) * 5000 ≈ 1.77 * 10^9, clipped by cartesian
@@ -1648,6 +1655,7 @@ mod tests {
             edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
             ordering: vec![0, 1, 2],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let c = estimate(&plan, &cat);
         assert!(
@@ -1703,6 +1711,7 @@ mod tests {
             ],
             ordering: vec![0, 1, 2],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let c = estimate(&plan, &cat);
         // Default 1000 → sqrt(1000^3) ≈ 31623.
@@ -1720,6 +1729,7 @@ mod tests {
             edges: vec![knows_edge(0, 1)],
             ordering: vec![0, 1],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let c = estimate(&plan, &cat);
         // R = 5000, cartesian = 1000*1000 = 1M, so AGM wins.
@@ -1748,6 +1758,7 @@ mod tests {
             edges: vec![knows_edge(0, 1), knows_edge(1, 2), knows_edge(2, 0)],
             ordering: vec![0, 1, 2],
             factorize_required: true,
+            distinct_edges: vec![],
         };
         let agm = estimate(&plan, &cat).rows;
         // The old naïve formula was outer * avg_degree^(k-1) = 1000 *

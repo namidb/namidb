@@ -79,6 +79,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(normalize_filters(*input)),
             source,
@@ -92,6 +93,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(normalize_filters(*input)),
@@ -450,6 +452,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(expand),
@@ -489,6 +492,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(expand),
@@ -528,6 +532,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(expand),
@@ -558,6 +563,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let result = normalize_filters(plan);
         match result {
@@ -633,6 +639,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(LogicalPlan::Filter {

@@ -670,6 +670,7 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(rewrite(*input, req)),
             source,
@@ -683,6 +684,7 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(rewrite(*input, req)),

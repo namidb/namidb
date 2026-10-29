@@ -125,6 +125,7 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(recurse(*input, catalog)),
             source,
@@ -138,6 +139,7 @@ fn recurse(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(recurse(*input, catalog)),

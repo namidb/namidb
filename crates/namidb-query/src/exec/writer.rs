@@ -1026,6 +1026,7 @@ fn execute_write_inner_mode<'a>(
                 back_reference,
                 shortest,
                 path_binding,
+                unique_rels,
             } if input.contains_write() => {
                 let input_rows =
                     execute_write_inner(input, writer, params, outcome, routing).await?;
@@ -1044,6 +1045,7 @@ fn execute_write_inner_mode<'a>(
                     *back_reference,
                     *shortest,
                     path_binding.as_deref(),
+                    unique_rels,
                     &snap,
                     crate::exec::walker::EdgeReadMode::Properties,
                     false,

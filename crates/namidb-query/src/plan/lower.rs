@@ -508,6 +508,10 @@ struct LowerCtx {
     /// elements (see [`LowerCtx::fill_anonymous_path_bindings`]). Never
     /// reset, so names stay unique across clauses.
     anon_counter: usize,
+    /// Relationships bound so far by the MATCH clause being lowered, with
+    /// their types (empty = any), for relationship uniqueness. `None`
+    /// outside a MATCH pattern.
+    clause_rels: Option<Vec<(String, Vec<String>)>>,
 }
 
 impl LowerCtx {
@@ -515,7 +519,46 @@ impl LowerCtx {
         Self {
             bindings: BTreeSet::new(),
             anon_counter: 0,
+            clause_rels: None,
         }
+    }
+
+    /// Cypher relationship uniqueness: two relationships of one MATCH
+    /// clause never bind the same relationship. Returns `parts` with an
+    /// internal `__anonr<N>` alias on every anonymous relationship whose
+    /// types overlap another one of the clause, so the hops after it can
+    /// compare against it (see `Expand::unique_rels`). shortestPath parts
+    /// are left out.
+    fn name_unique_rels(&mut self, parts: &[PatternPart]) -> Vec<PatternPart> {
+        let mut out = parts.to_vec();
+        let all: Vec<Vec<String>> = out
+            .iter()
+            .filter(|p| p.shortest_path.is_none())
+            .flat_map(|p| p.element.chain.iter().map(|(rel, _)| rel_type_names(rel)))
+            .collect();
+        let mut at = 0;
+        for part in out.iter_mut().filter(|p| p.shortest_path.is_none()) {
+            for (rel, _) in part.element.chain.iter_mut() {
+                let mine = at;
+                at += 1;
+                let shared = all
+                    .iter()
+                    .enumerate()
+                    .any(|(i, t)| i != mine && rel_types_overlap(t, &all[mine]));
+                if rel.binding.is_none() && shared {
+                    let name = loop {
+                        let n = self.anon_counter;
+                        self.anon_counter += 1;
+                        let name = format!("__anonr{n}");
+                        if !self.bindings.contains(&name) {
+                            break name;
+                        }
+                    };
+                    rel.binding = Some(ast::Identifier::new(name, rel.span));
+                }
+            }
+        }
+        out
     }
 
     /// A fresh internal binding name. The leading space can never appear
@@ -603,10 +646,13 @@ fn lower_match(
     // driven by an UNWIND `row`) are lifted ABOVE the join and stay bound.
     // A part whose head re-uses an already-bound alias reuses that binding
     // instead of emitting a new scan (see `lower_node_pattern_head`).
+    let patterns = ctx.name_unique_rels(&m.patterns);
+    let outer_rels = ctx.clause_rels.replace(Vec::new());
     let mut plan = input;
-    for part in &m.patterns {
+    for part in &patterns {
         plan = Some(lower_pattern_part(part, plan, m.optional, ctx)?);
     }
+    ctx.clause_rels = outer_rels;
     let mut plan = plan.expect("MATCH must have ≥ 1 pattern part");
     if let Some(pred) = &m.where_ {
         check_expression_bindings(pred, ctx)?;
@@ -971,6 +1017,7 @@ fn attach_path_binding(plan: LogicalPlan, name: &str) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding: _,
+            unique_rels,
         } => LogicalPlan::Expand {
             input,
             source,
@@ -984,6 +1031,7 @@ fn attach_path_binding(plan: LogicalPlan, name: &str) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding: Some(name.to_string()),
+            unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(attach_path_binding(*input, name)),
@@ -1351,6 +1399,19 @@ fn lower_rel_node(
     if let Some(name) = &rel_alias {
         ctx.introduce(name, rel.span)?;
     }
+    // Relationship uniqueness against the hops this clause bound earlier.
+    let mut unique_rels = Vec::new();
+    if let (Some(scope), ShortestMode::None) = (ctx.clause_rels.as_mut(), shortest) {
+        let types = rel_type_names(rel);
+        unique_rels = scope
+            .iter()
+            .filter(|(_, other)| rel_types_overlap(other, &types))
+            .map(|(name, _)| name.clone())
+            .collect();
+        if let Some(name) = &rel_alias {
+            scope.push((name.clone(), types));
+        }
+    }
     let target_alias = target
         .binding
         .as_ref()
@@ -1402,6 +1463,7 @@ fn lower_rel_node(
         back_reference: target_already_bound,
         shortest,
         path_binding: None,
+        unique_rels,
     };
     // Property checks on the target still ride as post-expand filters for the
     // non-OPTIONAL case (label checks are handled by the Expand above).
@@ -1434,6 +1496,16 @@ fn lower_rel_node(
         }
     }
     Ok((plan, target_alias))
+}
+
+fn rel_type_names(rel: &RelationshipPattern) -> Vec<String> {
+    rel.types.iter().map(|t| t.name.clone()).collect()
+}
+
+/// Whether two relationship patterns can match the same relationship by
+/// type. No types means any type.
+fn rel_types_overlap(a: &[String], b: &[String]) -> bool {
+    a.is_empty() || b.is_empty() || a.iter().any(|t| b.contains(t))
 }
 
 fn previous_source(plan: &LogicalPlan) -> Result<String, LowerError> {

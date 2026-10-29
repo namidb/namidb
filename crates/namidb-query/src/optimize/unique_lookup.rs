@@ -274,6 +274,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(rewrite(*input, catalog)),
             source,
@@ -287,6 +288,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Project {
             input,

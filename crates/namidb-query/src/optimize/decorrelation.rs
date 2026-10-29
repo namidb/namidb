@@ -283,6 +283,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(replace_argument(*input, x, label)),
             source,
@@ -296,6 +297,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(replace_argument(*input, x, label)),
@@ -383,6 +385,7 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
             input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
             source,
@@ -396,6 +399,7 @@ fn recurse_children(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(convert_semi_apply_to_hash_semi_join(*input, catalog)),
@@ -592,6 +596,7 @@ mod tests {
             back_reference: false,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         }
     }
     fn semi_apply(input: LogicalPlan, subplan: LogicalPlan, negated: bool) -> LogicalPlan {

@@ -158,6 +158,7 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => {
             let mut introduced = BTreeSet::new();
             introduced.insert(target_alias.clone());
@@ -186,6 +187,7 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
                     back_reference,
                     shortest,
                     path_binding,
+                    unique_rels,
                 },
                 stay,
             )
@@ -791,6 +793,7 @@ mod tests {
                 back_reference: false,
                 shortest: ShortestMode::None,
                 path_binding: None,
+                unique_rels: vec![],
             }),
             predicate: pred,
         };
@@ -824,6 +827,7 @@ mod tests {
                 back_reference: false,
                 shortest: ShortestMode::None,
                 path_binding: None,
+                unique_rels: vec![],
             }),
             predicate: pred,
         };
@@ -855,6 +859,7 @@ mod tests {
                 back_reference: false,
                 shortest: ShortestMode::None,
                 path_binding: None,
+                unique_rels: vec![],
             }),
             predicate: pred,
         };
@@ -883,6 +888,7 @@ mod tests {
                 back_reference: false,
                 shortest: ShortestMode::None,
                 path_binding: None,
+                unique_rels: vec![],
             }),
             predicate: compound,
         };
@@ -1264,6 +1270,7 @@ mod tests {
                 back_reference: false,
                 shortest: ShortestMode::None,
                 path_binding: None,
+                unique_rels: vec![],
             }),
             predicate: pred,
         };
@@ -1292,6 +1299,7 @@ mod tests {
                     back_reference: false,
                     shortest: ShortestMode::None,
                     path_binding: None,
+                    unique_rels: vec![],
                 }),
                 predicate: p1,
             }),
@@ -1348,6 +1356,7 @@ mod tests {
                 back_reference: false,
                 shortest: ShortestMode::None,
                 path_binding: None,
+                unique_rels: vec![],
             }),
             predicate: pred,
         };

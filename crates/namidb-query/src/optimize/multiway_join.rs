@@ -25,7 +25,9 @@
 //!   does not yet know how to relocate).
 //! - Each `Expand` has `length == None` (single hop), a typed edge
 //!   (`edge_type == Some(_)`), a non-`Both` direction, and no
-//!   `rel_alias` (the executor does not materialise rel bindings yet).
+//!   `rel_alias` (the executor does not materialise rel bindings yet),
+//!   except an internal one that only relationship uniqueness reads and
+//!   only from inside the chain. Those pairs become `distinct_edges`.
 //! - The chain terminates in a `NodeScan` with a declared label.
 //! - Every participating alias has a known label (head's `label` or the
 //!   Expand's `target_label`).
@@ -62,15 +64,40 @@ pub fn detect_multiway_join(plan: LogicalPlan) -> LogicalPlan {
         tracing::warn!("NAMIDB_WCOJ=1 requires NAMIDB_FACTORIZE=1; multiway join pass skipped");
         return plan;
     }
-    rewrite(plan)
+    let refs = unique_rel_refs(&plan);
+    rewrite(plan, &refs)
 }
 
-fn rewrite(plan: LogicalPlan) -> LogicalPlan {
-    if let Some(rewritten) = try_rewrite_chain(&plan) {
+/// How many Expands name each relationship binding in `unique_rels`, plus
+/// one for any binding an expression reads (a path, say), which no chain
+/// can account for.
+fn unique_rel_refs(plan: &LogicalPlan) -> BTreeMap<String, usize> {
+    fn visit(plan: &LogicalPlan, out: &mut BTreeMap<String, usize>) {
+        if let LogicalPlan::Expand { unique_rels, .. } = plan {
+            for name in unique_rels {
+                *out.entry(name.clone()).or_default() += 1;
+            }
+        }
+        for child in plan.children() {
+            visit(child, out);
+        }
+    }
+    let mut out = BTreeMap::new();
+    visit(plan, &mut out);
+    let mut read = BTreeSet::new();
+    crate::exec::walker::collect_plan_referenced_variables(plan, &mut read);
+    for name in read {
+        *out.entry(name).or_default() += 1;
+    }
+    out
+}
+
+fn rewrite(plan: LogicalPlan, refs: &BTreeMap<String, usize>) -> LogicalPlan {
+    if let Some(rewritten) = try_rewrite_chain_in(&plan, refs) {
         // MultiwayJoin is a leaf — nothing further to recurse into.
         return rewritten;
     }
-    recurse_children(plan)
+    recurse_children(plan, refs)
 }
 
 // ─────────────────────── chain harvest + rewrite ────────────────────────
@@ -79,7 +106,15 @@ fn rewrite(plan: LogicalPlan) -> LogicalPlan {
 /// participating aliases, labels, and edges. Returns `None` when the
 /// chain does not satisfy the v0 preconditions or when the resulting
 /// constraint graph has no cycle.
+#[cfg(test)]
 fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
+    try_rewrite_chain_in(plan, &unique_rel_refs(plan))
+}
+
+/// `refs` counts the `unique_rels` references of the whole plan, so a
+/// chain whose internal relationship aliases are read from outside it is
+/// left alone (the MultiwayJoin does not bind them).
+fn try_rewrite_chain_in(plan: &LogicalPlan, refs: &BTreeMap<String, usize>) -> Option<LogicalPlan> {
     let head = match plan {
         LogicalPlan::Expand { .. } => plan,
         _ => return None,
@@ -106,11 +141,12 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
         back_reference: _,
         shortest,
         path_binding,
+        unique_rels,
     } = cursor
     {
         if length.is_some()
             || edge_type.is_none()
-            || rel_alias.is_some()
+            || rel_alias.as_ref().is_some_and(|r| !r.starts_with("__anonr"))
             || *optional
             || !matches!(shortest, crate::plan::logical::ShortestMode::None)
             || path_binding.is_some()
@@ -128,6 +164,8 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
             target_label: target_labels.first().cloned(),
             edge_types: edge_type.as_ref().unwrap().clone(),
             direction: *direction,
+            rel_alias: rel_alias.clone(),
+            unique_rels: unique_rels.clone(),
         });
         cursor = input.as_ref();
     }
@@ -229,11 +267,36 @@ fn try_rewrite_chain(plan: &LogicalPlan) -> Option<LogicalPlan> {
 
     let ordering = variable_ordering(&vars, &edges, &head_alias);
 
+    // Relationship uniqueness pairs, by index into `edges` (which follows
+    // `raw_expands`). Every alias involved must live in this chain.
+    let mut in_chain: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, ex) in raw_expands.iter().enumerate() {
+        if let Some(r) = &ex.rel_alias {
+            in_chain.insert(r.as_str(), i);
+        }
+    }
+    let mut distinct_edges = Vec::new();
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, ex) in raw_expands.iter().enumerate() {
+        for name in &ex.unique_rels {
+            let j = *in_chain.get(name.as_str())?;
+            distinct_edges.push((i.min(j), i.max(j)));
+            *seen.entry(name.as_str()).or_default() += 1;
+        }
+    }
+    if in_chain
+        .keys()
+        .any(|r| refs.get(*r).copied().unwrap_or(0) != seen.get(r).copied().unwrap_or(0))
+    {
+        return None;
+    }
+
     Some(LogicalPlan::MultiwayJoin {
         vars,
         edges,
         ordering,
         factorize_required: true,
+        distinct_edges,
     })
 }
 
@@ -244,6 +307,8 @@ struct RawExpand {
     target_label: Option<String>,
     edge_types: Vec<String>,
     direction: RelationshipDirection,
+    rel_alias: Option<String>,
+    unique_rels: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -366,7 +431,7 @@ fn variable_ordering(
 
 // ─────────────────────── mechanical recursion ───────────────────────────
 
-fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
+fn recurse_children(plan: LogicalPlan, refs: &BTreeMap<String, usize>) -> LogicalPlan {
     match plan {
         LogicalPlan::Empty
         | LogicalPlan::Argument { .. }
@@ -381,7 +446,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             alias,
             id,
         } => LogicalPlan::NodeById {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             label,
             alias,
             id,
@@ -394,7 +459,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             value,
             multi,
         } => LogicalPlan::NodeByPropertyValue {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             label,
             alias,
             property,
@@ -408,7 +473,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             properties,
             values,
         } => LogicalPlan::NodeByPropertyTuple {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             label,
             alias,
             properties,
@@ -427,8 +492,9 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         } => LogicalPlan::Expand {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             source,
             edge_type,
             direction,
@@ -440,9 +506,10 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             back_reference,
             shortest,
             path_binding,
+            unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             predicate,
         },
         LogicalPlan::Project {
@@ -451,20 +518,20 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             distinct,
             discard_input_bindings,
         } => LogicalPlan::Project {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             items,
             distinct,
             discard_input_bindings,
         },
         LogicalPlan::DiscardResult { input } => LogicalPlan::DiscardResult {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
         },
         LogicalPlan::Aggregate {
             input,
             group_by,
             aggregations,
         } => LogicalPlan::Aggregate {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             group_by,
             aggregations,
         },
@@ -474,27 +541,27 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             skip,
             limit,
         } => LogicalPlan::TopN {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             keys,
             skip,
             limit,
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
         },
         LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
-            left: Box::new(rewrite(*left)),
-            right: Box::new(rewrite(*right)),
+            left: Box::new(rewrite(*left, refs)),
+            right: Box::new(rewrite(*right, refs)),
             all,
         },
         LogicalPlan::Unwind { input, list, alias } => LogicalPlan::Unwind {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             list,
             alias,
         },
         LogicalPlan::CrossProduct { left, right } => LogicalPlan::CrossProduct {
-            left: Box::new(rewrite(*left)),
-            right: Box::new(rewrite(*right)),
+            left: Box::new(rewrite(*left, refs)),
+            right: Box::new(rewrite(*right, refs)),
         },
         LogicalPlan::HashJoin {
             build,
@@ -502,8 +569,8 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             on,
             residual,
         } => LogicalPlan::HashJoin {
-            build: Box::new(rewrite(*build)),
-            probe: Box::new(rewrite(*probe)),
+            build: Box::new(rewrite(*build, refs)),
+            probe: Box::new(rewrite(*probe, refs)),
             on,
             residual,
         },
@@ -514,8 +581,8 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             negated,
             residual,
         } => LogicalPlan::HashSemiJoin {
-            outer: Box::new(rewrite(*outer)),
-            inner: Box::new(rewrite(*inner)),
+            outer: Box::new(rewrite(*outer, refs)),
+            inner: Box::new(rewrite(*inner, refs)),
             on,
             negated,
             residual,
@@ -525,7 +592,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             subplan,
             negated,
         } => LogicalPlan::SemiApply {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             // Do NOT recurse into `subplan`: a MultiwayJoin under a
             // correlated subplan would inherit bindings from the outer
             // row, which v0 explicitly refuses (see walker.rs).
@@ -533,7 +600,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             negated,
         },
         LogicalPlan::Apply { input, subplan } => LogicalPlan::Apply {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             subplan,
         },
         LogicalPlan::PatternList {
@@ -542,14 +609,14 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             projection,
             alias,
         } => LogicalPlan::PatternList {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             // Same as SemiApply: subplan stays binary.
             subplan,
             projection,
             alias,
         },
         LogicalPlan::Create { input, elements } => LogicalPlan::Create {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             elements,
         },
         LogicalPlan::Foreach {
@@ -558,7 +625,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             list,
             body,
         } => LogicalPlan::Foreach {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             variable,
             list,
             body,
@@ -569,17 +636,17 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             on_match_sets,
             on_create_sets,
         } => LogicalPlan::Merge {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             pattern,
             on_match_sets,
             on_create_sets,
         },
         LogicalPlan::Set { input, items } => LogicalPlan::Set {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             items,
         },
         LogicalPlan::Remove { input, items } => LogicalPlan::Remove {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             items,
         },
         LogicalPlan::Delete {
@@ -587,7 +654,7 @@ fn recurse_children(plan: LogicalPlan) -> LogicalPlan {
             targets,
             detach,
         } => LogicalPlan::Delete {
-            input: Box::new(rewrite(*input)),
+            input: Box::new(rewrite(*input, refs)),
             targets,
             detach,
         },
@@ -628,6 +695,7 @@ mod tests {
             back_reference,
             shortest: ShortestMode::None,
             path_binding: None,
+            unique_rels: vec![],
         }
     }
 
@@ -653,6 +721,7 @@ mod tests {
                 edges,
                 ordering,
                 factorize_required,
+                ..
             } => {
                 assert!(factorize_required);
                 let aliases: Vec<&str> = vars.iter().map(|v| v.alias.as_str()).collect();

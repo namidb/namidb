@@ -175,6 +175,15 @@ pub enum LogicalPlan {
         /// variable so `length(p)` etc. work. `None` for ordinary
         /// expands.
         path_binding: Option<String>,
+        /// Relationship bindings from the same MATCH clause, bound before
+        /// this hop, whose relationships this hop must not reuse (Cypher
+        /// relationship uniqueness). Each names a relationship or, for a
+        /// variable-length hop, a list of them; NULL binds nothing. An
+        /// anonymous relationship that takes part gets an internal
+        /// `__anonr<N>` alias so the row carries it. Separate MATCH clauses
+        /// never constrain each other, so this only ever names relationships
+        /// of the clause that produced the hop.
+        unique_rels: Vec<String>,
     },
 
     /// Selection predicate.
@@ -414,6 +423,11 @@ pub enum LogicalPlan {
         /// `Vec<Row>`-shaped fallback). Reserved for a follow-up
         /// flat-path WCOJ.
         factorize_required: bool,
+        /// Pairs of indices into `edges` whose relationships must differ
+        /// (Cypher relationship uniqueness within one MATCH clause; see
+        /// `Expand::unique_rels`). Empty when no two constraints can share a
+        /// relationship.
+        distinct_edges: Vec<(usize, usize)>,
     },
 
     /// Direct global count of edges by type, bypassing `NodeScan +
