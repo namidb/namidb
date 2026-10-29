@@ -51,11 +51,11 @@ crates.io release will establish and document that API explicitly.
   cannot read.** Embeddings and other numeric arrays moved out of the
   overflow JSON (see Changed). Nothing in the manifest marks the change, so
   a 2.x binary or wheel still opens a store that 3.0 has written to or
-  compacted. Its reads served from the property pages or the label postings
-  keep working, but its node reads through the new SSTs fail with
-  `Corrupted: node SST has N columns, expected N-1` or `unknown exact node
-  record encoding`, and its compaction fails on every pass. A downgrade therefore needs
-  a backup taken before the upgrade. Stores written by 2.x open and read as
+  compacted, but any node read that touches an SST written or compacted by
+  3.0 fails with a `corrupted artefact at ...` error (a node SST schema or
+  column count mismatch, or `unknown exact node record encoding`), and its
+  compaction fails too. A downgrade therefore needs a backup taken before
+  the upgrade. Stores written by 2.x open and read as
   before. Their SSTs move to the new format when compaction merges them
   with newer data; a bucket that is already one fully compacted SST keeps
   the old layout until then.
