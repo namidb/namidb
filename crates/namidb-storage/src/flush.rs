@@ -45,7 +45,7 @@
 //! sweeps them. Multipart errors are explicitly aborted; operators should also
 //! configure an incomplete-multipart lifecycle rule for process crashes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
@@ -128,9 +128,17 @@ impl NodeWriteRecord {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        #[cfg(test)]
+        NODE_RECORD_DECODES.with(|n| n.set(n.get() + 1));
         let v = serde_json::from_slice(bytes)?;
         Ok(v)
     }
+}
+
+// Test counter: JSON node payloads parsed on this thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static NODE_RECORD_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // ── Exact-node sidecar records ────────────────────────────────────────
@@ -502,6 +510,7 @@ where
             ))
         })?
         .map_err(|_| Error::invariant("flush SST build gate closed"))?;
+    let build = crate::sst::nodes::with_legacy_node_layout(build);
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         build()
@@ -803,9 +812,11 @@ impl IncrementalNodeSstWriter {
         if self.chunk.is_empty() {
             return Ok(());
         }
-        let batch = build_node_record_batch(&self.arrow_schema, &self.label, &self.chunk)?;
+        let (batch, binary_keys) =
+            build_node_record_batch(&self.arrow_schema, &self.label, &self.chunk)?;
         if batch.num_rows() > 0 {
-            self.writer.write_batch(&batch)?;
+            self.writer
+                .write_batch_with_binary_keys(&batch, binary_keys)?;
         }
         self.chunk.clear();
         Ok(())
@@ -834,11 +845,15 @@ pub(crate) fn build_node_sst(label: &LabelDef, rows: &[NodeRow]) -> Result<NodeS
     writer.finish()
 }
 
+/// The batch for `rows`, and the property names its [`BINARY_PROPS`]
+/// cells hold.
+///
+/// [`BINARY_PROPS`]: crate::sst::nodes::BINARY_PROPS
 fn build_node_record_batch(
     arrow_schema: &arrow_schema::SchemaRef,
     label: &LabelDef,
     rows: &[NodeRow],
-) -> Result<RecordBatch> {
+) -> Result<(RecordBatch, BTreeSet<String>)> {
     let n = rows.len();
     // Decided once per SST by its schema, so the layout cannot change midway.
     let legacy = arrow_schema
@@ -857,6 +872,7 @@ fn build_node_record_batch(
     let mut overflow_b = StringBuilder::with_capacity(n, 32 * n.max(1));
     let mut schema_version_b = UInt64Builder::with_capacity(n);
     let mut binary_b = BinaryBuilder::new();
+    let mut binary_keys = BTreeSet::new();
 
     let declared_names: Vec<&str> = label.properties.iter().map(|p| p.name.as_str()).collect();
 
@@ -901,6 +917,8 @@ fn build_node_record_batch(
                     for (k, v) in &binary {
                         overflow.insert(k, v);
                     }
+                } else {
+                    binary_keys.extend(binary.into_keys());
                 }
                 if overflow.is_empty() {
                     overflow_b.append_null();
@@ -940,8 +958,9 @@ fn build_node_record_batch(
         columns.push(Arc::new(binary_b.finish()));
     }
 
-    RecordBatch::try_new(arrow_schema.clone(), columns)
-        .map_err(|e| Error::invariant(format!("node batch build: {e}")))
+    let batch = RecordBatch::try_new(arrow_schema.clone(), columns)
+        .map_err(|e| Error::invariant(format!("node batch build: {e}")))?;
+    Ok((batch, binary_keys))
 }
 
 // ── Edge SST building ──────────────────────────────────────────────────
@@ -1092,15 +1111,6 @@ fn prepare_node_pending(
     if let Some((path, body)) = label_sidecar {
         index_sidecars.push((path, body));
     }
-    let mut locator_records = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
-    for row in rows {
-        let record = encode_exact_node_record(row, None)?;
-        locator_records.push(&row.id, &record)?;
-    }
-    let (mut node_locator, locator_sidecar) =
-        prepare_node_locator_sidecar(paths, level.as_u32(), &id, locator_records)?;
-    index_sidecars.push(locator_sidecar);
-
     let stats = finish.stats;
     // Transitional dual-write: Parquet remains the authoritative complete
     // node representation (and exact fallback), while `.npp` supplies
@@ -1112,19 +1122,23 @@ fn prepare_node_pending(
             crate::sst::nodes::property_pages::NodePropertyPageConfig::from_env()?,
             id,
         )?;
+    // One decode per row feeds both the exact record and the property pages.
+    let mut locator_records = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
     for (ordinal, row) in rows.iter().enumerate() {
         let ordinal = u64::try_from(ordinal)
             .map_err(|_| Error::invariant("node property ordinal exceeds u64"))?;
-        match &row.op {
-            MemOp::Upsert(payload) => {
-                let record = NodeWriteRecord::decode(payload)?;
-                property_builder.push_sorted(row.id, ordinal, &record.properties)?;
-            }
-            MemOp::Tombstone => {
-                property_builder.push_sorted(row.id, ordinal, &BTreeMap::new())?;
-            }
-        }
+        let record = match &row.op {
+            MemOp::Upsert(payload) => Some(NodeWriteRecord::decode(payload)?),
+            MemOp::Tombstone => None,
+        };
+        locator_records.push(&row.id, &encode_exact_node_record(row, record.as_ref())?)?;
+        let empty = BTreeMap::new();
+        let properties = record.as_ref().map_or(&empty, |record| &record.properties);
+        property_builder.push_sorted(row.id, ordinal, properties)?;
     }
+    let (mut node_locator, locator_sidecar) =
+        prepare_node_locator_sidecar(paths, level.as_u32(), &id, locator_records)?;
+    index_sidecars.push(locator_sidecar);
     let property_upload = property_builder.finish()?;
     let property_stats = property_upload.stats();
     if property_upload.sst_id() != id || property_stats.node_count != stats.row_count {
@@ -3840,6 +3854,43 @@ mod tests {
         let bytes = r.encode().unwrap();
         let back = NodeWriteRecord::decode(&bytes).unwrap();
         assert_eq!(back, r);
+    }
+
+    /// Each flushed node payload is parsed a fixed number of times by the
+    /// build, the exact record and the property pages sharing one parse.
+    #[test]
+    fn node_sst_build_parses_each_payload_a_fixed_number_of_times() {
+        let rows: Vec<NodeRow> = (1..=10_u8)
+            .map(|i| NodeRow {
+                id: [i; 16],
+                lsn: u64::from(i),
+                op: MemOp::Upsert(
+                    NodeWriteRecord {
+                        properties: BTreeMap::from([(
+                            "emb".into(),
+                            Value::Vec(vec![f32::from(i); 8]),
+                        )]),
+                        schema_version: 1,
+                        labels: vec![0],
+                    }
+                    .encode()
+                    .unwrap(),
+                ),
+            })
+            .collect();
+        let mut dict = LabelDictionary::default();
+        dict.intern("Device");
+        let before = NODE_RECORD_DECODES.with(|n| n.get());
+        build_pending_ssts(
+            &make_paths("flush-decodes"),
+            &rows,
+            BTreeMap::new(),
+            &SchemaBuilder::new().build(),
+            &dict,
+        )
+        .unwrap();
+        let per_row = (NODE_RECORD_DECODES.with(|n| n.get()) - before) / rows.len();
+        assert_eq!(per_row, 7);
     }
 
     #[test]

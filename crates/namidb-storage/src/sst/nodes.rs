@@ -166,7 +166,7 @@ pub fn node_arrow_schema(label: &LabelDef) -> SchemaRef {
 }
 
 /// The schema new node SSTs are written with: [`node_arrow_schema`], or the
-/// 2.x layout under the test switch [`LEGACY_NODE_LAYOUT`].
+/// 2.x layout under the test switch [`LegacyNodeLayout`].
 pub(crate) fn writer_node_arrow_schema(label: &LabelDef) -> SchemaRef {
     let schema = node_arrow_schema(label);
     if !legacy_node_layout() {
@@ -176,20 +176,53 @@ pub(crate) fn writer_node_arrow_schema(label: &LabelDef) -> SchemaRef {
     Arc::new(ArrowSchema::new(fields.to_vec()))
 }
 
-/// Test switch: write node SSTs the way 2.x did, every ad-hoc property in the
-/// overflow JSON and no [`BINARY_PROPS`] column, to test reading old stores.
-/// Tests that flip it, or that depend on the current layout, hold
-/// [`LEGACY_NODE_LAYOUT_LOCK`].
+// Test switch: write node SSTs the way 2.x did, every ad-hoc property in the
+// overflow JSON and no `__binary_props` column, to test reading old stores.
+// It is per thread so parallel tests never see each other's layout; the
+// blocking pools of flush and compaction carry it over with
+// `with_legacy_node_layout`. Flip it through `LegacyNodeLayout`.
 #[cfg(test)]
-pub(crate) static LEGACY_NODE_LAYOUT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static LEGACY_NODE_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Writes the 2.x node layout on this thread until dropped, even on panic.
+#[cfg(test)]
+pub(crate) struct LegacyNodeLayout(());
 
 #[cfg(test)]
-pub(crate) static LEGACY_NODE_LAYOUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+impl LegacyNodeLayout {
+    pub(crate) fn on() -> Self {
+        LEGACY_NODE_LAYOUT.with(|f| f.set(true));
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for LegacyNodeLayout {
+    fn drop(&mut self) {
+        LEGACY_NODE_LAYOUT.with(|f| f.set(false));
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn legacy_node_layout() -> bool {
-    LEGACY_NODE_LAYOUT.load(std::sync::atomic::Ordering::SeqCst)
+    LEGACY_NODE_LAYOUT.with(|f| f.get())
+}
+
+/// Wrap a closure bound for another thread so it sees this thread's layout.
+#[cfg(test)]
+pub(crate) fn with_legacy_node_layout<T>(f: impl FnOnce() -> T) -> impl FnOnce() -> T {
+    let legacy = legacy_node_layout();
+    move || {
+        let _layout = legacy.then(LegacyNodeLayout::on);
+        f()
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn with_legacy_node_layout<T>(f: impl FnOnce() -> T) -> impl FnOnce() -> T {
+    f
 }
 
 #[cfg(not(test))]
@@ -243,6 +276,8 @@ pub(crate) fn encode_binary_properties(properties: BTreeMap<String, Value>) -> R
 
 /// Decode one [`BINARY_PROPS`] cell.
 pub(crate) fn decode_binary_properties(bytes: &[u8]) -> Result<BTreeMap<String, Value>> {
+    #[cfg(test)]
+    BINARY_PROPS_DECODES.with(|n| n.set(n.get() + 1));
     match property_pages::decode_canonical_value(bytes)? {
         Value::Map(map) => Ok(map),
         _ => Err(Error::Corrupted {
@@ -250,6 +285,12 @@ pub(crate) fn decode_binary_properties(bytes: &[u8]) -> Result<BTreeMap<String, 
             detail: "__binary_props cell is not a map".into(),
         }),
     }
+}
+
+// Test counter: [`BINARY_PROPS`] cells decoded on this thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BINARY_PROPS_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Ad-hoc properties of node row `row`: the overflow JSON plus, when the SST
@@ -465,6 +506,25 @@ impl NodeSstWriter {
 
     /// Write one batch of rows. The batch's schema must equal `self.schema()`.
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let mut binary_keys = BTreeSet::new();
+        if let Some(binary) = batch
+            .column_by_name(BINARY_PROPS)
+            .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+        {
+            for i in (0..binary.len()).filter(|&i| !binary.is_null(i)) {
+                binary_keys.extend(decode_binary_properties(binary.value(i))?.into_keys());
+            }
+        }
+        self.write_batch_with_binary_keys(batch, binary_keys)
+    }
+
+    /// [`Self::write_batch`] for a caller that already knows the property
+    /// names in the batch's [`BINARY_PROPS`] cells, so they need no decode.
+    pub(crate) fn write_batch_with_binary_keys(
+        &mut self,
+        batch: &RecordBatch,
+        binary_keys: BTreeSet<String>,
+    ) -> Result<()> {
         if batch.schema() != self.schema {
             return Err(Error::invariant(format!(
                 "node SST batch schema mismatch: expected {:?}, got {:?}",
@@ -548,15 +608,7 @@ impl NodeSstWriter {
         }
 
         update_property_hlls(&self.label, &mut self.property_hlls, batch)?;
-        if let Some(binary) = batch
-            .column_by_name(BINARY_PROPS)
-            .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
-        {
-            for i in (0..binary.len()).filter(|&i| !binary.is_null(i)) {
-                self.binary_keys
-                    .extend(decode_binary_properties(binary.value(i))?.into_keys());
-            }
-        }
+        self.binary_keys.extend(binary_keys);
 
         self.inner
             .write(batch)
@@ -2376,9 +2428,6 @@ mod tests {
 
     #[test]
     fn spooled_writer_is_wire_identical_to_in_memory_arrow_writer() {
-        let _layout = LEGACY_NODE_LAYOUT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let label = person_label();
         let options = NodeSstWriterOptions {
             row_group_target_rows: 2,
@@ -2435,11 +2484,27 @@ mod tests {
         }
     }
 
+    /// The legacy layout switch stays on the thread that set it (and on the
+    /// closures it hands off), and goes back off even if the test panics.
+    #[test]
+    fn legacy_layout_switch_is_scoped_to_its_thread() {
+        let carried = {
+            let _layout = LegacyNodeLayout::on();
+            assert!(!std::thread::spawn(legacy_node_layout).join().unwrap());
+            with_legacy_node_layout(legacy_node_layout)
+        };
+        assert!(std::thread::spawn(carried).join().unwrap());
+        assert!(!legacy_node_layout());
+        let panicked = std::panic::catch_unwind(|| {
+            let _layout = LegacyNodeLayout::on();
+            panic!("test body failed");
+        });
+        assert!(panicked.is_err());
+        assert!(!legacy_node_layout());
+    }
+
     #[test]
     fn vectors_are_binary_and_other_projections_skip_them() {
-        let _layout = LEGACY_NODE_LAYOUT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         use crate::flush::{build_node_sst, NodeRow, NodeWriteRecord};
         use crate::memtable::MemOp;
 
@@ -2503,7 +2568,11 @@ mod tests {
             name: String::new(),
             properties: vec![],
         };
+        // The footer's binary key list comes from the build, not from
+        // decoding every vector the writer was just handed.
+        let before = BINARY_PROPS_DECODES.with(|n| n.get());
         let body = build_node_sst(&label, &node_rows).unwrap().body;
+        assert_eq!(BINARY_PROPS_DECODES.with(|n| n.get()), before);
         let reader = NodeSstReader::open(label, body.clone()).unwrap();
 
         // The JSON keeps only what is not a numeric array or byte string.

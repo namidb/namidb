@@ -379,7 +379,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    tokio::task::spawn_blocking(crate::sst::nodes::with_legacy_node_layout(f))
         .await
         .map_err(|e| Error::invariant(format!("compaction CPU task panicked: {e}")))
 }

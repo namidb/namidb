@@ -6289,15 +6289,6 @@ impl<'mt> Snapshot<'mt> {
         // the lookups by the rows returned, and only a small one bounds them
         // by much.
         let bounded = predicates.is_empty() && limit.is_some_and(|limit| limit <= BOUNDED_LIMIT);
-        let dict = &self.manifest.manifest.label_dict;
-        let mut memtable_ids = Vec::new();
-        for (key, entry) in self.node_entries() {
-            if let (MemKey::Node { id }, MemOp::Upsert(payload)) = (key, &entry.op) {
-                if record_carries_label(&NodeWriteRecord::decode(payload)?, label, dict) {
-                    memtable_ids.push(*id);
-                }
-            }
-        }
         // An unbounded projected scan is better served by the two-phase scan:
         // an id-only one (a count) never leaves its structural pass, and a
         // projected one reads property pages. Full exact records would decode
@@ -6306,8 +6297,7 @@ impl<'mt> Snapshot<'mt> {
         // pass over every node SST (9 nodes out of 220k: 0.6 ms against 48 ms).
         // ponytail: fixed 1/64 cut; measure the crossover per record size if
         // mid-sized labels pick the wrong side.
-        if !bounded
-            && !self.label_share_at_most(label, memtable_ids.len(), 64)
+        let prefer_two_phase = !bounded
             && projection.is_some_and(|columns| {
                 (columns.is_empty() && predicates.is_empty())
                     || self
@@ -6321,8 +6311,23 @@ impl<'mt> Snapshot<'mt> {
                             )
                             .is_some()
                         })
-            })
-        {
+            });
+        // Memtable members only add to a label's share, so a label already
+        // past the cut on the SSTs alone leaves before every memtable payload
+        // is decoded, which the two-phase scan would only do again.
+        if !bounded && !self.label_share_at_most(label, 0, if prefer_two_phase { 64 } else { 4 }) {
+            return Ok(None);
+        }
+        let dict = &self.manifest.manifest.label_dict;
+        let mut memtable_ids = Vec::new();
+        for (key, entry) in self.node_entries() {
+            if let (MemKey::Node { id }, MemOp::Upsert(payload)) = (key, &entry.op) {
+                if record_carries_label(&NodeWriteRecord::decode(payload)?, label, dict) {
+                    memtable_ids.push(*id);
+                }
+            }
+        }
+        if prefer_two_phase && !self.label_share_at_most(label, memtable_ids.len(), 64) {
             return Ok(None);
         }
 
@@ -16249,16 +16254,11 @@ mod tests {
     /// them in `__binary_props`. Overlapping, the two must reconcile by LWW on
     /// every read route, and compaction must rewrite the old rows as binary.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn vectors_from_json_and_binary_node_ssts_reconcile_and_compact_to_binary() {
-        use crate::sst::nodes::{LEGACY_NODE_LAYOUT, LEGACY_NODE_LAYOUT_LOCK};
+        use crate::sst::nodes::LegacyNodeLayout;
         use crate::sst::{BINARY_PROPS, OVERFLOW_JSON};
         use arrow_array::cast::AsArray;
-        use std::sync::atomic::Ordering;
 
-        let _layout = LEGACY_NODE_LAYOUT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let store = make_store();
         let paths = make_paths("binary-vectors-mixed");
         let ms = ManifestStore::new(store.clone(), paths.clone());
@@ -16288,12 +16288,12 @@ mod tests {
             )
         };
 
-        LEGACY_NODE_LAYOUT.store(true, Ordering::SeqCst);
+        let layout = LegacyNodeLayout::on();
         let old = (1..=4)
             .map(|i| (sorted_node_id(i), u64::from(i), record("old", Some(emb(i)))))
             .collect();
         let first = flush_batch(&ms, &fence, &base, &schema, old).await;
-        LEGACY_NODE_LAYOUT.store(false, Ordering::SeqCst);
+        drop(layout);
         let second = flush_batch(
             &ms,
             &fence,
@@ -16477,6 +16477,63 @@ mod tests {
         }
     }
 
+    /// A projected scan of a dense label over overlapping node SSTs goes to
+    /// the two-phase scan, which parses each memtable payload once. The
+    /// postings route must not parse them all first only to step aside.
+    #[tokio::test]
+    async fn dense_label_projected_scan_parses_each_memtable_payload_once() {
+        use crate::flush::NODE_RECORD_DECODES;
+
+        let store = make_store();
+        let paths = make_paths("dense-label-memtable-decodes");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+        let rows = (0..100_u16)
+            .map(|i| {
+                (
+                    spread_node_id(i),
+                    u64::from(i) + 1,
+                    upsert("n", vec![OTHER]),
+                )
+            })
+            .collect();
+        let first = flush_batch(&ms, &fence, &base, &schema, rows).await;
+        let second = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![(spread_node_id(5), 500, upsert("n", vec![OTHER]))],
+        )
+        .await;
+
+        let mut mt = Memtable::new();
+        for i in 100..120_u16 {
+            mt.apply(
+                MemKey::Node {
+                    id: spread_node_id(i),
+                },
+                1000 + u64::from(i),
+                upsert("m", vec![OTHER]),
+            );
+        }
+        let view = mt.snapshot_view();
+        let snap = Snapshot::new(second, &view, store, paths);
+        assert!(snap.disjoint_node_descriptors().is_none());
+        let before = NODE_RECORD_DECODES.with(|n| n.get());
+        let rows = snap
+            .scan_label_with_predicates_and_projection("Other", &[], Some(&["name".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 120);
+        assert_eq!(NODE_RECORD_DECODES.with(|n| n.get()) - before, 20);
+    }
+
     /// Byte-counting store for the label locality measurement below.
     #[derive(Debug)]
     struct FetchCountingStore {
@@ -16559,9 +16616,8 @@ mod tests {
     /// fetched and how many label rows had properties decoded.
     #[tokio::test]
     #[ignore = "measurement, prints numbers"]
-    #[allow(clippy::await_holding_lock)]
     async fn measure_sparse_label_reads_over_overlapping_node_ssts() {
-        use crate::sst::nodes::{LEGACY_NODE_LAYOUT, LEGACY_NODE_LAYOUT_LOCK};
+        use crate::sst::nodes::LegacyNodeLayout;
         use futures::TryStreamExt;
         use std::sync::atomic::Ordering;
 
@@ -16569,9 +16625,6 @@ mod tests {
         const CONTENT: usize = 4_096;
         const DEVICES: usize = 9;
         const UPDATES: usize = 20_000;
-        let _layout = LEGACY_NODE_LAYOUT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let mut state = 0x2545_F491_4F6C_DD1D_u64;
         let mut next = move || {
             state ^= state << 13;
@@ -16643,7 +16696,7 @@ mod tests {
             }
             let fence = WriterFence::new(base.manifest.epoch);
             let schema = SchemaBuilder::new().build();
-            LEGACY_NODE_LAYOUT.store(legacy, Ordering::SeqCst);
+            let layout = legacy.then(LegacyNodeLayout::on);
             let rows = (0..NODES)
                 .map(|i| (ids[i], i as u64 + 1, payload(i, 0)))
                 .collect();
@@ -16662,7 +16715,7 @@ mod tests {
             let second =
                 flush_batch_with_row_group_rows(128 * 1024, &ms, &fence, &first, &schema, rows)
                     .await;
-            LEGACY_NODE_LAYOUT.store(false, Ordering::SeqCst);
+            drop(layout);
             let sizes: Vec<(u64, u64)> = second
                 .manifest
                 .ssts
