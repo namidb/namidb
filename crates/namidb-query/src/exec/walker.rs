@@ -141,14 +141,6 @@ pub(crate) fn resolve_row_count(
 /// before the first candidate exists.
 const MAX_EAGER_QUERY_CAPACITY: usize = 64;
 
-/// Largest seed round an Expand pulls from a node scan over overlapping SSTs.
-/// Every round restarts the merge and point-reads its whole prefix, so when
-/// the seeds rarely expand the rounds would add up to more point reads than
-/// the store has nodes. Past this the remaining round is one full scan.
-// ponytail: fixed cut (64 + 256 + 1024 + 4096 point reads at most); resume
-// the merge from the last seed id if selective seed pulls get common.
-const OVERLAP_SEED_PULL_MAX: usize = 4096;
-
 #[inline]
 fn query_initial_capacity(requested: usize, available: usize) -> usize {
     requested.min(available).min(MAX_EAGER_QUERY_CAPACITY)
@@ -1230,24 +1222,20 @@ fn execute_capped<'a>(
                 // Each round expands only the seeds the previous one did not
                 // see, so `out` stays the same prefix as the uncapped result
                 // and edgeless seeds cannot starve the budget. Memtable nodes
-                // and overlapping SSTs are merged in id order by an unfiltered
-                // limited scan, so they stop early too. Any other input, a
-                // filtered scan over overlapping SSTs, or the full-body
-                // diagnostic read mode, runs uncapped once.
+                // and overlapping SSTs are merged in id order by the limited
+                // scan, so they stop early too. Any other input, or the
+                // full-body diagnostic read mode, runs uncapped once.
                 // NOTE: when few seeds match, the rounds rescan the prefix
                 // (about 1.33x a full scan) and end up holding every seed;
-                // only the row cap bounds that case. Over overlapping SSTs
-                // each seed is a point read, so past OVERLAP_SEED_PULL_MAX
-                // seeds the next round is the uncapped scan.
+                // only the row cap bounds that case.
+                // ponytail: rounds restart from the first id; resume after
+                // the last seed id if the 1.33x ever matters.
                 let mut want = match input.as_ref() {
-                    LogicalPlan::NodeScan { predicates, .. }
-                        if snapshot.node_scan_stops_early(predicates) =>
-                    {
+                    LogicalPlan::NodeScan { .. } if snapshot.node_scan_stops_early() => {
                         Some(cap.max(64))
                     }
                     _ => None,
                 };
-                let overlapping = want.is_some() && !snapshot.node_scan_is_disjoint();
                 let row_cap = crate::exec::limits::scoped_row_cap();
                 let mut out: Vec<Row> = Vec::new();
                 let mut seen = 0usize;
@@ -1303,9 +1291,7 @@ fn execute_capped<'a>(
                     // The budget is still open and more seeds remain, so
                     // the next round would hold more than this one.
                     crate::exec::limits::check_row_cap(total)?;
-                    want = want
-                        .map(|w| w.saturating_mul(4))
-                        .filter(|w| !overlapping || *w <= OVERLAP_SEED_PULL_MAX);
+                    want = want.map(|w| w.saturating_mul(4));
                 }
             }
 

@@ -668,15 +668,13 @@ async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
     }
 
     // A bare labelled LIMIT takes the label postings. A filtered one on a
-    // label as dense as `A`, or on no label, is left to the full reconcile:
-    // the merge could only test the filter after point-reading each
-    // candidate, which on a selective filter is one point read per node.
+    // label as dense as `A`, or on no label, takes the merge too: it reads
+    // the filtered column with the structural ones and tests the winning
+    // version, so a rejected node costs no point read.
     let predicate = [ScanPredicate::IsNotNull {
         column: "v".to_string(),
     }];
-    // So the seed pull does not run a full reconcile per round either.
-    assert!(snapshot.node_scan_stops_early(&[]));
-    assert!(!snapshot.node_scan_stops_early(&predicate));
+    assert!(snapshot.node_scan_stops_early());
     for label in [Some("A"), None] {
         let full = match label {
             Some(label) => snapshot
@@ -708,17 +706,18 @@ async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
                 &full[..limit.min(full.len())],
                 "{label:?} LIMIT {limit}"
             );
-            assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks + 1);
+            assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
         }
     }
 }
 
-/// When the seeds rarely expand, every round of the seed pull restarts the
-/// overlap merge and point-reads its whole prefix, so growing the rounds to
-/// the store size cost more point reads than the store has nodes. Past
-/// 4,096 seeds the last round is one full scan, and the rows are unchanged.
+/// When the seeds rarely expand, the rounds of the seed pull grow to the
+/// store size. Over overlapping SSTs each round used to point-read its whole
+/// prefix, so past 4,096 seeds the last round was one full scan. The merge
+/// now reads the winners' rows by ordinal from the SST that holds them, so
+/// the rounds keep growing like on disjoint SSTs and the rows are unchanged.
 #[tokio::test]
-async fn overlapping_seed_pull_stops_growing_when_seeds_rarely_expand() {
+async fn overlapping_seed_pull_keeps_growing_when_seeds_rarely_expand() {
     let sst_cache = SstCache::new(64 * 1024 * 1024);
     let mut caches = SessionCaches::none();
     caches.sst_cache = Some(sst_cache.clone());
@@ -749,6 +748,8 @@ async fn overlapping_seed_pull_stops_growing_when_seeds_rarely_expand() {
     let snapshot = writer.snapshot();
     assert!(!snapshot.node_scan_is_disjoint());
     let output = sst_cache.limited_node_scan_output_rows();
+    let fast_paths = sst_cache.limited_node_scan_fast_paths();
+    let fallbacks = sst_cache.limited_node_scan_fallbacks();
     let plan = lower(&parse("MATCH (a)-[:RARE]->(b) RETURN a.v AS v, b.v AS w LIMIT 10").unwrap())
         .unwrap();
     let rows = execute_flat_path(&plan, &snapshot, &Params::new())
@@ -763,9 +764,11 @@ async fn overlapping_seed_pull_stops_growing_when_seeds_rarely_expand() {
         rows[0].get("w"),
         Some(&RuntimeValue::Integer(10_000 + (N - 1) as i64))
     );
-    let point_read = sst_cache.limited_node_scan_output_rows() - output;
-    assert!(
-        point_read <= 64 + 256 + 1024 + 4096,
-        "{point_read} seeds point-read"
+    // Rounds of 64, 256, 1,024, 4,096 and then every node, all limited.
+    assert_eq!(sst_cache.limited_node_scan_fast_paths() - fast_paths, 5);
+    assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks);
+    assert_eq!(
+        sst_cache.limited_node_scan_output_rows() - output,
+        (64 + 256 + 1024 + 4096 + N) as u64
     );
 }
