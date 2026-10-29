@@ -218,8 +218,8 @@ crates.io release will establish and document that API explicitly.
 
 - **`memory://` takes `?ns=` like the other schemes.** `memory://?ns=acme`
   and `memory://acme?ns=acme` both open `acme`. A URI whose host and `?ns=`
-  disagree now fails with a clear conflict error instead of an
-  invalid-character one.
+  disagree, or that carries any other parameter (say a mistyped `?nss=`),
+  now fails with a clear error instead of an invalid-character one.
 
 - **Label scans over overlapping node SSTs no longer load whole SST files.**
   A denser label, or a projected scan that is better served by property
@@ -229,9 +229,9 @@ crates.io release will establish and document that API explicitly.
   from property pages for a projected scan, or from Parquet with a row
   selection that skips every other page. Counts and `RETURN id(n)` style
   scans stop after the first pass. Any mismatch between the passes falls
-  back to the full reconciliation. This also covers the BM25 and hybrid search label
-  walks. `SstCache::label_selected_node_rows()` reports how many label rows
-  had their properties read, here or from property pages.
+  back to the full reconciliation. This also covers the BM25 and hybrid
+  search label walks. `SstCache::label_selected_node_rows()` reports how
+  many label rows had their properties read, here or from property pages.
 
 - **The embedded Python client now compacts and reclaims space on its own.**
   It has no maintenance loop like the server, so L0 SSTs piled up until
@@ -463,14 +463,14 @@ crates.io release will establish and document that API explicitly.
   full page of candidates first. Each skipped candidate makes the next batch
   of lookups larger, and on a dense label a LIMIT that keeps hitting stale
   postings (say after a bulk relabel) gives up and uses the id-ordered merge
-  described above. Scans, filtered LIMITs and LIMITs above 4,096 rows take this route
-  only when the label is at most a quarter of the node rows, memtable
-  included, since each candidate is a full record lookup and a filter may
-  reject them all. That includes the hidden limit a row cap adds to a node
-  scan, so a capped query over a dense label is not looked up one record at
-  a time. Counts and
-  other unbounded id-only scans never take it: the first pass of the two-pass scan answers
-  them without reading any property.
+  described above. Scans, filtered LIMITs and LIMITs above 4,096 rows take
+  this route only when the label is at most a quarter of the node rows,
+  memtable included, since each candidate is a full record lookup and a
+  filter may reject them all. That includes the hidden limit a row cap adds
+  to a node scan, so a capped query over a dense label is not looked up one
+  record at a time. Counts and other unbounded id-only scans never take it:
+  the first pass of the two-pass scan answers them without reading any
+  property.
 
   Still open: a flush that only deletes nodes carries no label counts, which
   turns this route off until compaction. Node SSTs are still not split by
@@ -508,9 +508,10 @@ crates.io release will establish and document that API explicitly.
 
 - **Python reads were serialised behind the writer lock.** `cypher` reads,
   `lookup_node`, `scan_*` and edge lookups held the writer mutex for the
-  whole query, so two threads could not read at once and a long read
-  stalled every write. Reads now run on the latest committed snapshot
-  without the lock. Write statements are planned again under the lock.
+  whole query, so two threads could not read at once, a long read stalled
+  every write, and a bulk load stalled every read. Reads now run on the
+  latest committed snapshot without the lock. Write statements are
+  planned again under the lock.
   `sweep()` and the sweep after a compaction take their horizon from the
   oldest snapshot a read in the same process still holds, so they never
   delete files an in-flight read in another thread needs.
@@ -530,14 +531,6 @@ crates.io release will establish and document that API explicitly.
   on its own slot, so only requests for the namespace being opened wait, and
   concurrent first requests for it still share one writer. An evicted
   namespace is still fully quiesced before anything reopens it.
-  had their properties read, here, from property pages or in the full
-  reconciliation.
-  disagree, or that carries any other parameter (say a mistyped `?nss=`),
-  now fails with a clear error instead of an invalid-character one.
-  whole query, so two threads could not read at once, a long read
-  stalled every write, and a bulk load stalled every read. Reads now run
-  on the latest committed snapshot without waiting for the lock. Write
-  statements are planned again under the lock.
 
 ## [2.6.19] - 2026-09-16
 
