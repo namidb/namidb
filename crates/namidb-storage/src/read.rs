@@ -17253,7 +17253,11 @@ mod tests {
             (0..300_u16)
                 .map(|i| {
                     let name = format!("n{}", i % 4);
-                    (spread_node_id(i), u64::from(i) + 1, upsert(name, 1, vec![DEVICE]))
+                    (
+                        spread_node_id(i),
+                        u64::from(i) + 1,
+                        upsert(name, 1, vec![DEVICE]),
+                    )
                 })
                 .collect(),
         )

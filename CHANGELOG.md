@@ -219,10 +219,15 @@ crates.io release will establish and document that API explicitly.
   id, tests the filter on that version, and stops once it has the rows it
   needs. It then reads the properties of those rows only, from the SST row
   that won, so a node the filter rejects costs no point read. A labelled
-  scan still tries the label postings first. Each round of the seed pull
-  restarts the merge from the first id, so when few seeds expand the rounds
-  read about a third more than one full pass would; resuming after the last
-  seed would avoid that but is not done yet.
+  scan still tries the label postings first, and a filter on an indexed
+  number the range index, which now confirms candidates in id order and
+  stops at the limit instead of looking up the whole matching window. Each
+  round of the seed pull restarts the scan from the first id, so when few
+  seeds expand the rounds read between about 1.3 and 2.3 times what one
+  full pass would. A labelled or filtered seed pull over overlapping SSTs
+  still makes its round after 4,096 seeds one full scan, since the postings
+  and the range index redo their whole prefix each round. Resuming each
+  round after the last seed would avoid both but is not done yet.
 
 - **The query row cap did not bound memory for a node scan.** With a row cap
   in scope (`NAMIDB_QUERY_ROW_CAP` on the server), `MATCH (n) RETURN n`

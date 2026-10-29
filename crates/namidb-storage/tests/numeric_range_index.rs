@@ -391,7 +391,11 @@ async fn a_limited_range_scan_confirms_about_limit_candidates() {
     let mut writer = WriterSession::open(store, paths).await.unwrap();
     for ordinal in 0..4_000_i64 {
         writer
-            .upsert_node("T", NodeId::new(), &node(vec![("idx", Value::I64(ordinal))]))
+            .upsert_node(
+                "T",
+                NodeId::new(),
+                &node(vec![("idx", Value::I64(ordinal))]),
+            )
             .unwrap();
     }
     writer.commit_batch().await.unwrap();
