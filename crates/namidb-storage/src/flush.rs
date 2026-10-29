@@ -89,8 +89,8 @@ use crate::sst::edges::writer::{
 use crate::sst::edges::EdgeDirection;
 use crate::sst::hll::{Hll, DEFAULT_PRECISION};
 use crate::sst::nodes::{
-    encode_binary_properties, is_binary_property_value, legacy_node_layout, max_scalar, min_scalar,
-    writer_node_arrow_schema, NodeSstFinish, NodeSstWriter, NodeSstWriterOptions,
+    encode_binary_properties, is_binary_property_value, max_scalar, min_scalar, NodeSstFinish,
+    NodeSstWriter, NodeSstWriterOptions,
 };
 use crate::sst::stats::StatScalar;
 
@@ -136,18 +136,64 @@ impl NodeWriteRecord {
 // ── Exact-node sidecar records ────────────────────────────────────────
 
 // A `.nloc2` object carries the ordinary NodeId -> row-ordinal tree first
-// (for 2.0.4/2.0.5 readers) and an exact NodeId -> record tree after it. The
-// latter deliberately stores the existing JSON wire payload: it is already
-// the WAL/memtable compatibility format, so the accelerator cannot acquire a
-// second property codec that drifts from recovery. Large JSON payloads (most
-// notably float vectors) are compressed independently so one point read can
-// fetch/decompress one node without inflating the sidecar to JSON size.
+// (for 2.0.4/2.0.5 readers) and an exact NodeId -> record tree after it.
+// Records are the canonical binary property encoding the property pages and
+// `__binary_props` use, so a point read never parses an embedding as text.
+// 2.x wrote the JSON memtable payload instead (`RAW`/`ZSTD`), which still
+// reads, and stays the fallback for a record past the binary ceilings. Large
+// records are compressed independently so one point read can fetch and
+// decompress one node.
 const NODE_RECORD_TOMBSTONE: u8 = 0;
 const NODE_RECORD_RAW: u8 = 1;
 const NODE_RECORD_ZSTD: u8 = 2;
+const NODE_RECORD_BINARY: u8 = 3;
+const NODE_RECORD_BINARY_ZSTD: u8 = 4;
 const NODE_RECORD_HEADER_BYTES: usize = 1 + 8 + 4;
 
-pub(crate) fn encode_exact_node_record(row: &NodeRow) -> Result<Vec<u8>> {
+/// Binary record body: schema version, label ids, then the properties as one
+/// canonical map.
+fn encode_binary_node_record(record: &NodeWriteRecord) -> Result<Vec<u8>> {
+    let properties = crate::sst::nodes::encode_binary_properties(record.properties.clone())?;
+    let label_count = u32::try_from(record.labels.len())
+        .map_err(|_| Error::invariant("node record label count exceeds u32"))?;
+    let mut out = Vec::with_capacity(12 + 4 * record.labels.len() + properties.len());
+    out.extend_from_slice(&record.schema_version.to_le_bytes());
+    out.extend_from_slice(&label_count.to_le_bytes());
+    for label in &record.labels {
+        out.extend_from_slice(&label.to_le_bytes());
+    }
+    out.extend_from_slice(&properties);
+    Ok(out)
+}
+
+fn decode_binary_node_record(bytes: &[u8]) -> Result<NodeWriteRecord> {
+    let truncated = || Error::invariant("truncated binary exact node record");
+    let schema_version =
+        u64::from_le_bytes(bytes.get(..8).ok_or_else(truncated)?.try_into().unwrap());
+    let count = u32::from_le_bytes(bytes.get(8..12).ok_or_else(truncated)?.try_into().unwrap());
+    let labels_end = (count as usize)
+        .checked_mul(4)
+        .and_then(|len| len.checked_add(12))
+        .ok_or_else(truncated)?;
+    let labels = bytes
+        .get(12..labels_end)
+        .ok_or_else(truncated)?
+        .chunks_exact(4)
+        .map(|label| u32::from_le_bytes(label.try_into().unwrap()))
+        .collect();
+    Ok(NodeWriteRecord {
+        properties: crate::sst::nodes::decode_binary_properties(&bytes[labels_end..])?,
+        schema_version,
+        labels,
+    })
+}
+
+/// Encode `row` for the exact record tree. `record` is the decoded payload
+/// when the caller already has it, to save parsing it again.
+pub(crate) fn encode_exact_node_record(
+    row: &NodeRow,
+    record: Option<&NodeWriteRecord>,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     match &row.op {
         MemOp::Tombstone => {
@@ -157,14 +203,33 @@ pub(crate) fn encode_exact_node_record(row: &NodeRow) -> Result<Vec<u8>> {
             out.extend_from_slice(&0_u32.to_le_bytes());
         }
         MemOp::Upsert(payload) => {
-            let raw_len = u32::try_from(payload.len())
-                .map_err(|_| Error::invariant("exact node record exceeds 4 GiB"))?;
-            let compressed = zstd::bulk::compress(payload, 1)
-                .map_err(|e| Error::invariant(format!("exact node record zstd encode: {e}")))?;
-            let (tag, body) = if compressed.len() < payload.len() {
-                (NODE_RECORD_ZSTD, compressed.as_slice())
+            let decoded;
+            let record = match record {
+                Some(record) => record,
+                None => {
+                    decoded = NodeWriteRecord::decode(payload)?;
+                    &decoded
+                }
+            };
+            // Past the binary ceilings the JSON payload is kept as is.
+            let binary = if crate::sst::nodes::legacy_node_layout() {
+                None
             } else {
-                (NODE_RECORD_RAW, payload.as_ref())
+                encode_binary_node_record(record).ok()
+            };
+            let (raw, binary_tags) = match &binary {
+                Some(binary) => (binary.as_slice(), true),
+                None => (payload.as_ref(), false),
+            };
+            let raw_len = u32::try_from(raw.len())
+                .map_err(|_| Error::invariant("exact node record exceeds 4 GiB"))?;
+            let compressed = zstd::bulk::compress(raw, 1)
+                .map_err(|e| Error::invariant(format!("exact node record zstd encode: {e}")))?;
+            let (tag, body) = match (compressed.len() < raw.len(), binary_tags) {
+                (true, true) => (NODE_RECORD_BINARY_ZSTD, compressed.as_slice()),
+                (false, true) => (NODE_RECORD_BINARY, raw),
+                (true, false) => (NODE_RECORD_ZSTD, compressed.as_slice()),
+                (false, false) => (NODE_RECORD_RAW, raw),
             };
             out.reserve_exact(NODE_RECORD_HEADER_BYTES.saturating_add(body.len()));
             out.push(tag);
@@ -176,7 +241,8 @@ pub(crate) fn encode_exact_node_record(row: &NodeRow) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub(crate) fn decode_exact_node_record(bytes: &[u8]) -> Result<(u64, MemOp)> {
+/// Decode one exact record: its LSN and the record, `None` for a tombstone.
+pub(crate) fn decode_exact_node_record(bytes: &[u8]) -> Result<(u64, Option<NodeWriteRecord>)> {
     if bytes.len() < NODE_RECORD_HEADER_BYTES {
         return Err(Error::invariant("truncated exact node record"));
     }
@@ -192,28 +258,29 @@ pub(crate) fn decode_exact_node_record(bytes: &[u8]) -> Result<(u64, MemOp)> {
             .map_err(|_| Error::invariant("invalid exact node record length"))?,
     ) as usize;
     let body = &bytes[NODE_RECORD_HEADER_BYTES..];
-    let op = match tag {
-        NODE_RECORD_TOMBSTONE if raw_len == 0 && body.is_empty() => MemOp::Tombstone,
+    let decompressed;
+    let raw = match tag {
+        NODE_RECORD_TOMBSTONE if raw_len == 0 && body.is_empty() => return Ok((lsn, None)),
         NODE_RECORD_TOMBSTONE => {
             return Err(Error::invariant(
                 "tombstone exact node record carries a payload",
             ));
         }
-        NODE_RECORD_RAW if body.len() == raw_len => MemOp::Upsert(Bytes::copy_from_slice(body)),
-        NODE_RECORD_RAW => {
+        NODE_RECORD_RAW | NODE_RECORD_BINARY if body.len() == raw_len => body,
+        NODE_RECORD_RAW | NODE_RECORD_BINARY => {
             return Err(Error::invariant(
                 "raw exact node record length does not match its header",
             ));
         }
-        NODE_RECORD_ZSTD => {
-            let decoded = zstd::bulk::decompress(body, raw_len)
+        NODE_RECORD_ZSTD | NODE_RECORD_BINARY_ZSTD => {
+            decompressed = zstd::bulk::decompress(body, raw_len)
                 .map_err(|e| Error::invariant(format!("exact node record zstd decode: {e}")))?;
-            if decoded.len() != raw_len {
+            if decompressed.len() != raw_len {
                 return Err(Error::invariant(
                     "decoded exact node record length does not match its header",
                 ));
             }
-            MemOp::Upsert(Bytes::from(decoded))
+            decompressed.as_slice()
         }
         _ => {
             return Err(Error::invariant(format!(
@@ -221,7 +288,12 @@ pub(crate) fn decode_exact_node_record(bytes: &[u8]) -> Result<(u64, MemOp)> {
             )));
         }
     };
-    Ok((lsn, op))
+    let record = if matches!(tag, NODE_RECORD_BINARY | NODE_RECORD_BINARY_ZSTD) {
+        decode_binary_node_record(raw)?
+    } else {
+        NodeWriteRecord::decode(raw)?
+    };
+    Ok((lsn, Some(record)))
 }
 
 /// Decoded payload of a [`MemOp::Upsert`](crate::memtable::MemOp::Upsert) for
@@ -708,9 +780,10 @@ impl IncrementalNodeSstWriter {
         options: NodeSstWriterOptions,
         chunk_rows: usize,
     ) -> Result<Self> {
+        let writer = NodeSstWriter::new(label.clone(), options)?;
         Ok(Self {
-            writer: NodeSstWriter::new(label.clone(), options)?,
-            arrow_schema: writer_node_arrow_schema(label),
+            arrow_schema: writer.schema().clone(),
+            writer,
             label: label.clone(),
             chunk: Vec::new(),
             chunk_rows: chunk_rows.max(1),
@@ -767,6 +840,10 @@ fn build_node_record_batch(
     rows: &[NodeRow],
 ) -> Result<RecordBatch> {
     let n = rows.len();
+    // Decided once per SST by its schema, so the layout cannot change midway.
+    let legacy = arrow_schema
+        .column_with_name(crate::sst::nodes::BINARY_PROPS)
+        .is_none();
 
     let mut node_id_b = FixedSizeBinaryBuilder::with_capacity(n, 16);
     let mut tomb_b = BooleanBuilder::with_capacity(n);
@@ -807,7 +884,7 @@ fn build_node_record_batch(
                     if declared_names.contains(&k.as_str()) {
                         continue;
                     }
-                    if is_binary_property_value(v) && !legacy_node_layout() {
+                    if is_binary_property_value(v) && !legacy {
                         binary.insert(k.clone(), v.clone());
                     } else {
                         overflow.insert(k, v);
@@ -859,7 +936,7 @@ fn build_node_record_batch(
     }
     columns.push(Arc::new(overflow_b.finish()));
     columns.push(Arc::new(schema_version_b.finish()));
-    if !legacy_node_layout() {
+    if !legacy {
         columns.push(Arc::new(binary_b.finish()));
     }
 
@@ -1017,7 +1094,7 @@ fn prepare_node_pending(
     }
     let mut locator_records = crate::sst::paged_index::NodeLocatorRecordBuilder::new();
     for row in rows {
-        let record = encode_exact_node_record(row)?;
+        let record = encode_exact_node_record(row, None)?;
         locator_records.push(&row.id, &record)?;
     }
     let (mut node_locator, locator_sidecar) =
@@ -3784,25 +3861,42 @@ mod tests {
             lsn: 99,
             op: MemOp::Upsert(payload.clone()),
         };
-        let encoded = encode_exact_node_record(&row).unwrap();
-        assert!(
-            encoded.len() < payload.len(),
-            "a 1024d JSON vector should use the per-record zstd representation"
+        let encoded = encode_exact_node_record(&row, None).unwrap();
+        assert_eq!(encoded[0], NODE_RECORD_BINARY_ZSTD);
+        // The binary record is about the size of the raw floats, not of
+        // their JSON text.
+        assert!(encoded.len() < 4 * 1024 + 256, "{} bytes", encoded.len());
+        assert_eq!(
+            decode_exact_node_record(&encoded).unwrap(),
+            (99, Some(record.clone()))
         );
-        let (lsn, op) = decode_exact_node_record(&encoded).unwrap();
-        assert_eq!(lsn, 99);
-        assert_eq!(op, MemOp::Upsert(payload));
+        assert_eq!(
+            encode_exact_node_record(&row, Some(&record)).unwrap(),
+            encoded
+        );
+
+        // 2.x stored the JSON payload; it still decodes.
+        for (tag, body) in [
+            (NODE_RECORD_RAW, payload.to_vec()),
+            (NODE_RECORD_ZSTD, zstd::bulk::compress(&payload, 1).unwrap()),
+        ] {
+            let mut legacy = vec![tag];
+            legacy.extend_from_slice(&99_u64.to_le_bytes());
+            legacy.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            legacy.extend_from_slice(&body);
+            assert_eq!(
+                decode_exact_node_record(&legacy).unwrap(),
+                (99, Some(record.clone()))
+            );
+        }
 
         let tombstone = NodeRow {
             id: *sorted_node_id(2).as_bytes(),
             lsn: 100,
             op: MemOp::Tombstone,
         };
-        let encoded = encode_exact_node_record(&tombstone).unwrap();
-        assert_eq!(
-            decode_exact_node_record(&encoded).unwrap(),
-            (100, MemOp::Tombstone)
-        );
+        let encoded = encode_exact_node_record(&tombstone, None).unwrap();
+        assert_eq!(decode_exact_node_record(&encoded).unwrap(), (100, None));
     }
 
     #[test]

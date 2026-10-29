@@ -242,7 +242,7 @@ pub fn encode_binary_properties(properties: BTreeMap<String, Value>) -> Result<V
 }
 
 /// Decode one [`BINARY_PROPS`] cell.
-fn decode_binary_properties(bytes: &[u8]) -> Result<BTreeMap<String, Value>> {
+pub(crate) fn decode_binary_properties(bytes: &[u8]) -> Result<BTreeMap<String, Value>> {
     match property_pages::decode_canonical_value(bytes)? {
         Value::Map(map) => Ok(map),
         _ => Err(Error::Corrupted {

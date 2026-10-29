@@ -4665,18 +4665,19 @@ impl<'mt> Snapshot<'mt> {
                             let decoded = records
                                 .into_iter()
                                 .map(|(id_bytes, encoded)| {
-                                    let (lsn, op) = decode_exact_node_record(&encoded)?;
+                                    let (lsn, record) = decode_exact_node_record(&encoded)?;
                                     let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
-                                    let view = match op {
-                                        MemOp::Tombstone => None,
-                                        MemOp::Upsert(payload) => Some(node_view_from_payload(
-                                            id,
-                                            lsn,
-                                            &payload,
+                                    let view = record.map(|record| NodeView {
+                                        id,
+                                        labels: labels_from_ids(
+                                            &record.labels,
                                             &self.manifest.manifest.label_dict,
                                             &desc.scope,
-                                        )?),
-                                    };
+                                        ),
+                                        properties: record.properties,
+                                        lsn,
+                                        schema_version: record.schema_version,
+                                    });
                                     Ok((id_bytes, lsn, view))
                                 })
                                 .collect::<Result<Vec<_>>>();
@@ -16381,6 +16382,12 @@ mod tests {
                         );
                         let point = snap.lookup_node("Device", *id).await.unwrap().unwrap();
                         assert_eq!(point.properties, whole, "ranged={ranged}");
+                    }
+                    // A batched lookup resolves through the exact records.
+                    let ids: Vec<NodeId> = expected.iter().map(|(id, _, _)| *id).collect();
+                    let batched = snap.batch_lookup_nodes("Device", &ids).await.unwrap();
+                    for (view, row) in batched.iter().zip(&full) {
+                        assert_eq!(view.as_ref(), Some(row), "ranged={ranged}");
                     }
                 }
             }

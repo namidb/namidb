@@ -2896,7 +2896,7 @@ fn build_node_access_sidecars_from_source(
     let mut ordinal = 0_u64;
     while cursor.peek().is_some() {
         let (row, record) = cursor.materialize_current(label_def)?;
-        let exact_record = encode_exact_node_record(&row)?;
+        let exact_record = encode_exact_node_record(&row, record.as_ref())?;
         locator.push(&row.id, &exact_record)?;
         match record {
             Some(record) => properties.push_sorted(row.id, ordinal, &record.properties)?,
@@ -3183,7 +3183,7 @@ fn merge_node_sources(
             last_id = Some(entry.id);
             let (row, rec) = cursor.materialize_current(label_def)?;
             if !(gc_tombstones && matches!(row.op, MemOp::Tombstone)) {
-                let exact_record = encode_exact_node_record(&row)?;
+                let exact_record = encode_exact_node_record(&row, rec.as_ref())?;
                 node_locator_records.push(&row.id, &exact_record)?;
                 if let Some(rec) = &rec {
                     unique.observe(row.id, rec)?;
