@@ -767,28 +767,31 @@ async fn unlabelled_seed_pull_stops_early_on_overlapping_ssts() {
 }
 
 /// When the seeds rarely expand, the rounds of the seed pull grow to the
-/// store size. An unlabelled, unfiltered scan over overlapping SSTs only has
-/// the merge, which reads the winners' rows by ordinal from the SST that
-/// holds them, so its rounds keep growing like on disjoint SSTs. A labelled
-/// or filtered one can also take routes that redo their whole prefix every
-/// round (the label postings, the numeric range index, a merge that falls
-/// back), so past 4,096 seeds its last round is one full scan. The rows are
-/// the same either way.
+/// store size. Each round resumes after the last seed of the one before, on
+/// disjoint SSTs, through the merge of overlapping ones, and for a labelled
+/// or filtered scan alike, so the rounds return every seed once and decode
+/// about one pass over the nodes. They used to restart from the first id,
+/// returning 64 + 256 + 1,024 + 4,096 seeds again before the last round.
 #[tokio::test]
-async fn overlapping_seed_pull_rounds_when_seeds_rarely_expand() {
+async fn seed_pull_rounds_resume_when_seeds_rarely_expand() {
+    // Small row groups, so a resumed round can skip the ones before it.
+    std::env::set_var("NAMIDB_NODE_SST_ROW_GROUP_ROWS", "256");
     const N: usize = 6000;
-    for (query, name, rounds, seeds) in [
+    for (query, name, overlap) in [
         (
             "MATCH (a)-[:RARE]->(b) RETURN a.v AS v, b.v AS w LIMIT 10",
             "lp-overlap-rare",
-            5,
-            64 + 256 + 1024 + 4096 + N,
+            true,
         ),
         (
             "MATCH (a:A)-[:RARE]->(b) WHERE a.v >= 0 RETURN a.v AS v, b.v AS w LIMIT 10",
             "lp-overlap-rare-filtered",
-            4,
-            64 + 256 + 1024 + 4096,
+            true,
+        ),
+        (
+            "MATCH (a)-[:RARE]->(b) RETURN a.v AS v, b.v AS w LIMIT 10",
+            "lp-disjoint-rare",
+            false,
         ),
     ] {
         let sst_cache = SstCache::new(64 * 1024 * 1024);
@@ -808,18 +811,24 @@ async fn overlapping_seed_pull_rounds_when_seeds_rarely_expand() {
             .unwrap();
         writer.commit_batch().await.unwrap();
         writer.flush(Schema::empty()).await.unwrap();
-        // A second SST spanning the first one's id range makes them overlap.
-        for i in [0, N / 2, N - 1] {
-            writer
-                .upsert_node("A", ids[i], &node_with("v", 10_000 + i as i64))
-                .unwrap();
+        let mut target = (N - 1) as i64;
+        if overlap {
+            // A second SST spanning the first one's id range makes them
+            // overlap.
+            for i in [0, N / 2, N - 1] {
+                writer
+                    .upsert_node("A", ids[i], &node_with("v", 10_000 + i as i64))
+                    .unwrap();
+            }
+            writer.commit_batch().await.unwrap();
+            writer.flush(Schema::empty()).await.unwrap();
+            target += 10_000;
         }
-        writer.commit_batch().await.unwrap();
-        writer.flush(Schema::empty()).await.unwrap();
 
         let snapshot = writer.snapshot();
-        assert!(!snapshot.node_scan_is_disjoint());
+        assert_eq!(snapshot.node_scan_is_disjoint(), !overlap);
         let output = sst_cache.limited_node_scan_output_rows();
+        let decoded = sst_cache.limited_node_scan_decoded_rows();
         let fast_paths = sst_cache.limited_node_scan_fast_paths();
         let fallbacks = sst_cache.limited_node_scan_fallbacks();
         // Pushdown moves the filter into the scan, as the planner does.
@@ -827,31 +836,26 @@ async fn overlapping_seed_pull_rounds_when_seeds_rarely_expand() {
         let rows = execute_flat_path(&plan, &snapshot, &Params::new())
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1, "{query}");
+        assert_eq!(rows.len(), 1, "{name}");
         assert_eq!(
             rows[0].get("v"),
             Some(&RuntimeValue::Integer((N - 2) as i64))
         );
-        assert_eq!(
-            rows[0].get("w"),
-            Some(&RuntimeValue::Integer(10_000 + (N - 1) as i64))
-        );
-        // Rounds of 64, 256, 1,024 and 4,096, then either one more limited
-        // round over every node or one full scan.
+        assert_eq!(rows[0].get("w"), Some(&RuntimeValue::Integer(target)));
+        // Rounds of 64, 192, 768 and 3,072 more seeds, then the rest.
         assert_eq!(
             sst_cache.limited_node_scan_fast_paths() - fast_paths,
-            rounds,
-            "{query}"
+            5,
+            "{name}"
         );
-        assert_eq!(
-            sst_cache.limited_node_scan_fallbacks(),
-            fallbacks,
-            "{query}"
-        );
+        assert_eq!(sst_cache.limited_node_scan_fallbacks(), fallbacks, "{name}");
         assert_eq!(
             sst_cache.limited_node_scan_output_rows() - output,
-            seeds as u64,
-            "{query}"
+            N as u64,
+            "{name}"
         );
+        // One pass, plus at most the row group each round starts in.
+        let decoded = sst_cache.limited_node_scan_decoded_rows() - decoded;
+        assert!(decoded < (N + N / 4) as u64, "{name}: decoded {decoded}");
     }
 }

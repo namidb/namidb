@@ -27,7 +27,7 @@ use uuid::Uuid;
 use namidb_core::{LabelDef, LabelId, NodeId};
 
 use super::{
-    decode_node_labels, decode_node_row_properties, node_scan_limited_async,
+    decode_node_labels, decode_node_row_properties, node_scan_after_async, node_scan_limited_async,
     node_sst_can_contain_label, node_view_from_payload, node_view_matches_predicates,
     row_carries_label, LabelScanRow, NodePropertyPageReader, NodeView, RangedMode, Snapshot,
 };
@@ -74,7 +74,9 @@ impl Snapshot<'_> {
     }
 
     /// The first `limit` live nodes (optionally in `label`, matching every
-    /// predicate) in id order, without reading the rest of the store.
+    /// predicate) in id order, without reading the rest of the store. With
+    /// `after`, only ids above it, and each SST starts at the row group that
+    /// holds the first of them.
     ///
     /// `None` leaves the caller on the full reconciliation: the full-body
     /// diagnostic mode, a failed property page probe, or an SST whose rows
@@ -85,6 +87,7 @@ impl Snapshot<'_> {
         predicates: &[ScanPredicate],
         projection: Option<&[String]>,
         limit: usize,
+        after: Option<NodeId>,
     ) -> Result<Option<Vec<NodeView>>> {
         if matches!(self.ranged_mode, RangedMode::Force(false)) {
             return Ok(None);
@@ -107,7 +110,9 @@ impl Snapshot<'_> {
             let MemKey::Node { id } = key else {
                 continue;
             };
-            if memtable.get(id).is_some_and(|(lsn, _)| *lsn >= entry.lsn) {
+            if after.is_some_and(|after| *id <= after)
+                || memtable.get(id).is_some_and(|(lsn, _)| *lsn >= entry.lsn)
+            {
                 continue;
             }
             let payload = match &entry.op {
@@ -136,7 +141,7 @@ impl Snapshot<'_> {
             } else {
                 &predicate_columns
             };
-            let (stream, _) = node_scan_limited_async(
+            let (stream, _) = node_scan_after_async(
                 self.store.clone(),
                 Path::from(absolute),
                 desc.size_bytes,
@@ -144,17 +149,18 @@ impl Snapshot<'_> {
                 &[],
                 Some(columns),
                 Some(metadata),
+                after.map(|id| *id.as_bytes()),
             )
             .await?;
             cursors.push((
                 idx,
                 SstCursor {
+                    ordinal: stream.skipped_rows(),
                     stream,
                     label_def,
                     pages,
                     batches: Vec::new(),
                     rows: VecDeque::new(),
-                    ordinal: 0,
                     last: None,
                     done: false,
                 },
@@ -238,6 +244,9 @@ impl Snapshot<'_> {
                                 return Ok(None);
                             }
                             cursor.last = Some(id);
+                            if after.is_some_and(|after| id <= after) {
+                                continue;
+                            }
                             let keep = match &paged {
                                 Some(paged) => paged[row],
                                 None => {
