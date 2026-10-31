@@ -90,22 +90,13 @@ pub async fn copy_namespace_snapshot(
     overwrite: bool,
     verify: bool,
 ) -> Result<SnapshotCopyReport> {
-    // Refuse to stomp a live destination unless explicitly told to. A live
-    // namespace is identified by its pointer: the Create-only family
-    // (`manifest/pointer/p<N>.json`, RFC-029) for current namespaces, or the
-    // legacy `manifest/current.json` for ones bootstrapped before it.
-    if !overwrite {
-        let has_family = {
-            let mut s = dst_store.list(Some(&dst_paths.pointer_dir()));
-            s.try_next().await.map_err(Error::ObjectStore)?.is_some()
-        };
-        let has_legacy = dst_store.head(&dst_paths.current_pointer()).await.is_ok();
-        if has_family || has_legacy {
-            return Err(Error::precondition(format!(
-                "destination namespace '{}' already has a manifest pointer — pass overwrite/--force to replace it",
-                dst_paths.namespace()
-            )));
-        }
+    // Refuse to stomp a live destination (one with a manifest pointer, see
+    // [`has_manifest_pointer`]) unless explicitly told to.
+    if !overwrite && has_manifest_pointer(&dst_store, &dst_paths).await? {
+        return Err(Error::precondition(format!(
+            "destination namespace '{}' already has a manifest pointer — pass overwrite/--force to replace it",
+            dst_paths.namespace()
+        )));
     }
 
     // Pin the manifest version to copy.
@@ -150,6 +141,21 @@ pub async fn copy_namespace_snapshot(
         debug!(error = %e, "failed to release the backup retention pin");
     }
     result
+}
+
+/// Whether the namespace at `(store, paths)` has a manifest pointer, i.e.
+/// exists: the Create-only family (`manifest/pointer/p<N>.json`, RFC-029) for
+/// current namespaces, or the legacy `manifest/current.json` for ones
+/// bootstrapped before it. A best-effort probe, not a lock.
+pub async fn has_manifest_pointer(
+    store: &Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+) -> Result<bool> {
+    let has_family = {
+        let mut s = store.list(Some(&paths.pointer_dir()));
+        s.try_next().await.map_err(Error::ObjectStore)?.is_some()
+    };
+    Ok(has_family || store.head(&paths.current_pointer()).await.is_ok())
 }
 
 /// The copy body, run while `pin` holds the source's retention horizon. The

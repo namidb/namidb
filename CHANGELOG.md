@@ -15,6 +15,25 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /:namespace/v0/admin/restore` for `--multi-tenant` servers.**
+  Restores a backup into a namespace that does not exist yet, through the
+  server's own store. Until now a multi-tenant server on S3 had no working
+  restore: it keeps namespaces at the bucket root, and `namidb restore`
+  resolves every `s3://` URI under `<prefix or tenants>/<ns>/`. The body is
+  `{"from": uri, "version"?: u64, "verify"?: bool}` and the response
+  `{source_version, objects_copied, bytes_copied}`, like admin backup. It
+  needs a read-write token and `--backup-target-uri`, which `from` must sit
+  inside, and it shares the backup single-flight. There is no fencing, so
+  the target must be fresh: 409 when it is open or being opened, is already
+  being restored, or has a manifest pointer. While the copy runs, requests
+  that would open the target get a 503. A missing source or version is a
+  404. The unprefixed `/v0/admin/restore` resolves the namespace from
+  `X-NamiDB-Namespace` or `--default-namespace`. Single-tenant servers have
+  no restore route. A busy multi-tenant admin backup now says "another
+  backup or restore is already running".
+
 ### Fixed
 
 - **Numeric keys are indexed when the constraint or index is declared

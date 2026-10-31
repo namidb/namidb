@@ -165,6 +165,7 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush; remains available and globally serialized under RSS pressure |
 | `POST` | `/v0/admin/compact` | bearer | Drain L0 completely and block until done; outside the request timeout, single-flighted on its own permit. Run it after a bulk load |
 | `POST` | `/v0/admin/backup` | bearer (read-write) | Copy a point-in-time snapshot of the namespace to an allowlisted destination (disabled unless `--backup-target-uri` is set; multi-tenant: `/:namespace/v0/admin/backup`) |
+| `POST` | `/:namespace/v0/admin/restore` | bearer (read-write) | `--multi-tenant` only: copy an allowlisted backup into a namespace that does not exist yet (disabled unless `--backup-target-uri` is set; unprefixed `/v0/admin/restore` resolves the namespace like the other routes) |
 
 ### `POST /v0/admin/backup`
 
@@ -191,9 +192,58 @@ disabled (403) until the operator sets `--backup-target-uri` /
 multi-tenant mode, where `/:namespace/v0/admin/backup` resolves the
 namespace's committed state without opening it (cold namespaces stay
 cold) and namespace-scoped tokens are enforced by the auth middleware —
-with waiters getting a 503 after 30 s. Restore stays CLI-only on
-purpose: it requires an offline destination, and the serving process
-*is* the writer.
+with waiters getting a 503 after 30 s. A single-tenant server has no
+restore endpoint: its one namespace is always open, the serving process
+*is* the writer, and a restore needs an offline destination. Use
+`namidb restore` with the server stopped.
+
+Status codes: 403 for a read-only token, for a disabled endpoint, or for
+`to` outside the allowlist; 400 for an invalid `to` (or, multi-tenant, an
+invalid namespace name); 409 when the destination already has a pointer
+and `force` is unset, when the pinned version was reclaimed mid-copy, or
+when `verify` finds a mismatch; 503 when another backup or restore holds
+the permit for more than 30 s; 507/500 for other failures.
+
+### `POST /:namespace/v0/admin/restore` (multi-tenant)
+
+Copies a backup into `:namespace`, which must not exist yet. A
+multi-tenant server keeps every namespace at the root of its store,
+which no `s3://` URI can address (`parse_uri` falls back to the
+`tenants/` prefix), so `namidb restore` cannot write where the server
+reads. This endpoint writes the copy through the server's own store.
+
+```json
+{ "from": "s3://backups-bucket/namidb/nightly?ns=prod", "verify": true }
+```
+
+Optional fields: `version` (restore an older manifest version of the
+backup; a backup made by `admin/backup` holds version `0` only) and
+`verify`. Returns `{"source_version", "objects_copied",
+"bytes_copied"}`. The unprefixed `/v0/admin/restore` targets the
+`X-NamiDB-Namespace` header or `--default-namespace`, and
+namespace-scoped tokens are enforced like on every other route.
+
+**Fresh namespaces only, no fencing.** The restore refuses with 409 when
+the target is open on this server, is still being opened or evicted, is
+already being restored, or has a manifest pointer in the store. There is
+no `force`. While the copy runs, every request that would open the
+target is refused as temporarily unavailable (HTTP 503, a Bolt failure),
+so nothing can bootstrap an empty namespace under the copy. The pointer is written last, so a failed
+or interrupted restore leaves the target without a pointer and can simply
+be retried. Restoring over an existing namespace means deleting its
+objects first, out of band, with no server holding it open.
+
+`from` must sit inside the same `--backup-target-uri` allowlist as backup
+destinations, and restores share the backup single-flight (one copy per
+process at a time).
+
+Status codes: 403 for a read-only token, for a disabled endpoint, or for
+`from` outside the allowlist; 400 for an invalid `from` or namespace
+name; 404 when `from` holds no backup (or not the requested `version`);
+409 as above, and also when the source version was reclaimed mid-copy
+or `verify` finds a mismatch; 503 when another backup or restore holds
+the permit for more than 30 s; 507/500 for other failures. On a
+single-tenant server the route does not exist (404).
 
 ### `POST /v0/cypher`
 

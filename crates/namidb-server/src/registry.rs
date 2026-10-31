@@ -10,7 +10,7 @@
 //! sweep). The registry lazily creates sessions on first access and evicts
 //! idle namespaces under a cap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +96,11 @@ pub struct NamespaceRegistry {
     /// Evicted incarnations that are not quiesced yet. A reopen of the same
     /// namespace drains its previous incarnation before claiming the epoch.
     draining: std::sync::Mutex<HashMap<String, Arc<NamespaceState>>>,
+    /// Namespaces an admin restore is copying into. While a name is here no
+    /// slot can be inserted for it, so nothing opens (and bootstraps) the
+    /// namespace under the copy. Entries are owned by [`RestoreGuard`]s;
+    /// checked and inserted under the `sessions` write lock.
+    restoring: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Maximum number of concurrent namespaces. `0` means unlimited (no cap,
     /// no eviction). Otherwise, when the cap is reached, idle sessions are
     /// evicted oldest-first.
@@ -136,6 +141,7 @@ impl NamespaceRegistry {
             root,
             sessions: RwLock::new(HashMap::new()),
             draining: std::sync::Mutex::new(HashMap::new()),
+            restoring: Arc::new(std::sync::Mutex::new(HashSet::new())),
             max_namespaces,
             idle_timeout,
             anchor: Instant::now(),
@@ -169,6 +175,60 @@ impl NamespaceRegistry {
             self.store.clone(),
             NamespacePaths::new(self.root.clone(), ns_id),
         ))
+    }
+
+    /// Reserve `namespace` as the target of an admin restore. Refuses while
+    /// the namespace is open, being opened, draining a previous incarnation,
+    /// or already being restored: there is no fencing against a live writer,
+    /// so a restore only ever copies into a namespace nothing holds. The
+    /// returned guard keeps every open of the namespace failing with
+    /// [`RegistryError::Unavailable`] until it is dropped.
+    ///
+    /// The destination's durable state is not checked here: the copy itself
+    /// refuses a destination that already has a manifest pointer.
+    pub(crate) async fn begin_restore(
+        &self,
+        namespace: &str,
+    ) -> Result<RestoreGuard, RestoreRefusal> {
+        let ns_id = NamespaceId::new(namespace)
+            .map_err(|e| RestoreRefusal::InvalidNamespace(e.to_string()))?;
+        // The write lock orders this against `insert_slot`, which checks
+        // `restoring` under the same lock.
+        let mut sessions = self.sessions.write().await;
+        // A slot whose opener was cancelled holds no state and nobody waits
+        // on it (the map has the only reference); it must not block a restore
+        // forever when the registry has no cap to evict it.
+        if sessions
+            .get(namespace)
+            .is_some_and(|slot| !slot.initialized() && Arc::strong_count(slot) == 1)
+        {
+            sessions.remove(namespace);
+        }
+        let draining = self
+            .draining
+            .lock()
+            .expect("draining map poisoned")
+            .contains_key(namespace);
+        if sessions.contains_key(namespace) || draining {
+            return Err(RestoreRefusal::InUse(format!(
+                "namespace `{namespace}` is open on this server; restore only targets a \
+                 namespace that does not exist yet"
+            )));
+        }
+        let mut restoring = self.restoring.lock().expect("restoring set poisoned");
+        if !restoring.insert(namespace.to_string()) {
+            return Err(RestoreRefusal::InUse(format!(
+                "namespace `{namespace}` is already being restored"
+            )));
+        }
+        drop(restoring);
+        drop(sessions);
+        Ok(RestoreGuard {
+            restoring: Arc::clone(&self.restoring),
+            namespace: namespace.to_string(),
+            store: self.store.clone(),
+            paths: NamespacePaths::new(self.root.clone(), ns_id),
+        })
     }
 
     /// Return an already-open namespace without recovering or allocating a
@@ -223,6 +283,19 @@ impl NamespaceRegistry {
             let mut sessions = self.sessions.write().await;
             match sessions.get(namespace) {
                 Some(slot) => Ok(Arc::clone(slot)),
+                // An admin restore is copying into this namespace; opening it
+                // now would bootstrap an empty manifest under the copy.
+                None if self
+                    .restoring
+                    .lock()
+                    .expect("restoring set poisoned")
+                    .contains(namespace) =>
+                {
+                    Err(RegistryError::Unavailable(format!(
+                        "namespace `{namespace}` is being restored; retry when the restore \
+                         finishes"
+                    )))
+                }
                 None => {
                     let mut inserted = Ok(());
                     // Evict if at capacity (0 = unlimited, never evicts).
@@ -779,6 +852,38 @@ impl NamespaceState {
     }
 }
 
+/// Reservation of a namespace as an admin restore target, from
+/// [`NamespaceRegistry::begin_restore`]. Carries the registry's store and the
+/// namespace's paths (the copy destination); dropping it lets the namespace
+/// open again.
+pub(crate) struct RestoreGuard {
+    restoring: Arc<std::sync::Mutex<HashSet<String>>>,
+    namespace: String,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) paths: NamespacePaths,
+}
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        // Never panic in drop: a poisoned set still holds valid data.
+        let mut restoring = self
+            .restoring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        restoring.remove(&self.namespace);
+    }
+}
+
+/// Why [`NamespaceRegistry::begin_restore`] refused a target.
+#[derive(Debug)]
+pub(crate) enum RestoreRefusal {
+    /// The namespace name is invalid (400).
+    InvalidNamespace(String),
+    /// The namespace is open, opening, draining or already being restored
+    /// (409).
+    InUse(String),
+}
+
 /// Errors from namespace registry operations.
 #[derive(Debug, Clone)]
 pub enum RegistryError {
@@ -1281,5 +1386,72 @@ mod tests {
             "one namespace must get exactly one writer"
         );
         assert_eq!(reg.len().await, 3);
+    }
+
+    /// An admin restore reserves its target: nothing opens the namespace
+    /// while the guard lives, the reservation is exclusive, an open (or
+    /// opening) namespace cannot be reserved, and dropping the guard lets the
+    /// namespace open normally.
+    #[tokio::test]
+    async fn restore_guard_blocks_opens_until_dropped() {
+        let (store, _) = namidb_storage::parse_uri("memory://restore-guard").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let reg = NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics,
+            MaintenanceConfig::default(),
+        );
+
+        let guard = reg.begin_restore("fresh").await.expect("fresh target");
+        assert_eq!(guard.paths.namespace().as_str(), "fresh");
+        assert!(matches!(
+            reg.get_or_open("fresh").await,
+            Err(RegistryError::Unavailable(_))
+        ));
+        assert!(matches!(
+            reg.begin_restore("fresh").await,
+            Err(RestoreRefusal::InUse(_))
+        ));
+        // Other namespaces are unaffected.
+        reg.get_or_open("other").await.expect("other");
+        drop(guard);
+        reg.get_or_open("fresh").await.expect("open after restore");
+
+        assert!(matches!(
+            reg.begin_restore("fresh").await,
+            Err(RestoreRefusal::InUse(_))
+        ));
+        assert!(matches!(
+            reg.begin_restore("bad/name").await,
+            Err(RestoreRefusal::InvalidNamespace(_))
+        ));
+        assert_eq!(reg.len().await, 2);
+    }
+
+    /// A slot left by a cancelled opener holds no state; it must not block a
+    /// restore (an uncapped registry never evicts it).
+    #[tokio::test]
+    async fn restore_reclaims_a_cancelled_open_slot() {
+        let (store, _) = namidb_storage::parse_uri("memory://restore-cancelled").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let reg = NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics,
+            MaintenanceConfig::default(),
+        );
+        drop(reg.insert_slot("abandoned").await.expect("slot"));
+        assert!(reg.sessions.read().await.contains_key("abandoned"));
+        let guard = reg
+            .begin_restore("abandoned")
+            .await
+            .expect("an abandoned slot is not an open namespace");
+        assert!(!reg.sessions.read().await.contains_key("abandoned"));
+        drop(guard);
     }
 }
