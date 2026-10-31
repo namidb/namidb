@@ -117,6 +117,17 @@ pub struct PropertyDef {
     /// Defaults to `false`; the wire repr carries `#[serde(default)]` so
     /// existing manifests load unchanged.
     pub indexed: bool,
+    /// When `true`, `data_type` is a placeholder: the property was declared
+    /// by DDL (`CREATE CONSTRAINT` / `CREATE INDEX`) before any value existed
+    /// to infer a type from. The engine is schemaless, so the real type is
+    /// resolved from the first live value the next flush sees, and the flag
+    /// is cleared. Until then a pending declaration must not be read as a
+    /// String declaration: it neither wins the equality-sidecar text
+    /// tie-break nor admits the ordered string-prefix walk.
+    ///
+    /// Defaults to `false` and is omitted from the wire when `false`, so
+    /// existing manifests round-trip byte-identically.
+    pub type_pending: bool,
 }
 
 /// Wire-level representation used only by serde. The public type validates
@@ -131,6 +142,8 @@ struct PropertyDefRepr {
     unique: bool,
     #[serde(default)]
     indexed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    type_pending: bool,
 }
 
 impl TryFrom<PropertyDefRepr> for PropertyDef {
@@ -139,6 +152,7 @@ impl TryFrom<PropertyDefRepr> for PropertyDef {
         let mut p = PropertyDef::new(r.name, r.data_type, r.nullable)?;
         p.unique = r.unique;
         p.indexed = r.indexed;
+        p.type_pending = r.type_pending;
         Ok(p)
     }
 }
@@ -151,6 +165,7 @@ impl From<PropertyDef> for PropertyDefRepr {
             nullable: p.nullable,
             unique: p.unique,
             indexed: p.indexed,
+            type_pending: p.type_pending,
         }
     }
 }
@@ -183,6 +198,7 @@ impl PropertyDef {
             nullable,
             unique: false,
             indexed: false,
+            type_pending: false,
         })
     }
 
@@ -205,6 +221,13 @@ impl PropertyDef {
     /// ```
     pub fn with_indexed(mut self, indexed: bool) -> Self {
         self.indexed = indexed;
+        self
+    }
+
+    /// Builder method: mark `data_type` as a placeholder awaiting the first
+    /// live value (see [`PropertyDef::type_pending`]).
+    pub fn with_type_pending(mut self, pending: bool) -> Self {
+        self.type_pending = pending;
         self
     }
 
@@ -612,6 +635,29 @@ mod tests {
         let serialized = serde_json::to_string(&schema).unwrap();
         let round: Schema = serde_json::from_str(&serialized).unwrap();
         assert_eq!(schema, round);
+    }
+
+    #[test]
+    fn type_pending_round_trips_and_is_omitted_when_false() {
+        // Manifests written before the flag existed (and every concrete
+        // declaration) must keep their exact wire form.
+        let concrete = PropertyDef::new("id", DataType::Int64, true).unwrap();
+        let json = serde_json::to_string(&concrete).unwrap();
+        assert!(!json.contains("type_pending"), "{json}");
+        let legacy: PropertyDef = serde_json::from_str(
+            r#"{"name":"id","data_type":"Utf8","nullable":true,"unique":true}"#,
+        )
+        .unwrap();
+        assert!(!legacy.type_pending);
+
+        let pending = PropertyDef::new("id", DataType::Utf8, true)
+            .unwrap()
+            .with_unique(true)
+            .with_type_pending(true);
+        let json = serde_json::to_string(&pending).unwrap();
+        let round: PropertyDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(pending, round);
+        assert!(round.type_pending);
     }
 
     #[test]

@@ -465,3 +465,209 @@ async fn a_compaction_pass_backfills_numeric_postings_onto_existing_ssts() {
     let post = run(&writer, "MATCH (t:T {num: 5}) RETURN t.txt AS txt").await;
     assert_eq!(post, pre, "the backfilled route must agree with the scan");
 }
+
+fn declared(writer: &WriterSession, label: &str, property: &str) -> namidb_core::PropertyDef {
+    writer
+        .snapshot()
+        .manifest()
+        .manifest
+        .schema
+        .label(label)
+        .and_then(|def| def.properties.iter().find(|p| p.name == property))
+        .cloned()
+        .unwrap_or_else(|| panic!("{label}.{property} must be declared"))
+}
+
+/// The "schema first, then load" order: DDL runs on an EMPTY label, so there
+/// is no live value to infer a type from. The declaration used to commit a
+/// concrete `Utf8` placeholder, which then read as a String declaration
+/// forever — the harvester filed no numeric key, `numeric_complete` stayed
+/// false, and every numeric equality took the label scan through any number
+/// of flushes and compactions. The placeholder must instead stay pending and
+/// resolve from the first flushed value.
+#[tokio::test]
+async fn ddl_before_any_data_still_indexes_numeric_values() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("numeric-eq-ddl-first").unwrap());
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+
+    writer.create_property_index("T", "num").await.unwrap();
+    writer.create_unique_constraint("T", "fnum").await.unwrap();
+    for property in ["num", "fnum"] {
+        let def = declared(&writer, "T", property);
+        assert!(
+            def.type_pending,
+            "T.{property}: DDL on an empty label has no type to infer: {def:?}"
+        );
+    }
+
+    for ordinal in 0..ROWS {
+        writer
+            .upsert_node(
+                "T",
+                NodeId::new(),
+                &thing(ordinal, ordinal as f64 + 0.5, &ordinal.to_string()),
+            )
+            .unwrap();
+    }
+    writer
+        .upsert_node("T", NodeId::new(), &thing(5, 5.0, "five-integral"))
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+
+    let num = declared(&writer, "T", "num");
+    assert_eq!(
+        (num.data_type.clone(), num.type_pending),
+        (namidb_core::DataType::Int64, false),
+        "the flush must resolve T.num from its first value: {num:?}"
+    );
+    let fnum = declared(&writer, "T", "fnum");
+    assert_eq!(
+        (fnum.data_type.clone(), fnum.type_pending, fnum.unique),
+        (namidb_core::DataType::Float64, false, true),
+        "T.fnum: {fnum:?}"
+    );
+    assert_native_route(&writer, "ddl-first/flushed").await;
+    assert_plans_as_index_lookup(&writer, "MATCH (t:T {num: 5}) RETURN t.txt AS txt");
+
+    let resolved = writer.snapshot().manifest().manifest.schema.clone();
+    writer.compact_l0(&resolved).await.unwrap();
+    assert_native_route(&writer, "ddl-first/compacted").await;
+    let five = run(&writer, "MATCH (t:T {fnum: 5.5}) RETURN t.num AS num").await;
+    assert_eq!(five, vec!["num=5".to_string()]);
+}
+
+/// A pending declaration is not a String declaration. `union_indexed_props`
+/// lets a String declaration win a same-named property on purpose; a
+/// placeholder on a label that has no rows yet must not take that path, or
+/// declaring `CREATE INDEX FOR (n:Other) ON (n.num)` before loading `:Other`
+/// silently disables numeric postings for `:T.num` as well.
+#[tokio::test]
+async fn a_pending_declaration_does_not_downgrade_a_same_named_numeric_index() {
+    let mut writer = corpus("numeric-eq-pending-collision").await;
+    assert!(!declared(&writer, "T", "num").type_pending);
+
+    writer.create_property_index("Other", "num").await.unwrap();
+    assert!(declared(&writer, "Other", "num").type_pending);
+
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema.clone()).await.unwrap();
+    assert!(
+        declared(&writer, "Other", "num").type_pending,
+        "no :Other row was flushed, so its type stays pending"
+    );
+    assert_native_route(&writer, "pending-collision/flushed").await;
+
+    writer.compact_l0(&schema).await.unwrap();
+    assert_native_route(&writer, "pending-collision/compacted").await;
+    assert_all_agree(&writer, "pending-collision").await;
+}
+
+/// A rolled-back write must not decide a placeholder's type, and a value
+/// written before a restart must still resolve it after the reopen (those
+/// rows reach the new session through WAL replay, not the staging path).
+#[tokio::test]
+async fn pending_types_ignore_rolled_back_writes_and_survive_a_reopen() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new(
+        "tenants",
+        NamespaceId::new("numeric-eq-pending-wal").unwrap(),
+    );
+    let mut writer = WriterSession::open(store.clone(), paths.clone())
+        .await
+        .unwrap();
+    writer.create_unique_constraint("T", "num").await.unwrap();
+    writer.create_unique_constraint("U", "num").await.unwrap();
+
+    // :T — a string that never becomes durable, then integers.
+    let mut aborted = thing(1, 1.5, "aborted");
+    aborted
+        .properties
+        .insert("num".to_string(), CoreValue::Str("not-a-number".into()));
+    writer.upsert_node("T", NodeId::new(), &aborted).unwrap();
+    writer.discard_batch();
+    for ordinal in 0..ROWS {
+        writer
+            .upsert_node(
+                "T",
+                NodeId::new(),
+                &thing(ordinal, ordinal as f64 + 0.5, &ordinal.to_string()),
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+    let num = declared(&writer, "T", "num");
+    assert_eq!(
+        (num.data_type.clone(), num.type_pending),
+        (namidb_core::DataType::Int64, false),
+        "the discarded string must not decide T.num: {num:?}"
+    );
+
+    // :U — integers committed, then a restart before any flush.
+    for ordinal in 0..50_i64 {
+        writer
+            .upsert_node("U", NodeId::new(), &thing(ordinal, 0.5, "u"))
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    drop(writer);
+
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+    assert!(declared(&writer, "U", "num").type_pending);
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+    let num = declared(&writer, "U", "num");
+    assert_eq!(
+        (num.data_type.clone(), num.type_pending),
+        (namidb_core::DataType::Int64, false),
+        "the replayed rows must resolve U.num: {num:?}"
+    );
+    let (covered, total) = writer
+        .snapshot()
+        .numeric_property_index_coverage("U", "num");
+    assert!(total > 0 && covered == total, "{covered}/{total}");
+}
+
+/// Rows staged BEFORE the DDL, committed after it — an embedded client's open
+/// batch, or another request inside a group-commit window. The DDL's own
+/// inference only reads committed state, so those rows must be observed when
+/// the placeholder is declared, or the type would stay pending for good.
+#[tokio::test]
+async fn rows_staged_before_the_ddl_still_resolve_its_type() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new(
+        "tenants",
+        NamespaceId::new("numeric-eq-staged-before-ddl").unwrap(),
+    );
+    let mut writer = WriterSession::open(store, paths).await.unwrap();
+    for ordinal in 0..ROWS {
+        writer
+            .upsert_node(
+                "T",
+                NodeId::new(),
+                &thing(ordinal, ordinal as f64 + 0.5, &ordinal.to_string()),
+            )
+            .unwrap();
+    }
+    writer
+        .upsert_node("T", NodeId::new(), &thing(5, 5.0, "five-integral"))
+        .unwrap();
+    writer.create_property_index("T", "num").await.unwrap();
+    assert!(declared(&writer, "T", "num").type_pending);
+    writer.commit_batch().await.unwrap();
+
+    let schema = writer.snapshot().manifest().manifest.schema.clone();
+    writer.flush(schema).await.unwrap();
+    let num = declared(&writer, "T", "num");
+    assert_eq!(
+        (num.data_type.clone(), num.type_pending),
+        (namidb_core::DataType::Int64, false),
+        "{num:?}"
+    );
+    assert_native_route(&writer, "staged-before-ddl").await;
+}
