@@ -45,7 +45,7 @@
 //! single-writer model it's correct.
 //! - Background flush / compaction. The caller drives them manually.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -361,6 +361,9 @@ pub struct WriterSession {
     /// nodes: it uses committed point batches plus a scalar, statement-local
     /// overlay instead of repeatedly walking all prior staged embeddings.
     staged_unique_overlay_rows_scanned: AtomicU64,
+    /// First value type written for each DDL placeholder
+    /// ([`PropertyDef::type_pending`]); the next flush commits them.
+    pending_types: PendingTypes,
     /// Namespace label dictionary. Seeded from the manifest at `open` and
     /// extended as `upsert_node*` interns new label names; stamped onto every
     /// committed manifest so a node's on-row `LabelId`s always resolve to names.
@@ -531,7 +534,7 @@ impl WriterSession {
         // with an older session that started its counter at zero.
         let property_index_generation = current.manifest.version;
         let published_memtable = Arc::new(recovered.memtable.snapshot_view());
-        let session = Self {
+        let mut session = Self {
             manifest_store,
             wal_store,
             fence,
@@ -559,7 +562,9 @@ impl WriterSession {
             commits_since_snapshot: 0,
             poisoned: false,
             staged_unique_overlay_rows_scanned: AtomicU64::new(0),
+            pending_types: PendingTypes::default(),
         };
+        session.observe_recovered_pending_types()?;
         session.seed_exact_node_counts_from_metadata();
         // Publish this namespace's current immutable-object set to the shared
         // cache before handing out any snapshot. Besides reclaiming stale
@@ -1206,6 +1211,7 @@ impl WriterSession {
         }
         self.staged_memtable = rebuilt;
         self.unique_index.rollback_request();
+        self.pending_types.rollback_to(mark.records);
     }
 
     /// Highest staged (not yet durable) LSN — the group-commit waiter
@@ -1365,6 +1371,7 @@ impl WriterSession {
         // committed index: a timeout after a large write must not make the
         // next MERGE pay a full corpus scan (amplified by any L0 backlog).
         self.unique_index.rollback_staged();
+        self.pending_types.rollback_to(0);
         discarded
     }
 
@@ -1603,6 +1610,12 @@ impl WriterSession {
             .collect();
         self.unique_index
             .apply_upsert(id, &names, &record.properties);
+        self.pending_types.observe(
+            &self.current,
+            self.pending.records.len() - 1,
+            &names,
+            &record.properties,
+        );
         Ok(lsn)
     }
 
@@ -1918,6 +1931,7 @@ impl WriterSession {
         // committed state exactly. Forget only their rollback journal; keeping
         // the maps warm is what makes auto-commit MERGE-by-key O(1).
         self.unique_index.commit_staged();
+        self.pending_types.commit();
 
         // Auto-snapshot tick. Best effort: a snapshot is a cache, the
         // WAL is the source of truth. Log the failure and keep going
@@ -2252,6 +2266,7 @@ impl WriterSession {
  ))]
     pub async fn flush(&mut self, schema: Schema) -> Result<FlushOutcome> {
         let _ = self.commit_batch().await?;
+        let schema = self.resolve_pending_types(schema).await?;
         let frozen = self.memtable.freeze();
         let mut restore = FrozenMemtableRestoreGuard::new(
             &mut self.memtable,
@@ -2801,6 +2816,7 @@ impl WriterSession {
                 schema
                     .label(label)
                     .and_then(|l| l.properties.iter().find(|p| p.name == properties[0]))
+                    .filter(|p| !p.type_pending)
                     .map(|p| p.data_type.clone())
             } else {
                 None
@@ -2863,8 +2879,16 @@ impl WriterSession {
         // ── Commit the schema change ─────────────────────────────────────────
         let mut schema = self.current.manifest.schema.clone();
         if single {
-            let dtype = declared_type.unwrap_or_else(|| inferred.unwrap_or(DataType::Utf8));
-            upsert_property_flags(&mut schema, label, &properties[0], dtype, true, false)?;
+            let (dtype, type_pending) = ddl_property_type(declared_type, inferred);
+            upsert_property_flags(
+                &mut schema,
+                label,
+                &properties[0],
+                dtype,
+                type_pending,
+                true,
+                false,
+            )?;
         }
         let cname = name
             .map(str::to_string)
@@ -2963,6 +2987,7 @@ impl WriterSession {
             .schema
             .label(label)
             .and_then(|l| l.properties.iter().find(|p| p.name == property))
+            .filter(|p| !p.type_pending)
             .map(|p| p.data_type.clone());
 
         let mut inferred: Option<DataType> = None;
@@ -2980,16 +3005,90 @@ impl WriterSession {
             }
         }
 
-        let dtype = declared_type.unwrap_or_else(|| inferred.unwrap_or(DataType::Utf8));
+        let (dtype, type_pending) = ddl_property_type(declared_type, inferred);
         let mut schema = self.current.manifest.schema.clone();
-        upsert_property_flags(&mut schema, label, property, dtype, unique, indexed)?;
+        upsert_property_flags(
+            &mut schema,
+            label,
+            property,
+            dtype,
+            type_pending,
+            unique,
+            indexed,
+        )?;
         self.commit_schema_ddl(schema).await
     }
 
     /// Commit an updated schema (metadata-only manifest bump), retiring
     /// signature-stale search generations and resetting the caches whose
     /// contents key off the schema. Shared tail of every property/index DDL.
+    /// Commit the first value types durable writes recorded for DDL
+    /// placeholders ([`PropertyDef::type_pending`]), so the flush that
+    /// follows harvests their sidecars with the real type, and return
+    /// `schema` (the caller's flush schema) with the same resolutions.
+    ///
+    /// Committed as a schema version of its own rather than inside the flush
+    /// manifest so that Search-LSM retires only the generations whose own
+    /// catalog signature changed (`retire_signature_stale_generations`),
+    /// exactly as for a user-issued DDL. The logical property caches stay
+    /// warm: a resolved type changes no value, flag or constraint they
+    /// describe. No-op unless a placeholder saw a value.
+    async fn resolve_pending_types(&mut self, mut schema: Schema) -> Result<Schema> {
+        if self.pending_types.committed.is_empty() {
+            return Ok(schema);
+        }
+        let mut current = self.current.manifest.schema.clone();
+        if self.pending_types.apply(&mut current) {
+            self.commit_schema(current).await?;
+        }
+        self.pending_types.apply(&mut schema);
+        self.pending_types.committed.clear();
+        Ok(schema)
+    }
+
+    /// Seed [`Self::pending_types`] from the memtable replayed at open: rows
+    /// written before a restart never passed the staging chokepoint in this
+    /// session. Decodes nothing unless some declaration is pending.
+    fn observe_recovered_pending_types(&mut self) -> Result<()> {
+        if self.memtable.is_empty() || !self.pending_types.refresh(&self.current) {
+            return Ok(());
+        }
+        let mut observed = 0usize;
+        for (key, entry) in self.memtable.iter() {
+            let (MemKey::Node { .. }, MemOp::Upsert(payload)) = (key, &entry.op) else {
+                continue;
+            };
+            let record = NodeWriteRecord::decode(payload)?;
+            let names: Vec<&str> = record
+                .labels
+                .iter()
+                .filter_map(|&lid| self.label_dict.name(namidb_core::LabelId::new(lid)))
+                .collect();
+            self.pending_types
+                .observe(&self.current, observed, &names, &record.properties);
+            observed += 1;
+            if !self.pending_types.watching() {
+                break;
+            }
+        }
+        // Replayed rows are already durable.
+        self.pending_types.commit();
+        Ok(())
+    }
+
     async fn commit_schema_ddl(&mut self, schema: Schema) -> Result<u64> {
+        let version = self.commit_schema(schema).await?;
+        self.property_index_cache.reset_preserving_node_counts();
+        self.unique_index.reset();
+        self.observe_staged_pending_types()?;
+        Ok(version)
+    }
+
+    /// The manifest half of [`Self::commit_schema_ddl`]: commit `schema` as a
+    /// metadata-only version, retiring signature-stale search generations.
+    /// Leaves the logical property caches alone, which is only right for a
+    /// change that adds or drops no index or constraint.
+    async fn commit_schema(&mut self, schema: Schema) -> Result<u64> {
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.schema = schema;
         #[cfg(any(feature = "vector-index", feature = "text-index"))]
@@ -3010,9 +3109,37 @@ impl WriterSession {
         let version = committed.manifest.version;
         self.current = committed;
         self.refresh_published();
-        self.property_index_cache.reset_preserving_node_counts();
-        self.unique_index.reset();
         Ok(version)
+    }
+
+    /// A DDL can declare a pending placeholder while rows are already staged
+    /// (an embedded client's open batch, or another request inside a group
+    /// commit window): its inference scan reads committed state only, and
+    /// those rows passed the staging chokepoint before the property was
+    /// pending. Observe them now, at their own record index, so commit and
+    /// rollback treat them like any other staged observation. Decodes nothing
+    /// unless a declaration is pending and rows are staged.
+    fn observe_staged_pending_types(&mut self) -> Result<()> {
+        if self.pending_payloads.is_empty() || !self.pending_types.refresh(&self.current) {
+            return Ok(());
+        }
+        for (index, (key, _, op)) in self.pending_payloads.iter().enumerate() {
+            let (MemKey::Node { .. }, MemOp::Upsert(payload)) = (key, op) else {
+                continue;
+            };
+            let record = NodeWriteRecord::decode(payload)?;
+            let names: Vec<&str> = record
+                .labels
+                .iter()
+                .filter_map(|&lid| self.label_dict.name(namidb_core::LabelId::new(lid)))
+                .collect();
+            self.pending_types
+                .observe(&self.current, index, &names, &record.properties);
+            if !self.pending_types.watching() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// `CREATE INDEX [name] [IF NOT EXISTS] FOR (n:Label) ON (n.a, n.b, …)`
@@ -3082,7 +3209,7 @@ impl WriterSession {
 
         // Resolve each member's type first (immutable phase: the inference
         // scan borrows a snapshot), then mutate and commit.
-        let mut member_types: Vec<(String, DataType)> = Vec::with_capacity(properties.len());
+        let mut member_types: Vec<(String, DataType, bool)> = Vec::with_capacity(properties.len());
         {
             let snap = self.snapshot();
             for property in properties {
@@ -3092,33 +3219,39 @@ impl WriterSession {
                     .schema
                     .label(label)
                     .and_then(|l| l.properties.iter().find(|p| p.name == *property))
+                    .filter(|p| !p.type_pending)
                     .map(|p| p.data_type.clone());
-                let dtype = match declared {
-                    Some(dtype) => dtype,
-                    None => {
-                        let mut inferred: Option<DataType> = None;
-                        for node in snap.scan_label(label).await? {
-                            let Some(v) = node.properties.get(property) else {
-                                continue;
-                            };
-                            if matches!(v, Value::Null) {
-                                continue;
-                            }
-                            inferred = value_datatype(v);
-                            break;
+                let mut inferred: Option<DataType> = None;
+                if declared.is_none() {
+                    for node in snap.scan_label(label).await? {
+                        let Some(v) = node.properties.get(property) else {
+                            continue;
+                        };
+                        if matches!(v, Value::Null) {
+                            continue;
                         }
-                        inferred.unwrap_or(DataType::Utf8)
+                        inferred = value_datatype(v);
+                        break;
                     }
-                };
-                member_types.push((property.clone(), dtype));
+                }
+                let (dtype, type_pending) = ddl_property_type(declared, inferred);
+                member_types.push((property.clone(), dtype, type_pending));
             }
         }
         let mut schema = self.current.manifest.schema.clone();
-        for (property, dtype) in member_types {
+        for (property, dtype, type_pending) in member_types {
             // `false, false`: declare the type only; per-property flags are
             // OR-preserved by `upsert_property_flags`, so an existing
             // single-property index/constraint on a member is untouched.
-            upsert_property_flags(&mut schema, label, &property, dtype, false, false)?;
+            upsert_property_flags(
+                &mut schema,
+                label,
+                &property,
+                dtype,
+                type_pending,
+                false,
+                false,
+            )?;
         }
         schema.indexes.push(IndexDef {
             name,
@@ -3270,15 +3403,158 @@ pub fn clear_shared_caches() {
     writer_local_cache_registry().clear();
 }
 
+/// DDL placeholder types ([`PropertyDef::type_pending`]) and the first value
+/// type written for each. Observations happen at the node staging
+/// chokepoint, where the record is already decoded, so resolving a type never
+/// re-reads a row; an observation becomes final only when its write is
+/// durable, and the next flush commits it.
+#[derive(Debug, Default)]
+struct PendingTypes {
+    /// Manifest version [`Self::watch`] was derived from.
+    version: Option<u64>,
+    /// label -> its pending properties with no observation yet. Empty in the
+    /// common case, which keeps [`Self::observe`] a single branch.
+    watch: BTreeMap<String, Vec<String>>,
+    /// Observed by staged writes: (staged record index, label, property, type).
+    staged: Vec<(usize, String, String, DataType)>,
+    /// Observed by durable writes; the first observation wins.
+    committed: BTreeMap<(String, String), DataType>,
+}
+
+impl PendingTypes {
+    /// Re-derive the watch list when the manifest moved. Returns whether any
+    /// declaration is still waiting for a value.
+    fn refresh(&mut self, current: &LoadedManifest) -> bool {
+        let version = current.manifest.version;
+        if self.version != Some(version) {
+            self.version = Some(version);
+            self.watch.clear();
+            for (label, def) in &current.manifest.schema.labels {
+                let waiting: Vec<String> = def
+                    .properties
+                    .iter()
+                    .filter(|p| p.type_pending && !self.seen(label, &p.name))
+                    .map(|p| p.name.clone())
+                    .collect();
+                if !waiting.is_empty() {
+                    self.watch.insert(label.clone(), waiting);
+                }
+            }
+        }
+        self.watching()
+    }
+
+    fn watching(&self) -> bool {
+        !self.watch.is_empty()
+    }
+
+    fn seen(&self, label: &str, property: &str) -> bool {
+        self.committed
+            .contains_key(&(label.to_string(), property.to_string()))
+            || self
+                .staged
+                .iter()
+                .any(|(_, l, p, _)| l == label && p == property)
+    }
+
+    /// Record the first non-null value a write gives a pending property. Like
+    /// the DDL's own inference, the first value decides even when it has no
+    /// scalar type (a list, map or vector): that keeps the old `Utf8`.
+    fn observe(
+        &mut self,
+        current: &LoadedManifest,
+        record_index: usize,
+        labels: &[&str],
+        properties: &BTreeMap<String, Value>,
+    ) {
+        if !self.refresh(current) {
+            return;
+        }
+        for label in labels {
+            let Some(waiting) = self.watch.get_mut(*label) else {
+                continue;
+            };
+            waiting.retain(|property| {
+                let Some(value) = properties.get(property) else {
+                    return true;
+                };
+                if matches!(value, Value::Null) {
+                    return true;
+                }
+                let dtype = value_datatype(value).unwrap_or(DataType::Utf8);
+                self.staged
+                    .push((record_index, label.to_string(), property.clone(), dtype));
+                false
+            });
+            if waiting.is_empty() {
+                self.watch.remove(*label);
+            }
+        }
+    }
+
+    /// Forget observations made by staged records at or after `records`.
+    fn rollback_to(&mut self, records: usize) {
+        let before = self.staged.len();
+        self.staged.retain(|(index, ..)| *index < records);
+        if self.staged.len() != before {
+            // The dropped properties are waiting again.
+            self.version = None;
+        }
+    }
+
+    /// The staged writes are durable: their observations become final.
+    fn commit(&mut self) {
+        for (_, label, property, dtype) in self.staged.drain(..) {
+            self.committed.entry((label, property)).or_insert(dtype);
+        }
+    }
+
+    /// Resolve every committed observation whose property is still pending in
+    /// `schema`. Returns whether `schema` changed.
+    fn apply(&self, schema: &mut Schema) -> bool {
+        let mut changed = false;
+        for ((label, property), dtype) in &self.committed {
+            if let Some(p) = schema
+                .labels
+                .get_mut(label)
+                .and_then(|def| def.properties.iter_mut().find(|p| p.name == *property))
+                .filter(|p| p.type_pending)
+            {
+                p.data_type = dtype.clone();
+                p.type_pending = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// The type a DDL statement declares for a property: an existing concrete
+/// declaration wins, then the first live value. With neither — the usual
+/// "schema first, then load" order — there is nothing to infer from, so the
+/// property gets a `Utf8` placeholder marked `type_pending`, which the next
+/// flush resolves from the first value written to it (see [`PendingTypes`]).
+/// Committing the placeholder as a
+/// real `Utf8` would read as a String declaration forever and keep every
+/// numeric equality lookup on the scan route.
+fn ddl_property_type(declared: Option<DataType>, inferred: Option<DataType>) -> (DataType, bool) {
+    match declared.or(inferred) {
+        Some(dtype) => (dtype, false),
+        None => (DataType::Utf8, true),
+    }
+}
+
 /// Mark `(label, property)` unique and/or indexed in `schema`, creating the
 /// `LabelDef`/`PropertyDef` when absent (the engine is schemaless, so a
 /// constraint may target a property no manifest has declared yet). Existing
-/// flags are preserved — a second DDL only ORs its flag in.
+/// flags are preserved — a second DDL only ORs its flag in. A pending
+/// placeholder type is replaced once a later DDL can infer a concrete one.
 fn upsert_property_flags(
     schema: &mut Schema,
     label: &str,
     property: &str,
     dtype: DataType,
+    type_pending: bool,
     unique: bool,
     indexed: bool,
 ) -> Result<()> {
@@ -3292,10 +3568,15 @@ fn upsert_property_flags(
     if let Some(p) = label_def.properties.iter_mut().find(|p| p.name == property) {
         p.unique = p.unique || unique;
         p.indexed = p.indexed || indexed;
+        if p.type_pending && !type_pending {
+            p.data_type = dtype;
+            p.type_pending = false;
+        }
     } else {
         let mut p = PropertyDef::new(property, dtype, true).map_err(Error::Core)?;
         p.unique = unique;
         p.indexed = indexed;
+        p.type_pending = type_pending;
         label_def.properties.push(p);
     }
     Ok(())

@@ -2809,6 +2809,42 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_placeholder_signs_like_the_utf8_declaration_older_engines_see() {
+        // An engine that predates `type_pending` drops the flag and reads the
+        // placeholder as the plain indexed `Utf8` it always was. The catalog
+        // signature must agree with that reading, or rolling back would see
+        // every Search-LSM generation as catalog-stale. Resolving the type is
+        // a schema DDL (`retire_signature_stale_generations`), so a change
+        // retires only the generations on that label.
+        let with_year = |pending: bool| {
+            let mut manifest = active_vector_manifest();
+            manifest
+                .schema
+                .labels
+                .get_mut("Doc")
+                .unwrap()
+                .properties
+                .push(
+                    PropertyDef::new("year", DataType::Utf8, true)
+                        .unwrap()
+                        .with_indexed(true)
+                        .with_type_pending(pending),
+                );
+            manifest
+        };
+        let pending = with_year(true);
+        let legacy_view = with_year(false);
+        assert_eq!(
+            vector_catalog_signature(&pending, &pending.vector_indexes[0]),
+            vector_catalog_signature(&legacy_view, &legacy_view.vector_indexes[0]),
+        );
+        assert_eq!(
+            vector_native_filter_properties(&pending, &pending.vector_indexes[0]),
+            vector_native_filter_properties(&legacy_view, &legacy_view.vector_indexes[0]),
+        );
+    }
+
+    #[test]
     fn signatures_are_canonical_and_schema_sensitive() {
         let left = active_vector_manifest();
         assert_eq!(

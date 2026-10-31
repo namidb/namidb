@@ -741,6 +741,20 @@ pub(crate) fn union_indexed_props(schema: &Schema) -> LabelDef {
                 by_name
                     .entry(p.name.clone())
                     .and_modify(|current| {
+                        // A pending placeholder type (DDL ran before any
+                        // value existed) is not a declaration of any type:
+                        // a concrete declaration always replaces it, and it
+                        // never displaces one. Otherwise its `Utf8`
+                        // placeholder would win the text tie-break below and
+                        // silently downgrade a same-named numeric index on
+                        // another label.
+                        if p.type_pending {
+                            return;
+                        }
+                        if current.type_pending {
+                            *current = candidate.clone();
+                            return;
+                        }
                         // The synthetic definition is global: declarations
                         // with the same property name may legitimately use
                         // different types on different labels. Its type is

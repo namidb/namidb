@@ -340,3 +340,49 @@ async fn explain_states_the_tuple_route_for_composite_lookups() {
         "a covered tuple lookup must count as native: {native}"
     );
 }
+
+/// namidb/namidb#200: "schema first, then load". The constraint runs on an
+/// empty label, so its type cannot be inferred yet; after the data lands and
+/// flushes, an integer key must route through the index exactly like a key
+/// whose constraint was declared after the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_constraint_declared_before_any_data_still_routes_numeric_keys_through_the_index() {
+    let base = boot().await;
+    for ddl in [
+        "CREATE CONSTRAINT first_id IF NOT EXISTS FOR (p:IntFirst) REQUIRE p.a IS UNIQUE",
+        "CREATE INDEX first_v IF NOT EXISTS FOR (p:IntFirst) ON (p.v)",
+    ] {
+        let (status, body) = cypher(&base, ddl).await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let (status, body) = cypher(
+        &base,
+        "UNWIND range(1, 500) AS r CREATE (:IntFirst {a: r, v: toFloat(r) + 0.5})",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let flush = reqwest::Client::new()
+        .post(format!("{base}/v0/admin/flush"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flush.status().as_u16(), 200);
+
+    for query in [
+        "EXPLAIN MATCH (p:IntFirst {a: 7}) RETURN p.a",
+        "EXPLAIN MATCH (p:IntFirst {v: 7.5}) RETURN p.a",
+    ] {
+        let (status, body) = cypher(&base, query).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("→ index") && !body.contains("SCAN FALLBACK"),
+            "`{query}` must use the posting index after the first flush: {body}"
+        );
+    }
+    let (status, body) = cypher(&base, "MATCH (p:IntFirst {a: 7}) RETURN p.v AS v").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("7.5"), "{body}");
+    let (status, body) = cypher(&base, "CREATE (:IntFirst {a: 7})").await;
+    assert_eq!(status, 409, "uniqueness must still hold: {body}");
+}

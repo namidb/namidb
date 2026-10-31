@@ -2109,7 +2109,10 @@ impl<'mt> Snapshot<'mt> {
             .label(label)
             .and_then(|def| def.properties.iter().find(|p| p.name == property))
             .is_some_and(|p| {
+                // A pending placeholder `Utf8` is not a String declaration:
+                // the shared sidecar may file numeric keys for this name.
                 (p.indexed || p.unique)
+                    && !p.type_pending
                     && matches!(
                         p.data_type,
                         namidb_core::DataType::Utf8 | namidb_core::DataType::LargeUtf8

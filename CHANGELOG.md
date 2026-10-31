@@ -15,6 +15,31 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Numeric keys are indexed when the constraint or index is declared
+  before the data** ([#200](https://github.com/namidb/namidb/issues/200)).
+  `CREATE CONSTRAINT … IS UNIQUE` or `CREATE INDEX` on a label with no rows
+  had nothing to infer a type from and declared the property `Utf8`. That
+  placeholder then read as a String declaration forever: the equality
+  sidecar filed no numeric key, `numeric_complete` stayed false, and every
+  integer or float equality took the label scan (`SCAN FALLBACK (numeric
+  postings 0/N SSTs)`) through any number of flushes and compactions. On
+  20,000 nodes that was 5 lookups/s instead of 208. Such a declaration is
+  now marked `type_pending`. The writer records the type of the first
+  durable value written to it (staged rows, rolled-back writes and WAL
+  replay included) and the next flush commits it as a schema change before
+  building SSTs, so the "schema first, then load" order routes through the
+  index like the "data first" one. As with any DDL that changes a label's
+  String/Bool filter set, a vector or fulltext index on that label rebuilds
+  once when the placeholder resolves to a non-String type. A pending placeholder also no longer
+  wins the String tie-break in the shared sidecar, which had disabled the
+  numeric index of a same-named property on other labels. Manifests without
+  pending declarations serialize unchanged. A namespace whose 3.1.0
+  manifest already committed the placeholder keeps its `Utf8` declaration
+  (nothing in it tells a placeholder from a real one); reload it into a
+  fresh namespace to get the numeric index.
+
 ## [3.1.0] - 2026-10-29
 
 ### Changed
