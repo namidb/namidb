@@ -187,8 +187,21 @@ every copied object). Returns `{"source_version", "objects_copied",
 **The destination allowlist is the security boundary.** The server's
 ambient cloud credentials write wherever `to` points, so the endpoint is
 disabled (403) until the operator sets `--backup-target-uri` /
-`NAMIDB_BACKUP_TARGET_URI`; `to` must equal that prefix or extend it at a
-`/` (or `?ns=`) boundary. One backup runs at a time — process-wide in
+`NAMIDB_BACKUP_TARGET_URI`. The prefix carries the store options as well as
+the location, e.g.
+`s3://backups-bucket/namidb?endpoint=http://minio:9000&region=us-east-1&allow_http=true`.
+`to` is compared with it component by component: the same scheme and
+bucket (or host / account); a path at or below the prefix's path whose
+extra segments are neither empty nor `.` / `..` (percent-encoded forms
+included); and the same query parameters with the same values, in any
+order, plus only `ns` (or `namespace`). A request can therefore never pick
+its own `endpoint`, `region`, `allow_http` or `service_account`, and must
+repeat the prefix's. On `file://`, the path must also resolve (symlinks
+included) inside the prefix's directory. So with the prefix above,
+`s3://backups-bucket/namidb/acme?ns=acme&region=us-east-1&endpoint=http://minio:9000&allow_http=true`
+is accepted, and `s3://backups-bucket/namidb/../live?…`,
+`s3://backups-bucket/namidb-evil/…` or `…&endpoint=http://10.0.0.5:9000`
+are refused (403). One backup runs at a time — process-wide in
 multi-tenant mode, where `/:namespace/v0/admin/backup` resolves the
 namespace's committed state without opening it (cold namespaces stay
 cold) and namespace-scoped tokens are enforced by the auth middleware —
@@ -228,22 +241,33 @@ the target is open on this server, is still being opened or evicted, is
 already being restored, or has a manifest pointer in the store. There is
 no `force`. While the copy runs, every request that would open the
 target is refused as temporarily unavailable (HTTP 503, a Bolt failure),
-so nothing can bootstrap an empty namespace under the copy. The pointer is written last, so a failed
-or interrupted restore leaves the target without a pointer and can simply
-be retried. Restoring over an existing namespace means deleting its
-objects first, out of band, with no server holding it open.
+so nothing can bootstrap an empty namespace under the copy. The copy runs
+on its own task: a client or proxy that disconnects does not cut it short,
+and the target stays reserved until it ends. Restoring over an existing
+namespace means deleting its objects first, out of band, with no server
+holding it open.
+
+**A failed restore can simply be retried.** The pointer is written last,
+and a namespace without a pointer was never opened (opening writes one),
+so before copying the restore deletes whatever an interrupted attempt
+left under the target. A copy that fails, including a `verify` mismatch
+found after the pointer was written, deletes what it wrote before the
+target is released.
 
 `from` must sit inside the same `--backup-target-uri` allowlist as backup
-destinations, and restores share the backup single-flight (one copy per
-process at a time).
+destinations (same scheme, bucket, path rules and store options; see
+above), and restores share the backup single-flight (one copy per process
+at a time).
 
 Status codes: 403 for a read-only token, for a disabled endpoint, or for
 `from` outside the allowlist; 400 for an invalid `from` or namespace
-name; 404 when `from` holds no backup (or not the requested `version`);
-409 as above, and also when the source version was reclaimed mid-copy
-or `verify` finds a mismatch; 503 when another backup or restore holds
-the permit for more than 30 s; 507/500 for other failures. On a
-single-tenant server the route does not exist (404).
+name; 404 when `from` holds no backup (no manifest pointer, or not the
+requested `version`), checked before anything is written; 409 as above,
+and also when the source version was reclaimed mid-copy or `verify` finds
+a mismatch; 503 when another backup or restore holds the permit for more
+than 30 s; 507/500 for other failures, including an object the backup's
+manifest names but the backup lacks. On a single-tenant server the route
+does not exist (404).
 
 ### `POST /v0/cypher`
 

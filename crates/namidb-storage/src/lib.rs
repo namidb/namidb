@@ -53,7 +53,9 @@ pub use adjacency::{
     adjacency_budget_bytes, adjacency_enabled, build_adjacency, shared_adjacency_cache,
     AdjacencyCache, AdjacencyKey, EdgeAdjacency, EdgeSlice, DEFAULT_ADJACENCY_BUDGET_MIB,
 };
-pub use backup::{copy_namespace_snapshot, has_manifest_pointer, SnapshotCopyReport};
+pub use backup::{
+    copy_namespace_snapshot, delete_namespace_objects, has_manifest_pointer, SnapshotCopyReport,
+};
 pub use cache::{
     shared_sst_cache, sst_cache_budget_bytes, sst_cache_enabled, EdgeStreamBundle, SstCache,
     DEFAULT_SST_CACHE_BUDGET_MIB,
@@ -117,5 +119,5 @@ pub use sst::{
     NodeSstWriter, NodeSstWriterOptions, PropertyColumnStats, StatScalar,
 };
 pub use unique_index::UniqueProbe;
-pub use uri::{parse_store, parse_uri, UriError};
+pub use uri::{check_uri_within_prefix, parse_store, parse_uri, UriError};
 pub use wal::{WalRecord, WalSegment, WalSegmentRef, WalStore};

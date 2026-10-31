@@ -4320,16 +4320,27 @@ struct BackupRequest {
     verify: bool,
 }
 
-/// `to` equals the prefix, or extends it at a `/` or `?` boundary — so
-/// `s3://backups/namidb` admits `s3://backups/namidb/b1?ns=b1` but not
-/// `s3://backups/namidb-evil`.
-fn uri_within_prefix(uri: &str, prefix: &str) -> bool {
-    let trimmed = prefix.trim_end_matches('/');
-    match uri.strip_prefix(trimmed) {
-        Some("") => true,
-        Some(rest) => rest.starts_with('/') || rest.starts_with('?'),
-        None => false,
-    }
+/// 403 for a backup `to` or restore `from` outside the `--backup-target-uri`
+/// allowlist, or `None` when it is inside. The comparison is
+/// [`namidb_storage::check_uri_within_prefix`]: same scheme and bucket, a
+/// segment-wise path prefix with no `.`/`..`/empty segments after it, and
+/// every store option (`endpoint`, `region`, …) fixed by the prefix, so
+/// `s3://backups/namidb` admits `s3://backups/namidb/b1?ns=b1` but neither
+/// `s3://backups/namidb-evil` nor `s3://backups/namidb/../x` nor
+/// `…?ns=b1&endpoint=…`.
+fn outside_allowlist_response(uri: &str, prefix: &str, role: &str) -> Option<Response> {
+    let reason = namidb_storage::check_uri_within_prefix(uri, prefix).err()?;
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(ErrorBody {
+                error: format!(
+                    "{role} is outside the --backup-target-uri allowlist (`{prefix}`): {reason}"
+                ),
+            }),
+        )
+            .into_response(),
+    )
 }
 
 /// `POST /v0/admin/backup` — copy a point-in-time snapshot of this
@@ -4366,18 +4377,9 @@ async fn admin_backup(
     // The allowlist is the security boundary: the server's ambient cloud
     // credentials write wherever this URI says, so only operator-blessed
     // prefixes are acceptable.
-    if !uri_within_prefix(&req.to, &backup.target_prefix) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorBody {
-                error: format!(
-                    "destination is outside the --backup-target-uri allowlist \
-                     (`{}`)",
-                    backup.target_prefix
-                ),
-            }),
-        )
-            .into_response();
+    if let Some(refused) = outside_allowlist_response(&req.to, &backup.target_prefix, "destination")
+    {
+        return refused;
     }
     // Single-flight with a bounded wait: this route sits outside the request
     // timeout, so unbounded waiters would pin global concurrency slots
@@ -4526,16 +4528,8 @@ async fn dispatch_admin_backup_multi(
         )
             .into_response();
     };
-    if !uri_within_prefix(&req.to, prefix) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorBody {
-                error: format!(
-                    "destination is outside the --backup-target-uri allowlist (`{prefix}`)"
-                ),
-            }),
-        )
-            .into_response();
+    if let Some(refused) = outside_allowlist_response(&req.to, prefix, "destination") {
+        return refused;
     }
     let (src_store, src_paths) = match shared.registry.backup_source(namespace) {
         Ok(source) => source,
@@ -4577,11 +4571,17 @@ struct RestoreRequest {
 ///
 /// There is no fencing against a live writer, so the target must be fresh:
 /// the registry refuses (409) while the namespace is open or opening and
-/// keeps it from opening until the copy ends, and the copy refuses (409) a
-/// destination that already has a manifest pointer. The source must sit
-/// inside the same `--backup-target-uri` allowlist as backup destinations,
-/// and restores share the backup single-flight (one copy at a time per
-/// process). An interrupted copy leaves no pointer, so retrying it is safe.
+/// keeps it from opening until the copy ends, and a target that already has
+/// a manifest pointer is refused (409). The source must sit inside the same
+/// `--backup-target-uri` allowlist as backup destinations, and restores
+/// share the backup single-flight (one copy at a time per process).
+///
+/// Retrying is always safe. A target without a pointer was never opened
+/// (bootstrap writes `p0`), so whatever an interrupted copy left there is
+/// deleted before copying; a copy that fails (including a `verify`
+/// mismatch, after the pointer landed) deletes what it wrote before the
+/// reservation is released. The copy runs on its own task, so a client that
+/// goes away does not cut it short.
 async fn admin_restore_multi(
     Path(namespace): Path<String>,
     State(shared): State<SharedAppState>,
@@ -4630,14 +4630,8 @@ async fn dispatch_admin_restore_multi(
     // Same boundary as backup destinations: the server's ambient credentials
     // read wherever this URI says, so only operator-blessed prefixes may be
     // copied into a namespace. The prefix is process-wide, not per tenant.
-    if !uri_within_prefix(&req.from, prefix) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorBody {
-                error: format!("source is outside the --backup-target-uri allowlist (`{prefix}`)"),
-            }),
-        )
-            .into_response();
+    if let Some(refused) = outside_allowlist_response(&req.from, prefix, "source") {
+        return refused;
     }
     let (src_store, src_paths) = match namidb_storage::parse_uri(&req.from) {
         Ok(parsed) => parsed,
@@ -4668,25 +4662,97 @@ async fn dispatch_admin_restore_multi(
             return (StatusCode::CONFLICT, Json(ErrorBody { error: msg })).into_response();
         }
     };
-    let Ok(Ok(_permit)) =
-        tokio::time::timeout(ADMIN_FLUSH_WAIT, shared.backup_permit.acquire()).await
+    let Ok(Ok(permit)) = tokio::time::timeout(
+        ADMIN_FLUSH_WAIT,
+        Arc::clone(&shared.backup_permit).acquire_owned(),
+    )
+    .await
     else {
         return snapshot_copy_busy_response();
     };
-    // The copy refuses an existing pointer too, but its message offers a
-    // `force` this endpoint does not have. A failed probe falls through to
-    // the copy, which repeats it and reports the error.
-    if let Ok(true) = namidb_storage::has_manifest_pointer(&target.store, &target.paths).await {
-        return (
-            StatusCode::CONFLICT,
+    // The task owns the reservation and the permit. Hyper drops this
+    // handler's future when the client (or a proxy timing out) goes away;
+    // the copy must still run to its end, so it releases its source lease,
+    // finishes or aborts its multipart uploads, and clears a failed target
+    // before anything may open the namespace.
+    let namespace = namespace.to_string();
+    let copy = tokio::spawn(async move {
+        let _permit = permit;
+        run_restore_copy(target, src_store, src_paths, &req, &namespace).await
+    });
+    match copy.await {
+        Ok(response) => response,
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorBody {
-                error: format!(
-                    "namespace `{namespace}` already exists (it has a manifest pointer); \
-                     restore only targets a namespace that does not exist yet"
-                ),
+                error: format!("restore failed: the copy task ended abnormally: {e}"),
             }),
         )
-            .into_response();
+            .into_response(),
+    }
+}
+
+/// The restore body, run on its own task while `target` reserves the
+/// namespace (see [`dispatch_admin_restore_multi`]).
+async fn run_restore_copy(
+    target: registry::RestoreGuard,
+    src_store: Arc<dyn object_store::ObjectStore>,
+    src_paths: namidb_storage::NamespacePaths,
+    req: &RestoreRequest,
+    namespace: &str,
+) -> Response {
+    // An existing namespace is refused here rather than by the copy, whose
+    // message offers a `force` this endpoint does not have. The probe must
+    // succeed: the cleanup below relies on its "no pointer".
+    match namidb_storage::has_manifest_pointer(&target.store, &target.paths).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: format!(
+                        "namespace `{namespace}` already exists (it has a manifest pointer); \
+                         restore only targets a namespace that does not exist yet"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => return snapshot_copy_response(Err(e), "restore"),
+    }
+    // 404 only for a source that does not exist: no pointer, or not the
+    // requested version. Probed before anything is written, so a NotFound
+    // later in the copy (a backup missing an SST, a destination-side
+    // NotFound) is a failed restore (500, like backup), not a wrong `from`.
+    let src_manifests = ManifestStore::new(src_store.clone(), src_paths.clone());
+    let probed = match req.version {
+        Some(version) => src_manifests.load_manifest_at(version).await.map(|_| ()),
+        None => src_manifests.load_current().await.map(|_| ()),
+    };
+    match probed {
+        Ok(()) => {}
+        Err(e @ namidb_storage::Error::ObjectStore(object_store::Error::NotFound { .. })) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: format!("restore source not found: {e}"),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => return snapshot_copy_response(Err(e), "restore"),
+    }
+    // No pointer means nothing ever opened the target (bootstrap writes `p0`
+    // with its `v0`), so any object under it is an interrupted copy's. Left
+    // there, its `v0.json` would collide with this copy's.
+    match namidb_storage::delete_namespace_objects(&target.store, &target.paths).await {
+        Ok(0) => {}
+        Ok(objects) => info!(
+            namespace = %namespace,
+            objects,
+            "admin restore cleared an interrupted restore's leftovers"
+        ),
+        Err(e) => return snapshot_copy_response(Err(e), "restore"),
     }
     let copied = namidb_storage::copy_namespace_snapshot(
         src_store,
@@ -4699,21 +4765,7 @@ async fn dispatch_admin_restore_multi(
         req.verify,
     )
     .await;
-    // The read caches are process-wide and keyed by object path. Eviction
-    // already prunes a namespace's entries; pruning again before the guard
-    // lets the restored namespace open keeps it from ever being served
-    // entries cached under the same paths by an earlier incarnation.
-    namidb_storage::prune_shared_caches(&target.paths);
-    match copied {
-        // No backup there (no pointer, or not that version): the caller named
-        // a source that does not exist.
-        Err(e @ namidb_storage::Error::ObjectStore(object_store::Error::NotFound { .. })) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorBody {
-                error: format!("restore source not found: {e}"),
-            }),
-        )
-            .into_response(),
+    let response = match copied {
         Ok(report) => {
             info!(
                 namespace = %namespace,
@@ -4723,8 +4775,49 @@ async fn dispatch_admin_restore_multi(
             );
             snapshot_copy_response(Ok(report), "restore")
         }
-        Err(e) => snapshot_copy_response(Err(e), "restore"),
-    }
+        // Clear what the copy wrote: a `verify` mismatch fails after the
+        // pointer landed, and the target must not open (or refuse a retry
+        // as existing) once the reservation drops.
+        Err(e) => {
+            match namidb_storage::delete_namespace_objects(&target.store, &target.paths).await {
+                Ok(_) => snapshot_copy_response(
+                    Err(match e {
+                        namidb_storage::Error::Precondition(msg) => {
+                            namidb_storage::Error::Precondition(format!(
+                                "{msg}; the target was cleared and the restore can be retried"
+                            ))
+                        }
+                        other => other,
+                    }),
+                    "restore",
+                ),
+                Err(cleanup) => {
+                    error!(
+                        namespace = %namespace,
+                        error = %cleanup,
+                        "admin restore could not clear a failed restore's target"
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorBody {
+                            error: format!(
+                            "restore failed: {e}; clearing the target also failed ({cleanup}), \
+                             so delete its objects before retrying"
+                        ),
+                        }),
+                    )
+                        .into_response()
+                }
+            }
+        }
+    };
+    // The read caches are process-wide and keyed by object path. Eviction
+    // already prunes a namespace's entries; pruning again before the guard
+    // lets the restored namespace open keeps it from ever being served
+    // entries cached under the same paths by an earlier incarnation.
+    namidb_storage::prune_shared_caches(&target.paths);
+    drop(target);
+    response
 }
 
 async fn run_admin_flush(state: AppState) -> Response {

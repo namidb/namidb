@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, WriteMultipart};
 use tracing::debug;
@@ -59,9 +59,13 @@ pub struct SnapshotCopyReport {
 /// into `(dst_store, dst_paths)`, pinned to manifest `version` (or the current
 /// committed version when `None`).
 ///
-/// The destination is left openable: its `current.json` pointer is written
-/// **last**, so an interrupted copy leaves an un-pointed (and therefore
-/// ignored) set of objects rather than a half-written namespace. The snapshot
+/// The destination is left openable: its pointer is written **last**, so an
+/// interrupted copy leaves an un-pointed set of objects rather than a
+/// half-written namespace. Its `v0.json` is written only after every object
+/// it references, so if the copy got that far, opening the destination
+/// adopts the complete snapshot (see [`ManifestStore::bootstrap`]); a retry
+/// should clear the leftovers first ([`delete_namespace_objects`]), since
+/// the stray `v0.json` collides with its Create. The snapshot
 /// is renumbered to version 0 with a fresh epoch, so the destination is a
 /// self-contained namespace.
 ///
@@ -156,6 +160,51 @@ pub async fn has_manifest_pointer(
         s.try_next().await.map_err(Error::ObjectStore)?.is_some()
     };
     Ok(has_family || store.head(&paths.current_pointer()).await.is_ok())
+}
+
+/// Delete every object under the namespace prefix at `(store, paths)` and
+/// return how many were removed. The manifest pointers (the pointer family
+/// and the legacy `current.json`) go first, so a run that stops partway
+/// leaves a namespace without a pointer — one nothing opens as existing —
+/// rather than a pointer to objects that are gone.
+///
+/// Only for a namespace nothing holds open: there is no fencing here. The
+/// multi-tenant admin restore uses it, under its registry reservation, to
+/// clear the leftovers of an interrupted or failed copy into a target that
+/// has no pointer.
+pub async fn delete_namespace_objects(
+    store: &Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+) -> Result<usize> {
+    let pointer_dir = paths.pointer_dir();
+    let current = paths.current_pointer();
+    let mut pointers = Vec::new();
+    let mut rest = Vec::new();
+    let mut listing = store.list(Some(&paths.namespace_prefix()));
+    while let Some(meta) = listing.try_next().await.map_err(Error::ObjectStore)? {
+        if meta.location == current || meta.location.prefix_matches(&pointer_dir) {
+            pointers.push(meta.location);
+        } else {
+            rest.push(meta.location);
+        }
+    }
+    let mut deleted = 0usize;
+    for location in pointers {
+        match store.delete(&location).await {
+            Ok(()) => deleted += 1,
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(Error::ObjectStore(e)),
+        }
+    }
+    let mut results = store.delete_stream(futures::stream::iter(rest.into_iter().map(Ok)).boxed());
+    while let Some(result) = results.next().await {
+        match result {
+            Ok(_) => deleted += 1,
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(Error::ObjectStore(e)),
+        }
+    }
+    Ok(deleted)
 }
 
 /// The copy body, run while `pin` holds the source's retention horizon. The
@@ -913,6 +962,92 @@ mod tests {
 
         // And it opens cleanly (the writer then claims it and advances on).
         WriterSession::open(dst_store, dst_paths).await.unwrap();
+    }
+
+    /// A copy that stopped between its `v0.json` and its pointer wedges a
+    /// plain retry (the v0 Create collides). [`delete_namespace_objects`]
+    /// clears exactly that namespace — pointers included, siblings sharing a
+    /// name prefix untouched — after which the retry succeeds.
+    #[tokio::test]
+    async fn delete_namespace_objects_clears_an_interrupted_copy_for_retry() {
+        let (src_store, src_paths) = (store(), paths("bk-clear-src"));
+        {
+            let mut w = WriterSession::open(src_store.clone(), src_paths.clone())
+                .await
+                .unwrap();
+            w.upsert_node("Person", NodeId::new(), &person("Ada"))
+                .unwrap();
+            w.commit_batch().await.unwrap();
+            w.flush(schema()).await.unwrap();
+            w.upsert_node("Person", NodeId::new(), &person("Lin"))
+                .unwrap();
+            w.commit_batch().await.unwrap();
+        }
+        let dst_store = store();
+        let (dst_paths, sibling) = (paths("bk-clear"), paths("bk-clear-2"));
+        for target in [&dst_paths, &sibling] {
+            copy_namespace_snapshot(
+                src_store.clone(),
+                src_paths.clone(),
+                dst_store.clone(),
+                target.clone(),
+                None,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        // The interruption: every object landed except the pointers.
+        let mut pointers: Vec<Path> = dst_store
+            .list(Some(&dst_paths.pointer_dir()))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        pointers.push(dst_paths.current_pointer());
+        for location in pointers {
+            dst_store.delete(&location).await.unwrap();
+        }
+        assert!(!has_manifest_pointer(&dst_store, &dst_paths).await.unwrap());
+        let wedged = copy_namespace_snapshot(
+            src_store.clone(),
+            src_paths.clone(),
+            dst_store.clone(),
+            dst_paths.clone(),
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("the leftover v0 collides with the retry");
+        assert!(matches!(wedged, Error::Precondition(_)), "got {wedged:?}");
+
+        let deleted = delete_namespace_objects(&dst_store, &dst_paths)
+            .await
+            .unwrap();
+        assert!(deleted > 1, "the copied objects are removed: {deleted}");
+        let left: Vec<_> = dst_store
+            .list(Some(&dst_paths.namespace_prefix()))
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(has_manifest_pointer(&dst_store, &sibling).await.unwrap());
+
+        copy_namespace_snapshot(
+            src_store,
+            src_paths,
+            dst_store.clone(),
+            dst_paths.clone(),
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("a retry into the cleared namespace succeeds");
+        assert_eq!(names_in(dst_store.clone(), dst_paths).await, ["Ada", "Lin"]);
+        assert_eq!(names_in(dst_store, sibling).await, ["Ada", "Lin"]);
     }
 
     #[tokio::test]

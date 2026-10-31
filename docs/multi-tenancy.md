@@ -292,6 +292,16 @@ Both copies run inside the serving process, through its own store, and are
 disabled until `--backup-target-uri` names the allowlisted backup location.
 One backup or restore runs at a time per process.
 
+The prefix carries the store options too, e.g.
+`--backup-target-uri 's3://my-backups/namidb?endpoint=http://minio:9000&region=us-east-1&allow_http=true'`.
+A backup's `to` and a restore's `from` must use the same scheme and bucket,
+sit at or below the prefix's path with no `.`, `..` or empty segments
+(percent-encoded forms included), repeat every query parameter of the
+prefix with the same value, and add nothing but `ns`. A tenant can neither
+climb out of the prefix nor point the server's credentials at an endpoint
+of its choosing. On `file://` the path must also resolve, symlinks
+included, inside the prefix's directory.
+
 ```bash
 # Back up `acme` (live; the namespace keeps serving).
 curl -s -X POST https://host:8080/acme/v0/admin/backup \
@@ -314,8 +324,13 @@ Restore only targets a namespace that does not exist. There is no fencing
 and no `force`: the server answers 409 when the target is open or being
 opened on this node, is already being restored, or has a manifest pointer
 in the store, and while the copy runs every request that would open the
-target is refused as temporarily unavailable (HTTP 503, a Bolt failure). The pointer is written
-last, so a failed restore can be retried as is. To replace a namespace,
+target is refused as temporarily unavailable (HTTP 503, a Bolt failure). A
+restore can be retried as is: the pointer is written last, a target without
+a pointer was never opened, so the restore first deletes whatever an
+interrupted attempt left there, and a failed copy (a `verify` mismatch
+included) deletes what it wrote before releasing the target. The copy runs
+on its own task, so a client or proxy that disconnects does not abandon it
+halfway. To replace a namespace,
 restore into a new name and switch traffic to it, or stop serving the old
 one and delete its objects out of band first. Other nodes are not checked:
 the routing layer must not send requests for the target to another node
