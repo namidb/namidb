@@ -937,12 +937,13 @@ impl ManifestStore {
     ///
     /// Writes `manifest/v0.json` and `manifest/pointer/p0.json` for the first
     /// time, both with `PutMode::Create`. Fails with [`Error::Precondition`] if
-    /// either object already exists — pointing at an already-initialised
-    /// namespace.
+    /// the pointer already exists — pointing at an already-initialised
+    /// namespace. A `v0.json` without a pointer is adopted, not replaced (see
+    /// below).
     #[instrument(skip(self), fields(namespace = %self.paths.namespace()))]
     pub async fn bootstrap(&self, writer_id: Uuid) -> Result<LoadedManifest> {
-        let manifest = Manifest::empty(Epoch::ZERO, writer_id);
-        let manifest_path = self.paths.manifest_version(manifest.version);
+        let empty = Manifest::empty(Epoch::ZERO, writer_id);
+        let manifest_path = self.paths.manifest_version(empty.version);
         // Body PUT: tolerate `AlreadyExists`. A prior bootstrap may have
         // written `v0.json` and then crashed BEFORE the pointer landed — the
         // half-write this method must complete rather than wedge on (without
@@ -950,14 +951,33 @@ impl ManifestStore {
         // exists so bootstrap errored, but no pointer exists so load_current
         // returned NotFound). The pointer PUT below still guards a genuinely
         // bootstrapped namespace.
-        match self
-            .put_create(&manifest_path, serde_json::to_vec(&manifest)?.into())
+        //
+        // The existing body is loaded and adopted, never assumed empty: a
+        // snapshot copy (backup or restore, see `crate::backup`) that stopped
+        // between its `v0.json` and its pointer leaves a non-empty v0 behind,
+        // and the copy writes that body only after every object it
+        // references. Handing back `Manifest::empty` would point `p0` at the
+        // copied data while serving (and then committing over) nothing.
+        let manifest = match self
+            .put_create(&manifest_path, serde_json::to_vec(&empty)?.into())
             .await
         {
-            Ok(_) => {}
-            Err(Error::ObjectStore(object_store::Error::AlreadyExists { .. })) => {}
+            Ok(_) => empty,
+            Err(Error::ObjectStore(object_store::Error::AlreadyExists { .. })) => {
+                let existing = self.load_manifest_at(empty.version).await?;
+                if existing.version != empty.version {
+                    return Err(Error::Corrupted {
+                        path: manifest_path.as_ref().to_string(),
+                        detail: format!(
+                            "manifest body holds version {}, expected {}",
+                            existing.version, empty.version
+                        ),
+                    });
+                }
+                existing
+            }
             Err(other) => return Err(other),
-        }
+        };
 
         let pointer = ManifestPointer {
             version: manifest.version,
@@ -2258,6 +2278,58 @@ mod tests {
         // Pointer + advisory are now in place; load_current resolves.
         let reloaded = ms.load_current().await.unwrap();
         assert_eq!(reloaded.manifest.version, 0);
+    }
+
+    /// A snapshot copy (backup/restore) that stopped between its `v0.json`
+    /// and its pointer leaves a NON-empty v0 behind. Bootstrap must adopt that
+    /// body (in memory as well as through the pointer) rather than hand back
+    /// `Manifest::empty`, which would serve and then commit over nothing
+    /// while `p0` points at the copied data.
+    #[tokio::test]
+    async fn bootstrap_adopts_an_existing_v0_body() {
+        let (store, paths) = store();
+        let copier = Uuid::now_v7();
+        let mut copied = Manifest::empty(Epoch::ZERO, copier);
+        copied.wal_segments.push(WalSegmentDescriptor {
+            seq: 7,
+            path: paths.wal_segment(7).as_ref().to_string(),
+            last_lsn: 3,
+            xxh3: None,
+        });
+        let v0 = paths.manifest_version(0);
+        let ms = ManifestStore::new(store, paths);
+        ms.put_create(&v0, serde_json::to_vec(&copied).unwrap().into())
+            .await
+            .unwrap();
+
+        let loaded = ms
+            .bootstrap(Uuid::now_v7())
+            .await
+            .expect("bootstrap adopts a pointer-less v0");
+        assert_eq!(loaded.manifest, copied, "in-memory manifest is the v0 body");
+        assert_eq!(loaded.pointer.version, 0);
+        assert_eq!(loaded.pointer.manifest_path, v0.as_ref());
+
+        let reloaded = ms.load_current().await.unwrap();
+        assert_eq!(reloaded.manifest, copied);
+
+        // A body that does not hold version 0 is corruption, not adopted.
+        let (other_store, paths) = self::store();
+        let mut wrong = Manifest::empty(Epoch::ZERO, copier);
+        wrong.version = 3;
+        let v0 = paths.manifest_version(0);
+        let ms = ManifestStore::new(other_store, paths);
+        ms.put_create(&v0, serde_json::to_vec(&wrong).unwrap().into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            ms.bootstrap(Uuid::now_v7()).await,
+            Err(Error::Corrupted { .. })
+        ));
+        assert!(matches!(
+            ms.load_current().await,
+            Err(Error::ObjectStore(object_store::Error::NotFound { .. }))
+        ));
     }
 
     #[tokio::test]

@@ -15,8 +15,56 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /:namespace/v0/admin/restore` for `--multi-tenant` servers.**
+  Restores a backup into a namespace that does not exist yet, through the
+  server's own store. Until now a multi-tenant server on S3 had no working
+  restore: it keeps namespaces at the bucket root, and `namidb restore`
+  resolves every `s3://` URI under `<prefix or tenants>/<ns>/`. The body is
+  `{"from": uri, "version"?: u64, "verify"?: bool}` and the response
+  `{source_version, objects_copied, bytes_copied}`, like admin backup. It
+  needs a read-write token and `--backup-target-uri`, which `from` must sit
+  inside, and it shares the backup single-flight. There is no fencing, so
+  the target must be fresh: 409 when it is open or being opened, is already
+  being restored, or has a manifest pointer. While the copy runs, requests
+  that would open the target get a 503. A missing source or version is a
+  404. The unprefixed `/v0/admin/restore` resolves the namespace from
+  `X-NamiDB-Namespace` or `--default-namespace`. Single-tenant servers have
+  no restore route. A busy multi-tenant admin backup now says "another
+  backup or restore is already running". Retrying a failed or
+  interrupted restore is safe as long as nothing opened the target in
+  between (route no traffic to it until the restore succeeds): the
+  restore deletes an interrupted attempt's leftovers under a target that has
+  no pointer, a failed copy (a `verify` mismatch included) deletes what it
+  wrote, and the copy runs on its own task, so a dropped request does not
+  abandon it. 404 means only a missing source pointer or version; an object
+  missing from the backup mid-copy is a 500, as for backup.
+
+### Security
+
+- **`--backup-target-uri` is enforced on parsed URIs, not as a string
+  prefix.** Admin backup `to` (single- and multi-tenant) and restore `from`
+  must now use the prefix's scheme and bucket, stay at or below its path
+  with no `.`, `..` or empty segments (percent-encoded forms included), and
+  repeat its query parameters with the same values, adding only `ns`.
+  Before, `file:///backups/../data?ns=x` resolved outside the prefix (on a
+  multi-tenant `file://` store, into another tenant's live namespace), and
+  any `&endpoint=`, `&allow_http=` or `&service_account=` after the prefix
+  was honoured. On `file://`, the path must also resolve inside the
+  prefix's directory. **Upgrade note:** put the store options in the
+  prefix (`s3://bucket/backups?endpoint=…&region=…&allow_http=true`) and
+  have clients repeat them; a request that adds or changes one is now
+  refused with 403.
+
 ### Fixed
 
+- **Opening a namespace that has a manifest body but no pointer adopts that
+  body.** `ManifestStore::bootstrap` used to write the pointer to the
+  existing `v0` and then serve an empty manifest, so a backup or restore
+  interrupted between its `v0` and its pointer was shadowed by the first
+  commit. A `v0` is written only after every object it names, so it is now
+  loaded and served.
 - **Numeric keys are indexed when the constraint or index is declared
   before the data** ([#200](https://github.com/namidb/namidb/issues/200)).
   `CREATE CONSTRAINT … IS UNIQUE` or `CREATE INDEX` on a label with no rows

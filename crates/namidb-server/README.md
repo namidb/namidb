@@ -165,6 +165,7 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush; remains available and globally serialized under RSS pressure |
 | `POST` | `/v0/admin/compact` | bearer | Drain L0 completely and block until done; outside the request timeout, single-flighted on its own permit. Run it after a bulk load |
 | `POST` | `/v0/admin/backup` | bearer (read-write) | Copy a point-in-time snapshot of the namespace to an allowlisted destination (disabled unless `--backup-target-uri` is set; multi-tenant: `/:namespace/v0/admin/backup`) |
+| `POST` | `/:namespace/v0/admin/restore` | bearer (read-write) | `--multi-tenant` only: copy an allowlisted backup into a namespace that does not exist yet (disabled unless `--backup-target-uri` is set; unprefixed `/v0/admin/restore` resolves the namespace like the other routes) |
 
 ### `POST /v0/admin/backup`
 
@@ -186,14 +187,87 @@ every copied object). Returns `{"source_version", "objects_copied",
 **The destination allowlist is the security boundary.** The server's
 ambient cloud credentials write wherever `to` points, so the endpoint is
 disabled (403) until the operator sets `--backup-target-uri` /
-`NAMIDB_BACKUP_TARGET_URI`; `to` must equal that prefix or extend it at a
-`/` (or `?ns=`) boundary. One backup runs at a time — process-wide in
+`NAMIDB_BACKUP_TARGET_URI`. The prefix carries the store options as well as
+the location, e.g.
+`s3://backups-bucket/namidb?endpoint=http://minio:9000&region=us-east-1&allow_http=true`.
+`to` is compared with it component by component: the same scheme and
+bucket (or host / account); a path at or below the prefix's path whose
+extra segments are neither empty nor `.` / `..` (percent-encoded forms
+included); and the same query parameters with the same values, in any
+order, plus only `ns` (or `namespace`). A request can therefore never pick
+its own `endpoint`, `region`, `allow_http` or `service_account`, and must
+repeat the prefix's. On `file://`, the path must also resolve (symlinks
+included) inside the prefix's directory. So with the prefix above,
+`s3://backups-bucket/namidb/acme?ns=acme&region=us-east-1&endpoint=http://minio:9000&allow_http=true`
+is accepted, and `s3://backups-bucket/namidb/../live?…`,
+`s3://backups-bucket/namidb-evil/…` or `…&endpoint=http://10.0.0.5:9000`
+are refused (403). One backup runs at a time — process-wide in
 multi-tenant mode, where `/:namespace/v0/admin/backup` resolves the
 namespace's committed state without opening it (cold namespaces stay
 cold) and namespace-scoped tokens are enforced by the auth middleware —
-with waiters getting a 503 after 30 s. Restore stays CLI-only on
-purpose: it requires an offline destination, and the serving process
-*is* the writer.
+with waiters getting a 503 after 30 s. A single-tenant server has no
+restore endpoint: its one namespace is always open, the serving process
+*is* the writer, and a restore needs an offline destination. Use
+`namidb restore` with the server stopped.
+
+Status codes: 403 for a read-only token, for a disabled endpoint, or for
+`to` outside the allowlist; 400 for an invalid `to` (or, multi-tenant, an
+invalid namespace name); 409 when the destination already has a pointer
+and `force` is unset, when the pinned version was reclaimed mid-copy, or
+when `verify` finds a mismatch; 503 when another backup or restore holds
+the permit for more than 30 s; 507/500 for other failures.
+
+### `POST /:namespace/v0/admin/restore` (multi-tenant)
+
+Copies a backup into `:namespace`, which must not exist yet. A
+multi-tenant server keeps every namespace at the root of its store,
+which no `s3://` URI can address (`parse_uri` falls back to the
+`tenants/` prefix), so `namidb restore` cannot write where the server
+reads. This endpoint writes the copy through the server's own store.
+
+```json
+{ "from": "s3://backups-bucket/namidb/nightly?ns=prod", "verify": true }
+```
+
+Optional fields: `version` (restore an older manifest version of the
+backup; a backup made by `admin/backup` holds version `0` only) and
+`verify`. Returns `{"source_version", "objects_copied",
+"bytes_copied"}`. The unprefixed `/v0/admin/restore` targets the
+`X-NamiDB-Namespace` header or `--default-namespace`, and
+namespace-scoped tokens are enforced like on every other route.
+
+**Fresh namespaces only, no fencing.** The restore refuses with 409 when
+the target is open on this server, is still being opened or evicted, is
+already being restored, or has a manifest pointer in the store. There is
+no `force`. While the copy runs, every request that would open the
+target is refused as temporarily unavailable (HTTP 503, a Bolt failure),
+so nothing can bootstrap an empty namespace under the copy. The copy runs
+on its own task: a client or proxy that disconnects does not cut it short,
+and the target stays reserved until it ends. Restoring over an existing
+namespace means deleting its objects first, out of band, with no server
+holding it open.
+
+**A failed restore can simply be retried.** The pointer is written last,
+and a namespace without a pointer was never opened (opening writes one),
+so before copying the restore deletes whatever an interrupted attempt
+left under the target. A copy that fails, including a `verify` mismatch
+found after the pointer was written, deletes what it wrote before the
+target is released.
+
+`from` must sit inside the same `--backup-target-uri` allowlist as backup
+destinations (same scheme, bucket, path rules and store options; see
+above), and restores share the backup single-flight (one copy per process
+at a time).
+
+Status codes: 403 for a read-only token, for a disabled endpoint, or for
+`from` outside the allowlist; 400 for an invalid `from` or namespace
+name; 404 when `from` holds no backup (no manifest pointer, or not the
+requested `version`), checked before anything is written; 409 as above,
+and also when the source version was reclaimed mid-copy or `verify` finds
+a mismatch; 503 when another backup or restore holds the permit for more
+than 30 s; 507/500 for other failures, including an object the backup's
+manifest names but the backup lacks. On a single-tenant server the route
+does not exist (404).
 
 ### `POST /v0/cypher`
 

@@ -88,6 +88,7 @@ pub(crate) struct FaultStore {
     block_next_put_on: std::sync::Mutex<Option<String>>,
     blocked_put: tokio::sync::Notify,
     release_put: tokio::sync::Notify,
+    fail_heads: std::sync::atomic::AtomicBool,
 }
 
 impl FaultStore {
@@ -98,7 +99,14 @@ impl FaultStore {
             block_next_put_on: std::sync::Mutex::new(None),
             blocked_put: tokio::sync::Notify::new(),
             release_put: tokio::sync::Notify::new(),
+            fail_heads: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Every HEAD fails with a transient (non-NotFound) error from now on.
+    pub(crate) fn fail_heads(&self) {
+        self.fail_heads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
     pub(crate) fn fail_next_put_containing(&self, needle: &str) {
         *self.fail_next_put_on.lock().unwrap() = Some(needle.to_string());
@@ -176,6 +184,12 @@ impl ObjectStore for FaultStore {
         location: &object_store::path::Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        if options.head && self.fail_heads.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "FaultStore",
+                source: "injected transient head failure".into(),
+            });
+        }
         self.inner.get_opts(location, options).await
     }
 

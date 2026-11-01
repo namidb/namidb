@@ -71,10 +71,14 @@ struct Cli {
     )]
     group_commit_window: Duration,
 
-    /// Enable `POST /v0/admin/backup` and restrict its destinations: the
-    /// request's `to` URI must equal this prefix or extend it at a `/` (or
-    /// `?ns=` query) boundary, e.g. `s3://backups-bucket/namidb`. Unset =
-    /// the endpoint is disabled.
+    /// Enable `POST /v0/admin/backup` (and, with `--multi-tenant`, admin
+    /// restore) and restrict where they copy: a backup's `to` and a restore's
+    /// `from` must use this scheme and bucket, sit at or below this path (no
+    /// `.`, `..` or empty segments), and add no query parameter but `ns`.
+    /// The prefix carries the store options, which requests must repeat
+    /// exactly, e.g.
+    /// `s3://backups-bucket/namidb?endpoint=http://minio:9000&allow_http=true`.
+    /// Unset = the endpoints are disabled.
     #[arg(long, env = "NAMIDB_BACKUP_TARGET_URI")]
     backup_target_uri: Option<String>,
 
