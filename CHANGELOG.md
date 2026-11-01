@@ -32,7 +32,9 @@ crates.io release will establish and document that API explicitly.
   404. The unprefixed `/v0/admin/restore` resolves the namespace from
   `X-NamiDB-Namespace` or `--default-namespace`. Single-tenant servers have
   no restore route. A busy multi-tenant admin backup now says "another
-  backup or restore is already running". A retry is always safe: the
+  backup or restore is already running". Retrying a failed or
+  interrupted restore is safe as long as nothing opened the target in
+  between (route no traffic to it until the restore succeeds): the
   restore deletes an interrupted attempt's leftovers under a target that has
   no pointer, a failed copy (a `verify` mismatch included) deletes what it
   wrote, and the copy runs on its own task, so a dropped request does not

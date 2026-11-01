@@ -159,14 +159,24 @@ pub async fn has_manifest_pointer(
         let mut s = store.list(Some(&paths.pointer_dir()));
         s.try_next().await.map_err(Error::ObjectStore)?.is_some()
     };
-    Ok(has_family || store.head(&paths.current_pointer()).await.is_ok())
+    if has_family {
+        return Ok(true);
+    }
+    // Only a definite NotFound means "no legacy pointer": a throttled or
+    // failed HEAD must not read as absence, since callers wipe a target they
+    // believe was never opened.
+    match store.head(&paths.current_pointer()).await {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(e) => Err(Error::ObjectStore(e)),
+    }
 }
 
 /// Delete every object under the namespace prefix at `(store, paths)` and
 /// return how many were removed. The manifest pointers (the pointer family
-/// and the legacy `current.json`) go first, so a run that stops partway
-/// leaves a namespace without a pointer — one nothing opens as existing —
-/// rather than a pointer to objects that are gone.
+/// and the legacy `current.json`) go first and the manifest bodies next, so a
+/// run that stops partway leaves neither a pointer nor a `v0` body that a
+/// later bootstrap could adopt over objects that are already gone.
 ///
 /// Only for a namespace nothing holds open: there is no fencing here. The
 /// multi-tenant admin restore uses it, under its registry reservation, to
@@ -178,18 +188,22 @@ pub async fn delete_namespace_objects(
 ) -> Result<usize> {
     let pointer_dir = paths.pointer_dir();
     let current = paths.current_pointer();
+    let manifest_dir = paths.manifest_dir();
     let mut pointers = Vec::new();
+    let mut manifests = Vec::new();
     let mut rest = Vec::new();
     let mut listing = store.list(Some(&paths.namespace_prefix()));
     while let Some(meta) = listing.try_next().await.map_err(Error::ObjectStore)? {
         if meta.location == current || meta.location.prefix_matches(&pointer_dir) {
             pointers.push(meta.location);
+        } else if meta.location.prefix_matches(&manifest_dir) {
+            manifests.push(meta.location);
         } else {
             rest.push(meta.location);
         }
     }
     let mut deleted = 0usize;
-    for location in pointers {
+    for location in pointers.into_iter().chain(manifests) {
         match store.delete(&location).await {
             Ok(()) => deleted += 1,
             Err(object_store::Error::NotFound { .. }) => {}
@@ -968,6 +982,25 @@ mod tests {
     /// plain retry (the v0 Create collides). [`delete_namespace_objects`]
     /// clears exactly that namespace — pointers included, siblings sharing a
     /// name prefix untouched — after which the retry succeeds.
+    /// A failed HEAD of the legacy pointer is not proof of absence: the
+    /// restore wipes a target it believes was never opened, so a throttled or
+    /// failing store must surface as an error, not as "no pointer".
+    #[tokio::test]
+    async fn has_manifest_pointer_propagates_a_failed_head() {
+        let faulty = Arc::new(crate::test_support::FaultStore::new(store()));
+        let dst: Arc<dyn ObjectStore> = faulty.clone();
+        let target = paths("bk-head-fault");
+        assert!(
+            !has_manifest_pointer(&dst, &target).await.unwrap(),
+            "empty store: no pointer"
+        );
+        faulty.fail_heads();
+        assert!(
+            has_manifest_pointer(&dst, &target).await.is_err(),
+            "a failed HEAD must not read as a missing pointer"
+        );
+    }
+
     #[tokio::test]
     async fn delete_namespace_objects_clears_an_interrupted_copy_for_retry() {
         let (src_store, src_paths) = (store(), paths("bk-clear-src"));

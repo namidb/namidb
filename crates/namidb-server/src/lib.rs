@@ -4576,7 +4576,11 @@ struct RestoreRequest {
 /// `--backup-target-uri` allowlist as backup destinations, and restores
 /// share the backup single-flight (one copy at a time per process).
 ///
-/// Retrying is always safe. A target without a pointer was never opened
+/// Retrying is safe as long as nothing opened the target in between (if
+/// the process dies before `v0` lands and a request then opens the target,
+/// bootstrap makes it an empty namespace and a retry gets 409; route no
+/// traffic to a namespace until its restore succeeds). A target without a
+/// pointer was never opened
 /// (bootstrap writes `p0`), so whatever an interrupted copy left there is
 /// deleted before copying; a copy that fails (including a `verify`
 /// mismatch, after the pointer landed) deletes what it wrote before the
@@ -4774,6 +4778,16 @@ async fn run_restore_copy(
                 "admin restore completed"
             );
             snapshot_copy_response(Ok(report), "restore")
+        }
+        // The copy found a pointer that appeared after the probe above: some
+        // other process (a second server on this store, the offline CLI)
+        // created the namespace. It is not ours to clear.
+        // (`copy_namespace_snapshot` refuses such a destination before writing
+        // anything, with this message.)
+        Err(e @ namidb_storage::Error::Precondition(_))
+            if e.to_string().contains("already has a manifest pointer") =>
+        {
+            snapshot_copy_response(Err(e), "restore")
         }
         // Clear what the copy wrote: a `verify` mismatch fails after the
         // pointer landed, and the target must not open (or refuse a retry
