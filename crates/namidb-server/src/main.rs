@@ -315,6 +315,20 @@ struct Cli {
     #[arg(long, env = "NAMIDB_MEMORY_MAX_BYTES", default_value = "0")]
     memory_max_bytes: String,
 
+    /// Working-memory budget of one query, in exact bytes: the rows its
+    /// operators materialise plus sort, grouping, `collect()` and DISTINCT
+    /// state, estimated conservatively as they grow. A query that needs more
+    /// stops with a 413 `query_memory_limit` (Bolt
+    /// `Neo.ClientError.Statement.ResourceLimitExceeded`) instead of growing
+    /// until the kernel kills the process. `auto` (the default) is 50% of
+    /// `--memory-max-bytes`, and off when that is `0`. With a memory ceiling,
+    /// all running queries together also share a pool of 75% of it, and a
+    /// running query is stopped with a retryable 503 `memory_pressure` when
+    /// the pool is full or the process reaches the ceiling. `0` disables the
+    /// budget.
+    #[arg(long, env = "NAMIDB_QUERY_MEMORY_MAX_BYTES", default_value = "auto")]
+    query_memory_max_bytes: String,
+
     /// Bound on how long a foreground request (write, DDL, admin flush, Bolt
     /// BEGIN) may wait for the writer lock before failing fast with 503, so
     /// request queues stay bounded behind a stuck or long-held writer.
@@ -472,12 +486,18 @@ fn main() -> anyhow::Result<()> {
 
     let memory_max_bytes = namidb_server::memory::resolve_memory_max_bytes(&cli.memory_max_bytes)
         .map_err(anyhow::Error::msg)?;
+    let query_memory_max_bytes = namidb_server::memory::resolve_query_memory_max_bytes(
+        &cli.query_memory_max_bytes,
+        memory_max_bytes,
+    )
+    .map_err(anyhow::Error::msg)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(namidb_server::run_with_memory_max_bytes(
+    rt.block_on(namidb_server::run_with_memory_limits(
         config,
         memory_max_bytes,
+        query_memory_max_bytes,
     ))
 }
 

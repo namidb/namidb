@@ -30,6 +30,10 @@ pub enum EvalErrorKind {
     /// The operator cancel flag fired inside expression evaluation.
     /// Converted to [`ExecError::Cancelled`].
     Cancelled,
+    /// A list built inside expression evaluation (`range()`) would exceed
+    /// the query's working-memory budget. Converted to
+    /// [`ExecError::MemoryLimit`].
+    MemoryLimit(crate::exec::memory::QueryMemoryExceeded),
 }
 
 impl EvalError {
@@ -1475,6 +1479,25 @@ fn range_fn(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, Eva
                 ),
                 span,
             ));
+        }
+    }
+    // The same reasoning applies to the working-memory budget (#203): check
+    // the list's slots before allocating them. A growing `Vec` can hold up
+    // to twice its length while it doubles, so charge that.
+    if crate::exec::memory::memory_scoped() {
+        let distance = i128::from(end) - i128::from(start);
+        let steps = distance / i128::from(step);
+        let len: u128 = if steps < 0 { 0 } else { steps as u128 + 1 };
+        let slots = len.saturating_mul(2 * std::mem::size_of::<RuntimeValue>() as u128);
+        let bytes = usize::try_from(slots).unwrap_or(usize::MAX);
+        if let Err(crate::exec::walker::ExecError::MemoryLimit(exceeded)) =
+            crate::exec::memory::check_transient(bytes)
+        {
+            return Err(EvalError {
+                message: format!("range() of {len} items: {exceeded}"),
+                span,
+                kind: EvalErrorKind::MemoryLimit(exceeded),
+            });
         }
     }
     let mut out = Vec::new();

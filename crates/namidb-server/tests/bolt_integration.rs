@@ -688,6 +688,28 @@ async fn boot_bolt_config(
     bolt_max_message_bytes: usize,
     query_row_cap: usize,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    boot_bolt_memory(
+        ns,
+        tx_timeout,
+        query_timeout,
+        bolt_max_message_bytes,
+        query_row_cap,
+        0,
+    )
+    .await
+}
+
+/// [`boot_bolt_config`] plus an explicit per-query working-memory budget
+/// (`0` disables it), passed directly rather than through the environment
+/// so parallel tests cannot see each other's setting.
+async fn boot_bolt_memory(
+    ns: &str,
+    tx_timeout: Duration,
+    query_timeout: Duration,
+    bolt_max_message_bytes: usize,
+    query_row_cap: usize,
+    query_memory_max_bytes: usize,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bolt_addr = listener.local_addr().unwrap();
     drop(listener);
@@ -735,7 +757,9 @@ async fn boot_bolt_config(
         http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
-        if let Err(e) = namidb_server::run(config).await {
+        if let Err(e) =
+            namidb_server::run_with_memory_limits(config, 0, query_memory_max_bytes).await
+        {
             eprintln!("server exited: {e}");
         }
     });
@@ -1713,6 +1737,69 @@ async fn bolt_row_cap_failure_has_resource_limit_code() {
         }
         other => panic!("FAILURE missing message: {other:?}"),
     }
+
+    stream.shutdown().await.ok();
+    task.abort();
+}
+
+/// #203: a read whose working set outgrows the per-query budget fails with a
+/// typed, non-retryable FAILURE instead of growing until the process is
+/// OOM-killed, and the server keeps serving.
+#[tokio::test]
+async fn bolt_query_memory_budget_failure_is_a_resource_limit() {
+    let (bolt_addr, task) = boot_bolt_memory(
+        "bolt-query-memory",
+        Duration::ZERO,
+        Duration::ZERO,
+        DEFAULT_POST_AUTH_MESSAGE_BYTES,
+        1_000_000,
+        64 * 1024 * 1024,
+    )
+    .await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String("UNWIND range(1, 600000) AS i RETURN i, toString(i) AS s".into()),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    let meta = match recv_msg(&mut stream).await {
+        Response::Failure(meta) => meta,
+        other => panic!("a read past the memory budget must fail, got {other:?}"),
+    };
+    assert_eq!(
+        meta.get("code"),
+        Some(&Value::String(
+            "Neo.ClientError.Statement.ResourceLimitExceeded".into()
+        )),
+        "memory-budget FAILURE code: {meta:?}"
+    );
+    match meta.get("message") {
+        Some(Value::String(message)) => assert!(
+            message.contains("working-memory budget"),
+            "message: {message}"
+        ),
+        other => panic!("FAILURE missing message: {other:?}"),
+    }
+
+    let reset = Value::Struct {
+        tag: struct_tag::RESET,
+        fields: vec![],
+    };
+    send_msg(&mut stream, &pack(&reset)).await;
+    match recv_msg(&mut stream).await {
+        Response::Success(_) => {}
+        other => panic!("RESET should recover to READY, got {other:?}"),
+    }
+    // Same connection, same process: a query that fits still runs.
+    let (_fields, rows) = pull_all(&mut stream, "UNWIND range(1, 1000) AS i RETURN i").await;
+    assert_eq!(rows.len(), 1000);
 
     stream.shutdown().await.ok();
     task.abort();

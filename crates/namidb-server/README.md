@@ -57,8 +57,27 @@ registered, reconstructible writer property/constraint maps. A process-wide
 500 ms watchdog performs the same single-flight reclamation even when no
 request arrives; at the ceiling new Cypher work returns HTTP 503 or Bolt
 `Neo.TransientError.General.DatabaseUnavailable` until memory falls. Pair it
-with Docker `--memory` or another cgroup/OS limit for hard containment of an
-already-running query. Authenticated `POST /v0/admin/flush` bypasses Cypher
+with Docker `--memory` or another cgroup/OS limit for hard containment.
+
+Admission alone cannot stop a query that is already running, so the same
+ceiling also drives a per-query working-memory budget,
+`--query-memory-max-bytes` / `NAMIDB_QUERY_MEMORY_MAX_BYTES` (default `auto`:
+50% of `NAMIDB_MEMORY_MAX_BYTES`, off when that is `0`; an exact byte count
+also works without a ceiling; `0` disables it). The executor charges each
+query's materialised rows and operator state (sort keys, grouping state,
+`collect()` lists, DISTINCT fingerprints, cross products, `range()` lists)
+with conservative estimates as they grow, plus the HTTP response body's copies
+of the result. All running queries also reserve from one pool of 75% of the
+ceiling, and a growing query re-samples RSS every 16 MiB of growth. A query
+that needs more than its own budget fails with HTTP 413 `query_memory_limit`
+(Bolt `Neo.ClientError.Statement.ResourceLimitExceeded`): it will fail again
+unchanged, so page it, narrow it or aggregate it. A query stopped because the
+shared pool is full or the process reached its ceiling fails with HTTP 503
+`memory_pressure` (Bolt `Neo.TransientError.General.DatabaseUnavailable`) and
+can be retried; admission refusals now carry the same `code`. The row cap
+(`NAMIDB_QUERY_ROW_CAP`) still applies on its own. `/v0/metrics` exports
+`namidb_query_memory_limit_bytes`, `namidb_query_memory_pool_bytes{kind}` and
+`namidb_query_memory_stops_total{reason}`. Authenticated `POST /v0/admin/flush` bypasses Cypher
 admission and is serialized process-wide so an operator can drain a live
 memtable. It is excluded from the ordinary request timeout and its storage
 work survives a disconnected client; the global request cap still bounds
@@ -350,13 +369,14 @@ without string-matching the message:
 | Runtime evaluation error (division by zero, missing `$param`, type mismatch) | 400 | `eval_error` | `Neo.ClientError.Statement.ArgumentError` | `22000` |
 | Unique-constraint violation | 409 | `constraint` | `Neo.ClientError.Schema.ConstraintValidationFailed` | `23000` |
 | Query timeout | 504 | `timeout` | `Neo.ClientError.Transaction.TransactionTimedOut` | `57014` |
-| Row cap / search result caps | 413 | `row_cap`, `search_result_limit`, `search_document_limit` | `Neo.ClientError.Statement.ResourceLimitExceeded` | `54000` |
-| Transient resource pressure | 503 | `search_index_cache_capacity`, `search_workspace_capacity` | `Neo.TransientError.General.DatabaseUnavailable` | `53000` |
+| Row cap / search result caps / per-query working-memory budget | 413 | `row_cap`, `search_result_limit`, `search_document_limit`, `query_memory_limit` | `Neo.ClientError.Statement.ResourceLimitExceeded` | `54000` |
+| Transient resource pressure | 503 | `search_index_cache_capacity`, `search_workspace_capacity`, `memory_pressure` | `Neo.TransientError.General.DatabaseUnavailable` | `53000` |
 | Unclassified server fault | 500 | — | `Neo.DatabaseError.General.UnknownError` | `50N42` |
 
 The same classes drive the Bolt `FAILURE` code, so official Neo4j drivers —
 which auto-retry `Neo.TransientError.*` and nothing else — retry exactly the
-transient conditions. Deterministic budgets (timeout, row cap) are
+transient conditions. Deterministic budgets (timeout, row cap, per-query
+working memory) are
 `ClientError` **on purpose**: a re-run exceeds the same budget again, so
 auto-retrying them is a retry livelock. Bolt ≤ 5.4 has no GQLSTATUS on the
 wire (GQL-aware drivers show the `50N42` polyfill for every failure); the

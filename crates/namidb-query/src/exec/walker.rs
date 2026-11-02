@@ -51,6 +51,13 @@ pub enum ExecError {
     /// server's configured row cap allows. Carries the cap. Never raised
     /// when no cap is in scope.
     RowCap(usize),
+    /// The query's estimated working memory exceeded its per-query budget,
+    /// the shared query-memory pool, or the process ceiling (issue #203).
+    /// Only raised when a [`crate::exec::memory::QueryMemoryBudget`] is in
+    /// scope. [`crate::exec::memory::QueryMemoryExceeded::is_transient`]
+    /// tells a deterministic budget overrun from pressure that a retry can
+    /// outlast.
+    MemoryLimit(crate::exec::memory::QueryMemoryExceeded),
 }
 
 impl fmt::Display for ExecError {
@@ -65,6 +72,7 @@ impl fmt::Display for ExecError {
             ExecError::RowCap(cap) => {
                 write!(f, "query exceeded the configured row cap of {cap}")
             }
+            ExecError::MemoryLimit(exceeded) => write!(f, "{exceeded}"),
         }
     }
 }
@@ -92,6 +100,9 @@ impl From<EvalError> for ExecError {
         match e.kind {
             crate::exec::expr::EvalErrorKind::Timeout => ExecError::Timeout,
             crate::exec::expr::EvalErrorKind::Cancelled => ExecError::Cancelled,
+            crate::exec::expr::EvalErrorKind::MemoryLimit(exceeded) => {
+                ExecError::MemoryLimit(exceeded)
+            }
             _ => ExecError::Eval(e),
         }
     }
@@ -140,6 +151,11 @@ pub(crate) fn resolve_row_count(
 /// actually produced, but an enormous bound cannot trigger an allocation
 /// before the first candidate exists.
 const MAX_EAGER_QUERY_CAPACITY: usize = 64;
+
+/// How many rows a producer loop pushes between two working-memory meter
+/// checks (#203). The meter estimates only the rows pushed since the last
+/// check, so this bounds the latency of a check, not its total cost.
+const METER_STRIDE: usize = 1024;
 
 #[inline]
 fn query_initial_capacity(requested: usize, available: usize) -> usize {
@@ -215,9 +231,15 @@ pub async fn execute_factor_path(
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
     let routing = PlanRouting::analyze(plan);
+    let mem_base = crate::exec::memory::frame_base();
     let set = execute_factor_inner_with_routing(plan, snapshot, params, None, &routing).await?;
     let rows = set.materialize_all(None);
     crate::exec::limits::check_row_cap(rows.len())?;
+    // The factorised path charges its flat sub-plans per operator; the
+    // materialised root result is charged here (#203).
+    if let Some(base) = mem_base {
+        crate::exec::memory::settle(base, &rows, crate::exec::memory::OutputKind::Additive)?;
+    }
     Ok(rows)
 }
 
@@ -240,7 +262,61 @@ pub(crate) fn execute_inner_with_routing<'a>(
         // for `'a` and not mutated; `profile_query_tree` consults the
         // same collector to attribute stats per operator.
         let profile_start = crate::profile::collector_present().then(std::time::Instant::now);
-        let result = match plan {
+        let mem_base = crate::exec::memory::frame_base();
+        let result = execute_operator(plan, snapshot, params, outer, routing).await;
+        // Row-cap guard: bound the rows any single operator hands up. This
+        // covers every operator uniformly (NodeScan, Expand, CrossProduct,
+        // HashJoin, Unwind, ...); the most explosive producers also fail
+        // fast before fully materialising (see CrossProduct's pre-check and
+        // the Expand accumulation loop).
+        if let Ok(rows) = &result {
+            crate::exec::limits::check_row_cap(rows.len())?;
+            // Working-memory guard (#203): charge the finished output and
+            // release the inputs it was built from. Growth meters inside the
+            // big producers already failed fast if the operator outgrew the
+            // budget mid-flight; this boundary check covers every operator.
+            if let Some(base) = mem_base {
+                crate::exec::memory::settle(base, rows, operator_output_kind(plan))?;
+            }
+        }
+        if let Some(start) = profile_start {
+            if let Ok(rows) = &result {
+                crate::profile::record_op(plan, start.elapsed(), rows.len() as u64);
+            }
+        }
+        result
+    }
+    .boxed()
+}
+
+/// How an operator's output relates to its inputs, for the working-memory
+/// boundary in [`execute_inner_with_routing`]. Operators that only move or
+/// drop input rows are not re-estimated; everything that builds new rows is.
+fn operator_output_kind(plan: &LogicalPlan) -> crate::exec::memory::OutputKind {
+    use crate::exec::memory::OutputKind;
+    match plan {
+        LogicalPlan::Filter { .. }
+        | LogicalPlan::SemiApply { .. }
+        | LogicalPlan::HashSemiJoin { .. }
+        | LogicalPlan::Union { all: true, .. } => OutputKind::Moved,
+        LogicalPlan::TopN { .. } | LogicalPlan::Distinct { .. } | LogicalPlan::Union { .. } => {
+            OutputKind::Replaced
+        }
+        _ => OutputKind::Additive,
+    }
+}
+
+/// The operator dispatch behind [`execute_inner_with_routing`], kept apart so
+/// an arm that returns early still passes through the boundary guards.
+fn execute_operator<'a>(
+    plan: &'a LogicalPlan,
+    snapshot: &'a Snapshot<'_>,
+    params: &'a Params,
+    outer: Option<&'a Row>,
+    routing: &'a PlanRouting,
+) -> BoxFuture<'a, Result<Vec<Row>, ExecError>> {
+    async move {
+        match plan {
             LogicalPlan::Empty => Ok(vec![Row::new()]),
 
             LogicalPlan::Argument { bindings } => {
@@ -266,11 +342,15 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
+                let mark = crate::exec::memory::frame_base();
                 for row in rows {
                     let sub_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
                             .await?;
                     let matched = !sub_rows.is_empty();
+                    // The per-row subquery output is dropped right here.
+                    drop(sub_rows);
+                    crate::exec::memory::restore(mark);
                     let keep = if *negated { !matched } else { matched };
                     if keep {
                         out.push(row);
@@ -365,6 +445,8 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
+                let mark = crate::exec::memory::frame_base();
+                let mut meter = crate::exec::memory::GrowthMeter::new();
                 for row in rows {
                     let inner_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
@@ -372,6 +454,12 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     let mut list = Vec::with_capacity(inner_rows.len());
                     for inner in inner_rows {
                         list.push(evaluate(projection, &inner, params)?);
+                    }
+                    // The inner rows are gone; the list they produced is
+                    // metered as part of this operator's output instead.
+                    crate::exec::memory::restore(mark);
+                    if meter.active() {
+                        meter.add(crate::exec::memory::estimate_values_bytes(&list))?;
                     }
                     let mut new_row = row;
                     new_row.set(alias.clone(), RuntimeValue::List(list));
@@ -724,7 +812,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let projected = project_rows(&rows, items, *discard_input_bindings, params)?;
                 if *distinct {
-                    Ok(dedup_rows(projected))
+                    dedup_rows(projected)
                 } else {
                     Ok(projected)
                 }
@@ -806,7 +894,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
             LogicalPlan::Distinct { input } => {
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
-                Ok(dedup_rows(rows))
+                dedup_rows(rows)
             }
 
             LogicalPlan::Union { left, right, all } => {
@@ -817,7 +905,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 if *all {
                     Ok(l)
                 } else {
-                    Ok(dedup_rows(l))
+                    dedup_rows(l)
                 }
             }
 
@@ -828,7 +916,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 // product Vec, so a runaway cross product aborts instead of
                 // allocating `l.len() * r.len()` rows first.
                 crate::exec::limits::check_row_cap(l.len().saturating_mul(r.len()))?;
-                Ok(cross_product(l, r))
+                cross_product(l, r)
             }
 
             LogicalPlan::HashJoin {
@@ -866,7 +954,11 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 let probe_rows =
                     execute_inner_with_routing(probe, snapshot, params, outer, routing).await?;
                 let mut out = Vec::new();
+                let mut meter = crate::exec::memory::GrowthMeter::new();
                 for prow in probe_rows {
+                    // One probe row can join many build rows; account the
+                    // joined rows pushed for the previous one (#203).
+                    meter.observe(&out)?;
                     let mut key = Vec::with_capacity(on.len());
                     let mut has_null = false;
                     for jk in on {
@@ -993,6 +1085,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let mut out = Vec::new();
+                let mut meter = crate::exec::memory::GrowthMeter::new();
                 for row in rows {
                     // A huge `UNWIND range(...)` is a pure-CPU expansion with
                     // no scan underneath — without a probe here it could
@@ -1002,6 +1095,12 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     let v = evaluate(list, &row, params)?;
                     match v {
                         RuntimeValue::List(items) => {
+                            // The list's buffer stays allocated until the
+                            // loop has moved every item out.
+                            let buffer = items
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<RuntimeValue>());
+                            meter.add(buffer)?;
                             for item in items {
                                 if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
                                     crate::exec::limits::check_deadline()?;
@@ -1011,11 +1110,16 @@ pub(crate) fn execute_inner_with_routing<'a>(
                                     // the post-loop check let a 4 GB
                                     // container OOM between 3M and 5M rows).
                                     crate::exec::limits::check_row_cap(out.len())?;
+                                    // A row cap counts rows, not bytes: the
+                                    // working-memory budget bounds wide or
+                                    // numerous rows under the cap (#203).
+                                    meter.observe(&out)?;
                                 }
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);
                                 out.push(new_row);
                             }
+                            meter.release(buffer);
                         }
                         RuntimeValue::Null => {} // empty unwind
                         _ => {
@@ -1106,21 +1210,7 @@ pub(crate) fn execute_inner_with_routing<'a>(
                     Row::new().with(output.clone(), RuntimeValue::Integer(total))
                 ])
             }
-        };
-        // Row-cap guard: bound the rows any single operator hands up. This
-        // covers every operator uniformly (NodeScan, Expand, CrossProduct,
-        // HashJoin, Unwind, ...); the most explosive producers also fail
-        // fast before fully materialising (see CrossProduct's pre-check and
-        // the Expand accumulation loop).
-        if let Ok(rows) = &result {
-            crate::exec::limits::check_row_cap(rows.len())?;
         }
-        if let Some(start) = profile_start {
-            if let Ok(rows) = &result {
-                crate::profile::record_op(plan, start.elapsed(), rows.len() as u64);
-            }
-        }
-        result
     }
     .boxed()
 }
@@ -1419,9 +1509,17 @@ pub(crate) async fn apply_rows(
     let mut out = Vec::with_capacity(rows.len());
     let correlated = reads_outer_row(subplan);
     let mut shared: Option<Vec<Row>> = None;
+    // A correlated subquery runs once per input row: release each run's
+    // output once it is merged, and meter the merged rows instead (#203).
+    let mark = crate::exec::memory::frame_base();
+    let mut meter = crate::exec::memory::GrowthMeter::new();
     for row in rows {
         if cap.is_some_and(|cap| out.len() >= cap) {
             break;
+        }
+        meter.observe(&out)?;
+        if correlated {
+            crate::exec::memory::restore(mark);
         }
         let fresh;
         let sub_rows: &[Row] = if correlated {
@@ -1653,7 +1751,7 @@ async fn try_execute_endpoint_distinct_project(
         sort_rows(&mut expanded, sort_keys, params)?;
     }
     let projected = project_rows(&expanded, items, discard_input_bindings, params)?;
-    Ok(Some(dedup_rows(projected)))
+    Ok(Some(dedup_rows(projected)?))
 }
 
 /// Clamp an open-ended variable-length upper bound (`max == u32::MAX`, from a
@@ -1792,12 +1890,14 @@ pub(crate) async fn execute_expand(
     const NEIGHBOUR_MEMO_MAX_EDGES: usize = 1_000_000;
     let mut neighbour_memo: HashMap<NodeId, Arc<Vec<EdgeView>>> = HashMap::new();
     let mut neighbour_memo_edges: usize = 0;
+    let mut meter = crate::exec::memory::GrowthMeter::new();
     for row in rows {
         // Deadline + row-cap guards: a multi-seed (or variable-length)
         // expansion is the most expensive operator, so bound it at every
         // seed boundary and fail fast before `out` grows past the cap.
         crate::exec::limits::check_deadline()?;
         crate::exec::limits::check_row_cap(out.len())?;
+        meter.observe(&out)?;
         // LIMIT-pushdown budget (set only via `execute_capped`, never on
         // the normal path). Checked at the seed boundary BEFORE processing
         // the next input row, so every consumed seed contributes its
@@ -1862,6 +1962,7 @@ pub(crate) async fn execute_expand(
         // counts as a valid match at hop 0. Emit it before stepping
         // out; downstream filters / target labels still apply.
         let mut hop_results: Vec<Row> = Vec::new();
+        let mut hop_meter = crate::exec::memory::GrowthMeter::new();
         let mut matched_any = false;
         if min == 0 {
             let mut zero_row = row.clone();
@@ -1969,6 +2070,21 @@ pub(crate) async fn execute_expand(
             // DISTINCT query hung past the 30 s budget).
             crate::exec::limits::check_deadline()?;
             crate::exec::limits::check_row_cap(out.len() + hop_results.len() + frontier.len())?;
+            // Working memory of one seed's traversal: the rows emitted so
+            // far plus the live frontier, which is rebuilt every hop (#203).
+            if meter.active() {
+                hop_meter.observe(&hop_results)?;
+                let frontier_bytes = frontier
+                    .iter()
+                    .map(|step| crate::exec::memory::estimate_row_bytes(&step.row))
+                    .fold(0usize, usize::saturating_add);
+                crate::exec::memory::check_transient(
+                    meter
+                        .bytes()
+                        .saturating_add(hop_meter.bytes())
+                        .saturating_add(frontier_bytes),
+                )?;
+            }
             let mut guard_tick: u32 = 0;
             let mut next_frontier = Vec::new();
             let mut level_seen: std::collections::HashSet<NodeId> =
@@ -2704,10 +2820,12 @@ async fn execute_expand_shortest_grouped(
     // One emitted path per hit: its trail and its relationship list.
     type PathHit = (Vec<RuntimeValue>, Vec<RuntimeValue>);
     let mut out: Vec<Row> = Vec::new();
+    let mut meter = crate::exec::memory::GrowthMeter::new();
     let mut i = 0usize;
     while i < rows.len() {
         crate::exec::limits::check_deadline()?;
         crate::exec::limits::check_row_cap(out.len())?;
+        meter.observe(&out)?;
         let starting = match rows[i].get(source) {
             Some(RuntimeValue::Node(n)) => n.id,
             Some(RuntimeValue::Null) => {
@@ -2850,6 +2968,13 @@ async fn execute_expand_shortest_grouped(
             }
             crate::exec::limits::check_deadline()?;
             crate::exec::limits::check_row_cap(out.len() + frontier.len())?;
+            if meter.active() {
+                let frontier_bytes = frontier
+                    .iter()
+                    .map(|state| crate::exec::memory::estimate_values_bytes(&state.trail))
+                    .fold(0usize, usize::saturating_add);
+                crate::exec::memory::check_transient(meter.bytes().saturating_add(frontier_bytes))?;
+            }
             let mut guard_tick: u32 = 0;
             let mut next_frontier: Vec<PathState> = Vec::new();
             let mut level_seen: HashSet<NodeId> = HashSet::new();
@@ -7445,6 +7570,7 @@ pub(crate) fn project_rows(
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
     let mut out = Vec::with_capacity(rows.len());
+    let mut meter = crate::exec::memory::GrowthMeter::new();
     for row in rows {
         let mut new_row = if discard_input_bindings {
             Row::new()
@@ -7456,7 +7582,11 @@ pub(crate) fn project_rows(
             new_row.set(item.alias.clone(), v);
         }
         out.push(new_row);
+        if out.len() % METER_STRIDE == 0 {
+            meter.observe(&out)?;
+        }
     }
+    meter.observe(&out)?;
     Ok(out)
 }
 
@@ -7526,10 +7656,21 @@ pub(crate) fn sort_rows(
     // Pre-compute key values for each row to avoid re-evaluating during
     // comparisons.
     let mut keyed: Vec<(Vec<RuntimeValue>, Row)> = Vec::with_capacity(rows.len());
+    // The sort keys and the keyed buffer are new allocations on top of the
+    // rows (#203).
+    let mut meter = crate::exec::memory::GrowthMeter::new();
+    meter.add(
+        keyed
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(Vec<RuntimeValue>, Row)>()),
+    )?;
     for row in rows.drain(..) {
         let mut row_keys = Vec::with_capacity(keys.len());
         for k in keys {
             row_keys.push(evaluate(&k.expression, &row, params)?);
+        }
+        if meter.active() {
+            meter.add(crate::exec::memory::estimate_values_bytes(&row_keys))?;
         }
         keyed.push((row_keys, row));
     }
@@ -7663,9 +7804,21 @@ fn bounded_topk(
     Ok(items.into_iter().map(|it| it.row).collect())
 }
 
-pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
+pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>, ExecError> {
     if left.is_empty() || right.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+    // Every output row clones one left and one right row, so the product
+    // costs about |R| copies of the left side plus |L| copies of the right.
+    // Check that before allocating it (#203).
+    if crate::exec::memory::memory_scoped() {
+        let left_bytes = crate::exec::memory::estimate_row_vec_bytes(&left);
+        let right_bytes = crate::exec::memory::estimate_row_vec_bytes(&right);
+        crate::exec::memory::check_transient(
+            left_bytes
+                .saturating_mul(right.len())
+                .saturating_add(right_bytes.saturating_mul(left.len())),
+        )?;
     }
     let mut out = Vec::with_capacity(left.len() * right.len());
     for l in &left {
@@ -7677,10 +7830,10 @@ pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
             out.push(merged);
         }
     }
-    out
+    Ok(out)
 }
 
-pub(crate) fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
+pub(crate) fn dedup_rows(rows: Vec<Row>) -> Result<Vec<Row>, ExecError> {
     // ORDER-PRESERVING first-occurrence dedup. The previous
     // sort-by-fingerprint + dedup silently re-ordered its input, which
     // broke the `RETURN DISTINCT x ORDER BY x` lowering (TopN under
@@ -7690,9 +7843,21 @@ pub(crate) fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
     // relation.
     let mut seen: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(rows.len());
-    rows.into_iter()
-        .filter(|row| seen.insert(row_fingerprint(row)))
-        .collect()
+    // The fingerprint set is transient state the size of the input (#203).
+    let mut meter = crate::exec::memory::GrowthMeter::new();
+    meter.add(
+        seen.capacity()
+            .saturating_mul(std::mem::size_of::<String>() + 8),
+    )?;
+    let mut out = Vec::with_capacity(rows.len().min(MAX_EAGER_QUERY_CAPACITY));
+    for row in rows {
+        let fingerprint = row_fingerprint(&row);
+        meter.add(fingerprint.capacity().saturating_add(32))?;
+        if seen.insert(fingerprint) {
+            out.push(row);
+        }
+    }
+    Ok(out)
 }
 
 fn row_fingerprint(row: &Row) -> String {
@@ -7859,6 +8024,11 @@ pub(crate) fn execute_aggregate(
     use std::collections::BTreeMap;
 
     let mut groups: BTreeMap<String, (Vec<RuntimeValue>, Vec<Row>)> = BTreeMap::new();
+    // Grouping state on top of the (moved) input rows: one key, its values
+    // and a row-pointer slot per group (#203). The aggregated output, which
+    // is where `collect()` lists live, is metered below and charged at the
+    // operator boundary.
+    let mut meter = crate::exec::memory::GrowthMeter::new();
     for row in rows {
         let mut key_vals = Vec::with_capacity(group_by.len());
         let mut fingerprint = String::new();
@@ -7868,11 +8038,22 @@ pub(crate) fn execute_aggregate(
             fingerprint.push('|');
             key_vals.push(v);
         }
-        groups
-            .entry(fingerprint)
-            .or_insert_with(|| (key_vals, Vec::new()))
-            .1
-            .push(row);
+        let group = match groups.entry(fingerprint) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if meter.active() {
+                    meter.add(
+                        entry
+                            .key()
+                            .capacity()
+                            .saturating_add(crate::exec::memory::estimate_values_bytes(&key_vals))
+                            .saturating_add(AGGREGATE_GROUP_OVERHEAD_BYTES),
+                    )?;
+                }
+                entry.insert((key_vals, Vec::new()))
+            }
+        };
+        group.1.push(row);
     }
     // Empty input + no group keys: emit one row of "empty group" so that
     // `RETURN count(*)` over zero rows yields `0`.
@@ -7894,9 +8075,14 @@ pub(crate) fn execute_aggregate(
             row.set(alias.clone(), aggregate_over(&group_rows, agg, params)?);
         }
         out.push(row);
+        meter.observe(&out)?;
     }
     Ok(out)
 }
+
+/// Per-group bookkeeping of [`execute_aggregate`] beyond the key and its
+/// values: the B-tree slot, the group's row vector and its first growth.
+const AGGREGATE_GROUP_OVERHEAD_BYTES: usize = 160;
 
 fn aggregate_over(
     rows: &[Row],
@@ -8088,6 +8274,13 @@ fn collect_non_null(
 ) -> Result<Vec<RuntimeValue>, ExecError> {
     let mut out = Vec::with_capacity(rows.len());
     let mut seen = BTreeSet::new();
+    // `collect()` (and every aggregate built on this) clones each kept value
+    // into one list: meter it as it grows (#203).
+    let mut meter = crate::exec::memory::GrowthMeter::new();
+    meter.add(
+        out.capacity()
+            .saturating_mul(std::mem::size_of::<RuntimeValue>()),
+    )?;
     for row in rows {
         let v = evaluate_agg_arg(arg, row, params)?;
         if v.is_null() {
@@ -8095,13 +8288,20 @@ fn collect_non_null(
         }
         if distinct {
             let fp = fingerprint_value(&v);
+            if meter.active() {
+                meter.add(fp.capacity().saturating_add(64))?;
+            }
             if !seen.insert(fp) {
                 continue;
             }
         }
         // Only kept values pay the clone; distinct-dropped duplicates never
         // materialise an owned copy.
-        out.push(v.into_owned());
+        let v = v.into_owned();
+        if meter.active() {
+            meter.add(crate::exec::memory::estimate_value_bytes(&v))?;
+        }
+        out.push(v);
     }
     Ok(out)
 }
@@ -8975,7 +9175,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_rows = input_set.materialize_all(None);
                 let projected = project_rows(&input_rows, items, *discard_input_bindings, params)?;
                 let rows = if *distinct {
-                    dedup_rows(projected)
+                    dedup_rows(projected)?
                 } else {
                     projected
                 };
@@ -9154,7 +9354,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
                 let rows = input_set.materialize_all(None);
-                Ok(FactorRowSet::from_flat(dedup_rows(rows)))
+                Ok(FactorRowSet::from_flat(dedup_rows(rows)?))
             }
 
             LogicalPlan::Union { left, right, all } => {
@@ -9164,7 +9364,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     .await?;
                 let mut rows = l.materialize_all(None);
                 rows.extend(r.materialize_all(None));
-                let out = if *all { rows } else { dedup_rows(rows) };
+                let out = if *all { rows } else { dedup_rows(rows)? };
                 Ok(FactorRowSet::from_flat(out))
             }
 

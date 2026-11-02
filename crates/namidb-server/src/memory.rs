@@ -20,6 +20,18 @@ pub const DEFAULT_MEMORY_MAX_BYTES: usize = 0;
 /// overhead, and the delay between two 500 ms watchdog samples before the
 /// kernel's OOM killer reaches the container limit.
 pub const AUTO_MEMORY_LIMIT_PERCENT: usize = 90;
+/// Share of `NAMIDB_MEMORY_MAX_BYTES` one query may use for its working set
+/// when `NAMIDB_QUERY_MEMORY_MAX_BYTES` is `auto` (the default).
+///
+/// Half the ceiling lets the largest admitted query coexist with the
+/// memtable, the caches and a few smaller queries, and still covers the
+/// copies the HTTP response makes of the result.
+pub const AUTO_QUERY_MEMORY_PERCENT: usize = 50;
+/// Share of `NAMIDB_MEMORY_MAX_BYTES` that all in-flight queries together
+/// may reserve for working memory. The rest is for everything the
+/// per-query accounting does not see: memtables, caches, flush and
+/// compaction buffers, connection state.
+pub const QUERY_MEMORY_POOL_PERCENT: usize = 75;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const SELF_CGROUP: &str = "/proc/self/cgroup";
@@ -75,6 +87,23 @@ pub fn resolve_memory_max_bytes(raw: &str) -> Result<usize, String> {
     }
     raw.parse::<usize>().map_err(|error| {
         format!("NAMIDB_MEMORY_MAX_BYTES must be an exact byte count, 0, or auto: {error}")
+    })
+}
+
+/// Parse the per-query working-memory budget (`NAMIDB_QUERY_MEMORY_MAX_BYTES`).
+///
+/// `auto` derives it from the process ceiling: [`AUTO_QUERY_MEMORY_PERCENT`]
+/// of `memory_max_bytes`, or disabled when that ceiling is disabled, so a
+/// server that never opted into memory limits behaves exactly as before.
+/// `0` disables the budget; any other value is an exact byte count and also
+/// applies without a process ceiling.
+pub fn resolve_query_memory_max_bytes(raw: &str, memory_max_bytes: usize) -> Result<usize, String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return Ok(percent(memory_max_bytes, AUTO_QUERY_MEMORY_PERCENT));
+    }
+    raw.parse::<usize>().map_err(|error| {
+        format!("NAMIDB_QUERY_MEMORY_MAX_BYTES must be an exact byte count, 0, or auto: {error}")
     })
 }
 
@@ -234,6 +263,14 @@ pub struct MemoryGovernor {
     /// so the one operation that relieves pressure would be unavailable
     /// exactly while the server was under it.
     admin_compact_gate: Arc<tokio::sync::Semaphore>,
+    /// Per-query working-memory budget in bytes (issue #203); zero disables
+    /// it. Already clamped to the shared pool's capacity.
+    query_memory_max_bytes: usize,
+    /// Working-memory pool shared by every in-flight query, present when a
+    /// process ceiling is configured.
+    query_memory_pool: Option<Arc<namidb_query::QueryMemoryPool>>,
+    /// Running queries stopped because the process reached its ceiling.
+    query_memory_process_stops: AtomicU64,
 }
 
 /// RAII reservation against [`MemoryGovernor`]'s total-memory ceiling.
@@ -280,7 +317,91 @@ impl MemoryGovernor {
             reserved_headroom_bytes: AtomicUsize::new(0),
             admin_flush_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             admin_compact_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            query_memory_max_bytes: 0,
+            query_memory_pool: None,
+            query_memory_process_stops: AtomicU64::new(0),
         }
+        .with_query_memory_max_bytes(percent(max_bytes, AUTO_QUERY_MEMORY_PERCENT))
+    }
+
+    /// Set the per-query working-memory budget (issue #203). Zero disables
+    /// it. With a process ceiling, queries also reserve from a pool of
+    /// [`QUERY_MEMORY_POOL_PERCENT`] of it, and a budget larger than that
+    /// pool is clamped to it. [`Self::new`] starts from the `auto` value.
+    pub fn with_query_memory_max_bytes(mut self, per_query_bytes: usize) -> Self {
+        let pool_bytes = percent(self.max_bytes, QUERY_MEMORY_POOL_PERCENT);
+        if per_query_bytes == 0 {
+            self.query_memory_max_bytes = 0;
+            self.query_memory_pool = None;
+        } else if self.max_bytes > 0 {
+            self.query_memory_max_bytes = per_query_bytes.min(pool_bytes).max(1);
+            self.query_memory_pool = Some(Arc::new(namidb_query::QueryMemoryPool::new(pool_bytes)));
+        } else {
+            self.query_memory_max_bytes = per_query_bytes;
+            self.query_memory_pool = None;
+        }
+        self
+    }
+
+    /// The effective per-query working-memory budget; zero when disabled.
+    pub fn query_memory_max_bytes(&self) -> usize {
+        self.query_memory_max_bytes
+    }
+
+    /// The pool every in-flight query reserves working memory from.
+    pub fn query_memory_pool(&self) -> Option<&Arc<namidb_query::QueryMemoryPool>> {
+        self.query_memory_pool.as_ref()
+    }
+
+    /// Running queries stopped by the resident-memory probe.
+    pub fn query_memory_process_stops(&self) -> u64 {
+        self.query_memory_process_stops.load(Ordering::Relaxed)
+    }
+
+    /// A fresh working-memory budget for one statement, or `None` when the
+    /// budget is disabled. Scope it around execution with
+    /// [`namidb_query::with_query_memory`] and keep it alive while the
+    /// result is being turned into a response.
+    ///
+    /// With a process ceiling the budget also probes resident memory as the
+    /// query grows, so a query is stopped with a memory-pressure error when
+    /// the process as a whole reaches the ceiling (other queries, memtables
+    /// and caches included), instead of the kernel killing the process.
+    pub fn query_budget(self: &Arc<Self>) -> Option<Arc<namidb_query::QueryMemoryBudget>> {
+        if self.query_memory_max_bytes == 0 {
+            return None;
+        }
+        let mut budget = namidb_query::QueryMemoryBudget::new(self.query_memory_max_bytes);
+        if let Some(pool) = &self.query_memory_pool {
+            budget = budget.with_pool(Arc::clone(pool));
+        }
+        if self.max_bytes > 0 {
+            let governor = Arc::clone(self);
+            budget = budget.with_probe(Arc::new(move || governor.probe_running_query()));
+        }
+        Some(Arc::new(budget))
+    }
+
+    /// Resident-memory probe for a running query: `Some((resident, max))`
+    /// when the process is at or above its ceiling.
+    fn probe_running_query(&self) -> Option<(usize, usize)> {
+        let resident = sample_resident_bytes()?;
+        self.resident_bytes.store(resident, Ordering::Relaxed);
+        if resident < self.max_bytes {
+            return None;
+        }
+        self.query_memory_process_stops
+            .fetch_add(1, Ordering::Relaxed);
+        if self.should_log_rejection() {
+            tracing::warn!(
+                resident_bytes = resident,
+                max_bytes = self.max_bytes,
+                in_flight = %self.pressure_holders(),
+                "memory pressure: stopping a running query that is still growing at the \
+                 process memory ceiling"
+            );
+        }
+        Some((resident, self.max_bytes))
     }
 
     /// Sample current RSS/working-set and admit a new query only while it is

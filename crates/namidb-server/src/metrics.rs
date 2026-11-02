@@ -798,6 +798,49 @@ impl Metrics {
             "namidb_memory_rejected_queries_total {}",
             memory.rejected_queries()
         );
+        // Per-query working-memory budget and the pool every in-flight query
+        // reserves from (#203). Estimated bytes, not a resident measurement.
+        let _ = writeln!(
+            out,
+            "# HELP namidb_query_memory_limit_bytes Per-query working-memory budget; zero disables it."
+        );
+        let _ = writeln!(out, "# TYPE namidb_query_memory_limit_bytes gauge");
+        let _ = writeln!(
+            out,
+            "namidb_query_memory_limit_bytes {}",
+            memory.query_memory_max_bytes()
+        );
+        let pool = memory.query_memory_pool();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_query_memory_pool_bytes Shared query working-memory pool: capacity, currently reserved, and peak reserved."
+        );
+        let _ = writeln!(out, "# TYPE namidb_query_memory_pool_bytes gauge");
+        for (kind, value) in [
+            ("capacity", pool.map_or(0, |p| p.capacity_bytes())),
+            ("reserved", pool.map_or(0, |p| p.reserved_bytes())),
+            ("peak", pool.map_or(0, |p| p.peak_reserved_bytes())),
+        ] {
+            let _ = writeln!(
+                out,
+                "namidb_query_memory_pool_bytes{{kind=\"{kind}\"}} {value}"
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP namidb_query_memory_stops_total Running queries stopped for working memory: the shared pool was full, or the process reached its ceiling."
+        );
+        let _ = writeln!(out, "# TYPE namidb_query_memory_stops_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_query_memory_stops_total{{reason=\"pool\"}} {}",
+            pool.map_or(0, |p| p.rejections())
+        );
+        let _ = writeln!(
+            out,
+            "namidb_query_memory_stops_total{{reason=\"process\"}} {}",
+            memory.query_memory_process_stops()
+        );
 
         // Reading metrics must not be the operation that initializes an NVMe
         // cache or locks its directory. The storage snapshot is deliberately
@@ -1300,6 +1343,11 @@ mod tests {
         assert!(with_memory.contains("namidb_memory_resident_bytes "));
         assert!(with_memory.contains("namidb_memory_reclaims_total 0"));
         assert!(with_memory.contains("namidb_memory_rejected_queries_total 0"));
+        // auto: half of the ceiling per query, three quarters shared.
+        assert!(with_memory.contains("namidb_query_memory_limit_bytes 61728"));
+        assert!(with_memory.contains("namidb_query_memory_pool_bytes{kind=\"capacity\"} 92592"));
+        assert!(with_memory.contains("namidb_query_memory_stops_total{reason=\"pool\"} 0"));
+        assert!(with_memory.contains("namidb_query_memory_stops_total{reason=\"process\"} 0"));
         assert!(with_memory.contains("namidb_range_cache_enabled "));
         assert!(with_memory.contains("namidb_range_cache_bytes{tier=\"ram\",kind=\"usage\"} "));
         assert!(with_memory.contains("namidb_range_cache_lookups_total{outcome=\"memory_hit\"} "));

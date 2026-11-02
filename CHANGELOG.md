@@ -15,6 +15,44 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A running query's working memory is now bounded (#203).** Admission
+  under `NAMIDB_MEMORY_MAX_BYTES` only sampled RSS when a query started, so
+  one admitted read that materialised a large result (a 600k-row `UNWIND` in
+  a 384 MiB container) grew until the kernel OOM-killed the process and every
+  in-flight request with it. Each statement (HTTP and Bolt, reads and writes)
+  now runs under a working-memory budget set by the new
+  `--query-memory-max-bytes` / `NAMIDB_QUERY_MEMORY_MAX_BYTES` (default
+  `auto`: 50% of `NAMIDB_MEMORY_MAX_BYTES`, off when that is `0`; an exact
+  byte count also works without a ceiling; `0` disables). The executor
+  charges materialised rows at every operator boundary and meters the
+  producers that can outgrow their input mid-flight (`UNWIND`, expand and
+  variable-length traversal, projection, joins, cross products,
+  aggregation and `collect()`, `DISTINCT`, sorting, `range()`), using
+  conservative estimates of the heap the rows really occupy; the HTTP
+  response body's copies of the result are charged too. All running queries
+  also reserve from a shared pool of 75% of the ceiling, and a growing query
+  re-samples RSS every 16 MiB. A query over its own budget fails with HTTP
+  413 `code: "query_memory_limit"` / Bolt
+  `Neo.ClientError.Statement.ResourceLimitExceeded` (GQLSTATUS `54000`; not
+  retryable unchanged). A query stopped because the pool is full or the
+  process reached its ceiling fails with HTTP 503 `code: "memory_pressure"` /
+  Bolt `Neo.TransientError.General.DatabaseUnavailable` (`53000`;
+  retryable). `NAMIDB_QUERY_ROW_CAP` is unchanged and still applies on its
+  own. New metrics: `namidb_query_memory_limit_bytes`,
+  `namidb_query_memory_pool_bytes{kind}`,
+  `namidb_query_memory_stops_total{reason}`. Embedded Rust callers can scope
+  a `namidb_query::QueryMemoryBudget` with `with_query_memory`.
+
+### Changed
+
+- The HTTP 503 for a query refused at memory admission now carries
+  `code: "memory_pressure"`, `neo4j_code` and `gql_status`, like every
+  other executor error body. The `error` text is unchanged.
+- The row cap now also applies to the result of a few lookup and `DISTINCT`
+  paths that returned early and skipped the per-operator guard.
+
 ## [3.2.0] - 2026-10-31
 
 ### Added

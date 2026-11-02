@@ -598,6 +598,7 @@ cache, and admission guarantees are specified in the
 | `NAMIDB_SEARCH_MAX_RESULT_BYTES` | `67108864` (64 MiB) | Materialised-result ceiling for legacy unbounded (`k = None`) FTS APIs. Crossing it is an explicit error, never silent truncation; finite `k` stays bounded by its heap. |
 | `NAMIDB_BM25_MAX_DOCUMENT_BYTES` | `1048576` (1 MiB) | Maximum UTF-8 bytes across one document's configured string fields in the exact BM25 fallback. Tokenization is streaming, but the unique-term map reserves a conservative 160× document allowance together with result memory; raise this and `NAMIDB_SEARCH_WORKSPACE_MAX_BYTES` together with matching process headroom. |
 | `NAMIDB_MEMORY_MAX_BYTES` | `0` (disabled); `auto` in the official Compose example | Server-only total RSS/working-set admission ceiling. An exact byte count is accepted; `auto` selects 90% of a finite cgroup limit and fails startup if no hard limit exists. A 500 ms watchdog clears reconstructible caches at 90% of the resulting rail even without incoming work; at the ceiling new Cypher receives a retryable 503/Bolt transient error until memory falls. |
+| `NAMIDB_QUERY_MEMORY_MAX_BYTES` | `auto`: 50% of `NAMIDB_MEMORY_MAX_BYTES`, off when that is `0` | Server-only working-memory budget of one running query: materialised rows plus sort, grouping, `collect()`, DISTINCT and cross-product state, estimated conservatively as they grow, plus the HTTP body's copies of the result. Over budget the query fails with 413 `query_memory_limit` (Bolt `ResourceLimitExceeded`) instead of the process being OOM-killed. With a ceiling, running queries also share a pool of 75% of it and re-sample RSS as they grow; hitting either fails the query with a retryable 503 `memory_pressure`. An exact byte count works without a ceiling; `0` disables. |
 | `NAMIDB_BOLT_MEMORY_BUDGET_BYTES` | half of `NAMIDB_MEMORY_MAX_BYTES`, or `1073807360` (~1 GiB) when that governor is disabled | Process-wide admission budget shared by framed, decoded, converted and prefetched authenticated Bolt data. An incomplete frame holds `64 KiB + 2 × wire body bytes`; at its terminator a data frame must atomically upgrade to `64 KiB + 16 × wire body bytes` or fail retryably. Use smaller batches or raise this only with matching process/cgroup headroom. |
 | `NAMIDB_BOLT_PARTIAL_MESSAGE_TIMEOUT` | `120s` | Deadline from the first byte of an authenticated partial frame through framing/budget admission. `0s` disables it; a completely idle connection holds no message-memory permit and has no partial-frame deadline. |
 | `NAMIDB_CORRELATED_WRITE_CHUNK_ROWS` | `128` (hard-clamped to `1024`) | Existing-node rows point-probed and hydrated at once for a write-only `UNWIND … MATCH (n {unique_key: …}) SET …`. The request parameters remain caller-owned, while old wide node values (including embeddings) are released one bounded chunk at a time. |
@@ -725,7 +726,11 @@ limit and refuses to start without one, rather than guessing from shared host
 RAM. It measures RSS on
 Linux/macOS and working set on Windows, reclaims shared caches and writer-local
 reconstructible maps at 90%, and stops admitting new Cypher work at the
-configured byte ceiling. A process-wide 500 ms watchdog performs the same
+configured byte ceiling. Queries that are already running are bounded by the
+per-query working-memory budget (`NAMIDB_QUERY_MEMORY_MAX_BYTES`, by default
+half of this ceiling, with a shared pool of three quarters of it for all
+running queries) and stop with a typed 413/503 rather than growing until the
+kernel kills the process. A process-wide 500 ms watchdog performs the same
 single-flight reclamation while the server is idle or a background
 flush/compaction is running; reclamation no longer waits for the next request.
 Authenticated `POST /v0/admin/flush` remains available as a pressure-relief

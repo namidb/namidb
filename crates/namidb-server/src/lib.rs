@@ -990,12 +990,35 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
 /// Boot the server with an explicit process-wide RSS/working-set ceiling.
 ///
-/// The standalone binary uses this entry point for its CLI/env-parsed value;
 /// [`run`] retains the 2.0 `Config` shape and reads
-/// `NAMIDB_MEMORY_MAX_BYTES` for embedded callers.
+/// `NAMIDB_MEMORY_MAX_BYTES` for embedded callers. The per-query
+/// working-memory budget is read from `NAMIDB_QUERY_MEMORY_MAX_BYTES`
+/// (default `auto`); use [`run_with_memory_limits`] to pass it explicitly.
 pub async fn run_with_memory_max_bytes(
     config: Config,
     memory_max_bytes: usize,
+) -> anyhow::Result<()> {
+    let raw = match std::env::var("NAMIDB_QUERY_MEMORY_MAX_BYTES") {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => "auto".to_string(),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "NAMIDB_QUERY_MEMORY_MAX_BYTES is not valid UTF-8: {error}"
+            ))
+        }
+    };
+    let query_memory_max_bytes = memory::resolve_query_memory_max_bytes(&raw, memory_max_bytes)
+        .map_err(anyhow::Error::msg)?;
+    run_with_memory_limits(config, memory_max_bytes, query_memory_max_bytes).await
+}
+
+/// Boot the server with an explicit process ceiling and per-query
+/// working-memory budget (issue #203; `0` disables the budget). The
+/// standalone binary uses this entry point for its CLI/env-parsed values.
+pub async fn run_with_memory_limits(
+    config: Config,
+    memory_max_bytes: usize,
+    query_memory_max_bytes: usize,
 ) -> anyhow::Result<()> {
     namidb_storage::validate_cache_configuration().map_err(anyhow::Error::msg)?;
     if config.bolt_max_message_bytes == 0 {
@@ -1097,7 +1120,25 @@ pub async fn run_with_memory_max_bytes(
             Arc::new(authz::NoOpAuthz)
         }
     };
-    let memory = Arc::new(memory::MemoryGovernor::new(memory_max_bytes));
+    let memory = Arc::new(
+        memory::MemoryGovernor::new(memory_max_bytes)
+            .with_query_memory_max_bytes(query_memory_max_bytes),
+    );
+    if memory.query_memory_max_bytes() > 0 {
+        info!(
+            query_memory_max_bytes = memory.query_memory_max_bytes(),
+            query_memory_pool_bytes = memory.query_memory_pool().map_or(0, |p| p.capacity_bytes()),
+            "per-query working-memory budget enabled"
+        );
+        if query_memory_max_bytes > memory.query_memory_max_bytes() {
+            warn!(
+                requested = query_memory_max_bytes,
+                effective = memory.query_memory_max_bytes(),
+                "NAMIDB_QUERY_MEMORY_MAX_BYTES exceeds the shared query-memory pool \
+                 (75% of NAMIDB_MEMORY_MAX_BYTES); clamped to the pool"
+            );
+        }
+    }
     if memory_max_bytes > 0 {
         info!(
             memory_max_bytes,
@@ -1851,6 +1892,14 @@ fn exec_error_classification(
             (StatusCode::CONFLICT, Some("cancelled"))
         }
         ExecError::RowCap(_) => (StatusCode::PAYLOAD_TOO_LARGE, Some("row_cap")),
+        // Working-memory budget (#203). The query's own budget is
+        // deterministic, like the row cap: 413, do not retry unchanged. A
+        // full shared pool or the process ceiling is the same transient
+        // condition as admission's memory pressure: 503, retry later.
+        ExecError::MemoryLimit(exceeded) if exceeded.is_transient() => {
+            (StatusCode::SERVICE_UNAVAILABLE, Some("memory_pressure"))
+        }
+        ExecError::MemoryLimit(_) => (StatusCode::PAYLOAD_TOO_LARGE, Some("query_memory_limit")),
         // A unique-constraint violation is a client error (duplicate value), not
         // a server fault — surface it as 409 Conflict.
         ExecError::Constraint(_) => (StatusCode::CONFLICT, Some("constraint")),
@@ -1894,6 +1943,10 @@ fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'st
             ("Neo.TransientError.Transaction.Terminated", "57014")
         }
         ExecError::RowCap(_) => ("Neo.ClientError.Statement.ResourceLimitExceeded", "54000"),
+        ExecError::MemoryLimit(exceeded) if exceeded.is_transient() => {
+            ("Neo.TransientError.General.DatabaseUnavailable", "53000")
+        }
+        ExecError::MemoryLimit(_) => ("Neo.ClientError.Statement.ResourceLimitExceeded", "54000"),
         ExecError::Constraint(_) => ("Neo.ClientError.Schema.ConstraintValidationFailed", "23000"),
         ExecError::Storage(
             namidb_storage::Error::SearchResultLimitExceeded { .. }
@@ -2698,7 +2751,19 @@ fn memory_pressure_observation(
         kind: None,
         ok: false,
         elapsed: started.elapsed(),
-        response: (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorBody { error })).into_response(),
+        // Same machine-readable fields as a running query stopped by the
+        // memory budget's pressure scopes (#203), so clients handle both
+        // with one rule.
+        response: (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": error,
+                "code": "memory_pressure",
+                "neo4j_code": "Neo.TransientError.General.DatabaseUnavailable",
+                "gql_status": "53000",
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -3526,11 +3591,9 @@ async fn run_write_section(
         // the ACK arrives only after the merged commit is durable and
         // the snapshot republished (RFC-021 preserved).
         let mark = writer.begin_staged_request();
-        match execute_write_staged_with_deadline(
-            &plan,
-            &mut writer,
-            &params,
-            state.write_deadline(),
+        match namidb_query::with_query_memory(
+            state.memory.query_budget(),
+            execute_write_staged_with_deadline(&plan, &mut writer, &params, state.write_deadline()),
         )
         .await
         {
@@ -3572,8 +3635,11 @@ async fn run_write_section(
             }
         }
     } else {
-        let result =
-            execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline()).await;
+        let result = namidb_query::with_query_memory(
+            state.memory.query_budget(),
+            execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline()),
+        )
+        .await;
         // Sample the soft write-stall decision while still holding the lock
         // (RFC-027 P5), then release it and sleep — backpressure applies to
         // this request, not to the writer mutex other connections need.
@@ -3918,14 +3984,21 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             Err(gate) => return admission_exhausted_observation(started, gate),
         };
         let snap = owned.borrow();
-        let result = execute_with_limits(
-            &plan,
-            &snap,
-            &params,
-            state.query_deadline(),
-            state.query_row_cap(),
+        // Working-memory budget (#203): held until the response body is
+        // built below, which charges its own copies of the result.
+        let budget = state.memory.query_budget();
+        let result = namidb_query::with_query_memory(
+            budget.clone(),
+            execute_with_limits(
+                &plan,
+                &snap,
+                &params,
+                state.query_deadline(),
+                state.query_row_cap(),
+            ),
         )
-        .await;
+        .await
+        .and_then(|rows| charge_json_response(budget.as_deref(), rows));
         let elapsed = started.elapsed();
         match result {
             Ok(rows) => {
@@ -5086,11 +5159,14 @@ async fn run_write_section_multi(
         // namespace's committer (spawned by the registry, cancelled on
         // eviction) make the group durable with one commit.
         let mark = writer.begin_staged_request();
-        match execute_write_staged_with_deadline(
-            &plan,
-            &mut writer,
-            &params,
-            shared.write_deadline(),
+        match namidb_query::with_query_memory(
+            shared.memory.query_budget(),
+            execute_write_staged_with_deadline(
+                &plan,
+                &mut writer,
+                &params,
+                shared.write_deadline(),
+            ),
         )
         .await
         {
@@ -5139,8 +5215,11 @@ async fn run_write_section_multi(
             }
         }
     } else {
-        let result =
-            execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()).await;
+        let result = namidb_query::with_query_memory(
+            shared.memory.query_budget(),
+            execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()),
+        )
+        .await;
         let stall = match &result {
             Ok(_) => {
                 ns_state.snapshot.store(writer.owned_snapshot());
@@ -5487,14 +5566,21 @@ async fn run_cypher_multi(
             Err(gate) => return admission_exhausted_observation(started, gate),
         };
         let snap = owned.borrow();
-        let result = execute_with_limits(
-            &plan,
-            &snap,
-            &params,
-            shared.query_deadline(),
-            shared.query_row_cap(),
+        // Working-memory budget (#203): held until the response body is
+        // built below, which charges its own copies of the result.
+        let budget = shared.memory.query_budget();
+        let result = namidb_query::with_query_memory(
+            budget.clone(),
+            execute_with_limits(
+                &plan,
+                &snap,
+                &params,
+                shared.query_deadline(),
+                shared.query_row_cap(),
+            ),
         )
-        .await;
+        .await
+        .and_then(|rows| charge_json_response(budget.as_deref(), rows));
         let elapsed = started.elapsed();
         match result {
             Ok(rows) => {
@@ -5714,6 +5800,25 @@ fn json_to_runtime(v: &serde_json::Value) -> Result<RuntimeValue, String> {
             RuntimeValue::Map(out)
         }
     })
+}
+
+/// Charge the HTTP body's copies of a read result to the query's
+/// working-memory budget before building them (#203). The body copies the
+/// rows twice before they leave the process — into a `serde_json` tree of
+/// the same shape, then into the serialised text — so a result that only
+/// just fit the executor's budget could otherwise triple past it here.
+fn charge_json_response(
+    budget: Option<&namidb_query::QueryMemoryBudget>,
+    rows: Vec<namidb_query::Row>,
+) -> Result<Vec<namidb_query::Row>, namidb_query::exec::ExecError> {
+    if let Some(budget) = budget {
+        use namidb_query::exec::memory::{estimate_row_vec_bytes, estimate_rows_text_bytes};
+        let bytes = estimate_row_vec_bytes(&rows).saturating_add(estimate_rows_text_bytes(&rows));
+        budget
+            .charge(bytes)
+            .map_err(namidb_query::exec::ExecError::MemoryLimit)?;
+    }
+    Ok(rows)
 }
 
 fn rows_to_json(
@@ -6539,6 +6644,14 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "a real over-ceiling RSS must reject queries"
         );
+        let refused = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let refused: serde_json::Value = serde_json::from_slice(&refused).unwrap();
+        assert_eq!(refused["code"], "memory_pressure");
+        assert_eq!(refused["gql_status"], "53000");
+        assert!(refused["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("process memory pressure"));
         assert!(tiny.rejected_queries() > 0, "the rejection must be counted");
 
         // Recovery: the same server shape under a sane ceiling serves.
@@ -6561,6 +6674,218 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "a sane ceiling serves");
+    }
+
+    async fn post_cypher_json(app: &Router, query: &str) -> (StatusCode, serde_json::Value) {
+        let response = post_cypher(app, None, query).await;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// #203: the reproduction from the issue (a 600k-row UNWIND that
+    /// OOM-killed a 384 MiB container) fails with a typed 413 under a
+    /// 64 MiB per-query budget, and the server keeps answering.
+    #[tokio::test]
+    async fn query_memory_budget_turns_the_oom_repro_into_a_413() {
+        let (store, paths) = namidb_storage::parse_uri("memory://query-memory").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let governor =
+            Arc::new(memory::MemoryGovernor::new(0).with_query_memory_max_bytes(64 << 20));
+        assert_eq!(governor.query_memory_max_bytes(), 64 << 20);
+        assert!(
+            governor.query_memory_pool().is_none(),
+            "no ceiling, no pool"
+        );
+        let state = AppState::new(writer, None, "query-memory".into())
+            .with_query_row_cap(1_000_000)
+            .with_memory_governor(governor);
+        let app = build_router(state);
+
+        let (status, json) = post_cypher_json(
+            &app,
+            "UNWIND range(1, 600000) AS i RETURN i, toString(i) AS s",
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json}");
+        assert_eq!(json["code"], "query_memory_limit");
+        assert_eq!(
+            json["neo4j_code"],
+            "Neo.ClientError.Statement.ResourceLimitExceeded"
+        );
+        assert_eq!(json["gql_status"], "54000");
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("NAMIDB_QUERY_MEMORY_MAX_BYTES"));
+
+        // Writes run under the same budget and abort before commit.
+        let (status, json) = post_cypher_json(
+            &app,
+            "UNWIND range(1, 600000) AS i CREATE (:N {i: i}) RETURN i, toString(i) AS s",
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json}");
+        let (status, json) = post_cypher_json(&app, "MATCH (n:N) RETURN count(n) AS c").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["rows"][0]["c"], 0, "nothing partial was committed");
+
+        let (status, json) = post_cypher_json(
+            &app,
+            "UNWIND range(1, 1000) AS i RETURN i, toString(i) AS s",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["rows"].as_array().unwrap().len(), 1000);
+    }
+
+    /// A query that fits its own budget but finds the shared pool held by
+    /// other queries gets the retryable memory-pressure 503.
+    #[tokio::test]
+    async fn full_query_memory_pool_is_a_retryable_503() {
+        let (store, paths) = namidb_storage::parse_uri("memory://query-memory-pool").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        // A ceiling far above any test RSS, so admission and the RSS probe
+        // stay out of the way and only the pool decides.
+        let governor = Arc::new(memory::MemoryGovernor::new(64 << 30));
+        assert_eq!(governor.query_memory_max_bytes(), 32 << 30);
+        let pool = Arc::clone(governor.query_memory_pool().unwrap());
+        assert_eq!(pool.capacity_bytes(), 48 << 30);
+        let holder = namidb_query::QueryMemoryBudget::new(usize::MAX).with_pool(Arc::clone(&pool));
+        holder.charge(pool.capacity_bytes() - (1 << 20)).unwrap();
+        let state = AppState::new(writer, None, "query-memory-pool".into())
+            .with_memory_governor(Arc::clone(&governor));
+        let app = build_router(state);
+
+        let (status, json) = post_cypher_json(
+            &app,
+            "UNWIND range(1, 20000) AS i RETURN i, toString(i) AS s",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert_eq!(json["code"], "memory_pressure");
+        assert_eq!(
+            json["neo4j_code"],
+            "Neo.TransientError.General.DatabaseUnavailable"
+        );
+        assert_eq!(json["gql_status"], "53000");
+
+        drop(holder);
+        let (status, _) = post_cypher_json(
+            &app,
+            "UNWIND range(1, 20000) AS i RETURN i, toString(i) AS s",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the retry succeeds once the pool frees"
+        );
+        assert_eq!(
+            pool.reserved_bytes(),
+            0,
+            "a finished query returns its reservation"
+        );
+        assert!(pool.rejections() >= 1);
+    }
+
+    /// The JSON body copies the result twice; that is charged to the same
+    /// budget, so a result that only just fit the executor cannot triple
+    /// past the budget while the response is built.
+    #[test]
+    fn json_response_copies_are_charged() {
+        use namidb_query::exec::memory::estimate_row_vec_bytes;
+        let rows: Vec<namidb_query::Row> = (0..1000)
+            .map(|i| {
+                namidb_query::Row::new()
+                    .with("i", RuntimeValue::Integer(i))
+                    .with("s", RuntimeValue::String(i.to_string()))
+            })
+            .collect();
+        let result = estimate_row_vec_bytes(&rows);
+        // The executor leaves the root result charged.
+        let tight = namidb_query::QueryMemoryBudget::new(result + result / 2);
+        tight.charge(result).unwrap();
+        let err = charge_json_response(Some(&tight), rows.clone()).unwrap_err();
+        assert!(matches!(
+            err,
+            namidb_query::exec::ExecError::MemoryLimit(e)
+                if e.scope == namidb_query::QueryMemoryScope::Query
+        ));
+        let ample = namidb_query::QueryMemoryBudget::new(4 * result);
+        ample.charge(result).unwrap();
+        assert_eq!(
+            charge_json_response(Some(&ample), rows.clone())
+                .unwrap()
+                .len(),
+            1000
+        );
+        assert_eq!(charge_json_response(None, rows).unwrap().len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn memory_limit_responses_expose_taxonomy_fields() {
+        use namidb_query::{QueryMemoryExceeded, QueryMemoryScope};
+        for (scope, status, code, neo4j_code, gql) in [
+            (
+                QueryMemoryScope::Query,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "query_memory_limit",
+                "Neo.ClientError.Statement.ResourceLimitExceeded",
+                "54000",
+            ),
+            (
+                QueryMemoryScope::Shared,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "memory_pressure",
+                "Neo.TransientError.General.DatabaseUnavailable",
+                "53000",
+            ),
+            (
+                QueryMemoryScope::Process,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "memory_pressure",
+                "Neo.TransientError.General.DatabaseUnavailable",
+                "53000",
+            ),
+        ] {
+            let error = namidb_query::exec::ExecError::MemoryLimit(QueryMemoryExceeded {
+                scope,
+                required_bytes: 2,
+                limit_bytes: 1,
+            });
+            let response = exec_failure_response("read execution failed", &error);
+            assert_eq!(response.status(), status, "{scope:?}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["code"], code);
+            assert_eq!(json["neo4j_code"], neo4j_code);
+            assert_eq!(json["gql_status"], gql);
+        }
+    }
+
+    #[test]
+    fn query_memory_setting_resolves_against_the_ceiling() {
+        use memory::resolve_query_memory_max_bytes as resolve;
+        assert_eq!(resolve("auto", 0), Ok(0), "no ceiling: auto is off");
+        assert_eq!(resolve("auto", 1000), Ok(500));
+        assert_eq!(resolve(" AUTO ", 1000), Ok(500));
+        assert_eq!(resolve("", 1000), Ok(500));
+        assert_eq!(resolve("0", 1000), Ok(0));
+        assert_eq!(resolve("4096", 0), Ok(4096));
+        assert!(resolve("64MiB", 0)
+            .unwrap_err()
+            .contains("NAMIDB_QUERY_MEMORY_MAX_BYTES"));
+
+        let clamped = memory::MemoryGovernor::new(1000).with_query_memory_max_bytes(900);
+        assert_eq!(clamped.query_memory_max_bytes(), 750, "clamped to the pool");
+        let off = memory::MemoryGovernor::new(1000).with_query_memory_max_bytes(0);
+        assert_eq!(off.query_memory_max_bytes(), 0);
+        assert!(off.query_memory_pool().is_none());
+        assert!(Arc::new(off).query_budget().is_none());
+        assert!(Arc::new(memory::MemoryGovernor::new(0))
+            .query_budget()
+            .is_none());
     }
 
     /// Plan item 34: the serving route must be observable at the server

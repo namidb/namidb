@@ -11,6 +11,7 @@ pub mod factor;
 pub mod fusion;
 pub mod leapfrog;
 pub mod limits;
+pub mod memory;
 pub mod row;
 pub mod show;
 pub mod text_scoring;
@@ -23,6 +24,9 @@ pub use factor::{
     factorize_enabled, FactorArena, FactorIdx, FactorNode, FactorRowSet, Slot, FACTOR_ROOT,
 };
 pub use leapfrog::{LeapfrogIntersect, MergeSortedUnion, OrdIterator, SortedSliceIter};
+pub use memory::{
+    with_query_memory, QueryMemoryBudget, QueryMemoryExceeded, QueryMemoryPool, QueryMemoryScope,
+};
 pub use row::Row;
 pub use show::{show_constraints_rows, show_indexes_rows, show_schema_columns};
 pub use value::{NodeValue, RelValue, RuntimeValue};

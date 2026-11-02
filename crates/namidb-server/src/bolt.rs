@@ -863,11 +863,14 @@ impl ServerBackend {
                 }
             };
             let staged = {
-                let apply = execute_write_staged_with_deadline(
-                    &plan,
-                    &mut writer,
-                    &params,
-                    self.state.write_deadline(),
+                let apply = namidb_query::with_query_memory(
+                    self.state.memory.query_budget(),
+                    execute_write_staged_with_deadline(
+                        &plan,
+                        &mut writer,
+                        &params,
+                        self.state.write_deadline(),
+                    ),
                 );
                 tokio::pin!(apply);
                 tokio::select! {
@@ -1032,12 +1035,17 @@ impl ServerBackend {
                 }
             };
             let snap = owned.borrow();
-            let read = execute_with_limits(
-                &plan,
-                &snap,
-                &params,
-                self.state.query_deadline(),
-                self.state.query_row_cap(),
+            // Working-memory budget (#203). The finished rows are handed to
+            // the session and streamed record by record on PULL.
+            let read = namidb_query::with_query_memory(
+                self.state.memory.query_budget(),
+                execute_with_limits(
+                    &plan,
+                    &snap,
+                    &params,
+                    self.state.query_deadline(),
+                    self.state.query_row_cap(),
+                ),
             );
             tokio::pin!(read);
             let rows = tokio::select! {
@@ -1210,11 +1218,14 @@ impl ServerBackend {
                 }
             };
             let staged = {
-                let apply = execute_write_staged_with_deadline(
-                    &plan,
-                    writer,
-                    &params,
-                    self.state.write_deadline(),
+                let apply = namidb_query::with_query_memory(
+                    self.state.memory.query_budget(),
+                    execute_write_staged_with_deadline(
+                        &plan,
+                        writer,
+                        &params,
+                        self.state.write_deadline(),
+                    ),
                 );
                 tokio::pin!(apply);
                 tokio::select! {
@@ -1296,12 +1307,17 @@ impl ServerBackend {
                 TxState::Write { writer, .. } => writer.overlay_snapshot(),
                 TxState::Read { snapshot } => snapshot.borrow(),
             };
-            let read = execute_with_limits(
-                &plan,
-                &snap,
-                &params,
-                self.state.query_deadline(),
-                self.state.query_row_cap(),
+            // Working-memory budget (#203). The finished rows are handed to
+            // the session and streamed record by record on PULL.
+            let read = namidb_query::with_query_memory(
+                self.state.memory.query_budget(),
+                execute_with_limits(
+                    &plan,
+                    &snap,
+                    &params,
+                    self.state.query_deadline(),
+                    self.state.query_row_cap(),
+                ),
             );
             tokio::pin!(read);
             let rows = tokio::select! {
@@ -1736,6 +1752,14 @@ fn map_exec_err_ref(e: &ExecError) -> BackendError {
         ExecError::RowCap(cap) => {
             BackendError::ResourceLimit(format!("query exceeded the configured row cap of {cap}"))
         }
+        // Working-memory budget (#203): the query's own budget is a
+        // deterministic ClientError like the row cap; a full shared pool or
+        // the process ceiling stays TransientError, exactly like admission's
+        // memory pressure, so drivers retry it.
+        ExecError::MemoryLimit(exceeded) if exceeded.is_transient() => {
+            BackendError::Storage(exceeded.to_string())
+        }
+        ExecError::MemoryLimit(exceeded) => BackendError::ResourceLimit(exceeded.to_string()),
         ExecError::Storage(err) => match err {
             // Deterministic search result caps: same query, same outcome —
             // ClientError, not the auto-retried TransientError bucket.

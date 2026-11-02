@@ -514,7 +514,7 @@ fn execute_write_inner_mode<'a>(
                     params,
                 )?;
                 if *distinct {
-                    projected = crate::exec::walker::dedup_rows(projected);
+                    projected = crate::exec::walker::dedup_rows(projected)?;
                 }
                 Ok(if retain_output { projected } else { Vec::new() })
             }
@@ -580,7 +580,7 @@ fn execute_write_inner_mode<'a>(
                     return Ok(Vec::new());
                 }
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                Ok(crate::exec::walker::dedup_rows(rows))
+                crate::exec::walker::dedup_rows(rows)
             }
             LogicalPlan::Aggregate {
                 input,
@@ -599,6 +599,9 @@ fn execute_write_inner_mode<'a>(
             LogicalPlan::Unwind { input, list, alias } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::new();
+                // Retained rows count against the statement's working-memory
+                // budget exactly as on the read path (#203).
+                let mut meter = crate::exec::memory::GrowthMeter::new();
                 for row in rows {
                     let v = evaluate(list, &row, params)?;
                     match v {
@@ -607,6 +610,9 @@ fn execute_write_inner_mode<'a>(
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);
                                 out.push(new_row);
+                                if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
+                                    meter.observe(&out)?;
+                                }
                             }
                         }
                         RuntimeValue::List(_) => {}
@@ -639,7 +645,7 @@ fn execute_write_inner_mode<'a>(
                 if *all {
                     Ok(l)
                 } else {
-                    Ok(crate::exec::walker::dedup_rows(l))
+                    crate::exec::walker::dedup_rows(l)
                 }
             }
             LogicalPlan::CrossProduct { left, right } => {
@@ -657,7 +663,7 @@ fn execute_write_inner_mode<'a>(
                 }
                 let l = execute_write_inner(left, writer, params, outcome, routing).await?;
                 let r = execute_write_inner(right, writer, params, outcome, routing).await?;
-                Ok(crate::exec::walker::cross_product(l, r))
+                crate::exec::walker::cross_product(l, r)
             }
 
             LogicalPlan::HashJoin { .. } | LogicalPlan::HashSemiJoin { .. } => {
