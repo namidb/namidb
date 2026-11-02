@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-11-02
+
 ### Fixed
 
 - **A running query's working memory is now bounded (#203).** Admission
@@ -4344,7 +4346,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.2.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.2.1...HEAD
+[3.2.1]: https://github.com/namidb/namidb/compare/v3.2.0...v3.2.1
 [3.2.0]: https://github.com/namidb/namidb/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/namidb/namidb/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/namidb/namidb/compare/v2.6.19...v3.0.0
