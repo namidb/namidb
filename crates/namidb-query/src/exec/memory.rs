@@ -17,7 +17,11 @@
 //!   output) is checked against the budget; the operator's inputs are then
 //!   released and only its output stays charged until the parent finishes.
 //!   This mirrors the eager executor's real lifetimes: a child's rows live
-//!   until the parent has consumed them.
+//!   until the parent has consumed them. The factorised executor
+//!   (`NAMIDB_FACTORIZE=1`) settles the same way in
+//!   `execute_factor_inner_with_routing`, charging each operator's whole
+//!   arena, and charges the rows it materialises from a set in place of
+//!   the set.
 //! - **Growth meters.** The producers that can grow far beyond their input
 //!   in a single call (`UNWIND`, `Expand`, projections, joins, cross
 //!   products, aggregation and `collect()`, DISTINCT, sorting, `range()`)
@@ -52,6 +56,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use super::factor::{FactorArena, FactorIdx, FactorNode, FactorRowSet, Slot};
 use super::row::Row;
 use super::value::{NodeValue, RelValue, RuntimeValue};
 use super::walker::ExecError;
@@ -297,7 +302,14 @@ impl QueryMemoryBudget {
         if let Some(pool) = &self.pool {
             let held = self.pool_held.load(Ordering::Acquire);
             if projected > held {
-                let need = round_up(projected - held, POOL_CHUNK_BYTES);
+                // Round up to whole chunks, but never past what the pool
+                // could ever give this query: a budget clamped to the pool's
+                // (not chunk-aligned) capacity must still fit when it runs
+                // alone, so `Shared` only means other queries hold the pool.
+                let exact = projected - held;
+                let need = round_up(exact, POOL_CHUNK_BYTES)
+                    .min(pool.capacity_bytes().saturating_sub(held))
+                    .max(exact);
                 if !pool.try_reserve(need) {
                     return Err(QueryMemoryExceeded {
                         scope: QueryMemoryScope::Shared,
@@ -420,22 +432,60 @@ pub(crate) enum OutputKind {
 /// operator's start. The inputs charged since `base` are released and the
 /// output stays charged until the parent settles.
 pub(crate) fn settle(base: usize, rows: &Vec<Row>, kind: OutputKind) -> Result<(), ExecError> {
+    settle_with(base, kind, || estimate_row_vec_bytes(rows))
+}
+
+/// [`settle`] for a factorised operator's output: the whole arena it owns
+/// (inherited input nodes included) plus its leaf list.
+pub(crate) fn settle_factor(
+    base: usize,
+    set: &FactorRowSet,
+    kind: OutputKind,
+) -> Result<(), ExecError> {
+    settle_with(base, kind, || estimate_factor_set_bytes(set))
+}
+
+fn settle_with(
+    base: usize,
+    kind: OutputKind,
+    estimate: impl FnOnce() -> usize,
+) -> Result<(), ExecError> {
     let outcome = with_budget(|budget| -> Result<(), QueryMemoryExceeded> {
         let current = budget.used_bytes();
         let (peak, keep) = match kind {
             OutputKind::Moved => (current, current),
             OutputKind::Additive => {
-                let out = estimate_row_vec_bytes(rows);
+                let out = estimate();
                 (current.saturating_add(out), base.saturating_add(out))
             }
             OutputKind::Replaced => {
-                let out = estimate_row_vec_bytes(rows);
+                let out = estimate();
                 let keep = base.saturating_add(out);
                 (current.max(keep), keep)
             }
         };
         budget.ensure(peak)?;
         budget.set_used(keep);
+        Ok(())
+    });
+    match outcome {
+        Some(Err(exceeded)) => Err(ExecError::MemoryLimit(exceeded)),
+        _ => Ok(()),
+    }
+}
+
+/// Swap `release` charged bytes for `charge` new ones: an input the
+/// operator has just dropped for the copy it made of it (the factorised
+/// path materialising a set into rows). The copy stays charged until the
+/// operator settles.
+pub(crate) fn exchange(release: usize, charge: usize) -> Result<(), ExecError> {
+    let outcome = with_budget(|budget| -> Result<(), QueryMemoryExceeded> {
+        let next = budget
+            .used_bytes()
+            .saturating_sub(release)
+            .saturating_add(charge);
+        budget.ensure(next)?;
+        budget.set_used(next);
         Ok(())
     });
     match outcome {
@@ -554,6 +604,7 @@ const BTREE_LEAF_HEADER: usize = 16;
 const BTREE_EDGES: usize = (BTREE_CAPACITY + 1) * std::mem::size_of::<usize>();
 const VALUE_SIZE: usize = std::mem::size_of::<RuntimeValue>();
 const STRING_SIZE: usize = std::mem::size_of::<String>();
+const SLOT_SIZE: usize = std::mem::size_of::<Slot>();
 
 #[inline]
 fn round_up(value: usize, multiple: usize) -> usize {
@@ -665,6 +716,72 @@ pub fn estimate_row_vec_bytes(rows: &Vec<Row>) -> usize {
         alloc(rows.capacity().saturating_mul(std::mem::size_of::<Row>())),
         usize::saturating_add,
     )
+}
+
+/// Heap bytes of a shared binding name. Factor nodes usually share one
+/// `Arc<str>` per binding; each holder is charged its share of the block so
+/// a set's total counts the block once.
+fn arc_name_heap(name: &Arc<str>) -> usize {
+    alloc(16 + name.len()) / Arc::strong_count(name).max(1)
+}
+
+/// Heap bytes one factor node adds to an arena: its slot in the arena's
+/// node vector (twice, for the doubling buffer), its slot buffer, and each
+/// slot's value and name.
+pub(crate) fn estimate_factor_slots_bytes(slots: &Vec<Slot>) -> usize {
+    slots
+        .iter()
+        .map(|slot| estimate_value_bytes(&slot.value).saturating_add(arc_name_heap(&slot.name)))
+        .fold(
+            alloc(slots.capacity().saturating_mul(SLOT_SIZE))
+                .saturating_add(2 * std::mem::size_of::<FactorNode>()),
+            usize::saturating_add,
+        )
+}
+
+/// Heap bytes of the slots on a leaf's whole chain, root-ward: what one copy
+/// of that leaf's bindings costs as factor slots.
+pub(crate) fn estimate_factor_chain_bytes(arena: &FactorArena, leaf: FactorIdx) -> usize {
+    let mut bytes = 0usize;
+    let mut cur = Some(leaf);
+    while let Some(idx) = cur {
+        let node = arena.node(idx);
+        bytes = bytes.saturating_add(estimate_factor_slots_bytes(&node.slots));
+        cur = node.parent;
+    }
+    bytes
+}
+
+/// Heap bytes of a factorised result: the arena's node vector (by
+/// capacity), every node's slots, and the leaf list.
+pub fn estimate_factor_set_bytes(set: &FactorRowSet) -> usize {
+    let nodes = set.arena.nodes();
+    nodes
+        .iter()
+        .map(|node| {
+            node.slots
+                .iter()
+                .map(|slot| {
+                    estimate_value_bytes(&slot.value).saturating_add(arc_name_heap(&slot.name))
+                })
+                .fold(
+                    alloc(node.slots.capacity().saturating_mul(SLOT_SIZE)),
+                    usize::saturating_add,
+                )
+        })
+        .fold(
+            alloc(
+                nodes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<FactorNode>()),
+            )
+            .saturating_add(alloc(
+                set.leaves
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<FactorIdx>()),
+            )),
+            usize::saturating_add,
+        )
 }
 
 /// Upper estimate of the JSON text a value serialises to: strings are
@@ -790,6 +907,36 @@ mod tests {
         drop(b);
         assert_eq!(pool.reserved_bytes(), 0);
         assert_eq!(pool.peak_reserved_bytes(), 3 * POOL_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn lone_query_at_an_unaligned_pool_capacity_is_not_refused_as_shared() {
+        // The server clamps the per-query budget to the pool's capacity,
+        // which is a percentage of the ceiling and not chunk-aligned. A
+        // query alone on the server that stays within its budget must
+        // always reserve, however close to the limit it gets.
+        let capacity = 3 * POOL_CHUNK_BYTES + 12_345;
+        let pool = Arc::new(QueryMemoryPool::new(capacity));
+        let budget = QueryMemoryBudget::new(capacity).with_pool(Arc::clone(&pool));
+        budget.charge(3 * POOL_CHUNK_BYTES + 1).unwrap();
+        budget.charge(12_000).unwrap();
+        budget.charge(capacity - budget.used_bytes()).unwrap();
+        assert_eq!(budget.used_bytes(), capacity);
+        assert_eq!(pool.reserved_bytes(), capacity);
+        assert_eq!(pool.rejections(), 0);
+        // One byte more is the query's own limit, not the shared pool.
+        let err = budget.charge(1).unwrap_err();
+        assert_eq!(err.scope, QueryMemoryScope::Query);
+        drop(budget);
+        assert_eq!(pool.reserved_bytes(), 0);
+
+        // With another query holding part of the pool, the same need is
+        // transient.
+        let other = QueryMemoryBudget::new(capacity).with_pool(Arc::clone(&pool));
+        other.charge(POOL_CHUNK_BYTES).unwrap();
+        let budget = QueryMemoryBudget::new(capacity).with_pool(Arc::clone(&pool));
+        let err = budget.charge(3 * POOL_CHUNK_BYTES).unwrap_err();
+        assert_eq!(err.scope, QueryMemoryScope::Shared);
     }
 
     #[test]

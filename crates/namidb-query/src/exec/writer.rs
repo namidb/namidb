@@ -146,7 +146,26 @@ pub async fn execute_write_with_deadline(
     params: &Params,
     deadline: Option<Instant>,
 ) -> Result<WriteOutcome, ExecError> {
-    let outcome = match execute_write_staged_with_deadline(plan, writer, params, deadline).await {
+    execute_write_checked_with_deadline(plan, writer, params, deadline, |_| Ok(())).await
+}
+
+/// [`execute_write_with_deadline`] with `before_commit` run on the finished
+/// outcome before `commit_batch`. An error from it aborts the statement
+/// exactly like a failed apply: the pending batch is discarded and nothing
+/// is committed. The server uses it to charge the response's copies of the
+/// returned rows to the statement's working-memory budget (#203), so an
+/// over-budget response cannot follow a durable write.
+pub async fn execute_write_checked_with_deadline(
+    plan: &LogicalPlan,
+    writer: &mut WriterSession,
+    params: &Params,
+    deadline: Option<Instant>,
+    before_commit: impl FnOnce(&WriteOutcome) -> Result<(), ExecError>,
+) -> Result<WriteOutcome, ExecError> {
+    let staged = execute_write_staged_with_deadline(plan, writer, params, deadline)
+        .await
+        .and_then(|outcome| before_commit(&outcome).map(|()| outcome));
+    let outcome = match staged {
         Ok(outcome) => outcome,
         Err(e) => {
             // The statement failed (a timeout counts) after staging some

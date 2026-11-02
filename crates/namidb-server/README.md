@@ -66,9 +66,16 @@ ceiling also drives a per-query working-memory budget,
 also works without a ceiling; `0` disables it). The executor charges each
 query's materialised rows and operator state (sort keys, grouping state,
 `collect()` lists, DISTINCT fingerprints, cross products, `range()` lists)
-with conservative estimates as they grow, plus the HTTP response body's copies
-of the result. All running queries also reserve from one pool of 75% of the
-ceiling, and a growing query re-samples RSS every 16 MiB of growth. A query
+with conservative estimates as they grow, on the flat and the factorised
+(`NAMIDB_FACTORIZE=1`) executor, plus the HTTP response body's copies of the
+result. A write's response is charged before its commit, so a write whose
+response would not fit is rolled back. A Bolt result stays buffered in the
+session until the client pulls it, and keeps its budget (and its share of the
+pool) until the last row is pulled or the stream is discarded, reset or
+closed: a client that leaves a large result unpulled holds that memory. All
+running queries also reserve from one pool of 75% of the ceiling (a query
+running alone always gets its full budget), and a growing query re-samples
+RSS every 16 MiB of growth. A query
 that needs more than its own budget fails with HTTP 413 `query_memory_limit`
 (Bolt `Neo.ClientError.Statement.ResourceLimitExceeded`): it will fail again
 unchanged, so page it, narrow it or aggregate it. A query stopped because the

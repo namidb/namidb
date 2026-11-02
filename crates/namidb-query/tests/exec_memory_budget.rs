@@ -15,8 +15,9 @@ use namidb_storage::{EdgeWriteRecord, NamespacePaths, NodeWriteRecord, WriterSes
 use object_store::memory::InMemory;
 
 use namidb_query::{
-    execute, execute_with_limits, lower, parse, with_query_memory, ExecError, Params,
-    QueryMemoryBudget, QueryMemoryPool, QueryMemoryScope, Row,
+    execute, execute_factor_path, execute_flat_path, execute_with_limits, lower, parse,
+    with_query_memory, ExecError, Params, QueryMemoryBudget, QueryMemoryPool, QueryMemoryScope,
+    Row,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -58,6 +59,18 @@ async fn run(
         execute_with_limits(&plan, &snap, &Params::new(), None, row_cap),
     )
     .await
+}
+
+/// [`run`] on the factorised executor (`NAMIDB_FACTORIZE=1`), called
+/// directly so parallel tests do not race on the environment.
+async fn run_factor(
+    writer: &WriterSession,
+    cypher: &str,
+    budget: Option<Arc<QueryMemoryBudget>>,
+) -> Result<Vec<Row>, ExecError> {
+    let snap = writer.snapshot();
+    let plan = lower(&parse(cypher).unwrap()).unwrap();
+    with_query_memory(budget, execute_factor_path(&plan, &snap, &Params::new())).await
 }
 
 fn expect_query_scope(err: ExecError, limit: usize) {
@@ -262,7 +275,82 @@ async fn shared_pool_is_enforced_across_queries() {
 /// 16 MiB budget, while any single evaluation fits easily.
 #[tokio::test]
 async fn per_row_subqueries_do_not_accumulate() {
-    let paths = NamespacePaths::new("tenants", NamespaceId::new("mem-correlated").unwrap());
+    let writer = seed_complete_graph("mem-correlated").await;
+    let cypher = "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b:Person) } \
+                  RETURN count(a) AS n";
+    // Sanity: the budget would be blown if every evaluation stayed charged.
+    let one = run(
+        &writer,
+        "MATCH (a:Person {name: 'person-0'})-[:KNOWS]->(b:Person) RETURN a, b",
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let one_evaluation = namidb_query::exec::memory::estimate_row_vec_bytes(&one);
+    let limit = 16 * MIB;
+    assert!(
+        one_evaluation * 200 > limit,
+        "one evaluation is {one_evaluation} bytes"
+    );
+
+    let budget = Arc::new(QueryMemoryBudget::new(limit));
+    let rows = run(&writer, cypher, Some(Arc::clone(&budget)), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].get("n"),
+        Some(&namidb_query::RuntimeValue::Integer(200))
+    );
+    assert!(budget.used_bytes() < MIB, "used {}", budget.used_bytes());
+}
+
+/// The same on the factorised executor, whose SemiApply and PatternList
+/// arms run their subqueries once per outer row too: a query that fits
+/// must not be refused because every evaluation stayed charged.
+#[tokio::test]
+async fn factorised_per_row_subqueries_do_not_accumulate() {
+    let writer = seed_complete_graph("mem-correlated-factor").await;
+    let limit = 16 * MIB;
+    for (cypher, check) in [
+        (
+            "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b:Person) } \
+             RETURN count(a) AS n",
+            200i64,
+        ),
+        (
+            "MATCH (a:Person) RETURN a.name AS name, \
+             [(a)-[:KNOWS]->(b:Person) | b.name] AS names",
+            199,
+        ),
+    ] {
+        let snap = writer.snapshot();
+        let plan = lower(&parse(cypher).unwrap()).unwrap();
+        let unbudgeted = execute_flat_path(&plan, &snap, &Params::new())
+            .await
+            .unwrap();
+        let budget = Arc::new(QueryMemoryBudget::new(limit));
+        let rows = run_factor(&writer, cypher, Some(Arc::clone(&budget)))
+            .await
+            .unwrap_or_else(|e| panic!("{cypher}: {e}"));
+        assert_eq!(rows.len(), unbudgeted.len(), "{cypher}");
+        let got = match (rows[0].get("n"), rows[0].get("names")) {
+            (Some(namidb_query::RuntimeValue::Integer(n)), _) => *n,
+            (_, Some(namidb_query::RuntimeValue::List(names))) => names.len() as i64,
+            other => panic!("{cypher}: unexpected {other:?}"),
+        };
+        assert_eq!(got, check, "{cypher}");
+        assert!(
+            budget.peak_bytes() < limit / 2,
+            "{cypher}: peak {}",
+            budget.peak_bytes()
+        );
+    }
+}
+
+/// 200 people with a 256-byte bio, each KNOWS every other one.
+async fn seed_complete_graph(name: &str) -> WriterSession {
+    let paths = NamespacePaths::new("tenants", NamespaceId::new(name).unwrap());
     let mut writer = WriterSession::open(Arc::new(InMemory::new()), paths)
         .await
         .unwrap();
@@ -293,34 +381,7 @@ async fn per_row_subqueries_do_not_accumulate() {
         }
     }
     writer.commit_batch().await.unwrap();
-
-    let cypher = "MATCH (a:Person) WHERE EXISTS { MATCH (a)-[:KNOWS]->(b:Person) } \
-                  RETURN count(a) AS n";
-    // Sanity: the budget would be blown if every evaluation stayed charged.
-    let one = run(
-        &writer,
-        "MATCH (a:Person {name: 'person-0'})-[:KNOWS]->(b:Person) RETURN a, b",
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let one_evaluation = namidb_query::exec::memory::estimate_row_vec_bytes(&one);
-    let limit = 16 * MIB;
-    assert!(
-        one_evaluation * 200 > limit,
-        "one evaluation is {one_evaluation} bytes"
-    );
-
-    let budget = Arc::new(QueryMemoryBudget::new(limit));
-    let rows = run(&writer, cypher, Some(Arc::clone(&budget)), None)
-        .await
-        .unwrap();
-    assert_eq!(
-        rows[0].get("n"),
-        Some(&namidb_query::RuntimeValue::Integer(200))
-    );
-    assert!(budget.used_bytes() < MIB, "used {}", budget.used_bytes());
+    writer
 }
 
 #[tokio::test]
@@ -336,4 +397,49 @@ async fn range_is_checked_before_it_allocates() {
     .await
     .unwrap_err();
     expect_query_scope(err, limit);
+}
+
+/// The factorised executor (`NAMIDB_FACTORIZE=1`) is metered like the flat
+/// one: the #203 reproduction, a nested UNWIND that only an aggregate sees,
+/// and a cross product all stop under the budget, and a query that fits
+/// returns the flat path's rows.
+#[tokio::test]
+async fn factorised_path_is_bounded_like_the_flat_path() {
+    let writer = seed("mem-factor", 1500).await;
+    let limit = 64 * MIB;
+    for cypher in [
+        "UNWIND range(1, 600000) AS i RETURN i, toString(i) AS s",
+        "UNWIND range(1, 1000) AS i UNWIND range(1, 900) AS j RETURN count(*) AS n",
+        "MATCH (a:Person), (b:Person) RETURN a.name, b.name",
+        "UNWIND range(1, 120000) AS i RETURN i, toString(i) AS s ORDER BY s",
+    ] {
+        let budget = Arc::new(QueryMemoryBudget::new(limit));
+        let err = run_factor(&writer, cypher, Some(Arc::clone(&budget)))
+            .await
+            .expect_err(cypher);
+        expect_query_scope(err, limit);
+        assert!(
+            budget.peak_bytes() <= limit,
+            "{cypher}: peak {}",
+            budget.peak_bytes()
+        );
+    }
+
+    let cypher = "MATCH (p:Person) WHERE p.name STARTS WITH 'person-1' \
+                  UNWIND range(1, 10) AS i RETURN p.name AS name, i ORDER BY name, i";
+    let snap = writer.snapshot();
+    let plan = lower(&parse(cypher).unwrap()).unwrap();
+    let flat = execute_flat_path(&plan, &snap, &Params::new())
+        .await
+        .unwrap();
+    let budget = Arc::new(QueryMemoryBudget::new(limit));
+    let factor = run_factor(&writer, cypher, Some(Arc::clone(&budget)))
+        .await
+        .unwrap();
+    assert_eq!(factor, flat);
+    assert_eq!(factor.len(), 611 * 10);
+    // Only the root result stays charged, at a realistic size.
+    let charged = budget.used_bytes();
+    assert!(charged >= namidb_query::exec::memory::estimate_row_vec_bytes(&factor) / 2);
+    assert!(charged < 32 * MIB, "charged {charged}");
 }

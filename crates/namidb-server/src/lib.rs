@@ -42,7 +42,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use namidb_query::{
-    execute_with_limits, execute_write_staged_with_deadline, execute_write_with_deadline,
+    execute_with_limits, execute_write_checked_with_deadline, execute_write_staged_with_deadline,
     parse as cypher_parse, plan as build_plan, Params, RuntimeValue, StatsCatalog, WriteOutcome,
 };
 use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
@@ -3565,6 +3565,10 @@ enum WriteSection {
     Done {
         result: Result<namidb_query::exec::WriteOutcome, WriteFailure>,
         stall: Option<Duration>,
+        /// The statement's working-memory budget (#203), already charged
+        /// for the response's copies of the returned rows. The caller holds
+        /// it until the response body is built.
+        budget: Option<Arc<namidb_query::QueryMemoryBudget>>,
     },
 }
 
@@ -3583,6 +3587,7 @@ async fn run_write_section(
     let Some(mut writer) = state.lock_writer_bounded(WriterLockKind::Http).await else {
         return WriteSection::Busy;
     };
+    let budget = state.memory.query_budget();
     let (result, stall) = if let Some(group) = state.group_commit.clone() {
         // RFC-034 group commit: stage inside a request scope and let the
         // namespace committer make the whole group durable with ONE
@@ -3591,11 +3596,15 @@ async fn run_write_section(
         // the ACK arrives only after the merged commit is durable and
         // the snapshot republished (RFC-021 preserved).
         let mark = writer.begin_staged_request();
+        // The response's copies of the returned rows are charged before the
+        // request joins the group: an over-budget response rolls back like
+        // any failed statement instead of following a durable write (#203).
         match namidb_query::with_query_memory(
-            state.memory.query_budget(),
+            budget.clone(),
             execute_write_staged_with_deadline(&plan, &mut writer, &params, state.write_deadline()),
         )
         .await
+        .and_then(|outcome| charge_json_rows(budget.as_deref(), &outcome.rows).map(|()| outcome))
         {
             Ok(outcome) => {
                 writer.commit_staged_request();
@@ -3635,9 +3644,16 @@ async fn run_write_section(
             }
         }
     } else {
+        // Charged before the commit, as on the grouped path above.
         let result = namidb_query::with_query_memory(
-            state.memory.query_budget(),
-            execute_write_with_deadline(&plan, &mut writer, &params, state.write_deadline()),
+            budget.clone(),
+            execute_write_checked_with_deadline(
+                &plan,
+                &mut writer,
+                &params,
+                state.write_deadline(),
+                |outcome| charge_json_rows(budget.as_deref(), &outcome.rows),
+            ),
         )
         .await;
         // Sample the soft write-stall decision while still holding the lock
@@ -3667,7 +3683,11 @@ async fn run_write_section(
         drop(writer);
         (result.map_err(WriteFailure::Own), stall)
     };
-    WriteSection::Done { result, stall }
+    WriteSection::Done {
+        result,
+        stall,
+        budget,
+    }
 }
 
 /// Run one HTTP Cypher request and classify it for metrics. Mirrors the Bolt
@@ -3928,8 +3948,14 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 }
             })
         };
-        let (result, stall) = match section.await {
-            Ok(WriteSection::Done { result, stall }) => (result, stall),
+        // `_budget` keeps the write's working-memory charge (rows and their
+        // response copies) until the response body below is built (#203).
+        let (result, stall, _budget) = match section.await {
+            Ok(WriteSection::Done {
+                result,
+                stall,
+                budget,
+            }) => (result, stall, budget),
             Ok(WriteSection::Busy) => {
                 return ObservedQuery {
                     kind: Some(QueryKind::Write),
@@ -3942,6 +3968,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
                     format!("write section task failed: {join_error}"),
                 ))),
+                None,
                 None,
             ),
         };
@@ -5126,6 +5153,8 @@ enum WriteSectionMulti {
     Done {
         result: Result<namidb_query::exec::WriteOutcome, WriteFailure>,
         stall: Option<Duration>,
+        /// See [`WriteSection::Done`].
+        budget: Option<Arc<namidb_query::QueryMemoryBudget>>,
     },
 }
 
@@ -5153,14 +5182,17 @@ async fn run_write_section_multi(
         drop(writer);
         return WriteSectionMulti::Retired;
     }
+    let budget = shared.memory.query_budget();
     let (result, stall) = if let Some(group) = ns_state.group_commit.clone() {
         // RFC-034 grouped write, multi-tenant flavour: stage inside a
         // request scope, register under the lock, and let this
         // namespace's committer (spawned by the registry, cancelled on
         // eviction) make the group durable with one commit.
         let mark = writer.begin_staged_request();
+        // Response copies charged before joining the group (see the
+        // single-tenant section, #203).
         match namidb_query::with_query_memory(
-            shared.memory.query_budget(),
+            budget.clone(),
             execute_write_staged_with_deadline(
                 &plan,
                 &mut writer,
@@ -5169,6 +5201,7 @@ async fn run_write_section_multi(
             ),
         )
         .await
+        .and_then(|outcome| charge_json_rows(budget.as_deref(), &outcome.rows).map(|()| outcome))
         {
             Ok(outcome) => {
                 writer.commit_staged_request();
@@ -5216,8 +5249,14 @@ async fn run_write_section_multi(
         }
     } else {
         let result = namidb_query::with_query_memory(
-            shared.memory.query_budget(),
-            execute_write_with_deadline(&plan, &mut writer, &params, shared.write_deadline()),
+            budget.clone(),
+            execute_write_checked_with_deadline(
+                &plan,
+                &mut writer,
+                &params,
+                shared.write_deadline(),
+                |outcome| charge_json_rows(budget.as_deref(), &outcome.rows),
+            ),
         )
         .await;
         let stall = match &result {
@@ -5250,7 +5289,11 @@ async fn run_write_section_multi(
         drop(writer);
         (result.map_err(WriteFailure::Own), stall)
     };
-    WriteSectionMulti::Done { result, stall }
+    WriteSectionMulti::Done {
+        result,
+        stall,
+        budget,
+    }
 }
 
 /// Run one HTTP Cypher request in multi-tenant mode.
@@ -5514,8 +5557,14 @@ async fn run_cypher_multi(
                 }
             })
         };
-        let (result, stall) = match section.await {
-            Ok(WriteSectionMulti::Done { result, stall }) => (result, stall),
+        // `_budget` keeps the write's working-memory charge (rows and their
+        // response copies) until the response body below is built (#203).
+        let (result, stall, _budget) = match section.await {
+            Ok(WriteSectionMulti::Done {
+                result,
+                stall,
+                budget,
+            }) => (result, stall, budget),
             Ok(WriteSectionMulti::Busy) => {
                 return ObservedQuery {
                     kind: Some(QueryKind::Write),
@@ -5529,6 +5578,7 @@ async fn run_cypher_multi(
                 Err(WriteFailure::Own(namidb_query::exec::ExecError::Runtime(
                     format!("write section task failed: {join_error}"),
                 ))),
+                None,
                 None,
             ),
         };
@@ -5811,14 +5861,25 @@ fn charge_json_response(
     budget: Option<&namidb_query::QueryMemoryBudget>,
     rows: Vec<namidb_query::Row>,
 ) -> Result<Vec<namidb_query::Row>, namidb_query::exec::ExecError> {
+    charge_json_rows(budget, &rows)?;
+    Ok(rows)
+}
+
+/// [`charge_json_response`] by reference, for the write sections, which
+/// charge the response before they commit and keep the rows in the
+/// [`WriteOutcome`].
+fn charge_json_rows(
+    budget: Option<&namidb_query::QueryMemoryBudget>,
+    rows: &Vec<namidb_query::Row>,
+) -> Result<(), namidb_query::exec::ExecError> {
     if let Some(budget) = budget {
         use namidb_query::exec::memory::{estimate_row_vec_bytes, estimate_rows_text_bytes};
-        let bytes = estimate_row_vec_bytes(&rows).saturating_add(estimate_rows_text_bytes(&rows));
+        let bytes = estimate_row_vec_bytes(rows).saturating_add(estimate_rows_text_bytes(rows));
         budget
             .charge(bytes)
             .map_err(namidb_query::exec::ExecError::MemoryLimit)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 fn rows_to_json(
@@ -6787,6 +6848,80 @@ mod tests {
             "a finished query returns its reservation"
         );
         assert!(pool.rejections() >= 1);
+    }
+
+    /// #203 review: a write's HTTP response copies its returned rows like a
+    /// read's, and is charged to the same budget *before* the commit. A write
+    /// whose execution fits but whose response does not is refused with the
+    /// deterministic 413 and leaves nothing committed, on the inline and on
+    /// the group-commit path.
+    #[tokio::test]
+    async fn write_response_copies_are_charged_before_commit() {
+        // Four 1 MiB columns: the executor's working set is a few MiB, the
+        // JSON copies (the rows again plus their escaped text) add ~12 MiB.
+        let doubling = " WITH s + s AS s".repeat(16);
+        let write = format!(
+            "WITH 'xxxxxxxxxxxxxxxx' AS s{doubling} CREATE (:Wide) \
+             RETURN s AS a, s AS b, s AS c, s AS d"
+        );
+        let limit = 10 << 20;
+
+        // The statement alone fits the budget: only the response cannot.
+        {
+            let (store, paths) = namidb_storage::parse_uri("memory://write-response-dry").unwrap();
+            let mut writer = WriterSession::open(store, paths).await.unwrap();
+            let plan =
+                build_plan(&cypher_parse(&write).unwrap(), &StatsCatalog::default()).unwrap();
+            let budget = Arc::new(namidb_query::QueryMemoryBudget::new(limit));
+            let outcome = namidb_query::with_query_memory(
+                Some(Arc::clone(&budget)),
+                execute_write_staged_with_deadline(&plan, &mut writer, &Params::new(), None),
+            )
+            .await
+            .expect("the write's execution fits its budget");
+            assert_eq!(outcome.rows.len(), 1);
+            assert!(charge_json_rows(Some(&budget), &outcome.rows).is_err());
+            writer.discard_batch();
+        }
+
+        for group_commit in [false, true] {
+            let (store, paths) = namidb_storage::parse_uri("memory://write-response").unwrap();
+            let writer = WriterSession::open(store, paths).await.unwrap();
+            let governor =
+                Arc::new(memory::MemoryGovernor::new(0).with_query_memory_max_bytes(limit));
+            let mut state =
+                AppState::new(writer, None, "write-response".into()).with_memory_governor(governor);
+            if group_commit {
+                state = state.with_group_commit(Duration::from_millis(1));
+                state.spawn_group_committer();
+            }
+            let app = build_router(state);
+
+            let (status, json) = post_cypher_json(&app, &write).await;
+            // Not `{json}`: a wrongly accepted write echoes 4 MiB of rows.
+            assert_eq!(
+                status,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "group_commit={group_commit}: {}",
+                json["error"]
+            );
+            assert_eq!(json["code"], "query_memory_limit");
+            let (status, json) =
+                post_cypher_json(&app, "MATCH (n:Wide) RETURN count(n) AS c").await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(
+                json["rows"][0]["c"], 0,
+                "group_commit={group_commit}: the refused write must not commit"
+            );
+
+            // A write whose response fits still commits and answers.
+            let (status, json) =
+                post_cypher_json(&app, "CREATE (n:Wide {i: 1}) RETURN n.i AS i").await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["rows"][0]["i"], 1);
+            let (_, json) = post_cypher_json(&app, "MATCH (n:Wide) RETURN count(n) AS c").await;
+            assert_eq!(json["rows"][0]["c"], 1);
+        }
     }
 
     /// The JSON body copies the result twice; that is charged to the same

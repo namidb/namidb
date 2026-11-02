@@ -32,6 +32,7 @@ pub use show::{show_constraints_rows, show_indexes_rows, show_schema_columns};
 pub use value::{NodeValue, RelValue, RuntimeValue};
 pub use walker::{execute, execute_factor_path, execute_flat_path, execute_with_limits, ExecError};
 pub use writer::{
-    enforce_node_unique_constraints, execute_write, execute_write_staged,
-    execute_write_staged_with_deadline, execute_write_with_deadline, WriteOutcome,
+    enforce_node_unique_constraints, execute_write, execute_write_checked_with_deadline,
+    execute_write_staged, execute_write_staged_with_deadline, execute_write_with_deadline,
+    WriteOutcome,
 };

@@ -30,10 +30,15 @@ crates.io release will establish and document that API explicitly.
   producers that can outgrow their input mid-flight (`UNWIND`, expand and
   variable-length traversal, projection, joins, cross products,
   aggregation and `collect()`, `DISTINCT`, sorting, `range()`), using
-  conservative estimates of the heap the rows really occupy; the HTTP
-  response body's copies of the result are charged too. All running queries
-  also reserve from a shared pool of 75% of the ceiling, and a growing query
-  re-samples RSS every 16 MiB. A query over its own budget fails with HTTP
+  conservative estimates of the heap the rows really occupy, on the flat and
+  the factorised (`NAMIDB_FACTORIZE=1`) executor alike. The HTTP response
+  body's copies of the result are charged too; for a write they are charged
+  before the commit, so a write whose response would not fit is rolled back.
+  Bolt buffers a result until the client pulls it, and the statement keeps
+  its budget until the last row is pulled or the stream is discarded, reset
+  or closed. All running queries also reserve from a shared pool of 75% of
+  the ceiling (a query running alone always gets its full budget), and a
+  growing query re-samples RSS every 16 MiB. A query over its own budget fails with HTTP
   413 `code: "query_memory_limit"` / Bolt
   `Neo.ClientError.Statement.ResourceLimitExceeded` (GQLSTATUS `54000`; not
   retryable unchanged). A query stopped because the pool is full or the

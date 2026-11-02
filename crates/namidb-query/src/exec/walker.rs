@@ -233,12 +233,12 @@ pub async fn execute_factor_path(
     let routing = PlanRouting::analyze(plan);
     let mem_base = crate::exec::memory::frame_base();
     let set = execute_factor_inner_with_routing(plan, snapshot, params, None, &routing).await?;
-    let rows = set.materialize_all(None);
-    crate::exec::limits::check_row_cap(rows.len())?;
-    // The factorised path charges its flat sub-plans per operator; the
-    // materialised root result is charged here (#203).
+    crate::exec::limits::check_row_cap(set.cardinality())?;
+    // Every factor operator settles its set; the root's rows are metered as
+    // they are materialised and replace the set's charge (#203).
+    let rows = materialize_metered(set)?;
     if let Some(base) = mem_base {
-        crate::exec::memory::settle(base, &rows, crate::exec::memory::OutputKind::Additive)?;
+        crate::exec::memory::settle(base, &rows, crate::exec::memory::OutputKind::Replaced)?;
     }
     Ok(rows)
 }
@@ -8735,6 +8735,92 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
         // Deadline guard (read query timeout): one check per factor-path
         // operator invocation, mirroring the flat path.
         crate::exec::limits::check_deadline()?;
+        // Working-memory guard (#203), the factor twin of the flat
+        // boundary: charge the operator's finished set (its whole arena)
+        // and release the inputs it was built from.
+        let mem_base = crate::exec::memory::frame_base();
+        let set = execute_factor_operator(plan, snapshot, params, outer, routing).await?;
+        if let Some(base) = mem_base {
+            crate::exec::memory::settle_factor(base, &set, factor_output_kind(plan))?;
+        }
+        Ok(set)
+    }
+    .boxed()
+}
+
+/// How a factorised operator's set relates to its inputs, for the
+/// working-memory boundary in [`execute_factor_inner_with_routing`].
+/// Operators that extend or filter their input's arena, or rebuild a set
+/// from rows moved out of it, replace the input; the ones that build new
+/// rows next to their input (projections, UNWIND, aggregation, leaves) add
+/// to it.
+fn factor_output_kind(plan: &LogicalPlan) -> crate::exec::memory::OutputKind {
+    use crate::exec::memory::OutputKind;
+    match plan {
+        LogicalPlan::Filter { .. } => OutputKind::Moved,
+        LogicalPlan::Expand { .. }
+        | LogicalPlan::NodeById { .. }
+        | LogicalPlan::NodeByPropertyValue { .. }
+        | LogicalPlan::CrossProduct { .. }
+        | LogicalPlan::HashJoin { .. }
+        | LogicalPlan::HashSemiJoin { .. }
+        | LogicalPlan::SemiApply { .. }
+        | LogicalPlan::TopN { .. }
+        | LogicalPlan::Distinct { .. }
+        | LogicalPlan::Union { .. } => OutputKind::Replaced,
+        _ => OutputKind::Additive,
+    }
+}
+
+/// Materialise every leaf of a factorised input for a flat operator,
+/// metering the copy as it grows: a set whose leaves share deep chains can
+/// be far smaller than its rows (#203). The set is dropped and its charge
+/// swapped for the rows', which stay charged until the operator settles.
+fn materialize_metered(set: FactorRowSet) -> Result<Vec<Row>, ExecError> {
+    if !crate::exec::memory::memory_scoped() {
+        return Ok(set.materialize_all(None));
+    }
+    let set_bytes = crate::exec::memory::estimate_factor_set_bytes(&set);
+    let rows = materialize_leaves_metered(&set.arena, set.leaves.iter().copied())?;
+    drop(set);
+    crate::exec::memory::exchange(
+        set_bytes,
+        crate::exec::memory::estimate_row_vec_bytes(&rows),
+    )?;
+    Ok(rows)
+}
+
+/// Materialise `leaves` of `arena` into rows, checking the copy against the
+/// working-memory budget as it grows (#203). The rows are transient here;
+/// the caller's boundary charges whatever it keeps.
+fn materialize_leaves_metered(
+    arena: &FactorArena,
+    leaves: impl Iterator<Item = FactorIdx>,
+) -> Result<Vec<Row>, ExecError> {
+    // Check the row buffer before allocating it at its exact size.
+    let capacity = leaves.size_hint().0;
+    crate::exec::memory::check_transient(capacity.saturating_mul(std::mem::size_of::<Row>()))?;
+    let mut rows = Vec::with_capacity(capacity);
+    let mut meter = crate::exec::memory::GrowthMeter::new();
+    for leaf in leaves {
+        rows.push(arena.materialize(leaf, None));
+        if rows.len() % METER_STRIDE == 0 {
+            meter.observe(&rows)?;
+        }
+    }
+    Ok(rows)
+}
+
+/// The operator dispatch behind [`execute_factor_inner_with_routing`], kept
+/// apart so an arm that returns early still passes through the boundary.
+fn execute_factor_operator<'a>(
+    plan: &'a LogicalPlan,
+    snapshot: &'a Snapshot<'_>,
+    params: &'a Params,
+    outer: Option<&'a Row>,
+    routing: &'a PlanRouting,
+) -> BoxFuture<'a, Result<FactorRowSet, ExecError>> {
+    async move {
         match plan {
             // Operators that benefit directly: keep everything factorised.
             LogicalPlan::Empty => Ok(FactorRowSet::singleton_root()),
@@ -8837,12 +8923,14 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 // `id` (which is an Expression over bindings). Building
                 // the row only includes the bindings the Expression
                 // references is a future optimisation;
-                // materialising the whole chain is correct now.
-                let arena_view = input_set.arena.clone();
+                // materialising the whole chain is correct now. The rows
+                // are read from the arena before it is extended, so it is
+                // not cloned: a copy would double the input's memory
+                // outside the working-memory budget (#203).
                 let mut next_arena = input_set.arena;
                 let mut keyed = Vec::with_capacity(input_set.leaves.len());
                 for leaf in input_set.leaves {
-                    let row = arena_view.materialize(leaf, None);
+                    let row = next_arena.materialize(leaf, None);
                     if let Some(node_id) = seek_node_id(&evaluate(id, &row, params)?) {
                         keyed.push((leaf, node_id));
                     }
@@ -8887,13 +8975,13 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         .await?;
                 let alias_arc: Arc<str> = Arc::from(alias.as_str());
                 let mut out_leaves = Vec::new();
-                let arena_view = input_set.arena.clone();
+                // Read before extending, so no arena copy (see NodeById).
                 let mut next_arena = input_set.arena;
                 let evaluated_leaves = input_set
                     .leaves
                     .into_iter()
                     .map(|leaf| {
-                        let row = arena_view.materialize(leaf, None);
+                        let row = next_arena.materialize(leaf, None);
                         let lookup_val = evaluate(value, &row, params)?;
                         Ok::<_, ExecError>((leaf, lookup_val))
                     })
@@ -8990,13 +9078,12 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
-                let arena_view = input_set.arena.clone();
                 let mut out_leaves = Vec::with_capacity(input_set.leaves.len());
-                for leaf in input_set.leaves {
+                for &leaf in &input_set.leaves {
                     // Materialise full row to evaluate predicate. Column-
                     // aware materialise is a follow-up; today we accept the
                     // O(depth) walk + transient Row alloc per leaf.
-                    let row = arena_view.materialize(leaf, None);
+                    let row = input_set.arena.materialize(leaf, None);
                     let v = evaluate(predicate, &row, params)?;
                     if v.as_bool() == Some(true) {
                         out_leaves.push(leaf);
@@ -9038,7 +9125,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     || !matches!(shortest, crate::plan::ShortestMode::None)
                     || (length.is_some() && rel_alias.is_some())
                 {
-                    let rows = input_set.materialize_all(None);
+                    let rows = materialize_metered(input_set)?;
                     let out = execute_expand(
                         rows,
                         source,
@@ -9172,7 +9259,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
-                let input_rows = input_set.materialize_all(None);
+                let input_rows = materialize_metered(input_set)?;
                 let projected = project_rows(&input_rows, items, *discard_input_bindings, params)?;
                 let rows = if *distinct {
                     dedup_rows(projected)?
@@ -9237,13 +9324,10 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     } else {
                         row_count_as_usize(limit)
                     };
-                    let rows: Vec<Row> = input_set
-                        .leaves
-                        .iter()
-                        .skip(skip)
-                        .take(take)
-                        .map(|&leaf| input_set.arena.materialize(leaf, None))
-                        .collect();
+                    let rows = materialize_leaves_metered(
+                        &input_set.arena,
+                        input_set.leaves.iter().copied().skip(skip).take(take),
+                    )?;
                     return Ok(FactorRowSet::from_flat(rows));
                 }
 
@@ -9302,18 +9386,26 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                         }
                         let mut kept = heap.into_vec();
                         kept.sort_unstable();
-                        let rows: Vec<Row> = kept
-                            .into_iter()
-                            .skip(row_count_as_usize(skip))
-                            .take(row_count_as_usize(limit))
-                            .map(|it| input_set.arena.materialize(it.leaf, None))
-                            .collect();
+                        let rows = materialize_leaves_metered(
+                            &input_set.arena,
+                            kept.into_iter()
+                                .skip(row_count_as_usize(skip))
+                                .take(row_count_as_usize(limit))
+                                .map(|it| it.leaf),
+                        )?;
                         return Ok(FactorRowSet::from_flat(rows));
                     }
                 }
 
                 let mut keyed: Vec<(Vec<RuntimeValue>, crate::exec::FactorIdx)> =
                     Vec::with_capacity(input_set.cardinality());
+                // The sort keys are new allocations next to the arena, as in
+                // the flat `sort_rows` (#203).
+                let mut meter = crate::exec::memory::GrowthMeter::new();
+                meter.add(keyed.capacity().saturating_mul(std::mem::size_of::<(
+                    Vec<RuntimeValue>,
+                    crate::exec::FactorIdx,
+                )>()))?;
                 for &leaf in &input_set.leaves {
                     // Thin row: only the bindings the keys actually read.
                     let mut thin_row = Row::new();
@@ -9325,6 +9417,9 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     let mut key_vals = Vec::with_capacity(keys.len());
                     for k in keys {
                         key_vals.push(evaluate(&k.expression, &thin_row, params)?);
+                    }
+                    if meter.active() {
+                        meter.add(crate::exec::memory::estimate_values_bytes(&key_vals))?;
                     }
                     keyed.push((key_vals, leaf));
                 }
@@ -9340,12 +9435,14 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 } else {
                     row_count_as_usize(limit)
                 };
-                let rows: Vec<Row> = keyed
-                    .into_iter()
-                    .skip(skip)
-                    .take(take)
-                    .map(|(_, leaf)| input_set.arena.materialize(leaf, None))
-                    .collect();
+                let rows = materialize_leaves_metered(
+                    &input_set.arena,
+                    keyed
+                        .into_iter()
+                        .skip(skip)
+                        .take(take)
+                        .map(|(_, leaf)| leaf),
+                )?;
                 Ok(FactorRowSet::from_flat(rows))
             }
 
@@ -9353,7 +9450,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
-                let rows = input_set.materialize_all(None);
+                let rows = materialize_metered(input_set)?;
                 Ok(FactorRowSet::from_flat(dedup_rows(rows)?))
             }
 
@@ -9362,8 +9459,8 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     .await?;
                 let r = execute_factor_inner_with_routing(right, snapshot, params, outer, routing)
                     .await?;
-                let mut rows = l.materialize_all(None);
-                rows.extend(r.materialize_all(None));
+                let mut rows = materialize_metered(l)?;
+                rows.extend(materialize_metered(r)?);
                 let out = if *all { rows } else { dedup_rows(rows)? };
                 Ok(FactorRowSet::from_flat(out))
             }
@@ -9372,14 +9469,22 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
-                let input_rows = input_set.materialize_all(None);
+                let input_rows = materialize_metered(input_set)?;
                 let mut out = Vec::new();
+                // Same working-memory meter as the flat Unwind arm (#203).
+                let mut meter = crate::exec::memory::GrowthMeter::new();
                 for row in input_rows {
                     // Same cancellation probes as the flat Unwind arm.
                     crate::exec::limits::check_deadline()?;
                     let v = evaluate(list, &row, params)?;
                     match v {
                         RuntimeValue::List(items) => {
+                            // The list's buffer stays allocated until the
+                            // loop has moved every item out.
+                            let buffer = items
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<RuntimeValue>());
+                            meter.add(buffer)?;
                             for item in items {
                                 if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
                                     crate::exec::limits::check_deadline()?;
@@ -9389,11 +9494,13 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                                     // the post-loop check let a 4 GB
                                     // container OOM between 3M and 5M rows).
                                     crate::exec::limits::check_row_cap(out.len())?;
+                                    meter.observe(&out)?;
                                 }
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);
                                 out.push(new_row);
                             }
+                            meter.release(buffer);
                         }
                         RuntimeValue::Null => {}
                         _ => {
@@ -9423,7 +9530,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     let input_set =
                         execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                             .await?;
-                    let rows = input_set.materialize_all(None);
+                    let rows = materialize_metered(input_set)?;
                     let agg_rows = execute_aggregate(rows, group_by, aggregations, params)?;
                     Ok(FactorRowSet::from_flat(agg_rows))
                 }
@@ -9442,13 +9549,18 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
-                let rows = input_set.materialize_all(None);
+                let rows = materialize_metered(input_set)?;
                 let mut out = Vec::with_capacity(rows.len());
+                // Release each per-row subquery's output as the flat arm
+                // does, or every evaluation's charge would accumulate (#203).
+                let mark = crate::exec::memory::frame_base();
                 for row in rows {
                     let sub_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
                             .await?;
                     let matched = !sub_rows.is_empty();
+                    drop(sub_rows);
+                    crate::exec::memory::restore(mark);
                     let keep = if *negated { !matched } else { matched };
                     if keep {
                         out.push(row);
@@ -9465,7 +9577,7 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
-                let rows = input_set.materialize_all(None);
+                let rows = materialize_metered(input_set)?;
                 let out = apply_rows(
                     rows,
                     subplan,
@@ -9488,8 +9600,12 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                 let input_set =
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
-                let rows = input_set.materialize_all(None);
+                let rows = materialize_metered(input_set)?;
                 let mut out = Vec::with_capacity(rows.len());
+                // As the flat arm: release each per-row subquery's output and
+                // meter the lists built from it instead (#203).
+                let mark = crate::exec::memory::frame_base();
+                let mut meter = crate::exec::memory::GrowthMeter::new();
                 for row in rows {
                     let inner_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
@@ -9497,6 +9613,10 @@ pub(crate) fn execute_factor_inner_with_routing<'a>(
                     let mut list = Vec::with_capacity(inner_rows.len());
                     for inner in inner_rows {
                         list.push(evaluate(projection, &inner, params)?);
+                    }
+                    crate::exec::memory::restore(mark);
+                    if meter.active() {
+                        meter.add(crate::exec::memory::estimate_values_bytes(&list))?;
                     }
                     let mut new_row = row;
                     new_row.set(alias.clone(), RuntimeValue::List(list));
@@ -9617,6 +9737,9 @@ async fn execute_expand_factor(
     let rel_arc: Option<Arc<str>> = rel_alias.map(Arc::from);
 
     let mut out_leaves: Vec<crate::exec::FactorIdx> = Vec::new();
+    // The nodes this expansion adds to the arena, metered as they are
+    // pushed like the flat `execute_expand`'s rows (#203).
+    let mut meter = crate::exec::memory::GrowthMeter::new();
 
     for parent_leaf in input_leaves {
         // Deadline + row-cap guards, mirroring the flat `execute_expand`:
@@ -9930,6 +10053,9 @@ async fn execute_expand_factor(
                             })),
                         });
                     }
+                    if meter.active() {
+                        meter.add(crate::exec::memory::estimate_factor_slots_bytes(&slots))?;
+                    }
                     // One arena push per (parent, edge) pair. NO Row clone.
                     let new_idx = arena.push(cur_parent, slots);
                     let mut new_rels = rels.clone();
@@ -10033,6 +10159,7 @@ fn execute_multiway_join_factor<'a>(
             leaves: Vec::new(),
             bound: vec![None; vars.len()],
             materialised: vec![None; vars.len()],
+            meter: crate::exec::memory::GrowthMeter::new(),
         };
         descend_multiway(&mut state, 0, vars, edges, ordering, distinct, snapshot).await?;
         Ok(FactorRowSet {
@@ -10048,6 +10175,8 @@ struct MultiwayState {
     leaves: Vec<FactorIdx>,
     bound: Vec<Option<NodeId>>,
     materialised: Vec<Option<NodeValue>>,
+    /// Working memory of the leaves pushed so far (#203).
+    meter: crate::exec::memory::GrowthMeter,
 }
 
 fn descend_multiway<'a>(
@@ -10124,6 +10253,11 @@ fn descend_multiway<'a>(
                     Arc::<str>::from(v.alias.as_str()),
                     RuntimeValue::Node(Box::new(value)),
                 ));
+            }
+            if state.meter.active() {
+                let bytes = crate::exec::memory::estimate_factor_slots_bytes(&slots)
+                    .saturating_add(copies.saturating_mul(std::mem::size_of::<FactorIdx>()));
+                state.meter.add(bytes)?;
             }
             let leaf = state.arena.push(root, slots);
             for _ in 0..copies {
@@ -10376,6 +10510,21 @@ fn cross_product_factor(
     // Pre-check the multiplicative size before building, mirroring the flat
     // path, so a runaway cross product aborts instead of allocating first.
     crate::exec::limits::check_row_cap(left.leaves.len().saturating_mul(right.leaves.len()))?;
+    // Same for the working-memory budget (#203): every left leaf gets one
+    // bridge node per right leaf carrying a copy of that leaf's chain.
+    if crate::exec::memory::memory_scoped() {
+        let right_chains = right
+            .leaves
+            .iter()
+            .map(|&r| crate::exec::memory::estimate_factor_chain_bytes(&right.arena, r))
+            .fold(0usize, usize::saturating_add);
+        let pairs = left.leaves.len().saturating_mul(right.leaves.len());
+        crate::exec::memory::check_transient(
+            right_chains
+                .saturating_mul(left.leaves.len())
+                .saturating_add(pairs.saturating_mul(std::mem::size_of::<FactorIdx>())),
+        )?;
+    }
     let FactorRowSet {
         mut arena,
         leaves: left_leaves,
@@ -10429,8 +10578,8 @@ async fn hash_join_factor(
     // Build phase: execute factor, materialise, hash by build_side key.
     let build_set =
         execute_factor_inner_with_routing(build_plan, snapshot, params, outer, routing).await?;
-    let build_rows = build_set.materialize_all(None);
-    crate::exec::limits::check_row_cap(build_rows.len())?;
+    crate::exec::limits::check_row_cap(build_set.cardinality())?;
+    let build_rows = materialize_metered(build_set)?;
     let mut table: std::collections::HashMap<Vec<String>, Vec<Row>> =
         std::collections::HashMap::new();
     for row in build_rows {
@@ -10458,6 +10607,10 @@ async fn hash_join_factor(
         leaves: probe_leaves,
     } = probe_set;
     let mut out_leaves = Vec::new();
+    // One probe leaf can join many build rows, each a new bridge node
+    // carrying a copy of the build row: meter them as the flat join does
+    // its joined rows (#203).
+    let mut meter = crate::exec::memory::GrowthMeter::new();
     for probe_leaf in probe_leaves {
         let probe_row = arena.materialize(probe_leaf, None);
         let mut key = Vec::with_capacity(on.len());
@@ -10481,6 +10634,9 @@ async fn hash_join_factor(
                         continue;
                     }
                     slots.push(Slot::new(Arc::from(name.as_str()), value.clone()));
+                }
+                if meter.active() {
+                    meter.add(crate::exec::memory::estimate_factor_slots_bytes(&slots))?;
                 }
                 let new_idx = arena.push(probe_leaf, slots);
                 if let Some(res) = residual {
@@ -10525,8 +10681,8 @@ async fn hash_semi_join_factor(
     // Build inner: factor → materialise → hash by build_side.
     let inner_set =
         execute_factor_inner_with_routing(inner_plan, snapshot, params, outer, routing).await?;
-    let inner_rows = inner_set.materialize_all(None);
-    crate::exec::limits::check_row_cap(inner_rows.len())?;
+    crate::exec::limits::check_row_cap(inner_set.cardinality())?;
+    let inner_rows = materialize_metered(inner_set)?;
     let mut key_set: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     let mut residual_index: std::collections::HashMap<Vec<String>, Vec<Row>> =
         std::collections::HashMap::new();

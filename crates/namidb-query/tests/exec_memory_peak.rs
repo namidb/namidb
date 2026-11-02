@@ -7,7 +7,8 @@
 //! 1. the estimate is conservative: for a query that fits, the budget's peak
 //!    charge is at least the heap the query really allocated at its peak;
 //! 2. the bound holds: when the #203 reproduction is stopped by a budget,
-//!    the real heap never grew much past that budget.
+//!    the real heap never grew much past that budget, on the flat and on
+//!    the factorised executor (`NAMIDB_FACTORIZE=1`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +19,8 @@ use namidb_storage::{NamespacePaths, WriterSession};
 use object_store::memory::InMemory;
 
 use namidb_query::{
-    execute_with_limits, lower, parse, with_query_memory, ExecError, Params, QueryMemoryBudget,
+    execute_factor_path, execute_with_limits, lower, parse, with_query_memory, ExecError, Params,
+    QueryMemoryBudget,
 };
 
 struct Counting;
@@ -64,21 +66,28 @@ static ALLOCATOR: Counting = Counting;
 const MIB: usize = 1024 * 1024;
 
 /// Run `cypher` under `budget` and return (result, heap growth at peak).
+/// `factor` runs the factorised executor (`NAMIDB_FACTORIZE=1`) directly
+/// instead of the default flat one.
 async fn measured(
     writer: &WriterSession,
     cypher: &str,
     budget: Arc<QueryMemoryBudget>,
+    factor: bool,
 ) -> (Result<usize, ExecError>, usize) {
     let snap = writer.snapshot();
     let plan = lower(&parse(cypher).unwrap()).unwrap();
     let params = Params::new();
     let baseline = CURRENT.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
-    let result = with_query_memory(
-        Some(budget),
-        execute_with_limits(&plan, &snap, &params, None, None),
-    )
-    .await
+    let result = if factor {
+        with_query_memory(Some(budget), execute_factor_path(&plan, &snap, &params)).await
+    } else {
+        with_query_memory(
+            Some(budget),
+            execute_with_limits(&plan, &snap, &params, None, None),
+        )
+        .await
+    }
     .map(|rows| rows.len());
     let grown = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
     (result, grown)
@@ -96,7 +105,7 @@ async fn budget_estimate_is_conservative_and_bounds_the_real_heap() {
     //    its own per-block overhead on top of the requested sizes counted
     //    here, which the estimate also covers.
     let budget = Arc::new(QueryMemoryBudget::new(1024 * MIB));
-    let (rows, real_peak) = measured(&writer, &cypher(100_000), Arc::clone(&budget)).await;
+    let (rows, real_peak) = measured(&writer, &cypher(100_000), Arc::clone(&budget), false).await;
     assert_eq!(rows.unwrap(), 100_000);
     let estimated_peak = budget.peak_bytes();
     eprintln!("100k rows: estimated peak {estimated_peak} B, real heap peak {real_peak} B");
@@ -116,11 +125,48 @@ async fn budget_estimate_is_conservative_and_bounds_the_real_heap() {
     //    budget this query allocates several hundred MiB.
     let limit = 64 * MIB;
     let budget = Arc::new(QueryMemoryBudget::new(limit));
-    let (rows, real_peak) = measured(&writer, &cypher(600_000), budget).await;
+    let (rows, real_peak) = measured(&writer, &cypher(600_000), budget, false).await;
     assert!(matches!(rows, Err(ExecError::MemoryLimit(_))), "{rows:?}");
     eprintln!("600k rows under {limit} B: stopped, real heap peak {real_peak} B");
     assert!(
         real_peak <= limit + limit / 4,
         "real heap peaked at {real_peak} bytes under a {limit}-byte budget"
+    );
+
+    // 3. The same bound on the factorised executor, for the repro and for
+    //    a nested UNWIND whose rows only an aggregate consumes (unmetered,
+    //    these reached ~515 MiB and ~760 MiB of real heap).
+    for cypher in [
+        cypher(600_000),
+        "UNWIND range(1, 1000) AS i UNWIND range(1, 900) AS j RETURN count(*) AS n".to_string(),
+    ] {
+        let budget = Arc::new(QueryMemoryBudget::new(limit));
+        let (rows, real_peak) = measured(&writer, &cypher, budget, true).await;
+        assert!(
+            matches!(rows, Err(ExecError::MemoryLimit(_))),
+            "{cypher}: {rows:?}"
+        );
+        eprintln!("factorised `{cypher}` under {limit} B: stopped, real heap peak {real_peak} B");
+        assert!(
+            real_peak <= limit + limit / 4,
+            "factorised `{cypher}`: real heap peaked at {real_peak} bytes under a {limit}-byte budget"
+        );
+    }
+
+    // 4. ... and its estimate stays conservative for a query that fits.
+    let budget = Arc::new(QueryMemoryBudget::new(1024 * MIB));
+    let (rows, real_peak) = measured(&writer, &cypher(100_000), Arc::clone(&budget), true).await;
+    assert_eq!(rows.unwrap(), 100_000);
+    let estimated_peak = budget.peak_bytes();
+    eprintln!(
+        "factorised 100k rows: estimated peak {estimated_peak} B, real heap peak {real_peak} B"
+    );
+    assert!(
+        estimated_peak >= real_peak,
+        "factorised estimate {estimated_peak} below the real peak {real_peak}"
+    );
+    assert!(
+        estimated_peak <= real_peak.saturating_mul(3),
+        "factorised estimate {estimated_peak} more than 3x the real peak {real_peak}"
     );
 }
