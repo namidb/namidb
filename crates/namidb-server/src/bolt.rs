@@ -243,6 +243,7 @@ impl ServerBackend {
                     rows: vec![],
                     statement_type: StatementType::Schema,
                     counters: BTreeMap::new(),
+                    retained: None,
                 }),
             },
             Err(e) => {
@@ -325,6 +326,7 @@ impl ServerBackend {
                     rows: vec![],
                     statement_type: StatementType::Schema,
                     counters: BTreeMap::new(),
+                    retained: None,
                 }),
             },
             Err(e) => {
@@ -414,6 +416,7 @@ impl ServerBackend {
                     rows: vec![],
                     statement_type: StatementType::Schema,
                     counters: BTreeMap::new(),
+                    retained: None,
                 }),
             },
             Err(e) => {
@@ -505,6 +508,7 @@ impl ServerBackend {
                     rows: vec![],
                     statement_type: StatementType::Schema,
                     counters: BTreeMap::new(),
+                    retained: None,
                 }),
             },
             Err(e) => {
@@ -633,6 +637,7 @@ impl ServerBackend {
                         rows: vec![],
                         statement_type: StatementType::Schema,
                         counters: BTreeMap::new(),
+                        retained: None,
                     }),
                 }
             }
@@ -805,6 +810,7 @@ impl ServerBackend {
                     rows,
                     statement_type: StatementType::Read,
                     counters: Default::default(),
+                    retained: None,
                 }),
             };
         }
@@ -862,12 +868,18 @@ impl ServerBackend {
                     writer.discard_batch();
                 }
             };
+            // Working-memory budget (#203), handed to the session with the
+            // returned rows so it lasts until they are pulled.
+            let budget = self.state.memory.query_budget();
             let staged = {
-                let apply = execute_write_staged_with_deadline(
-                    &plan,
-                    &mut writer,
-                    &params,
-                    self.state.write_deadline(),
+                let apply = namidb_query::with_query_memory(
+                    budget.clone(),
+                    execute_write_staged_with_deadline(
+                        &plan,
+                        &mut writer,
+                        &params,
+                        self.state.write_deadline(),
+                    ),
                 );
                 tokio::pin!(apply);
                 tokio::select! {
@@ -922,7 +934,9 @@ impl ServerBackend {
                 let acked = crate::bounded_group_ack(ack, self.state.write_deadline()).await;
                 let elapsed = started.elapsed();
                 let result = match acked {
-                    crate::GroupAck::Committed => Ok(write_run_outcome(&plan, outcome)),
+                    crate::GroupAck::Committed => {
+                        Ok(retain_budget(write_run_outcome(&plan, outcome), budget))
+                    }
                     crate::GroupAck::Shared(shared) => Err(map_exec_err_ref(shared.0.as_ref())),
                     crate::GroupAck::CoordinatorExited => Err(BackendError::Other(
                         "group commit coordinator exited".into(),
@@ -986,7 +1000,7 @@ impl ServerBackend {
                     RunObservation {
                         kind: Some(QueryKind::Write),
                         elapsed,
-                        result: Ok(write_run_outcome(&plan, outcome)),
+                        result: Ok(retain_budget(write_run_outcome(&plan, outcome), budget)),
                     }
                 }
                 Err(error) => {
@@ -1032,12 +1046,20 @@ impl ServerBackend {
                 }
             };
             let snap = owned.borrow();
-            let read = execute_with_limits(
-                &plan,
-                &snap,
-                &params,
-                self.state.query_deadline(),
-                self.state.query_row_cap(),
+            // Working-memory budget (#203). The finished rows are handed to
+            // the session and streamed record by record on PULL; the budget
+            // goes with them, so its shared-pool reservation keeps counting
+            // the rows until the client has pulled or discarded them.
+            let budget = self.state.memory.query_budget();
+            let read = namidb_query::with_query_memory(
+                budget.clone(),
+                execute_with_limits(
+                    &plan,
+                    &snap,
+                    &params,
+                    self.state.query_deadline(),
+                    self.state.query_row_cap(),
+                ),
             );
             tokio::pin!(read);
             let rows = tokio::select! {
@@ -1051,7 +1073,7 @@ impl ServerBackend {
                 kind: Some(QueryKind::Read),
                 elapsed,
                 result: rows
-                    .map(|rows| read_run_outcome(&plan, rows))
+                    .map(|rows| retain_budget(read_run_outcome(&plan, rows), budget))
                     .map_err(map_exec_err),
             }
         }
@@ -1209,12 +1231,17 @@ impl ServerBackend {
                     };
                 }
             };
+            // Retained with the buffered rows, as on the auto-commit path.
+            let budget = self.state.memory.query_budget();
             let staged = {
-                let apply = execute_write_staged_with_deadline(
-                    &plan,
-                    writer,
-                    &params,
-                    self.state.write_deadline(),
+                let apply = namidb_query::with_query_memory(
+                    budget.clone(),
+                    execute_write_staged_with_deadline(
+                        &plan,
+                        writer,
+                        &params,
+                        self.state.write_deadline(),
+                    ),
                 );
                 tokio::pin!(apply);
                 tokio::select! {
@@ -1225,7 +1252,7 @@ impl ServerBackend {
             let result = match staged {
                 Some(Ok(outcome)) => {
                     *tx_staged = true;
-                    Ok(write_run_outcome(&plan, outcome))
+                    Ok(retain_budget(write_run_outcome(&plan, outcome), budget))
                 }
                 Some(Err(e)) => {
                     // A failed statement aborts the transaction. Drop whatever
@@ -1296,12 +1323,20 @@ impl ServerBackend {
                 TxState::Write { writer, .. } => writer.overlay_snapshot(),
                 TxState::Read { snapshot } => snapshot.borrow(),
             };
-            let read = execute_with_limits(
-                &plan,
-                &snap,
-                &params,
-                self.state.query_deadline(),
-                self.state.query_row_cap(),
+            // Working-memory budget (#203). The finished rows are handed to
+            // the session and streamed record by record on PULL; the budget
+            // goes with them, so its shared-pool reservation keeps counting
+            // the rows until the client has pulled or discarded them.
+            let budget = self.state.memory.query_budget();
+            let read = namidb_query::with_query_memory(
+                budget.clone(),
+                execute_with_limits(
+                    &plan,
+                    &snap,
+                    &params,
+                    self.state.query_deadline(),
+                    self.state.query_row_cap(),
+                ),
             );
             tokio::pin!(read);
             let rows = tokio::select! {
@@ -1315,7 +1350,7 @@ impl ServerBackend {
                 kind: Some(QueryKind::Read),
                 elapsed,
                 result: rows
-                    .map(|rows| read_run_outcome(&plan, rows))
+                    .map(|rows| retain_budget(read_run_outcome(&plan, rows), budget))
                     .map_err(map_exec_err),
             }
         }
@@ -1662,7 +1697,22 @@ fn write_run_outcome(plan: &namidb_query::LogicalPlan, outcome: WriteOutcome) ->
         rows: outcome.rows,
         statement_type: stype,
         counters,
+        retained: None,
     }
+}
+
+/// Hand a statement's working-memory budget (#203) to the session with its
+/// rows. The session buffers the rows until the client pulls them and drops
+/// the budget with the last of them, so the budget's reservation in the
+/// shared query-memory pool covers buffered results too: many sessions
+/// holding unpulled results cannot together exceed the process ceiling.
+fn retain_budget(
+    mut outcome: RunOutcome,
+    budget: Option<Arc<namidb_query::QueryMemoryBudget>>,
+) -> RunOutcome {
+    outcome.retained =
+        budget.map(|budget| Box::new(budget) as Box<dyn std::any::Any + Send + Sync>);
+    outcome
 }
 
 /// Build the Bolt `RunOutcome` for a read statement.
@@ -1673,6 +1723,7 @@ fn read_run_outcome(plan: &namidb_query::LogicalPlan, rows: Vec<Row>) -> RunOutc
         rows,
         statement_type: StatementType::Read,
         counters: Default::default(),
+        retained: None,
     }
 }
 
@@ -1686,6 +1737,7 @@ fn show_run_outcome(rows: Vec<Row>) -> RunOutcome {
         rows,
         statement_type: StatementType::Read,
         counters: Default::default(),
+        retained: None,
     }
 }
 
@@ -1736,6 +1788,14 @@ fn map_exec_err_ref(e: &ExecError) -> BackendError {
         ExecError::RowCap(cap) => {
             BackendError::ResourceLimit(format!("query exceeded the configured row cap of {cap}"))
         }
+        // Working-memory budget (#203): the query's own budget is a
+        // deterministic ClientError like the row cap; a full shared pool or
+        // the process ceiling stays TransientError, exactly like admission's
+        // memory pressure, so drivers retry it.
+        ExecError::MemoryLimit(exceeded) if exceeded.is_transient() => {
+            BackendError::Storage(exceeded.to_string())
+        }
+        ExecError::MemoryLimit(exceeded) => BackendError::ResourceLimit(exceeded.to_string()),
         ExecError::Storage(err) => match err {
             // Deterministic search result caps: same query, same outcome —
             // ClientError, not the auto-retried TransientError bucket.
@@ -2629,6 +2689,61 @@ mod tests {
         let backend = backend_with_authz(Arc::new(crate::authz::NoOpAuthz)).await;
         let out = backend.run("MATCH (n) RETURN n", Params::new()).await;
         assert!(out.is_ok(), "default authz should allow: {out:?}");
+    }
+
+    /// #203 review: a Bolt result is buffered in the session until the
+    /// client pulls it, so the statement's working-memory budget, and its
+    /// reservation in the shared query-memory pool, must live with the
+    /// returned rows rather than end with execution. Otherwise many sessions
+    /// holding unpulled results could together pass the process ceiling.
+    #[tokio::test]
+    async fn bolt_results_keep_their_query_memory_reservation_until_released() {
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-retained-budget").unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        // A ceiling far above any test RSS: admission and the RSS probe stay
+        // out of the way, the pool is what is observed.
+        let governor = Arc::new(crate::memory::MemoryGovernor::new(64 << 30));
+        let pool = Arc::clone(governor.query_memory_pool().unwrap());
+        let state = AppState::new(writer, None, "bolt-retained".into())
+            .with_memory_governor(Arc::clone(&governor));
+        let backend = ServerBackend::new(state, Arc::new(std::sync::Mutex::new(None)));
+        let read = "UNWIND range(1, 20000) AS i RETURN i, toString(i) AS s";
+
+        // Auto-commit read.
+        let outcome = backend.run(read, Params::new()).await.unwrap();
+        assert_eq!(outcome.rows.len(), 20_000);
+        assert!(outcome.retained.is_some());
+        assert!(
+            pool.reserved_bytes() >= 20_000 * 650,
+            "buffered rows must stay reserved: {}",
+            pool.reserved_bytes()
+        );
+        drop(outcome);
+        assert_eq!(pool.reserved_bytes(), 0);
+
+        // Auto-commit write returning rows.
+        let outcome = backend
+            .run("CREATE (n:N {i: 1}) RETURN n", Params::new())
+            .await
+            .unwrap();
+        assert!(pool.reserved_bytes() > 0);
+        drop(outcome);
+        assert_eq!(pool.reserved_bytes(), 0);
+
+        // In-transaction write and read.
+        backend.begin_tx().await.unwrap();
+        let write = backend
+            .run_in_tx("CREATE (n:N {i: 2}) RETURN n", Params::new())
+            .await
+            .unwrap();
+        let outcome = backend.run_in_tx(read, Params::new()).await.unwrap();
+        assert!(pool.reserved_bytes() >= 20_000 * 650);
+        drop(outcome);
+        drop(write);
+        assert_eq!(pool.reserved_bytes(), 0);
+        backend.rollback_tx().await.unwrap();
     }
 
     #[tokio::test]

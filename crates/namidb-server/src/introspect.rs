@@ -623,6 +623,7 @@ fn read_outcome(fields: Vec<String>, rows: Vec<Row>) -> RunOutcome {
         rows,
         statement_type: StatementType::Read,
         counters: Default::default(),
+        retained: None,
     }
 }
 

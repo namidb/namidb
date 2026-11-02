@@ -474,6 +474,13 @@ pub struct RunOutcome {
     pub statement_type: StatementType,
     /// Write counters (`SUCCESS { stats: {...} }`).
     pub counters: BTreeMap<String, i64>,
+    /// Kept alive with the buffered rows until the stream closes: PULL
+    /// drains the last row, DISCARD drops them, or RESET, a failure, a new
+    /// RUN or the end of the connection clears them. A backend uses it to
+    /// hold whatever accounts for the rows' memory (the server keeps the
+    /// statement's working-memory budget, and with it its share of the
+    /// process-wide query-memory pool, here) for as long as they live.
+    pub retained: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -774,6 +781,9 @@ pub struct Session<S: AsyncReadExt + AsyncWriteExt + Unpin> {
     /// client-demanded batches (`n` per PULL). DISCARD drops rows without
     /// expanding their values to Bolt containers. Cleared on RESET.
     pending_rows: std::collections::VecDeque<Row>,
+    /// [`RunOutcome::retained`] of the in-flight stream, released together
+    /// with `pending_rows`.
+    pending_retained: Option<Box<dyn std::any::Any + Send + Sync>>,
     /// Write counters of the in-flight stream, emitted as `stats` in the
     /// closing `SUCCESS` after PULL/DISCARD. Empty for reads.
     pending_counters: BTreeMap<String, i64>,
@@ -838,6 +848,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             pending_fields: Vec::new(),
             pending_field_is_last_occurrence: Vec::new(),
             pending_rows: std::collections::VecDeque::new(),
+            pending_retained: None,
             prefetched_messages: std::collections::VecDeque::new(),
             prefetched_bytes: 0,
             post_auth_message_bytes: DEFAULT_POST_AUTH_MESSAGE_BYTES,
@@ -1170,6 +1181,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                 let _ = self.backend.rollback_tx().await;
             }
             drop(std::mem::take(&mut self.pending_rows));
+            drop(self.pending_retained.take());
             drop(std::mem::take(&mut self.pending_fields));
             drop(std::mem::take(&mut self.pending_field_is_last_occurrence));
             self.pending_statement_type = None;
@@ -1411,8 +1423,10 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                     self.state = State::Ready;
                 }
                 // Popping every row leaves VecDeque's peak allocation behind.
-                // Release it and the projection fields when the stream closes.
+                // Release it and the projection fields when the stream closes,
+                // and only then whatever the backend retained for them.
                 drop(std::mem::take(&mut self.pending_rows));
+                drop(self.pending_retained.take());
                 drop(std::mem::take(&mut self.pending_fields));
                 drop(std::mem::take(&mut self.pending_field_is_last_occurrence));
                 self.write_response(Response::Success(meta)).await
@@ -1547,6 +1561,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
             rows,
             statement_type,
             counters,
+            retained,
         } = outcome;
         let mut head_meta = BTreeMap::new();
         head_meta.insert(
@@ -1570,6 +1585,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         self.pending_fields = fields;
         self.pending_field_is_last_occurrence = field_is_last_occurrence;
         self.pending_rows = rows.into();
+        self.pending_retained = retained;
 
         // 2) Transition to STREAMING; PULL/DISCARD drain or drop the buffer.
         self.state = if inside_tx {
@@ -1678,6 +1694,7 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
         // Release potentially corpus-sized result memory before waiting on
         // rollback or socket I/O.
         drop(std::mem::take(&mut self.pending_rows));
+        drop(self.pending_retained.take());
         drop(std::mem::take(&mut self.pending_fields));
         drop(std::mem::take(&mut self.pending_field_is_last_occurrence));
         self.pending_statement_type = None;
@@ -3474,6 +3491,157 @@ mod tests {
         assert!(session.pending_field_is_last_occurrence.is_empty());
     }
 
+    /// Counts the [`RunOutcome::retained`] guards still alive.
+    struct LiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for LiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Returns three rows and a fresh [`LiveGuard`] for every RUN.
+    struct RetainingBackend {
+        live: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Backend for RetainingBackend {
+        async fn run(
+            &self,
+            _cypher: &str,
+            _params: Params,
+        ) -> std::result::Result<RunOutcome, BackendError> {
+            self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(RunOutcome {
+                fields: vec!["n".into()],
+                rows: (0..3)
+                    .map(|i| Row::new().with("n", RuntimeValue::Integer(i)))
+                    .collect(),
+                retained: Some(Box::new(LiveGuard(Arc::clone(&self.live)))),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// The backend's retained guard (the server's working-memory budget,
+    /// #203) lives exactly as long as the buffered rows: through a partial
+    /// PULL, and no longer than the PULL that drains them, a DISCARD, a
+    /// RESET or a failure.
+    #[tokio::test]
+    async fn retained_guard_lives_as_long_as_the_buffered_rows() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut client, server) = duplex(64 * 1024);
+        let mut session = Session::new(
+            server,
+            ServerInfo {
+                agent: "NamiDB/test".into(),
+                connection_id: "test-conn".into(),
+            },
+            AuthPolicy::Open,
+            Arc::new(RetainingBackend {
+                live: Arc::clone(&live),
+            }),
+        );
+        session.state = State::Ready;
+        session.authenticated = true;
+        let pull = |n: i64| Request::Pull {
+            extra: [("n".into(), Value::Int(n))].into_iter().collect(),
+        };
+        let discard = Request::Discard {
+            extra: [("n".into(), Value::Int(-1))].into_iter().collect(),
+        };
+
+        // PULL: held through a partial batch, released by the last one.
+        session
+            .execute_run(
+                "RETURN 1",
+                BTreeMap::new(),
+                ElementIdMode::Include,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = read_msg(&mut client).await;
+        assert_eq!(live.load(SeqCst), 1);
+        session
+            .handle(pull(2), ElementIdMode::Include)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            let _ = read_msg(&mut client).await; // 2 RECORDs + has_more
+        }
+        assert_eq!(live.load(SeqCst), 1, "rows remain buffered");
+        session
+            .handle(pull(2), ElementIdMode::Include)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let _ = read_msg(&mut client).await; // RECORD + summary
+        }
+        assert_eq!(session.state, State::Ready);
+        assert_eq!(live.load(SeqCst), 0, "released with the last row");
+
+        // DISCARD and RESET release it too.
+        for close in [discard, Request::Reset] {
+            session
+                .execute_run(
+                    "RETURN 1",
+                    BTreeMap::new(),
+                    ElementIdMode::Include,
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+            let _ = read_msg(&mut client).await;
+            assert_eq!(live.load(SeqCst), 1);
+            session.handle(close, ElementIdMode::Include).await.unwrap();
+            let _ = read_msg(&mut client).await;
+            assert_eq!(session.state, State::Ready);
+            assert_eq!(live.load(SeqCst), 0);
+        }
+
+        // So does a failure: a message invalid while streaming.
+        session
+            .execute_run(
+                "RETURN 1",
+                BTreeMap::new(),
+                ElementIdMode::Include,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = read_msg(&mut client).await;
+        assert_eq!(live.load(SeqCst), 1);
+        session
+            .handle(Request::Commit, ElementIdMode::Include)
+            .await
+            .unwrap();
+        let _ = read_msg(&mut client).await;
+        assert_eq!(session.state, State::Failed);
+        assert_eq!(live.load(SeqCst), 0);
+
+        // And the end of the connection, with rows still unpulled.
+        session.state = State::Ready;
+        session
+            .execute_run(
+                "RETURN 1",
+                BTreeMap::new(),
+                ElementIdMode::Include,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.load(SeqCst), 1);
+        drop(session);
+        assert_eq!(live.load(SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn reset_releases_pending_runtime_rows_and_stream_metadata() {
         let outcome = RunOutcome {
@@ -3481,6 +3649,7 @@ mod tests {
             rows: vec![Row::new().with("embedding", RuntimeValue::Vector(vec![1.0; 1024]))],
             statement_type: StatementType::Write,
             counters: [("properties-set".into(), 1)].into_iter().collect(),
+            retained: None,
         };
         let (mut client, server) = duplex(64 * 1024);
         let mut session = fixture_session(server, outcome, AuthPolicy::Open);
@@ -3524,6 +3693,7 @@ mod tests {
             rows: vec![Row::new().with("embedding", RuntimeValue::Vector(vec![1.0; 16 * 1024]))],
             statement_type: StatementType::Read,
             counters: [("properties-set".into(), 1)].into_iter().collect(),
+            retained: None,
         };
         let (mut client, server) = duplex(64 * 1024);
         let mut session = fixture_session(server, outcome, AuthPolicy::Open);

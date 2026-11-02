@@ -146,7 +146,26 @@ pub async fn execute_write_with_deadline(
     params: &Params,
     deadline: Option<Instant>,
 ) -> Result<WriteOutcome, ExecError> {
-    let outcome = match execute_write_staged_with_deadline(plan, writer, params, deadline).await {
+    execute_write_checked_with_deadline(plan, writer, params, deadline, |_| Ok(())).await
+}
+
+/// [`execute_write_with_deadline`] with `before_commit` run on the finished
+/// outcome before `commit_batch`. An error from it aborts the statement
+/// exactly like a failed apply: the pending batch is discarded and nothing
+/// is committed. The server uses it to charge the response's copies of the
+/// returned rows to the statement's working-memory budget (#203), so an
+/// over-budget response cannot follow a durable write.
+pub async fn execute_write_checked_with_deadline(
+    plan: &LogicalPlan,
+    writer: &mut WriterSession,
+    params: &Params,
+    deadline: Option<Instant>,
+    before_commit: impl FnOnce(&WriteOutcome) -> Result<(), ExecError>,
+) -> Result<WriteOutcome, ExecError> {
+    let staged = execute_write_staged_with_deadline(plan, writer, params, deadline)
+        .await
+        .and_then(|outcome| before_commit(&outcome).map(|()| outcome));
+    let outcome = match staged {
         Ok(outcome) => outcome,
         Err(e) => {
             // The statement failed (a timeout counts) after staging some
@@ -514,7 +533,7 @@ fn execute_write_inner_mode<'a>(
                     params,
                 )?;
                 if *distinct {
-                    projected = crate::exec::walker::dedup_rows(projected);
+                    projected = crate::exec::walker::dedup_rows(projected)?;
                 }
                 Ok(if retain_output { projected } else { Vec::new() })
             }
@@ -580,7 +599,7 @@ fn execute_write_inner_mode<'a>(
                     return Ok(Vec::new());
                 }
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
-                Ok(crate::exec::walker::dedup_rows(rows))
+                crate::exec::walker::dedup_rows(rows)
             }
             LogicalPlan::Aggregate {
                 input,
@@ -599,6 +618,9 @@ fn execute_write_inner_mode<'a>(
             LogicalPlan::Unwind { input, list, alias } => {
                 let rows = execute_write_inner(input, writer, params, outcome, routing).await?;
                 let mut out = Vec::new();
+                // Retained rows count against the statement's working-memory
+                // budget exactly as on the read path (#203).
+                let mut meter = crate::exec::memory::GrowthMeter::new();
                 for row in rows {
                     let v = evaluate(list, &row, params)?;
                     match v {
@@ -607,6 +629,9 @@ fn execute_write_inner_mode<'a>(
                                 let mut new_row = row.clone();
                                 new_row.set(alias.clone(), item);
                                 out.push(new_row);
+                                if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
+                                    meter.observe(&out)?;
+                                }
                             }
                         }
                         RuntimeValue::List(_) => {}
@@ -639,7 +664,7 @@ fn execute_write_inner_mode<'a>(
                 if *all {
                     Ok(l)
                 } else {
-                    Ok(crate::exec::walker::dedup_rows(l))
+                    crate::exec::walker::dedup_rows(l)
                 }
             }
             LogicalPlan::CrossProduct { left, right } => {
@@ -657,7 +682,7 @@ fn execute_write_inner_mode<'a>(
                 }
                 let l = execute_write_inner(left, writer, params, outcome, routing).await?;
                 let r = execute_write_inner(right, writer, params, outcome, routing).await?;
-                Ok(crate::exec::walker::cross_product(l, r))
+                crate::exec::walker::cross_product(l, r)
             }
 
             LogicalPlan::HashJoin { .. } | LogicalPlan::HashSemiJoin { .. } => {

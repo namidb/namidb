@@ -117,6 +117,12 @@ impl FactorArena {
         &self.nodes[idx as usize]
     }
 
+    /// The node vector itself, for the working-memory estimate (#203),
+    /// which needs its capacity as well as its nodes.
+    pub(crate) fn nodes(&self) -> &Vec<FactorNode> {
+        &self.nodes
+    }
+
     /// Walk the parent chain `leaf → root` accumulating bindings into a
     /// flat [`Row`]. Child slots **shadow** parent slots with the same
     /// name (the deeper, more recent binding wins).

@@ -15,6 +15,10 @@
 //!   inside the `Expand` accumulation loop so a runaway never fully
 //!   materialises.
 //!
+//! A row cap counts rows, not bytes: the working-memory budget in
+//! [`super::memory`] bounds wide rows and operator state under the cap, and
+//! is scoped separately with [`super::memory::with_query_memory`].
+//!
 //! The server scopes both from its configuration (env `NAMIDB_QUERY_TIMEOUT`
 //! and `NAMIDB_QUERY_ROW_CAP`). Writes carry only a deadline (no row cap):
 //! the write executor scopes it through [`with_limits`] in
