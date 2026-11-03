@@ -15,6 +15,42 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The query timeout and the admin cancel now stop a cartesian product
+  mid-operator.** A cross product does no storage reads, so the only
+  cooperative probe it reached was the operator boundary:
+  `MATCH (a:N), (b:N) RETURN count(*)` over 3,000 nodes ran for more than
+  40 s under `--query-timeout 1s` and ignored `POST
+  /v0/admin/queries/{id}/cancel`. Every operator loop that does CPU work over
+  already-materialised rows now probes the deadline and the cancel flag,
+  amortised to one check per 1,024 rows: the cross product (flat and
+  factorised), hash joins and semi-joins (build, probe and fan-out), an
+  uncorrelated `Apply` (itself a product), filter, projection, `DISTINCT`,
+  grouping and aggregation (`count(DISTINCT)`, `collect()`, percentiles),
+  `ORDER BY` key evaluation and bounded top-k, factorised leaf
+  materialisation, pattern comprehensions, the worst-case-optimal multiway
+  join, the graph-algorithm projection, and `reduce` / list comprehensions /
+  list quantifiers. A guarded `ORDER BY` over more than 16,384 rows sorts in
+  runs and merges them with probes in between, with an identical, stable
+  result. The query fails with the existing timeout (HTTP 504, Bolt
+  `TransactionTimedOut`) or cancelled (HTTP 409, Bolt `Transaction.Terminated`) error within
+  milliseconds of the deadline or cancel. Expand, variable-length paths,
+  `shortestPath`, `UNWIND`, `range()`, vector, full-text and hybrid search
+  and the graph algorithms already probed both inside their loops.
+
+### Documentation
+
+- Engine READMEs brought in line with the code: the Bolt listener
+  negotiates 4.4, 5.0, 5.4 and 5.7 (5.7 adds the GQLSTATUS failure fields);
+  `NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES` / `NAMIDB_EDGE_POINT_MAX_SST_BYTES`
+  default to `0` (unlimited) and a positive limit fails the build rather than
+  dropping the sidecar; `NAMIDB_VECTOR_FILTER_MAX_DISTINCT` and
+  `NAMIDB_VECTOR_FILTER_MAX_BYTES` were documented but never read, so they
+  are removed (the per-property limit is a fixed 4,096 distinct values; only
+  `NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP` is configurable); and the
+  `namidb-mcp` README lists all 14 tools (it showed 10).
+
 ## [3.2.1] - 2026-11-02
 
 ### Fixed
