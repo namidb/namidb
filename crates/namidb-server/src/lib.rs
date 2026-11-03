@@ -165,6 +165,14 @@ pub struct Config {
     /// (RFC-027) makes that safe by construction. Set `false` for a dry-run
     /// that only logs what it would free.
     pub sweep_delete: bool,
+    /// How long every manifest version stays restorable for a point-in-time
+    /// backup (`as_of` on `POST /v0/admin/backup`, listed by `GET
+    /// /v0/admin/restore-points`). The maintenance loop keeps the namespace's
+    /// restore point window lease ([`namidb_storage::restore_point`]) before
+    /// each sweep, so the sweep keeps that much history and everything it
+    /// references. `Duration::ZERO` (the default) turns it off and releases a
+    /// lease left from an earlier run. Requires `compaction_interval > 0`.
+    pub restore_point_retention: Duration,
     /// Bolt listener address. `None` keeps the protocol off (HTTP only).
     pub bolt_listen: Option<std::net::SocketAddr>,
     /// Maximum body size for one authenticated Bolt message. The
@@ -354,6 +362,10 @@ pub struct AppState {
     /// Per-namespace read concurrency cap ([`namespace_query_gate`]).
     /// `None` = off, the default.
     pub(crate) query_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// The namespace's committed manifest history, read without the writer
+    /// lock by `GET /v0/admin/restore-points` and to resolve a backup's
+    /// `as_of`.
+    pub(crate) history: ManifestStore,
 }
 
 /// See [`AppState::backup`].
@@ -371,6 +383,7 @@ pub(crate) struct BackupHandles {
 impl AppState {
     pub fn new(writer: WriterSession, auth_token: Option<String>, namespace: String) -> Self {
         let snapshot = Arc::new(SnapshotCell::new(writer.owned_snapshot()));
+        let history = writer.manifest_store().clone();
         // A single non-empty token is read-write; `None` or an empty string is
         // open (an empty secret would otherwise be a bypass — `Bearer ` would
         // match it). The server overrides this with the resolved multi-token
@@ -406,6 +419,7 @@ impl AppState {
             backup: None,
             // One namespace: the process-wide gate already caps it.
             query_gate: None,
+            history,
         }
     }
 
@@ -452,6 +466,7 @@ impl AppState {
         ns: &Arc<crate::registry::NamespaceState>,
     ) -> Self {
         Self {
+            history: ns.history.clone(),
             writer: ns.writer.clone(),
             snapshot: ns.snapshot.clone(),
             compaction_scheduler: ns.compaction_scheduler.clone(),
@@ -722,6 +737,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v0/admin/flush", post(admin_flush))
         .route("/v0/admin/compact", post(admin_compact))
         .route("/v0/admin/backup", post(admin_backup))
+        .route("/v0/admin/restore-points", get(admin_restore_points))
         .route("/v0/admin/queries", get(admin_queries))
         .route("/v0/admin/queries/:id/cancel", post(admin_cancel_query))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -867,6 +883,7 @@ where
 /// - `/:namespace/v0/admin/flush` - manual flush
 /// - `/:namespace/v0/admin/compact` - drain L0 and block until done
 /// - `/:namespace/v0/admin/backup` - copy a snapshot to an allowlisted URI
+/// - `/:namespace/v0/admin/restore-points` - list the restore point window
 /// - `/:namespace/v0/admin/restore` - copy an allowlisted backup into a new
 ///   namespace
 pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
@@ -906,6 +923,14 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
         .route("/v0/admin/compact", post(admin_compact_multi_unprefixed))
         .route("/:namespace/v0/admin/backup", post(admin_backup_multi))
         .route("/v0/admin/backup", post(admin_backup_multi_unprefixed))
+        .route(
+            "/:namespace/v0/admin/restore-points",
+            get(admin_restore_points_multi),
+        )
+        .route(
+            "/v0/admin/restore-points",
+            get(admin_restore_points_multi_unprefixed),
+        )
         .route("/:namespace/v0/admin/restore", post(admin_restore_multi))
         .route("/v0/admin/restore", post(admin_restore_multi_unprefixed))
         .route("/:namespace/v0/admin/queries", get(admin_queries_multi))
@@ -1023,6 +1048,15 @@ pub async fn run_with_memory_limits(
     namidb_storage::validate_cache_configuration().map_err(anyhow::Error::msg)?;
     if config.bolt_max_message_bytes == 0 {
         anyhow::bail!("NAMIDB_BOLT_MAX_MESSAGE_BYTES must be greater than zero");
+    }
+    // The restore point window is kept by the maintenance loop, before each
+    // sweep. Without the loop nothing would keep it, and restore points
+    // would silently never exist.
+    if !config.restore_point_retention.is_zero() && config.compaction_interval.is_zero() {
+        anyhow::bail!(
+            "NAMIDB_RESTORE_POINT_RETENTION needs the background maintenance loop: \
+             set NAMIDB_COMPACTION_INTERVAL above zero, or the retention to 0"
+        );
     }
     // Resolve the outer HTTP ceiling before any router is built, so it can be
     // derived from (and never silently truncate) the query/write budgets.
@@ -1223,6 +1257,7 @@ pub async fn run_with_memory_limits(
             compaction_interval: config.compaction_interval,
             sweep_min_age: config.sweep_min_age,
             sweep_delete: config.sweep_delete,
+            restore_point_retention: config.restore_point_retention,
             compaction_l0_trigger: config.compaction_l0_trigger,
             group_commit_window: config.group_commit_window,
             fence_policy: config.fence_policy,
@@ -1460,7 +1495,17 @@ pub async fn run_with_memory_limits(
         let interval = config.compaction_interval;
         let sweep_min_age = config.sweep_min_age;
         let sweep_delete = config.sweep_delete;
+        let restore_point_retention = config.restore_point_retention;
         tokio::spawn(async move {
+            // Open (or release, when retention is off) the restore point
+            // window now rather than one interval from now.
+            maintenance::keep_restore_point_window(
+                &maint_manifest_store,
+                restore_point_retention,
+                interval,
+                &state_for_maint.namespace,
+            )
+            .await;
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await; // first tick fires immediately; skip.
@@ -1505,6 +1550,17 @@ pub async fn run_with_memory_limits(
                     &state_for_maint.namespace,
                 )
                 .await;
+                // Advance the restore point window before the sweep reads the
+                // pins, so the sweep keeps exactly the configured history.
+                if !restore_point_retention.is_zero() {
+                    maintenance::keep_restore_point_window(
+                        &maint_manifest_store,
+                        restore_point_retention,
+                        interval,
+                        &state_for_maint.namespace,
+                    )
+                    .await;
+                }
                 let horizon = state_for_maint.snapshot.retention_horizon();
                 match sweep_orphans(
                     &maint_manifest_store,
@@ -1520,7 +1576,8 @@ pub async fn run_with_memory_limits(
                             || report.manifest_snapshots_reclaimed > 0
                             || report.pointer_files_reclaimed > 0
                             || report.wal_segments_reclaimed > 0
-                            || report.memtable_snapshots_reclaimed > 0 =>
+                            || report.memtable_snapshots_reclaimed > 0
+                            || report.restore_window_retained > 0 =>
                     {
                         info!(
                             found = report.orphans_found,
@@ -1534,6 +1591,8 @@ pub async fn run_with_memory_limits(
                             wal_bytes_freed = report.wal_bytes_freed,
                             memtable_snapshots = report.memtable_snapshots_reclaimed,
                             memtable_snapshot_bytes_freed = report.memtable_snapshot_bytes_freed,
+                            restore_window_retained = report.restore_window_retained,
+                            restore_window_bytes = report.restore_window_bytes,
                             dry_run = !sweep_delete,
                             "orphan sweep"
                         )
@@ -4409,9 +4468,16 @@ struct BackupRequest {
     /// Destination namespace URI. Must sit inside the operator-configured
     /// `--backup-target-uri` prefix.
     to: String,
-    /// Source manifest version to pin; `None` = current committed.
+    /// Source manifest version to pin; `None` = current committed. Not
+    /// checked against the restore point window; prefer `as_of`.
     #[serde(default)]
     version: Option<u64>,
+    /// Copy the namespace as it was at a restore point: an RFC 3339 instant
+    /// (the newest version committed at or before it) or a manifest version
+    /// (a JSON integer). Must fall inside the restore point window
+    /// (`GET /v0/admin/restore-points`). Exclusive with `version`.
+    #[serde(default)]
+    as_of: Option<AsOfParam>,
     /// Overwrite an existing destination pointer.
     #[serde(default)]
     force: bool,
@@ -4513,6 +4579,107 @@ fn snapshot_copy_busy_response() -> Response {
         .into_response()
 }
 
+/// A backup's `as_of`: a JSON integer is a manifest version, a string an
+/// RFC 3339 instant.
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum AsOfParam {
+    Version(u64),
+    Time(String),
+}
+
+/// A JSON error body with a machine-readable `code` and extra fields.
+fn coded_error(
+    status: StatusCode,
+    code: &str,
+    error: String,
+    extra: serde_json::Value,
+) -> Response {
+    let mut body = serde_json::json!({ "error": error, "code": code });
+    if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        body.extend(extra.clone());
+    }
+    (status, Json(body)).into_response()
+}
+
+/// The source version a backup pins: `version` as given, or `as_of`
+/// resolved against the namespace's restore point window. `Err` is the
+/// response to send instead of copying.
+async fn backup_source_version(
+    src_store: &Arc<dyn object_store::ObjectStore>,
+    src_paths: &namidb_storage::NamespacePaths,
+    req: &BackupRequest,
+) -> std::result::Result<Option<u64>, Response> {
+    let as_of = match (&req.as_of, req.version) {
+        (None, version) => return Ok(version),
+        (Some(_), Some(_)) => {
+            return Err(coded_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_as_of",
+                "pass either `version` or `as_of`, not both".into(),
+                serde_json::Value::Null,
+            ))
+        }
+        (Some(AsOfParam::Version(v)), None) => namidb_storage::AsOf::Version(*v),
+        (Some(AsOfParam::Time(raw)), None) => match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(t) => namidb_storage::AsOf::Time(t.with_timezone(&chrono::Utc)),
+            Err(e) => {
+                return Err(coded_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_as_of",
+                    format!(
+                        "`as_of` must be an RFC 3339 timestamp (e.g. \
+                             2026-11-03T10:00:00Z) or a manifest version: {e}"
+                    ),
+                    serde_json::Value::Null,
+                ))
+            }
+        },
+    };
+    let history = ManifestStore::new(src_store.clone(), src_paths.clone());
+    match namidb_storage::resolve_restore_point(&history, as_of).await {
+        Ok(namidb_storage::RestorePointResolution::Found(point)) => Ok(Some(point.version)),
+        Ok(namidb_storage::RestorePointResolution::OutOfWindow(window)) => Err(coded_error(
+            StatusCode::NOT_FOUND,
+            "restore_point_unavailable",
+            format!(
+                "`as_of` is outside the restore point window (versions {} to {}, \
+                 committed {} to {})",
+                window.earliest.version,
+                window.latest.version,
+                window.earliest.created_at.to_rfc3339(),
+                window.latest.created_at.to_rfc3339()
+            ),
+            serde_json::json!({ "earliest": window.earliest, "latest": window.latest }),
+        )),
+        Ok(namidb_storage::RestorePointResolution::InFuture { now }) => Err(coded_error(
+            StatusCode::BAD_REQUEST,
+            "as_of_in_future",
+            format!(
+                "`as_of` is later than the server's clock ({})",
+                now.to_rfc3339()
+            ),
+            serde_json::Value::Null,
+        )),
+        Err(e) => Err(history_error_response(e, "backup")),
+    }
+}
+
+/// Map a failure to read a namespace's manifest history: 404 when the
+/// namespace has no manifest at all, else the snapshot-copy mapping.
+fn history_error_response(e: namidb_storage::Error, op: &str) -> Response {
+    match e {
+        namidb_storage::Error::ObjectStore(object_store::Error::NotFound { .. })
+        | namidb_storage::Error::ManifestNotFound(_) => coded_error(
+            StatusCode::NOT_FOUND,
+            "namespace_not_found",
+            format!("{op} failed: the namespace has no committed manifest: {e}"),
+            serde_json::Value::Null,
+        ),
+        e => snapshot_copy_response(Err(e), op),
+    }
+}
+
 /// The copy itself plus its error mapping, shared by the single-tenant and
 /// multi-tenant handlers. Gating (role, allowlist, single-flight) is the
 /// caller's job.
@@ -4521,6 +4688,10 @@ async fn run_backup_copy(
     src_paths: namidb_storage::NamespacePaths,
     req: &BackupRequest,
 ) -> Response {
+    let version = match backup_source_version(&src_store, &src_paths, req).await {
+        Ok(version) => version,
+        Err(response) => return response,
+    };
     let (dst_store, dst_paths) = match namidb_storage::parse_uri(&req.to) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -4534,13 +4705,7 @@ async fn run_backup_copy(
         }
     };
     let copied = namidb_storage::copy_namespace_snapshot(
-        src_store,
-        src_paths,
-        dst_store,
-        dst_paths,
-        req.version,
-        req.force,
-        req.verify,
+        src_store, src_paths, dst_store, dst_paths, version, req.force, req.verify,
     )
     .await;
     snapshot_copy_response(copied, "backup")
@@ -4555,6 +4720,7 @@ fn snapshot_copy_response(
     match copied {
         Ok(report) => Json(serde_json::json!({
             "source_version": report.source_version,
+            "source_created_at": report.source_created_at,
             "objects_copied": report.objects_copied,
             "bytes_copied": report.bytes_copied,
         }))
@@ -4649,6 +4815,120 @@ async fn dispatch_admin_backup_multi(
         return snapshot_copy_busy_response();
     };
     run_backup_copy(src_store, src_paths, &req).await
+}
+
+/// Query string of `GET /v0/admin/restore-points`.
+#[derive(serde::Deserialize)]
+struct RestorePointsQuery {
+    /// Page size, `1..=1000`; default 100.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Only versions strictly below this one (the previous page's
+    /// `next_before`).
+    #[serde(default)]
+    before: Option<u64>,
+}
+
+const DEFAULT_RESTORE_POINT_PAGE: usize = 100;
+
+/// `GET /v0/admin/restore-points` — the namespace's restore point window and
+/// one page of its points, newest first. Read-write tokens only, like every
+/// admin route. Reads committed state; never takes the writer lock.
+async fn admin_restore_points(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Query(query): axum::extract::Query<RestorePointsQuery>,
+) -> Response {
+    if !principal.allows_write() {
+        return restore_points_forbidden();
+    }
+    restore_points_response(&state.history, &query).await
+}
+
+fn restore_points_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "this token is read-only; admin restore points are forbidden".into(),
+        }),
+    )
+        .into_response()
+}
+
+async fn restore_points_response(history: &ManifestStore, query: &RestorePointsQuery) -> Response {
+    let limit = query.limit.unwrap_or(DEFAULT_RESTORE_POINT_PAGE);
+    if limit == 0 || limit > namidb_storage::MAX_RESTORE_POINT_PAGE {
+        return coded_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            format!(
+                "`limit` must be between 1 and {}",
+                namidb_storage::MAX_RESTORE_POINT_PAGE
+            ),
+            serde_json::Value::Null,
+        );
+    }
+    match namidb_storage::list_restore_points(history, query.before, limit).await {
+        Ok(page) => {
+            let lease = page.window.lease;
+            Json(serde_json::json!({
+                "enabled": lease.is_some(),
+                "retention_secs": lease.map(|l| l.retention.as_secs()),
+                "lease_expires_at": lease.map(|l| l.expires_at),
+                "earliest": page.window.earliest,
+                "latest": page.window.latest,
+                "points": page.points,
+                "next_before": page.next_before,
+            }))
+            .into_response()
+        }
+        Err(e) => history_error_response(e, "listing restore points"),
+    }
+}
+
+/// Multi-tenant twin of [`admin_restore_points`]. Reads the namespace's
+/// committed history without opening it, like backup.
+async fn admin_restore_points_multi(
+    Path(namespace): Path<String>,
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Query(query): axum::extract::Query<RestorePointsQuery>,
+) -> Response {
+    dispatch_admin_restore_points_multi(&shared, &namespace, &principal, &query).await
+}
+
+async fn admin_restore_points_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<RestorePointsQuery>,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    dispatch_admin_restore_points_multi(&shared, &namespace, &principal, &query).await
+}
+
+async fn dispatch_admin_restore_points_multi(
+    shared: &SharedAppState,
+    namespace: &str,
+    principal: &Principal,
+    query: &RestorePointsQuery,
+) -> Response {
+    if !principal.allows_write() {
+        return restore_points_forbidden();
+    }
+    let (store, paths) = match shared.registry.backup_source(namespace) {
+        Ok(source) => source,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: format!("namespace `{namespace}`: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    restore_points_response(&ManifestStore::new(store, paths), query).await
 }
 
 #[derive(serde::Deserialize)]
@@ -6057,6 +6337,7 @@ mod tests {
             compaction_interval: Duration::ZERO,
             sweep_min_age: Duration::ZERO,
             sweep_delete: false,
+            restore_point_retention: Duration::ZERO,
             bolt_listen: None,
             bolt_max_message_bytes: 64 << 20,
             bolt_tx_timeout: Duration::ZERO,
@@ -8346,6 +8627,257 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// GET a JSON admin path with a bearer token.
+    async fn get_admin_json(app: &Router, path: &str, token: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The `k` values of every `:B` node in the namespace at `uri`, sorted.
+    async fn b_keys(uri: &str) -> Vec<String> {
+        let (store, paths) = namidb_storage::parse_uri(uri).unwrap();
+        let restored = WriterSession::open(store, paths).await.unwrap();
+        let snap = restored.snapshot();
+        let plan =
+            namidb_query::lower(&namidb_query::parse("MATCH (b:B) RETURN b.k AS k").unwrap())
+                .unwrap();
+        let rows = namidb_query::execute(&plan, &snap, &namidb_query::Params::new())
+            .await
+            .unwrap();
+        let mut keys: Vec<String> = rows
+            .iter()
+            .map(|row| match row.bindings.get("k") {
+                Some(namidb_query::RuntimeValue::String(s)) => s.clone(),
+                other => panic!("unexpected k: {other:?}"),
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The point-in-time contract the control plane relies on: list the
+    /// window, back up `as_of` an instant after writes, deletes, flushes,
+    /// compaction and a sweep happened, and get exactly the rows of that
+    /// instant; and the error codes for every request that cannot succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_restore_points_list_the_window_and_backup_as_of_restores_it_exactly() {
+        let scratch = std::env::temp_dir().join(format!(
+            "namidb-pitr-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let prefix = format!("file://{}", scratch.display());
+        let path = std::env::temp_dir().join(format!(
+            "namidb-test-tokens-pitr-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, ROLE_TOKENS).unwrap();
+        let auth = crate::auth::AuthConfig::load_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let (store, paths) = namidb_storage::parse_uri("memory://pitr-endpoint").unwrap();
+        let history = ManifestStore::new(store.clone(), paths.clone());
+        let writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "pitr-endpoint".into())
+            .with_auth(Arc::new(auth))
+            .with_backup(store.clone(), paths.clone(), prefix.clone());
+        let app = build_router(state.clone());
+
+        // Retention off: the window is the current version alone.
+        let response = get_admin_json(&app, "/v0/admin/restore-points", "wkey").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["enabled"], false, "{json}");
+        assert_eq!(json["retention_secs"], serde_json::Value::Null);
+        assert_eq!(json["earliest"], json["latest"]);
+        assert_eq!(json["points"].as_array().unwrap().len(), 1);
+
+        // What the maintenance loop does before each sweep.
+        namidb_storage::refresh_restore_point_lease(
+            &history,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        for k in ["a", "b"] {
+            let r = post_cypher(&app, Some("wkey"), &format!("CREATE (:B {{k: '{k}'}})")).await;
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let instant = chrono::Utc::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Everything after the instant: a delete, a new row, flushes, a
+        // compaction that supersedes the SSTs holding `a`, and a sweep.
+        let r = post_cypher(&app, Some("wkey"), "MATCH (b:B {k: 'a'}) DELETE b").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        {
+            let mut w = state.writer.lock().await;
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.flush(schema.clone()).await.unwrap();
+        }
+        let r = post_cypher(&app, Some("wkey"), "CREATE (:B {k: 'c'})").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        {
+            let mut w = state.writer.lock().await;
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.flush(schema.clone()).await.unwrap();
+            w.compact_l0(&schema).await.unwrap();
+            state.snapshot.store(w.owned_snapshot());
+        }
+        namidb_storage::sweep_orphans(&history, u64::MAX, Duration::ZERO, 4, true)
+            .await
+            .unwrap();
+
+        // The window now spans every version since the lease was taken.
+        let response = get_admin_json(&app, "/v0/admin/restore-points?limit=2", "wkey").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["enabled"], true, "{json}");
+        assert_eq!(json["retention_secs"], 3600);
+        assert!(json["lease_expires_at"].is_string(), "{json}");
+        let earliest = json["earliest"]["version"].as_u64().unwrap();
+        let latest = json["latest"]["version"].as_u64().unwrap();
+        assert!(latest > earliest + 4, "{json}");
+        let points = json["points"].as_array().unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0]["version"].as_u64(), Some(latest));
+        assert_eq!(points[1]["version"].as_u64(), Some(latest - 1));
+        assert!(points[0]["created_at"].is_string());
+        assert_eq!(json["next_before"].as_u64(), Some(latest - 1));
+        let next = get_admin_json(
+            &app,
+            &format!("/v0/admin/restore-points?limit=1000&before={}", latest - 1),
+            "wkey",
+        )
+        .await;
+        let next = body_json(next).await;
+        assert_eq!(
+            next["points"].as_array().unwrap().len() as u64,
+            latest - 1 - earliest
+        );
+        assert_eq!(next["next_before"], serde_json::Value::Null);
+
+        // Backup as of the instant: `a` and `b`, not the later delete or `c`.
+        let dest = format!("{prefix}/pitr?ns=pitr");
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "wkey",
+            serde_json::json!({ "to": dest, "as_of": instant.to_rfc3339(), "verify": true }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let source_version = json["source_version"].as_u64().unwrap();
+        assert!(source_version < latest, "{json}");
+        let created: chrono::DateTime<chrono::Utc> =
+            json["source_created_at"].as_str().unwrap().parse().unwrap();
+        assert!(created <= instant, "{json}");
+        assert_eq!(b_keys(&dest).await, ["a", "b"]);
+
+        // as_of a version, as a JSON integer: the same snapshot.
+        let dest_v = format!("{prefix}/pitr-v?ns=pitr-v");
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "wkey",
+            serde_json::json!({ "to": dest_v, "as_of": source_version }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(b_keys(&dest_v).await, ["a", "b"]);
+
+        // Now: the current state.
+        let dest_now = format!("{prefix}/pitr-now?ns=pitr-now");
+        let response = post_admin_json(
+            &app,
+            "/v0/admin/backup",
+            "wkey",
+            serde_json::json!({ "to": dest_now, "as_of": chrono::Utc::now().to_rfc3339() }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["source_version"].as_u64(),
+            Some(latest)
+        );
+        assert_eq!(b_keys(&dest_now).await, ["b", "c"]);
+
+        // Requests that cannot succeed, each with its code.
+        let unused = format!("{prefix}/never?ns=never");
+        for (body, status, code) in [
+            (
+                serde_json::json!({ "to": unused, "as_of": "2000-01-01T00:00:00Z" }),
+                StatusCode::NOT_FOUND,
+                "restore_point_unavailable",
+            ),
+            (
+                serde_json::json!({ "to": unused, "as_of": latest + 10 }),
+                StatusCode::NOT_FOUND,
+                "restore_point_unavailable",
+            ),
+            (
+                serde_json::json!({ "to": unused, "as_of": "2999-01-01T00:00:00Z" }),
+                StatusCode::BAD_REQUEST,
+                "as_of_in_future",
+            ),
+            (
+                serde_json::json!({ "to": unused, "as_of": "yesterday" }),
+                StatusCode::BAD_REQUEST,
+                "invalid_as_of",
+            ),
+            (
+                serde_json::json!({ "to": unused, "as_of": source_version, "version": source_version }),
+                StatusCode::BAD_REQUEST,
+                "invalid_as_of",
+            ),
+        ] {
+            let response = post_admin_json(&app, "/v0/admin/backup", "wkey", body.clone()).await;
+            assert_eq!(response.status(), status, "{body}");
+            let json = body_json(response).await;
+            assert_eq!(json["code"], code, "{json}");
+            if code == "restore_point_unavailable" {
+                assert_eq!(
+                    json["earliest"]["version"].as_u64(),
+                    Some(earliest),
+                    "{json}"
+                );
+                assert_eq!(json["latest"]["version"].as_u64(), Some(latest), "{json}");
+            }
+        }
+        // None of them wrote anything.
+        let (never_store, never_paths) = namidb_storage::parse_uri(&unused).unwrap();
+        assert!(
+            !namidb_storage::has_manifest_pointer(&never_store, &never_paths)
+                .await
+                .unwrap()
+        );
+
+        // Admin-only, and the page size is bounded.
+        let response = get_admin_json(&app, "/v0/admin/restore-points", "rkey").await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = get_admin_json(&app, "/v0/admin/restore-points?limit=0", "wkey").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["code"], "invalid_limit");
+        let response = get_admin_json(&app, "/v0/admin/restore-points?limit=1001", "wkey").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         std::fs::remove_dir_all(&scratch).ok();
     }

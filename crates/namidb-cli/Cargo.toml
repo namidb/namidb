@@ -24,6 +24,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 console = { workspace = true }
 indicatif = { workspace = true }
 object_store = { workspace = true }

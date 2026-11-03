@@ -24,6 +24,7 @@ fn base_config(ns: &str) -> namidb_server::Config {
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
+        restore_point_retention: Duration::ZERO,
         bolt_listen: None,
         bolt_max_message_bytes: 64 << 20,
         bolt_tx_timeout: Duration::ZERO,
@@ -71,6 +72,20 @@ async fn empty_auth_token_refuses_to_boot() {
     let err = namidb_server::run(config).await.unwrap_err();
     assert!(
         err.to_string().contains("--auth-token is empty"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Restore points are kept by the maintenance loop. Asking for them with the
+/// loop off would boot a server that silently keeps none.
+#[tokio::test]
+async fn restore_point_retention_without_maintenance_refuses_to_boot() {
+    let mut config = base_config("startup-restore-points");
+    config.restore_point_retention = Duration::from_secs(3600);
+    config.compaction_interval = Duration::ZERO;
+    let err = namidb_server::run(config).await.unwrap_err();
+    assert!(
+        err.to_string().contains("NAMIDB_RESTORE_POINT_RETENTION"),
         "unexpected error: {err}"
     );
 }

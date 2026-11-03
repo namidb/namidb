@@ -15,6 +15,40 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Restore points: point-in-time backups.** A new
+  `--restore-point-retention` / `NAMIDB_RESTORE_POINT_RETENTION` (default
+  `0`, off; e.g. `24h`, `7d`) keeps every committed manifest version of that
+  window restorable. The maintenance loop keeps a restore point window lease
+  (`manifest/pins/restore-points.json`) before each sweep, and the sweep then
+  keeps every manifest body in the window plus every SST, side-car and WAL
+  object those versions reference, so no later write, delete, flush,
+  compaction or sweep breaks a retained point. `POST /v0/admin/backup` (and
+  the multi-tenant `/:namespace/v0/admin/backup`) takes `as_of`: an RFC 3339
+  instant, resolved to the newest version committed at or before it, or a
+  manifest version as a JSON integer. The copy is the namespace row for row
+  as of that point. Its response adds `source_created_at`. New
+  `GET /v0/admin/restore-points` (multi-tenant:
+  `/:namespace/v0/admin/restore-points`, which does not open the namespace)
+  returns the window's `earliest` and `latest` points and pages of points,
+  newest first (`limit`, `before`, `next_before`). Errors carry a `code`:
+  `invalid_as_of` and `as_of_in_future` (400), `restore_point_unavailable`
+  (404, with the window's bounds) and `namespace_not_found` (404). Storage
+  grows by what the namespace writes during the window; see
+  `docs/architecture/restore-points.md`. The server refuses to boot with a
+  retention but `NAMIDB_COMPACTION_INTERVAL=0s`. Each sweep logs
+  `restore_window_retained` / `restore_window_bytes`.
+
+### Changed
+
+- Retention pin leases carry a scope (`floor`, `point` or `window`). A
+  backup now pins only the version it copies (`point`) instead of every
+  version from it to current, so a backup of an old restore point does not
+  make each sweep load every manifest in between. Leases without a scope are
+  floors, as before; an older release reads every lease as a floor, which
+  keeps strictly more, so mixed-version janitors stay safe.
+
 ## [3.2.1] - 2026-11-02
 
 ### Fixed

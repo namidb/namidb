@@ -165,8 +165,14 @@ enum Cmd {
         #[arg(long)]
         to: String,
         /// Manifest version to pin. Defaults to the current committed version.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "as_of")]
         version: Option<u64>,
+        /// Copy the namespace as it was at this instant (RFC 3339, e.g.
+        /// `2026-11-03T09:30:00Z`): the newest version committed at or before
+        /// it. Must fall inside the source's restore point window (see
+        /// `restore-points`).
+        #[arg(long)]
+        as_of: Option<String>,
         /// Proceed even if the destination already holds a namespace.
         #[arg(long, default_value_t = false)]
         force: bool,
@@ -174,6 +180,19 @@ enum Cmd {
         /// SST/WAL object, failing if any is missing or empty.
         #[arg(long, default_value_t = false)]
         verify: bool,
+    },
+    /// List a namespace's restore points: the versions `backup --as-of` can
+    /// copy, newest first.
+    ///
+    /// A server with `NAMIDB_RESTORE_POINT_RETENTION` keeps that window of
+    /// history; without it the window is the current version alone.
+    RestorePoints {
+        /// Namespace URI to inspect (see `run --help` for schemes).
+        #[arg(long)]
+        from: String,
+        /// How many points to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Restore a namespace from a backup made with `backup`.
     ///
@@ -283,20 +302,26 @@ fn main() -> anyhow::Result<()> {
             from,
             to,
             version,
+            as_of,
             force,
             verify,
         } => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(copy_namespace_cmd(
-                "backed up",
-                &from,
-                &to,
-                version,
-                force,
-                verify,
-            ))?;
+            rt.block_on(async {
+                let version = match as_of {
+                    Some(as_of) => Some(resolve_as_of(&from, &as_of).await?),
+                    None => version,
+                };
+                copy_namespace_cmd("backed up", &from, &to, version, force, verify).await
+            })?;
+        }
+        Cmd::RestorePoints { from, limit } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(restore_points_cmd(&from, limit))?;
         }
         Cmd::Restore {
             from,
@@ -312,6 +337,63 @@ fn main() -> anyhow::Result<()> {
                 "restored", &from, &to, version, force, verify,
             ))?;
         }
+    }
+    Ok(())
+}
+
+/// Resolve `backup --as-of` to the source version to pin.
+async fn resolve_as_of(from: &str, as_of: &str) -> anyhow::Result<u64> {
+    use namidb_storage::{resolve_restore_point, AsOf, ManifestStore, RestorePointResolution};
+    let t = chrono::DateTime::parse_from_rfc3339(as_of)
+        .map_err(|e| anyhow::anyhow!("--as-of must be an RFC 3339 instant: {e}"))?
+        .with_timezone(&chrono::Utc);
+    let (store, paths) = parse_uri(from)?;
+    match resolve_restore_point(&ManifestStore::new(store, paths), AsOf::Time(t)).await? {
+        RestorePointResolution::Found(point) => Ok(point.version),
+        RestorePointResolution::OutOfWindow(window) => anyhow::bail!(
+            "--as-of {as_of} is outside the restore point window ({} to {})",
+            window.earliest.created_at.to_rfc3339(),
+            window.latest.created_at.to_rfc3339()
+        ),
+        RestorePointResolution::InFuture { now } => {
+            anyhow::bail!("--as-of {as_of} is later than now ({})", now.to_rfc3339())
+        }
+    }
+}
+
+/// `restore-points`: print the window and its newest points.
+async fn restore_points_cmd(from: &str, limit: usize) -> anyhow::Result<()> {
+    let (store, paths) = parse_uri(from)?;
+    let page = namidb_storage::list_restore_points(
+        &namidb_storage::ManifestStore::new(store, paths),
+        None,
+        limit,
+    )
+    .await?;
+    let window = page.window;
+    match window.lease {
+        Some(lease) => println!(
+            "restore point window: retention {}s, lease expires {}",
+            lease.retention.as_secs(),
+            lease.expires_at.to_rfc3339()
+        ),
+        None => println!("restore point window: off (current version only)"),
+    }
+    println!(
+        "  earliest v{} at {}",
+        window.earliest.version,
+        window.earliest.created_at.to_rfc3339()
+    );
+    println!(
+        "  latest   v{} at {}",
+        window.latest.version,
+        window.latest.created_at.to_rfc3339()
+    );
+    for point in page.points {
+        println!("  v{}  {}", point.version, point.created_at.to_rfc3339());
+    }
+    if page.next_before.is_some() {
+        println!("  … (raise --limit for older points)");
     }
     Ok(())
 }

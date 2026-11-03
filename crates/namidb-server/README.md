@@ -140,6 +140,28 @@ reclaims versions below the live-reader horizon after
 object-count growth observed during the first hours of a bulk load is bounded
 history under the default maintenance settings.
 
+`--restore-point-retention` / `NAMIDB_RESTORE_POINT_RETENTION` (default `0`,
+off; e.g. `24h`, `7d`) keeps that history on purpose: every committed version
+of the last `retention` stays restorable, so `POST /v0/admin/backup` with
+`as_of` can copy the namespace exactly as it was at any instant in the window
+(see [restore points](#get-v0adminrestore-points)). The maintenance loop
+advances the window before each sweep, so it needs
+`NAMIDB_COMPACTION_INTERVAL` above zero (the server refuses to boot
+otherwise). The window starts empty when retention is first turned on and
+fills up from there. Storage grows by what the namespace writes during the
+window plus `NAMIDB_SWEEP_MIN_AGE`: one manifest body and one WAL segment per
+commit, every flush output, and every SST that a later compaction
+superseded — roughly `retention × ingest rate × compaction write
+amplification`, plus `commits × manifest size`, on top of the live data. The
+sweep's and a cold open's LISTs of `manifest/` and `wal/` grow with the
+number of commits kept. Each sweep logs `restore_window_retained` /
+`restore_window_bytes`, the objects kept only for the window. Setting the
+retention back to `0` releases the window when the maintenance loop next
+starts (multi-tenant: when each namespace next opens); a server that stops
+refreshing it (stopped, or the namespace evicted) leaves a lease that expires
+on its own once its points have aged out. See
+[`docs/architecture/restore-points.md`](../../docs/architecture/restore-points.md).
+
 If you don't configure any auth source, the server **refuses to start**
 (since 2.2.0). Pass `--no-auth` / `NAMIDB_NO_AUTH=1` to explicitly boot in
 unauthenticated mode for local development — it prints a loud warning, and
@@ -191,6 +213,7 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush; remains available and globally serialized under RSS pressure |
 | `POST` | `/v0/admin/compact` | bearer | Drain L0 completely and block until done; outside the request timeout, single-flighted on its own permit. Run it after a bulk load |
 | `POST` | `/v0/admin/backup` | bearer (read-write) | Copy a point-in-time snapshot of the namespace to an allowlisted destination (disabled unless `--backup-target-uri` is set; multi-tenant: `/:namespace/v0/admin/backup`) |
+| `GET` | `/v0/admin/restore-points` | bearer (read-write) | The restore point window and a page of its points, newest first (multi-tenant: `/:namespace/v0/admin/restore-points`) |
 | `POST` | `/:namespace/v0/admin/restore` | bearer (read-write) | `--multi-tenant` only: copy an allowlisted backup into a namespace that does not exist yet (disabled unless `--backup-target-uri` is set; unprefixed `/v0/admin/restore` resolves the namespace like the other routes) |
 
 ### `POST /v0/admin/backup`
@@ -205,10 +228,19 @@ namespace at the destination — point-in-time at the pinned version
 { "to": "s3://backups-bucket/namidb/nightly?ns=prod", "force": false, "verify": true }
 ```
 
-Optional fields: `version` (pin an older manifest version), `force`
+Optional fields: `as_of` (copy the namespace as it was at a restore point:
+an RFC 3339 instant such as `"2026-11-03T09:30:00Z"`, resolved to the newest
+version committed at or before it, or a manifest version as a JSON integer;
+see [restore points](#get-v0adminrestore-points)), `version` (pin a manifest
+version without checking the window; exclusive with `as_of`), `force`
 (overwrite an existing destination pointer), `verify` (re-read and checksum
-every copied object). Returns `{"source_version", "objects_copied",
-"bytes_copied"}`.
+every copied object). Returns `{"source_version", "source_created_at",
+"objects_copied", "bytes_copied"}`: the version copied and the instant it
+was committed.
+
+```json
+{ "to": "s3://backups-bucket/namidb/pitr-0930?ns=prod", "as_of": "2026-11-03T09:30:00Z", "verify": true }
+```
 
 **The destination allowlist is the security boundary.** The server's
 ambient cloud credentials write wherever `to` points, so the endpoint is
@@ -238,10 +270,53 @@ restore endpoint: its one namespace is always open, the serving process
 
 Status codes: 403 for a read-only token, for a disabled endpoint, or for
 `to` outside the allowlist; 400 for an invalid `to` (or, multi-tenant, an
-invalid namespace name); 409 when the destination already has a pointer
+invalid namespace name), for `code: "invalid_as_of"` (an `as_of` that is
+neither an RFC 3339 instant nor a version, or one sent with `version`) and
+for `code: "as_of_in_future"`; 404 `code: "restore_point_unavailable"` when
+`as_of` falls outside the window (the body carries the window's `earliest`
+and `latest` points), and `code: "namespace_not_found"` when the namespace
+has no manifest; 409 when the destination already has a pointer
 and `force` is unset, when the pinned version was reclaimed mid-copy, or
 when `verify` finds a mismatch; 503 when another backup or restore holds
 the permit for more than 30 s; 507/500 for other failures.
+
+### `GET /v0/admin/restore-points`
+
+Lists the namespace's restore point window: the versions a backup's `as_of`
+can resolve to. Each committed version (a write, flush, compaction or DDL)
+is a restore point. Read-write tokens only; reads committed state without
+the writer lock (multi-tenant: `/:namespace/v0/admin/restore-points`, which
+does not open the namespace, or the unprefixed route with
+`X-NamiDB-Namespace`).
+
+Query parameters: `limit` (page size, 1–1000, default 100) and `before`
+(only versions strictly below it: pass the previous page's `next_before`).
+
+```json
+{
+  "enabled": true,
+  "retention_secs": 604800,
+  "lease_expires_at": "2026-11-10T10:20:00Z",
+  "earliest": { "version": 1182, "created_at": "2026-10-27T10:05:12.123456Z" },
+  "latest":   { "version": 1931, "created_at": "2026-11-03T10:04:58.654321Z" },
+  "points": [
+    { "version": 1931, "created_at": "2026-11-03T10:04:58.654321Z" },
+    { "version": 1930, "created_at": "2026-11-03T10:04:41.002113Z" }
+  ],
+  "next_before": 1930
+}
+```
+
+`earliest` is the window's floor, the state at the start of the window: any
+instant from `earliest.created_at` to now resolves to a restore point.
+`latest` is the current version. With retention off (`enabled: false`,
+`retention_secs` and `lease_expires_at` null) the window is just the current
+version. `next_before` is null on the last page. Each listed point costs one
+manifest read, so prefer `earliest`/`latest` when only the bounds matter.
+
+Status codes: 403 for a read-only token; 400 for an invalid `limit`
+(`code: "invalid_limit"`) or, multi-tenant, an invalid namespace name; 404
+`code: "namespace_not_found"` when the namespace has no manifest.
 
 ### `POST /:namespace/v0/admin/restore` (multi-tenant)
 

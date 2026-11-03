@@ -36,6 +36,7 @@ pub mod range_cache;
 pub mod read;
 pub mod reader;
 pub mod recovery;
+pub mod restore_point;
 pub mod route_telemetry;
 pub mod search_lsm;
 pub(crate) mod search_lsm_flush;
@@ -91,7 +92,7 @@ pub use parquet_loader::{
     load_edges as load_edges_from_parquet, load_nodes as load_nodes_from_parquet, LoadOutcome,
 };
 pub use paths::NamespacePaths;
-pub use pin::{PinLease, RetentionPin, DEFAULT_PIN_TTL};
+pub use pin::{PinLease, PinScope, RetentionPin, DEFAULT_PIN_TTL};
 pub use range_cache::{
     mark_store_paths_immutable, shared_range_cache, ImmutableRangeCache, ImmutableRangeKey,
     PinnedObjectGeneration, PinnedObjectRangeSource, RangeCacheConfig, RangeCacheError,
@@ -109,6 +110,11 @@ pub use reader::ReaderSession;
 pub use recovery::{
     recover_memtable, recover_memtable_with_snapshot, write_memtable_snapshot,
     MemtableSnapshotEntry, MemtableSnapshotFile, RecoveredMemtable, WalEntry, WalOp,
+};
+pub use restore_point::{
+    list_restore_points, refresh_restore_point_lease, release_restore_point_lease,
+    resolve_restore_point, restore_point_window, AsOf, RestorePoint, RestorePointLease,
+    RestorePointPage, RestorePointResolution, RestorePointWindow, MAX_RESTORE_POINT_PAGE,
 };
 pub use sst::paged_index::set_default_spool_dir;
 #[cfg(feature = "vector-index")]

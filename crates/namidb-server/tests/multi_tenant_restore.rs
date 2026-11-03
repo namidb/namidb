@@ -61,6 +61,7 @@ fn config(
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
+        restore_point_retention: Duration::ZERO,
         bolt_listen: None,
         bolt_max_message_bytes: 64 << 20,
         bolt_tx_timeout: Duration::ZERO,
@@ -93,6 +94,17 @@ async fn boot(
     backup_target_uri: Option<String>,
     multi_tenant: bool,
 ) -> String {
+    boot_with(scratch, store_uri, backup_target_uri, multi_tenant, |_| {}).await
+}
+
+/// [`boot`] with a hook to adjust the config before the server starts.
+async fn boot_with(
+    scratch: &std::path::Path,
+    store_uri: String,
+    backup_target_uri: Option<String>,
+    multi_tenant: bool,
+    tweak: impl FnOnce(&mut namidb_server::Config),
+) -> String {
     let tokens_path = scratch.join("tokens.json");
     std::fs::write(
         &tokens_path,
@@ -106,13 +118,14 @@ async fn boot(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let config = config(
+    let mut config = config(
         store_uri,
         addr,
         tokens_path,
         backup_target_uri,
         multi_tenant,
     );
+    tweak(&mut config);
     tokio::spawn(async move {
         if let Err(e) = namidb_server::run(config).await {
             eprintln!("server exited: {e}");
@@ -389,6 +402,158 @@ async fn restore_into_new_namespace_on_file_store() {
     let backup_uri = format!("{prefix}/f-b1?ns=f-b1");
     interrupted_restore_is_retried(&base, &data, &backup_uri).await;
     failed_restores_leave_a_retryable_target(&base, &data, &backups, &prefix).await;
+}
+
+async fn get(url: String, token: &str, namespace_header: Option<&str>) -> (u16, serde_json::Value) {
+    let mut request = reqwest::Client::new().get(url).bearer_auth(token);
+    if let Some(ns) = namespace_header {
+        request = request.header("x-namidb-namespace", ns);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap();
+    let json = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+    (status, json)
+}
+
+/// Point-in-time restore over a real multi-tenant server whose maintenance
+/// loop keeps the restore point window: the namespace's window is listed
+/// without opening anything new, a backup `as_of` an instant taken before a
+/// delete, more writes, flushes, a compaction and several sweeps copies the
+/// rows of that instant, and restoring it into a new namespace serves them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn point_in_time_restore_on_file_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let backups = dir.path().join("backups");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&backups).unwrap();
+    let prefix = format!("file://{}", backups.display());
+    let base = boot_with(
+        dir.path(),
+        format!("file://{}", data.display()),
+        Some(prefix.clone()),
+        true,
+        |config| {
+            config.compaction_interval = Duration::from_millis(100);
+            config.sweep_delete = true;
+            config.restore_point_retention = Duration::from_secs(3600);
+        },
+    )
+    .await;
+    let src = "pitr-src";
+    let points = format!("{base}/{src}/v0/admin/restore-points");
+
+    // Open the namespace; its maintenance loop opens the window.
+    let (status, body) = cypher(&base, src, "MATCH (i:Item) RETURN i").await;
+    assert_eq!(status, 200, "open: {body}");
+    let mut opened = false;
+    for _ in 0..200 {
+        let (status, body) = get(points.clone(), RW, None).await;
+        assert_eq!(status, 200, "{body}");
+        if body["enabled"] == true {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(opened, "the maintenance loop never opened the window");
+
+    let (status, body) = cypher(
+        &base,
+        src,
+        "CREATE (:Item {name: 'a'}), (:Item {name: 'b'})",
+    )
+    .await;
+    assert_eq!(status, 200, "seed: {body}");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let instant = chrono::Utc::now();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    for step in [
+        "MATCH (i:Item {name: 'a'}) DELETE i",
+        "flush",
+        "CREATE (:Item {name: 'c'})",
+        "flush",
+        "compact",
+    ] {
+        let (status, body) = match step {
+            "flush" | "compact" => {
+                post(
+                    format!("{base}/{src}/v0/admin/{step}"),
+                    RW,
+                    None,
+                    serde_json::json!({}),
+                )
+                .await
+            }
+            query => cypher(&base, src, query).await,
+        };
+        assert_eq!(status, 200, "{step}: {body}");
+    }
+    // Several maintenance ticks: refresh, then sweep with no age margin.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(item_names(&base, src).await, ["b", "c"]);
+
+    let (status, window) = get(format!("{points}?limit=1"), RW, None).await;
+    assert_eq!(status, 200, "{window}");
+    assert_eq!(window["retention_secs"], 3600, "{window}");
+    let earliest = window["earliest"]["version"].as_u64().unwrap();
+    let latest = window["latest"]["version"].as_u64().unwrap();
+    assert!(latest > earliest, "{window}");
+    assert_eq!(window["points"][0]["version"].as_u64(), Some(latest));
+    // The header-routed twin answers for the same namespace.
+    let (status, same) = get(
+        format!("{base}/v0/admin/restore-points?limit=1"),
+        RW,
+        Some(src),
+    )
+    .await;
+    assert_eq!(status, 200, "{same}");
+    assert_eq!(same["earliest"], window["earliest"]);
+
+    let backup_uri = format!("{prefix}/pitr-b?ns=pitr-b");
+    let (status, body) = post(
+        format!("{base}/{src}/v0/admin/backup"),
+        RW,
+        None,
+        serde_json::json!({ "to": backup_uri, "as_of": instant.to_rfc3339(), "verify": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "backup as_of: {body}");
+    assert!(body["source_version"].as_u64().unwrap() < latest, "{body}");
+    let (status, body) = restore(
+        &base,
+        "pitr-restored",
+        serde_json::json!({ "from": backup_uri, "verify": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "restore: {body}");
+    assert_eq!(item_names(&base, "pitr-restored").await, ["a", "b"]);
+
+    // Outside the window, read-only tokens, unknown namespaces.
+    let (status, body) = post(
+        format!("{base}/{src}/v0/admin/backup"),
+        RW,
+        None,
+        serde_json::json!({ "to": format!("{prefix}/pitr-x?ns=pitr-x"), "as_of": "2001-01-01T00:00:00Z" }),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["code"], "restore_point_unavailable");
+    let (status, _) = get(points.clone(), RO, None).await;
+    assert_eq!(status, 403);
+    let (status, body) = get(
+        format!("{base}/never-created/v0/admin/restore-points"),
+        RW,
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["code"], "namespace_not_found");
+    assert!(
+        !data.join("never-created").exists(),
+        "listing must not create the namespace"
+    );
 }
 
 /// Every file under `dir`, recursively (empty directories are not objects).

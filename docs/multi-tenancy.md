@@ -315,6 +315,24 @@ curl -s -X POST https://host:8080/acme-restored/v0/admin/restore \
 # => {"source_version":0,"objects_copied":<n>,"bytes_copied":<n>}
 ```
 
+Point-in-time: with `NAMIDB_RESTORE_POINT_RETENTION` set, each open
+namespace keeps that much history, `GET /acme/v0/admin/restore-points`
+lists it (without opening the namespace), and a backup with `as_of` copies
+the namespace as it was at that instant. Restoring that backup into a new
+namespace completes a point-in-time restore. A namespace's window advances
+only while it is open on a server; one evicted for longer than the window
+starts a fresh window when it next opens (nothing was written meanwhile, so
+no point in between is lost).
+
+```bash
+curl -s "https://host:8080/acme/v0/admin/restore-points?limit=1" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN"
+curl -s -X POST https://host:8080/acme/v0/admin/backup \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'content-type: application/json' \
+  -d '{"to": "s3://my-backups/namidb/acme-pitr?ns=acme", "as_of": "2026-11-03T09:30:00Z"}'
+# => {"source_version":1874,"source_created_at":"2026-11-03T09:29:58.1Z",...}
+```
+
 Use the HTTP restore, not `namidb restore`, for a multi-tenant server on
 S3: the server keeps namespaces at the bucket root, and an `s3://` URI
 always resolves to `<prefix or tenants>/<ns>/`, so the CLI writes where the

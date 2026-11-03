@@ -193,6 +193,20 @@ struct Cli {
     )]
     sweep_delete: bool,
 
+    /// How long every committed version of the namespace stays restorable
+    /// for a point-in-time backup (`as_of` on `POST /v0/admin/backup`, listed
+    /// by `GET /v0/admin/restore-points`), e.g. `24h` or `7d`. The sweep keeps
+    /// that much history and everything it references, so storage grows by
+    /// what the namespace writes in that window. `0` (the default) turns it
+    /// off. Needs `--compaction-interval` above zero.
+    #[arg(
+        long,
+        env = "NAMIDB_RESTORE_POINT_RETENTION",
+        default_value = "0s",
+        value_parser = humantime::parse_duration,
+    )]
+    restore_point_retention: Duration,
+
     /// Address for the Bolt protocol listener (Neo4j driver
     /// compatibility). When omitted the protocol is off and the
     /// server is HTTP-only. The canonical Bolt port is 7687.
@@ -461,6 +475,7 @@ fn main() -> anyhow::Result<()> {
         compaction_interval: cli.compaction_interval,
         sweep_min_age: cli.sweep_min_age,
         sweep_delete: cli.sweep_delete,
+        restore_point_retention: cli.restore_point_retention,
         bolt_listen: cli.bolt_listen,
         bolt_max_message_bytes: cli.bolt_max_message_bytes,
         bolt_tx_timeout: cli.bolt_tx_timeout,
@@ -619,5 +634,32 @@ mod tests {
         std::env::set_var("NAMIDB_WRITE_TIMEOUT", "2m");
         assert_eq!(parse(&[]).write_timeout, Duration::from_secs(120));
         std::env::remove_var("NAMIDB_WRITE_TIMEOUT");
+    }
+
+    /// Restore point retention is off unless asked for, and takes the
+    /// humantime forms an operator would write, from the flag or the env.
+    #[test]
+    fn restore_point_retention_defaults_off_and_parses_durations() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let base = ["namidb-server", "--store", "memory://t"];
+        let parse = |extra: &[&str]| {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        assert_eq!(parse(&[]).unwrap().restore_point_retention, Duration::ZERO);
+        assert_eq!(
+            parse(&["--restore-point-retention", "7d"])
+                .unwrap()
+                .restore_point_retention,
+            Duration::from_secs(7 * 24 * 3600)
+        );
+        assert!(parse(&["--restore-point-retention", "a week"]).is_err());
+        std::env::set_var("NAMIDB_RESTORE_POINT_RETENTION", "24h");
+        assert_eq!(
+            parse(&[]).unwrap().restore_point_retention,
+            Duration::from_secs(24 * 3600)
+        );
+        std::env::remove_var("NAMIDB_RESTORE_POINT_RETENTION");
     }
 }

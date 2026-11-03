@@ -50,6 +50,9 @@ pub struct MaintenanceConfig {
     pub compaction_interval: Duration,
     pub sweep_min_age: Duration,
     pub sweep_delete: bool,
+    /// Restore point window kept by each open namespace's maintenance loop
+    /// (see `Config::restore_point_retention`). Zero turns it off.
+    pub restore_point_retention: Duration,
     /// L0-count high-water mark per bucket that triggers a reactive
     /// compaction on flush. `0` disables it.
     pub compaction_l0_trigger: usize,
@@ -70,6 +73,7 @@ impl Default for MaintenanceConfig {
             compaction_interval: Duration::ZERO,
             sweep_min_age: Duration::ZERO,
             sweep_delete: false,
+            restore_point_retention: Duration::ZERO,
             compaction_l0_trigger: 0,
             group_commit_window: Duration::ZERO,
             fence_policy: recovery::FencePolicy::Steal,
@@ -394,6 +398,7 @@ impl NamespaceRegistry {
 
         let state = Arc::new(NamespaceState {
             namespace: namespace.to_string(),
+            history: ManifestStore::new(self.store.clone(), paths.clone()),
             writer: Arc::new(tokio::sync::Mutex::new(writer)),
             snapshot,
             compaction_scheduler: Arc::new(CompactionScheduler::new()),
@@ -580,8 +585,20 @@ impl NamespaceRegistry {
             let interval = maint.compaction_interval;
             let sweep_min_age = maint.sweep_min_age;
             let sweep_delete = maint.sweep_delete;
+            let restore_point_retention = maint.restore_point_retention;
             let ns = state.namespace.clone();
             let handle = tokio::spawn(async move {
+                // Open (or release) the restore point window on open. A
+                // namespace evicted for longer than the window comes back
+                // with a lapsed lease and starts a fresh window: nothing was
+                // written while it was closed, so no point was lost.
+                crate::maintenance::keep_restore_point_window(
+                    &ms,
+                    restore_point_retention,
+                    interval,
+                    &ns,
+                )
+                .await;
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 tick.tick().await; // first tick fires immediately; skip
@@ -621,6 +638,15 @@ impl NamespaceRegistry {
                     // Orphan sweep — no writer lock; the retention horizon
                     // (RFC-027) keeps it from deleting a body a live reader
                     // still references.
+                    if !restore_point_retention.is_zero() {
+                        crate::maintenance::keep_restore_point_window(
+                            &ms,
+                            restore_point_retention,
+                            interval,
+                            &ns,
+                        )
+                        .await;
+                    }
                     let horizon = s.snapshot.retention_horizon();
                     if let Err(e) =
                         sweep_orphans(&ms, horizon, sweep_min_age, 1, sweep_delete).await
@@ -697,6 +723,9 @@ impl NamespaceRegistry {
 pub struct NamespaceState {
     /// Namespace identifier (human-readable, e.g. "acme").
     pub namespace: String,
+    /// The namespace's committed manifest history, read without the writer
+    /// lock (see `AppState::history`).
+    pub(crate) history: ManifestStore,
     /// Single writer for this namespace (epoch-fenced, CAS-protected).
     pub writer: Arc<Mutex<WriterSession>>,
     /// Snapshot cache for read queries.

@@ -31,9 +31,13 @@
 //! ## What the janitor does
 //!
 //! 0. Lists `manifest/pins/` for retention pin leases ([`crate::pin`]).
-//! Every unexpired lease lowers the retention horizon to its pinned
-//! version, so a cross-process reader (a running backup) keeps the
-//! closure it is copying alive; expired leases are ignored and deleted.
+//! Every unexpired floor lease lowers the retention horizon to its pinned
+//! version, so a cross-process reader keeps the closure it is reading
+//! alive; a point lease (a running backup) keeps exactly its version's
+//! closure; a window lease (the restore point window,
+//! [`crate::restore_point`]) keeps every manifest body from its version up
+//! plus every object written since the window opened. Expired leases are
+//! ignored and deleted.
 //! 1. Loads `manifest/current.json` and, for every manifest version from
 //! the caller-supplied retention horizon to current, unions the "live"
 //! relative paths (SST body, bloom side-car, unique/equality/label index
@@ -155,16 +159,37 @@ pub struct JanitorReport {
     /// sweep's horizon: nothing was deleted this pass; the next tick
     /// recomputes with the lease in view.
     pub aborted_by_pin: bool,
+    /// Unreachable SST, side-car and WAL objects kept only because a restore
+    /// point window lease ([`crate::restore_point`]) covers their write time:
+    /// a manifest version inside the window may reference them. This is the
+    /// object-count side of the window's storage cost.
+    pub restore_window_retained: usize,
+    /// Bytes held by the objects in `restore_window_retained`.
+    pub restore_window_bytes: u64,
 }
 
-/// Read-only floor over the unexpired pin leases right now (no reclaim, no
-/// report side effects) — the pre-delete re-check in [`sweep_orphans`].
-async fn current_pin_floor(
+/// The restore point window a sweep honours: the oldest window lease's floor
+/// version and the instant it opened.
+#[derive(Debug, Clone, Copy)]
+struct RestoreWindow {
+    version: u64,
+    since: chrono::DateTime<Utc>,
+}
+
+/// The pre-delete re-check in [`sweep_orphans`]: `true` when an unexpired
+/// lease now asks for more than the sweep honoured when it listed the pins —
+/// a lease it never saw, or one rewritten to an older version or an earlier
+/// window — and that request reaches below the dense `horizon` (everything
+/// at or above it is in the live set whatever the lease's scope). Read-only:
+/// no reclaim, no report side effects.
+async fn pins_changed_below_horizon(
     store: &dyn object_store::ObjectStore,
     paths: &crate::paths::NamespacePaths,
     now_unix: i64,
-) -> Result<u64> {
-    let mut floor = u64::MAX;
+    honoured: &std::collections::HashMap<String, crate::pin::PinLease>,
+    horizon: u64,
+) -> Result<bool> {
+    use crate::pin::PinScope;
     let mut pins = store.list(Some(&paths.pins_dir()));
     while let Some(meta) = pins.try_next().await.map_err(Error::ObjectStore)? {
         let body = match store.get(&meta.location).await {
@@ -175,11 +200,25 @@ async fn current_pin_floor(
         let Ok(lease) = serde_json::from_slice::<crate::pin::PinLease>(&body) else {
             continue;
         };
-        if lease.expires_at_unix >= now_unix {
-            floor = floor.min(lease.version);
+        if lease.expires_at_unix < now_unix || lease.version >= horizon {
+            continue;
+        }
+        let covered = match honoured.get(meta.location.as_ref()) {
+            None => false,
+            Some(seen) => match (seen.scope, lease.scope) {
+                (PinScope::Floor, _) => seen.version <= lease.version,
+                (PinScope::Point, PinScope::Point) => seen.version == lease.version,
+                (PinScope::Window { since: a }, PinScope::Window { since: b }) => {
+                    seen.version <= lease.version && a <= b
+                }
+                _ => false,
+            },
+        };
+        if !covered {
+            return Ok(true);
         }
     }
-    Ok(floor)
+    Ok(false)
 }
 
 /// Scan every canonical numeric level discovered below `sst/` for objects not
@@ -228,14 +267,22 @@ pub async fn sweep_orphans(
     let now = Utc::now();
 
     // Retention pin leases (see `crate::pin`): cross-process readers — a
-    // running backup — that the in-process horizon cannot see. Listed BEFORE
-    // anything is classified or deleted, so every unexpired lease lowers the
-    // horizon for the whole sweep. An expired lease is void (its holder
+    // running backup, the restore point window — that the in-process horizon
+    // cannot see. Listed BEFORE anything is classified or deleted, so every
+    // unexpired lease is honoured, for its scope, for the whole sweep: a
+    // floor lowers the horizon, a point keeps one version, a window keeps
+    // history by write time (see `PinScope`). An expired lease is void (its holder
     // crashed or stalled past the TTL): ignored for the horizon and deleted,
     // so a dead holder cannot pin the namespace forever. An undecodable body
     // under the prefix is not ours to judge — it names no version, so it pins
     // nothing, and it is left alone.
     let mut pin_floor = u64::MAX;
+    // Point leases: versions kept on their own, whatever the horizon.
+    let mut point_versions: std::collections::BTreeSet<u64> = Default::default();
+    // The restore point window (the oldest, if several holders wrote one).
+    let mut window: Option<RestoreWindow> = None;
+    // Every lease honoured, by path, for the pre-delete re-check.
+    let mut honoured: std::collections::HashMap<String, crate::pin::PinLease> = Default::default();
     let now_unix = now.timestamp();
     let mut pins = store.list(Some(&paths.pins_dir()));
     while let Some(meta) = pins.try_next().await.map_err(Error::ObjectStore)? {
@@ -260,13 +307,42 @@ pub async fn sweep_orphans(
             continue;
         }
         report.pins_honoured += 1;
-        pin_floor = pin_floor.min(lease.version);
+        match lease.scope {
+            crate::pin::PinScope::Floor => pin_floor = pin_floor.min(lease.version),
+            crate::pin::PinScope::Point => {
+                point_versions.insert(lease.version);
+            }
+            crate::pin::PinScope::Window { since } => {
+                window = Some(match window {
+                    None => RestoreWindow {
+                        version: lease.version,
+                        since,
+                    },
+                    Some(w) => RestoreWindow {
+                        version: w.version.min(lease.version),
+                        since: w.since.min(since),
+                    },
+                });
+            }
+        }
+        honoured.insert(meta.location.as_ref().to_string(), lease);
     }
 
     // The horizon is the oldest manifest version any live reader is pinned
     // to: the in-process reader horizon (RFC-027) unioned with every
     // unexpired pin lease. Clamp defensively to the current version.
     let horizon = retention_horizon.min(pin_floor).min(current_version);
+    // Manifest bodies at or above this version are kept: the dense horizon,
+    // or the restore point window's floor when it reaches further back.
+    let body_floor = window.map_or(horizon, |w| horizon.min(w.version));
+    // Objects written at or after this instant are kept for the window: a
+    // version inside it may reference them (see `PinScope::Window`).
+    let window_keep_since = window.map(|w| {
+        chrono::Duration::from_std(min_age)
+            .ok()
+            .and_then(|margin| w.since.checked_sub_signed(margin))
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
+    });
     // Versions at or above this floor are retained for in-process readers and
     // must load; versions below it are retained only because of a pin lease
     // and may already have been reclaimed before the lease existed (the pin
@@ -369,6 +445,29 @@ pub async fn sweep_orphans(
         };
         mark_live(manifest);
     }
+    // Versions kept on their own below the dense horizon: point leases (a
+    // backup of an older restore point) and the restore point window's floor
+    // version, whose closure holds every object older than the window that
+    // its versions still reference. Like any version below the strict floor,
+    // one that is already gone is skipped (its holder re-checks its root).
+    let extra_versions: std::collections::BTreeSet<u64> = point_versions
+        .iter()
+        .copied()
+        .chain(window.map(|w| w.version))
+        .filter(|v| *v < horizon)
+        .collect();
+    for version in &extra_versions {
+        match manifest_store.load_manifest_at(*version).await {
+            Ok(manifest) => mark_live(&manifest),
+            Err(Error::ObjectStore(object_store::Error::NotFound { .. })) => {
+                debug!(
+                    version,
+                    "point/window-pinned manifest version already reclaimed; skipping"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     let ns_prefix = paths.namespace_prefix();
     let ns_prefix_str = ns_prefix.as_ref();
@@ -380,7 +479,9 @@ pub async fn sweep_orphans(
     // pass instead; the next tick recomputes with the lease in view. The
     // holder's own post-acquire root verification covers the (now much
     // smaller) residual window between this check and the deletes below.
-    if delete && current_pin_floor(store.as_ref(), paths, now_unix).await? < horizon {
+    if delete
+        && pins_changed_below_horizon(store.as_ref(), paths, now_unix, &honoured, horizon).await?
+    {
         warn!(
             horizon,
             "retention pin arrived mid-sweep; skipping deletions this pass"
@@ -431,6 +532,11 @@ pub async fn sweep_orphans(
             );
         }
         if referenced.contains(relative) {
+            continue;
+        }
+        if window_keep_since.is_some_and(|since| meta.last_modified >= since) {
+            report.restore_window_retained += 1;
+            report.restore_window_bytes = report.restore_window_bytes.saturating_add(meta.size);
             continue;
         }
         let age_secs = (now - meta.last_modified).num_seconds();
@@ -491,7 +597,12 @@ pub async fn sweep_orphans(
         // Keep current and every version a pinned reader could still load. For
         // pointers this also keeps the family contiguous over [horizon,
         // current], which load_current's forward HEAD probe relies on.
+        // Bodies also stay for the restore point window and point leases;
+        // history is read by `load_manifest_at`, which needs no pointer.
         if version >= horizon {
+            continue;
+        }
+        if !is_pointer && (version >= body_floor || point_versions.contains(&version)) {
             continue;
         }
         let age_secs = (now - meta.last_modified).num_seconds();
@@ -553,6 +664,11 @@ pub async fn sweep_orphans(
             continue;
         };
         if referenced_wal.contains(&seq) {
+            continue;
+        }
+        if window_keep_since.is_some_and(|since| meta.last_modified >= since) {
+            report.restore_window_retained += 1;
+            report.restore_window_bytes = report.restore_window_bytes.saturating_add(meta.size);
             continue;
         }
         let age_secs = (now - meta.last_modified).num_seconds();
@@ -630,7 +746,7 @@ mod tests {
     use crate::manifest::ManifestStore;
     use crate::memtable::{MemKey, MemOp, Memtable};
     use crate::paths::NamespacePaths;
-    use crate::pin::{PinLease, RetentionPin};
+    use crate::pin::{PinLease, PinScope, RetentionPin};
     use namidb_core::{DataType, Value};
 
     fn make_store() -> Arc<dyn ObjectStore> {
@@ -1480,6 +1596,7 @@ mod tests {
         let live = PinLease {
             version: v_commit,
             expires_at_unix: chrono::Utc::now().timestamp() + 3600,
+            scope: PinScope::Floor,
         };
         store
             .put(
@@ -1500,6 +1617,7 @@ mod tests {
         let expired = PinLease {
             version: v_commit,
             expires_at_unix: chrono::Utc::now().timestamp() - 3600,
+            scope: PinScope::Floor,
         };
         store
             .put(

@@ -48,6 +48,20 @@ namidb run --store "az://acct/container?ns=prod" \
   "MATCH (p:Person) RETURN count(*) AS n"
 ```
 
+Backups copy a consistent snapshot of a namespace, live or not. A source
+kept by a server with `NAMIDB_RESTORE_POINT_RETENTION` can also be copied as
+it was at an earlier instant:
+
+```bash
+# The window of instants the source can be copied at.
+namidb restore-points --from "s3://my-bucket/data?ns=prod&region=us-east-1"
+
+# Copy it as it was at 09:30 UTC, then restore that copy elsewhere.
+namidb backup --from "s3://my-bucket/data?ns=prod&region=us-east-1" \
+  --to "s3://my-backups/prod-0930?ns=prod-0930&region=us-east-1" \
+  --as-of 2026-11-03T09:30:00Z --verify
+```
+
 The full URI grammar (endpoint overrides for R2, MinIO and LocalStack,
 GCS service-account paths, Azure emulator mode) lives in the
 [project README](../../README.md#pick-your-storage-backend) and in
