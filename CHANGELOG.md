@@ -38,7 +38,8 @@ crates.io release will establish and document that API explicitly.
   grows by what the namespace writes during the window; see
   `docs/architecture/restore-points.md`. The server refuses to boot with a
   retention but `NAMIDB_COMPACTION_INTERVAL=0s`. Each sweep logs
-  `restore_window_retained` / `restore_window_bytes`.
+  `restore_window_retained` / `restore_window_bytes`. The CLI gains
+  `namidb restore-points --from <uri>` and `namidb backup --as-of <instant>`.
 
 ### Changed
 
