@@ -8117,7 +8117,9 @@ pub(crate) fn execute_aggregate(
 
     let mut out = Vec::with_capacity(groups.len());
     for (_, (key_vals, group_rows)) in groups {
-        crate::exec::limits::check_deadline()?;
+        // Each group is folded by `aggregate_over`, whose per-row loops
+        // probe on their own; this covers many tiny groups.
+        guard.tick()?;
         let mut row = Row::new();
         for ((_, alias), v) in group_by.iter().zip(key_vals) {
             row.set(alias.clone(), v);
@@ -10249,6 +10251,7 @@ fn execute_multiway_join_factor<'a>(
             bound: vec![None; vars.len()],
             materialised: vec![None; vars.len()],
             meter: crate::exec::memory::GrowthMeter::new(),
+            probe: crate::exec::limits::DeadlineProbe::new(),
         };
         descend_multiway(&mut state, 0, vars, edges, ordering, distinct, snapshot).await?;
         Ok(FactorRowSet {
@@ -10266,6 +10269,8 @@ struct MultiwayState {
     materialised: Vec<Option<NodeValue>>,
     /// Working memory of the leaves pushed so far (#203).
     meter: crate::exec::memory::GrowthMeter,
+    /// Deadline / cancel probe shared by every search node.
+    probe: crate::exec::limits::DeadlineProbe,
 }
 
 fn descend_multiway<'a>(
@@ -10278,9 +10283,10 @@ fn descend_multiway<'a>(
     snapshot: &'a Snapshot<'_>,
 ) -> BoxFuture<'a, Result<(), ExecError>> {
     async move {
-        // One probe per WCOJ search node: a cyclic pattern over a dense
-        // graph can descend millions of times inside this one operator.
-        crate::exec::limits::check_deadline()?;
+        // Amortised probe per WCOJ search node: a cyclic pattern over a
+        // dense graph can descend millions of times inside this one
+        // operator.
+        state.probe.tick()?;
         if level == ordering.len() {
             // Per-tuple multiplicity to match Cypher's per-path semantics
             // (and the binary executor): for each constraint, count how

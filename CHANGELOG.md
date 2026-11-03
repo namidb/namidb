@@ -37,7 +37,9 @@ crates.io release will establish and document that API explicitly.
   `TransactionTimedOut`) or cancelled (HTTP 409, Bolt `Transaction.Terminated`) error within
   milliseconds of the deadline or cancel. Expand, variable-length paths,
   `shortestPath`, `UNWIND`, `range()`, vector, full-text and hybrid search
-  and the graph algorithms already probed both inside their loops.
+  and the graph algorithms already probed both inside their loops (#207).
+  A new criterion bench, `cargo bench -p namidb-query --bench cpu_operators`,
+  times these loops with and without a deadline in scope.
 
 ### Documentation
 
