@@ -16,7 +16,7 @@
 //! supports. When no offer matches the server replies with four zero
 //! bytes and the client is expected to close.
 //!
-//! v0 supports Bolt 4.4, 5.0 and 5.4 only. Other versions can land by
+//! Supported: Bolt 4.4, 5.0, 5.4 and 5.7. Other versions can land by
 //! extending [`SUPPORTED_VERSIONS`].
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

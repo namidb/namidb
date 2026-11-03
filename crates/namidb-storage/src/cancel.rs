@@ -106,6 +106,15 @@ pub fn interrupted() -> Option<Interrupt> {
     .flatten()
 }
 
+/// `true` when a deadline or an operator cancel flag is scoped on this
+/// task, whether or not it has fired. Lets a caller pick an interruptible
+/// (slightly costlier) algorithm only when something can interrupt it.
+#[inline]
+pub fn guarded() -> bool {
+    CTX.try_with(|ctx| ctx.deadline.is_some() || ctx.cancel.is_some())
+        .unwrap_or(false)
+}
+
 /// `true` when a guard is in scope and has fired (deadline passed OR the
 /// query was cancelled). The historical name predates operator cancel.
 #[inline]
@@ -130,3 +139,29 @@ pub fn check() -> Result<()> {
 /// Probing every row would put an `Instant::now()` on the hot path; a power
 /// of two lets the compiler turn the modulus into a mask.
 pub const CHECK_STRIDE: usize = 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn guarded_reports_any_scoped_guard() {
+        assert!(!guarded(), "no guard outside a scope");
+        with_deadline(None, async { assert!(!guarded()) }).await;
+        let later = Instant::now() + Duration::from_secs(60);
+        with_deadline(Some(later), async {
+            assert!(guarded());
+            assert!(check().is_ok(), "an unexpired deadline has not fired");
+        })
+        .await;
+        let flag = Arc::new(AtomicBool::new(false));
+        with_cancel_flag(flag.clone(), async {
+            assert!(guarded());
+            assert!(check().is_ok());
+            flag.store(true, Ordering::Relaxed);
+            assert!(matches!(check(), Err(Error::Cancelled)));
+        })
+        .await;
+    }
+}

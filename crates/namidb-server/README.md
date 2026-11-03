@@ -112,17 +112,19 @@ running an O(corpus) flat scan. The error reports required and assigned bytes.
 Missing/stale/corrupt index generations still use the exact correctness
 fallback.
 
-Current forward edge SSTs also build an optional exact relationship sidecar
-for bound-endpoint `MERGE`. `NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES` (64 KiB) and
-`NAMIDB_EDGE_POINT_MAX_SST_BYTES` (512 MiB) bound its per-record and per-SST
-footprint; setting either to `0`, crossing either limit, or losing/corrupting
-the optional object selects the authoritative CSR path.
+Current forward edge SSTs also build an exact relationship sidecar for
+bound-endpoint `MERGE`. `NAMIDB_EDGE_POINT_MAX_ENTRY_BYTES` and
+`NAMIDB_EDGE_POINT_MAX_SST_BYTES` are optional hard ceilings on its
+per-record and per-SST footprint; both default to `0` (unlimited). A positive
+limit is enforced explicitly: crossing it fails the flush/compaction instead
+of silently omitting the sidecar. A missing or corrupt sidecar on read falls
+back to the authoritative CSR path.
 
-Filtered vector indexes keep bounded String/Bool ordinal postings inside each
-`.vg`. Tune `NAMIDB_VECTOR_FILTER_MAX_DISTINCT` (default 4096 values/property)
-and `NAMIDB_VECTOR_FILTER_MAX_BYTES` (default 64 MiB/body); crossing a bound
-omits the whole property rather than writing an incomplete posting. A legacy or
-omitted-property query may lazily use at most
+Filtered vector indexes keep String/Bool ordinal postings for the label's
+indexed, non-unique String/Bool properties inside each `.vg`, bounded by a
+fixed 4096 distinct values per property (not configurable). The posting build
+spills to the index spool under `NAMIDB_INDEX_BUILD_MEMORY_BYTES`. A legacy or
+posting-less query may lazily use at most
 `NAMIDB_VECTOR_FILTER_ID_CANDIDATE_CAP` complete sidecar IDs (default 8192,
 `0` disables) before retaining the exact scan fallback.
 
@@ -498,7 +500,8 @@ Parameterise sensitive values to keep them out of it.
 ## Bolt protocol
 
 Pass `--bolt-listen 0.0.0.0:7687` (or `NAMIDB_BOLT_LISTEN`) to expose
-a Bolt 4.4 / 5.0 / 5.4 listener alongside the HTTP API. Both protocols
+a Bolt 4.4 / 5.0 / 5.4 / 5.7 listener alongside the HTTP API (on 5.7
+sessions every `FAILURE` also carries the GQLSTATUS fields). Both protocols
 share the same `WriterSession`, the same auth token, and the same
 single-writer-per-namespace invariant.
 

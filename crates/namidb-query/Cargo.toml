@@ -50,3 +50,10 @@ proptest = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
+criterion = { workspace = true }
+
+# CPU-only operator hot loops with and without a query deadline in scope
+# (the cost of the in-loop timeout / cancel probes).
+[[bench]]
+name = "cpu_operators"
+harness = false

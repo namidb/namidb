@@ -7,7 +7,9 @@ message vocabulary and the per-session state machine. It does not own
 the TCP listener: `namidb-server` wires the session against a writer
 session and an auth token.
 
-Negotiated Bolt versions: **4.4**, **5.0**, **5.4**.
+Negotiated Bolt versions: **4.4**, **5.0**, **5.4**, **5.7** (highest
+preferred). On 5.7 every `FAILURE` additionally carries the GQLSTATUS fields
+(`gql_status`, `description`, `diagnostic_record`).
 
 See [RFC-022](../../docs/rfc/022-bolt-protocol.md) for the design.
 

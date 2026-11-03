@@ -41,17 +41,27 @@ Then register it with your MCP client. For Claude Code:
 
 ## Tools
 
-All read-only.
+14 tools, all read-only:
 
-- `list_notes` - every note (title, path)
+- `list_notes` - every note (title, path), up to 500
 - `get_note {note}` - a note's title, path and full body
-- `backlinks {note}` - notes linking to a note
+- `backlinks {note}` - notes linking to or embedding a note
 - `neighbors {note, hops?}` - notes within N hops (undirected, default 1, max 5)
-- `orphans` - notes with no links in or out
-- `search {text}` - notes whose title or body contains a substring
-- `list_tags` - every tag in the graph
-- `notes_by_tag {tag}` - notes carrying a tag (exact, case-sensitive)
+- `orphans` - notes with no links or embeds in or out
+- `search {text}` - notes whose title or body contains a substring (up to 100)
+- `list_tags` - every tag in the graph, up to 500
+- `notes_by_tag {tag}` - notes carrying a tag or any tag nested under it
+  (`area` also returns `area/db`; case-sensitive)
+- `subtags {tag}` - immediate child tags in the nested-tag tree
 - `tags_of {note}` - a note's tags
+- `vector_search {query, label?, property?, k?, where?}` - semantic K-NN by
+  cosine similarity; the query is embedded with the vault's model
+- `hybrid_search {query, label?, property?, k?, lexical_weight?,
+  semantic_weight?, where?}` - lexical + semantic fused with reciprocal rank
+  fusion
+- `graph_algorithm {algorithm, label?, edge_types?, k?, ...}` - `wcc`, `scc`,
+  `pagerank`, `degree`, `triangle_count`, `label_propagation`, `louvain`,
+  `betweenness` or `shortest_path` over the subgraph induced by a label
 - `cypher {query}` - run an arbitrary read-only Cypher query
 
 This is the single-user local server. Multi-tenant hosting belongs in the
