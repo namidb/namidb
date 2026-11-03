@@ -447,12 +447,14 @@ fn execute_operator<'a>(
                 let mut out = Vec::with_capacity(rows.len());
                 let mark = crate::exec::memory::frame_base();
                 let mut meter = crate::exec::memory::GrowthMeter::new();
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for row in rows {
                     let inner_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
                             .await?;
                     let mut list = Vec::with_capacity(inner_rows.len());
                     for inner in inner_rows {
+                        guard.tick()?;
                         list.push(evaluate(projection, &inner, params)?);
                     }
                     // The inner rows are gone; the list they produced is
@@ -774,7 +776,9 @@ fn execute_operator<'a>(
                 let rows =
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let mut out = Vec::with_capacity(rows.len());
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for row in rows {
+                    guard.tick()?;
                     let v = evaluate(predicate, &row, params)?;
                     if v.as_bool() == Some(true) {
                         out.push(row);
@@ -933,7 +937,11 @@ fn execute_operator<'a>(
                     execute_inner_with_routing(build, snapshot, params, outer, routing).await?;
                 let mut table: std::collections::HashMap<Vec<String>, Vec<Row>> =
                     std::collections::HashMap::new();
+                // Build, probe and the joined-row fan-out are pure CPU over
+                // materialised rows: probe the deadline / cancel inside them.
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for row in build_rows {
+                    guard.tick()?;
                     let mut key = Vec::with_capacity(on.len());
                     let mut has_null = false;
                     for jk in on {
@@ -956,6 +964,7 @@ fn execute_operator<'a>(
                 let mut out = Vec::new();
                 let mut meter = crate::exec::memory::GrowthMeter::new();
                 for prow in probe_rows {
+                    guard.tick()?;
                     // One probe row can join many build rows; account the
                     // joined rows pushed for the previous one (#203).
                     meter.observe(&out)?;
@@ -974,6 +983,7 @@ fn execute_operator<'a>(
                     }
                     if let Some(matches) = table.get(&key) {
                         for brow in matches {
+                            guard.tick()?;
                             let mut combined = brow.clone();
                             for (k, v) in &prow.bindings {
                                 combined.bindings.insert(k.clone(), v.clone());
@@ -1009,7 +1019,9 @@ fn execute_operator<'a>(
                     std::collections::HashSet::new();
                 let mut residual_index: std::collections::HashMap<Vec<String>, Vec<Row>> =
                     std::collections::HashMap::new();
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for row in inner_rows {
+                    guard.tick()?;
                     let mut key = Vec::with_capacity(on.len());
                     let mut has_null = false;
                     for jk in on {
@@ -1036,6 +1048,7 @@ fn execute_operator<'a>(
                         .await?;
                 let mut out = Vec::with_capacity(outer_rows.len());
                 for orow in outer_rows {
+                    guard.tick()?;
                     let mut key = Vec::with_capacity(on.len());
                     let mut has_null = false;
                     for jk in on {
@@ -1055,6 +1068,7 @@ fn execute_operator<'a>(
                             Some(inner_rows) => {
                                 let mut any = false;
                                 for irow in inner_rows {
+                                    guard.tick()?;
                                     let mut combined = irow.clone();
                                     for (k, v) in &orow.bindings {
                                         combined.bindings.insert(k.clone(), v.clone());
@@ -1513,7 +1527,9 @@ pub(crate) async fn apply_rows(
     // output once it is merged, and meter the merged rows instead (#203).
     let mark = crate::exec::memory::frame_base();
     let mut meter = crate::exec::memory::GrowthMeter::new();
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for row in rows {
+        guard.tick()?;
         if cap.is_some_and(|cap| out.len() >= cap) {
             break;
         }
@@ -1551,7 +1567,10 @@ pub(crate) async fn apply_rows(
             }
             continue;
         }
+        // An uncorrelated subplan reuses one result for every input row,
+        // which makes this loop a cross product: probe inside it.
         for s in sub_rows {
+            guard.tick()?;
             let mut merged = row.clone();
             for (k, v) in &s.bindings {
                 merged.set(k.clone(), v.clone());
@@ -5833,8 +5852,12 @@ async fn snapshot_to_algo_graph(
         Some(ts) => ts.clone(),
         None => snapshot.observed_edge_types(),
     };
+    // Projecting every edge into the in-memory graph is CPU-only after the
+    // scan returns; probe it like the algorithm kernels themselves.
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for et in &edge_types {
         for e in snapshot.scan_edge_type(et).await? {
+            guard.tick()?;
             if let Some(keep) = &projected {
                 if !keep.contains(&e.src) || !keep.contains(&e.dst) {
                     continue;
@@ -7571,7 +7594,9 @@ pub(crate) fn project_rows(
 ) -> Result<Vec<Row>, ExecError> {
     let mut out = Vec::with_capacity(rows.len());
     let mut meter = crate::exec::memory::GrowthMeter::new();
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for row in rows {
+        guard.tick()?;
         let mut new_row = if discard_input_bindings {
             Row::new()
         } else {
@@ -7664,7 +7689,9 @@ pub(crate) fn sort_rows(
             .capacity()
             .saturating_mul(std::mem::size_of::<(Vec<RuntimeValue>, Row)>()),
     )?;
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for row in rows.drain(..) {
+        guard.tick()?;
         let mut row_keys = Vec::with_capacity(keys.len());
         for k in keys {
             row_keys.push(evaluate(&k.expression, &row, params)?);
@@ -7674,7 +7701,17 @@ pub(crate) fn sort_rows(
         }
         keyed.push((row_keys, row));
     }
-    keyed.sort_by(|(av, _), (bv, _)| compare_keys(av, bv, keys));
+    // A guarded sort merges runs into a second buffer of the same shape.
+    if crate::exec::limits::sort_merges_runs(keyed.len()) {
+        meter.add(
+            keyed
+                .len()
+                .saturating_mul(std::mem::size_of::<(Vec<RuntimeValue>, Row)>()),
+        )?;
+    }
+    crate::exec::limits::sort_by_interruptible(&mut keyed, |(av, _), (bv, _)| {
+        compare_keys(av, bv, keys)
+    })?;
     *rows = keyed.into_iter().map(|(_, r)| r).collect();
     Ok(())
 }
@@ -7779,7 +7816,9 @@ fn bounded_topk(
         .collect();
     let mut heap: BinaryHeap<FlatTopNItem> =
         BinaryHeap::with_capacity(query_initial_capacity(bound, rows.len()));
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for (pos, row) in rows.into_iter().enumerate() {
+        guard.tick()?;
         let mut vals = Vec::with_capacity(keys.len());
         for k in keys {
             vals.push(evaluate(&k.expression, &row, params)?);
@@ -7821,8 +7860,13 @@ pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>,
         )?;
     }
     let mut out = Vec::with_capacity(left.len() * right.len());
+    // The product is pure CPU with no storage read underneath, so without
+    // an in-loop probe `MATCH (a:N), (b:N)` ran to completion past the
+    // query timeout and an admin cancel.
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for l in &left {
         for r in &right {
+            guard.tick()?;
             let mut merged = l.clone();
             for (k, v) in &r.bindings {
                 merged.set(k.clone(), v.clone());
@@ -7850,7 +7894,9 @@ pub(crate) fn dedup_rows(rows: Vec<Row>) -> Result<Vec<Row>, ExecError> {
             .saturating_mul(std::mem::size_of::<String>() + 8),
     )?;
     let mut out = Vec::with_capacity(rows.len().min(MAX_EAGER_QUERY_CAPACITY));
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for row in rows {
+        guard.tick()?;
         let fingerprint = row_fingerprint(&row);
         meter.add(fingerprint.capacity().saturating_add(32))?;
         if seen.insert(fingerprint) {
@@ -8029,7 +8075,11 @@ pub(crate) fn execute_aggregate(
     // is where `collect()` lists live, is metered below and charged at the
     // operator boundary.
     let mut meter = crate::exec::memory::GrowthMeter::new();
+    // Grouping and per-group folding are pure CPU over materialised rows:
+    // probe the deadline / cancel per row (amortised).
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for row in rows {
+        guard.tick()?;
         let mut key_vals = Vec::with_capacity(group_by.len());
         let mut fingerprint = String::new();
         for (expr, _) in group_by {
@@ -8067,6 +8117,9 @@ pub(crate) fn execute_aggregate(
 
     let mut out = Vec::with_capacity(groups.len());
     for (_, (key_vals, group_rows)) in groups {
+        // Each group is folded by `aggregate_over`, whose per-row loops
+        // probe on their own; this covers many tiny groups.
+        guard.tick()?;
         let mut row = Row::new();
         for ((_, alias), v) in group_by.iter().zip(key_vals) {
             row.set(alias.clone(), v);
@@ -8095,7 +8148,9 @@ fn aggregate_over(
             Some(e) => {
                 let mut count: i64 = 0;
                 let mut seen = BTreeSet::new();
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for row in rows {
+                    guard.tick()?;
                     let v = evaluate_agg_arg(e, row, params)?;
                     if v.is_null() {
                         continue;
@@ -8189,7 +8244,9 @@ fn aggregate_over(
             let nums = numeric_values(&vals, name)?;
             if *continuous {
                 let mut nums = nums;
-                nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                crate::exec::limits::sort_by_interruptible(&mut nums, |a, b| {
+                    a.partial_cmp(b).unwrap_or(Ordering::Equal)
+                })?;
                 let rank = p * (nums.len() - 1) as f64;
                 let lo = rank.floor() as usize;
                 let hi = rank.ceil() as usize;
@@ -8197,7 +8254,9 @@ fn aggregate_over(
                 Ok(RuntimeValue::Float(nums[lo] + (nums[hi] - nums[lo]) * frac))
             } else {
                 let mut sorted = vals;
-                sorted.sort_by(|a, b| order_for_sort(a, b, false));
+                crate::exec::limits::sort_by_interruptible(&mut sorted, |a, b| {
+                    order_for_sort(a, b, false)
+                })?;
                 // Nearest-rank: 1-based ceil(p * n), clamped into range so
                 // p = 0.0 yields the minimum.
                 let n = sorted.len();
@@ -8281,7 +8340,9 @@ fn collect_non_null(
         out.capacity()
             .saturating_mul(std::mem::size_of::<RuntimeValue>()),
     )?;
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for row in rows {
+        guard.tick()?;
         let v = evaluate_agg_arg(arg, row, params)?;
         if v.is_null() {
             continue;
@@ -8778,7 +8839,18 @@ fn factor_output_kind(plan: &LogicalPlan) -> crate::exec::memory::OutputKind {
 /// swapped for the rows', which stay charged until the operator settles.
 fn materialize_metered(set: FactorRowSet) -> Result<Vec<Row>, ExecError> {
     if !crate::exec::memory::memory_scoped() {
-        return Ok(set.materialize_all(None));
+        if !namidb_storage::cancel::guarded() {
+            return Ok(set.materialize_all(None));
+        }
+        // Materialising a cross product's leaves is the product's row
+        // copy: probe the guards while it runs.
+        let mut guard = crate::exec::limits::DeadlineProbe::new();
+        let mut rows = Vec::with_capacity(set.leaves.len());
+        for &leaf in &set.leaves {
+            guard.tick()?;
+            rows.push(set.arena.materialize(leaf, None));
+        }
+        return Ok(rows);
     }
     let set_bytes = crate::exec::memory::estimate_factor_set_bytes(&set);
     let rows = materialize_leaves_metered(&set.arena, set.leaves.iter().copied())?;
@@ -8802,7 +8874,9 @@ fn materialize_leaves_metered(
     crate::exec::memory::check_transient(capacity.saturating_mul(std::mem::size_of::<Row>()))?;
     let mut rows = Vec::with_capacity(capacity);
     let mut meter = crate::exec::memory::GrowthMeter::new();
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for leaf in leaves {
+        guard.tick()?;
         rows.push(arena.materialize(leaf, None));
         if rows.len() % METER_STRIDE == 0 {
             meter.observe(&rows)?;
@@ -9079,7 +9153,9 @@ fn execute_factor_operator<'a>(
                     execute_factor_inner_with_routing(input, snapshot, params, outer, routing)
                         .await?;
                 let mut out_leaves = Vec::with_capacity(input_set.leaves.len());
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for &leaf in &input_set.leaves {
+                    guard.tick()?;
                     // Materialise full row to evaluate predicate. Column-
                     // aware materialise is a follow-up; today we accept the
                     // O(depth) walk + transient Row alloc per leaf.
@@ -9359,7 +9435,9 @@ fn execute_factor_operator<'a>(
                                 k,
                                 input_set.cardinality(),
                             ));
+                        let mut guard = crate::exec::limits::DeadlineProbe::new();
                         for (pos, &leaf) in input_set.leaves.iter().enumerate() {
+                            guard.tick()?;
                             let mut thin_row = Row::new();
                             for var_name in &needed {
                                 if let Some(v) = input_set.arena.lookup_binding(leaf, var_name) {
@@ -9406,7 +9484,9 @@ fn execute_factor_operator<'a>(
                     Vec<RuntimeValue>,
                     crate::exec::FactorIdx,
                 )>()))?;
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for &leaf in &input_set.leaves {
+                    guard.tick()?;
                     // Thin row: only the bindings the keys actually read.
                     let mut thin_row = Row::new();
                     for var_name in &needed {
@@ -9424,7 +9504,16 @@ fn execute_factor_operator<'a>(
                     keyed.push((key_vals, leaf));
                 }
 
-                keyed.sort_by(|(av, _), (bv, _)| compare_keys(av, bv, keys));
+                // A guarded sort merges runs into a second buffer.
+                if crate::exec::limits::sort_merges_runs(keyed.len()) {
+                    meter.add(keyed.len().saturating_mul(std::mem::size_of::<(
+                        Vec<RuntimeValue>,
+                        crate::exec::FactorIdx,
+                    )>()))?;
+                }
+                crate::exec::limits::sort_by_interruptible(&mut keyed, |(av, _), (bv, _)| {
+                    compare_keys(av, bv, keys)
+                })?;
 
                 let skip = row_count_as_usize(skip);
                 if skip >= keyed.len() {
@@ -9606,12 +9695,14 @@ fn execute_factor_operator<'a>(
                 // meter the lists built from it instead (#203).
                 let mark = crate::exec::memory::frame_base();
                 let mut meter = crate::exec::memory::GrowthMeter::new();
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for row in rows {
                     let inner_rows =
                         execute_inner_with_routing(subplan, snapshot, params, Some(&row), routing)
                             .await?;
                     let mut list = Vec::with_capacity(inner_rows.len());
                     for inner in inner_rows {
+                        guard.tick()?;
                         list.push(evaluate(projection, &inner, params)?);
                     }
                     crate::exec::memory::restore(mark);
@@ -10160,6 +10251,7 @@ fn execute_multiway_join_factor<'a>(
             bound: vec![None; vars.len()],
             materialised: vec![None; vars.len()],
             meter: crate::exec::memory::GrowthMeter::new(),
+            probe: crate::exec::limits::DeadlineProbe::new(),
         };
         descend_multiway(&mut state, 0, vars, edges, ordering, distinct, snapshot).await?;
         Ok(FactorRowSet {
@@ -10177,6 +10269,8 @@ struct MultiwayState {
     materialised: Vec<Option<NodeValue>>,
     /// Working memory of the leaves pushed so far (#203).
     meter: crate::exec::memory::GrowthMeter,
+    /// Deadline / cancel probe shared by every search node.
+    probe: crate::exec::limits::DeadlineProbe,
 }
 
 fn descend_multiway<'a>(
@@ -10189,6 +10283,10 @@ fn descend_multiway<'a>(
     snapshot: &'a Snapshot<'_>,
 ) -> BoxFuture<'a, Result<(), ExecError>> {
     async move {
+        // Amortised probe per WCOJ search node: a cyclic pattern over a
+        // dense graph can descend millions of times inside this one
+        // operator.
+        state.probe.tick()?;
         if level == ordering.len() {
             // Per-tuple multiplicity to match Cypher's per-path semantics
             // (and the binary executor): for each constraint, count how
@@ -10531,8 +10629,11 @@ fn cross_product_factor(
     } = left;
 
     let mut out_leaves = Vec::with_capacity(left_leaves.len() * right.leaves.len());
+    // Same in-loop deadline / cancel probe as the flat product.
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for &l in &left_leaves {
         for &r in &right.leaves {
+            guard.tick()?;
             let r_row = right.arena.materialize(r, None);
             let mut slots: Vec<Slot> = Vec::with_capacity(r_row.bindings.len());
             for (name, value) in r_row.bindings {
@@ -10582,7 +10683,10 @@ async fn hash_join_factor(
     let build_rows = materialize_metered(build_set)?;
     let mut table: std::collections::HashMap<Vec<String>, Vec<Row>> =
         std::collections::HashMap::new();
+    // Same in-loop deadline / cancel probes as the flat join.
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for row in build_rows {
+        guard.tick()?;
         let mut key = Vec::with_capacity(on.len());
         let mut has_null = false;
         for jk in on {
@@ -10612,6 +10716,7 @@ async fn hash_join_factor(
     // its joined rows (#203).
     let mut meter = crate::exec::memory::GrowthMeter::new();
     for probe_leaf in probe_leaves {
+        guard.tick()?;
         let probe_row = arena.materialize(probe_leaf, None);
         let mut key = Vec::with_capacity(on.len());
         let mut has_null = false;
@@ -10628,6 +10733,7 @@ async fn hash_join_factor(
         }
         if let Some(matches) = table.get(&key) {
             for brow in matches {
+                guard.tick()?;
                 let mut slots: Vec<Slot> = Vec::with_capacity(brow.bindings.len());
                 for (name, value) in &brow.bindings {
                     if arena.lookup_binding(probe_leaf, name).is_some() {
@@ -10686,7 +10792,9 @@ async fn hash_semi_join_factor(
     let mut key_set: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     let mut residual_index: std::collections::HashMap<Vec<String>, Vec<Row>> =
         std::collections::HashMap::new();
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
     for row in inner_rows {
+        guard.tick()?;
         let mut key = Vec::with_capacity(on.len());
         let mut has_null = false;
         for jk in on {
@@ -10715,6 +10823,7 @@ async fn hash_semi_join_factor(
     } = outer_set;
     let mut out_leaves = Vec::with_capacity(outer_leaves.len());
     for outer_leaf in outer_leaves {
+        guard.tick()?;
         let outer_row = arena.materialize(outer_leaf, None);
         let mut key = Vec::with_capacity(on.len());
         let mut has_null = false;
@@ -10733,6 +10842,7 @@ async fn hash_semi_join_factor(
                 Some(irows) => {
                     let mut any = false;
                     for irow in irows {
+                        guard.tick()?;
                         let mut combined = irow.clone();
                         for (k, v) in &outer_row.bindings {
                             combined.bindings.insert(k.clone(), v.clone());
@@ -11794,6 +11904,132 @@ mod tests {
     fn sum_integers_yields_integer() {
         let v = sum_values(&[RuntimeValue::Integer(1), RuntimeValue::Integer(2)]).unwrap();
         assert_eq!(v, RuntimeValue::Integer(3));
+    }
+
+    // ── Cooperative cancellation inside CPU-only operator loops ──────────
+
+    fn int_rows(alias: &str, n: i64) -> Vec<Row> {
+        (0..n)
+            .map(|i| Row::new().with(alias, RuntimeValue::Integer(i % 97)))
+            .collect()
+    }
+
+    fn var(name: &str) -> Expression {
+        let sp = SourceSpan::point(0);
+        mk_filter_expr(
+            ExpressionKind::Variable(crate::parser::ast::Identifier::new(name, sp)),
+            sp,
+        )
+    }
+
+    /// Run `f` with the query deadline (or the cancel flag) already fired, so
+    /// the first amortised probe inside the operator loop must stop it.
+    async fn fired<T>(cancel: bool, f: impl FnOnce() -> Result<T, ExecError>) -> ExecError {
+        let result = if cancel {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            namidb_storage::cancel::with_cancel_flag(flag, async { f() }).await
+        } else {
+            let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+            namidb_storage::cancel::with_deadline(Some(past), async { f() }).await
+        };
+        match result {
+            Ok(_) => panic!("operator ignored a fired guard"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test]
+    async fn cpu_operators_stop_on_a_fired_deadline_or_cancel() {
+        let params = Params::new();
+        let left = int_rows("a", 3_000);
+        let right = int_rows("b", 3_000);
+        let keys = vec![OrderKey {
+            expression: var("a"),
+            direction: crate::parser::OrderDirection::Desc,
+        }];
+        let items = vec![ProjectionItem {
+            expression: var("a"),
+            alias: "x".into(),
+        }];
+        let count_a = vec![(
+            "n".to_string(),
+            AggregateExpr::Count {
+                arg: Some(var("a")),
+                distinct: true,
+            },
+        )];
+        let group_a = [(var("a"), "a".to_string())];
+        let collect = vec![(
+            "c".to_string(),
+            AggregateExpr::Collect {
+                arg: var("a"),
+                distinct: false,
+            },
+        )];
+        let percentile = vec![(
+            "p".to_string(),
+            AggregateExpr::Percentile {
+                arg: var("a"),
+                percentile: mk_filter_expr(
+                    ExpressionKind::Literal(crate::parser::ast::Literal::Float(0.5)),
+                    SourceSpan::point(0),
+                ),
+                continuous: true,
+            },
+        )];
+        for cancel in [false, true] {
+            let expected = |e: &ExecError| {
+                if cancel {
+                    matches!(e, ExecError::Cancelled)
+                } else {
+                    matches!(e, ExecError::Timeout)
+                }
+            };
+            let e = fired(cancel, || cross_product(left.clone(), right.clone())).await;
+            assert!(expected(&e), "cross_product: {e:?}");
+            let e = fired(cancel, || dedup_rows(left.clone())).await;
+            assert!(expected(&e), "dedup_rows: {e:?}");
+            let e = fired(cancel, || project_rows(&left, &items, true, &params)).await;
+            assert!(expected(&e), "project_rows: {e:?}");
+            let e = fired(cancel, || {
+                let mut rows = left.clone();
+                sort_rows(&mut rows, &keys, &params)
+            })
+            .await;
+            assert!(expected(&e), "sort_rows: {e:?}");
+            let e = fired(cancel, || bounded_topk(left.clone(), &keys, &params, 5)).await;
+            assert!(expected(&e), "bounded_topk: {e:?}");
+            for (group, aggs) in [
+                (&[][..], &count_a),
+                (&group_a[..], &count_a),
+                (&[][..], &collect),
+                (&[][..], &percentile),
+            ] {
+                let e = fired(cancel, || {
+                    execute_aggregate(left.clone(), group, aggs, &params)
+                })
+                .await;
+                assert!(expected(&e), "execute_aggregate: {e:?}");
+            }
+            let factor = |rows: &[Row]| FactorRowSet::from_flat(rows.to_vec());
+            let e = fired(cancel, || {
+                cross_product_factor(factor(&left[..100]), factor(&right[..100]))
+            })
+            .await;
+            assert!(expected(&e), "cross_product_factor: {e:?}");
+            let e = fired(cancel, || materialize_metered(factor(&left))).await;
+            assert!(expected(&e), "materialize_metered: {e:?}");
+        }
+        // Unguarded, the same operators run to completion.
+        assert_eq!(
+            cross_product(left[..50].to_vec(), right[..40].to_vec())
+                .unwrap()
+                .len(),
+            2_000
+        );
+        let mut rows = left.clone();
+        sort_rows(&mut rows, &keys, &params).unwrap();
+        assert_eq!(rows.len(), 3_000);
     }
 
     #[test]

@@ -6618,6 +6618,93 @@ mod tests {
         assert!(body.contains("cancelled"), "{body}");
     }
 
+    /// A cartesian product does no storage reads, so it used to reach no
+    /// cooperative probe between its operator boundaries: `MATCH (a:N),
+    /// (b:N)` over 3,000 nodes ran > 40 s past `--query-timeout 1s` and
+    /// ignored an admin cancel. Both must now stop it mid-product.
+    async fn seed_cartesian(app: &Router) {
+        let (status, body) = post_json(
+            app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "UNWIND range(1, 3000) AS i CREATE (:N {i: i})" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_can_cancel_a_runaway_cartesian_product() {
+        let app = fixture(None).await;
+        seed_cartesian(&app).await;
+        let runaway = "MATCH (a:N), (b:N) RETURN count(*) AS cartesian";
+        let app_for_read = app.clone();
+        let read = tokio::spawn(async move {
+            post_json(
+                &app_for_read,
+                "/v0/cypher",
+                serde_json::json!({ "query": runaway }),
+            )
+            .await
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let id = loop {
+            let (_, body) = get_json(&app, "/v0/admin/queries").await;
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(entry) = parsed["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["statement"].as_str().unwrap().contains("cartesian"))
+            {
+                break entry["id"].as_u64().unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "read never appeared in the list"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let (status, _) = post_json(
+            &app,
+            &format!("/v0/admin/queries/{id}/cancel"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let cancelled_at = std::time::Instant::now();
+        let (status, body) = read.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("cancelled"), "{body}");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_millis(1_500),
+            "the product kept running {:?} after the cancel",
+            cancelled_at.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_timeout_stops_a_cartesian_product() {
+        let (store, paths) = namidb_storage::parse_uri("memory://test").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state =
+            AppState::new(writer, None, "test".into()).with_query_timeout(Duration::from_secs(1));
+        let app = build_router(state);
+        seed_cartesian(&app).await;
+        let start = std::time::Instant::now();
+        let (status, body) = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "MATCH (a:N), (b:N) RETURN count(*) AS n" }),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(
+            elapsed < Duration::from_millis(2_500),
+            "a 1 s timeout took {elapsed:?} to stop the product"
+        );
+    }
+
     /// The query list carries statement text: read-only tokens get 403 on
     /// both routes, and the unauthenticated /v0/metrics never exposes it.
     #[tokio::test]

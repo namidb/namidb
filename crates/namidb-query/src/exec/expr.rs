@@ -1506,17 +1506,7 @@ fn range_fn(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, Eva
         if (step > 0 && i > end) || (step < 0 && i < end) {
             break;
         }
-        if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
-            match namidb_storage::cancel::interrupted() {
-                None => {}
-                Some(namidb_storage::cancel::Interrupt::Timeout) => {
-                    return Err(EvalError::interrupted(EvalErrorKind::Timeout, span));
-                }
-                Some(namidb_storage::cancel::Interrupt::Cancelled) => {
-                    return Err(EvalError::interrupted(EvalErrorKind::Cancelled, span));
-                }
-            }
-        }
+        probe_interrupt(out.len(), span)?;
         out.push(RuntimeValue::Integer(i));
         match i.checked_add(step) {
             Some(next) => i = next,
@@ -1524,6 +1514,27 @@ fn range_fn(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, Eva
         }
     }
     Ok(RuntimeValue::List(out))
+}
+
+/// Amortised deadline / cancel probe for per-element expression loops
+/// (`range()`, `reduce`, list comprehensions, quantifiers): checks the guards
+/// on every [`CHECK_STRIDE`](namidb_storage::cancel::CHECK_STRIDE)-th
+/// element. Each element of the binding loops clones the row, so a
+/// million-element `reduce` used to outlive the query timeout.
+#[inline]
+fn probe_interrupt(index: usize, span: SourceSpan) -> Result<(), EvalError> {
+    if index % namidb_storage::cancel::CHECK_STRIDE != 0 {
+        return Ok(());
+    }
+    match namidb_storage::cancel::interrupted() {
+        None => Ok(()),
+        Some(namidb_storage::cancel::Interrupt::Timeout) => {
+            Err(EvalError::interrupted(EvalErrorKind::Timeout, span))
+        }
+        Some(namidb_storage::cancel::Interrupt::Cancelled) => {
+            Err(EvalError::interrupted(EvalErrorKind::Cancelled, span))
+        }
+    }
 }
 
 /// Evaluate `reduce(acc = init, x IN list | expr)`: fold `list` into a
@@ -1545,7 +1556,8 @@ fn eval_reduce(
         }
     };
     let mut acc = evaluate(&r.init, row, params)?;
-    for item in items {
+    for (index, item) in items.into_iter().enumerate() {
+        probe_interrupt(index, r.list.span)?;
         let mut local = row.clone();
         local.set(r.accumulator.name.clone(), acc);
         local.set(r.variable.name.clone(), item);
@@ -1574,7 +1586,8 @@ fn eval_list_comprehension(
         }
     };
     let mut out = Vec::with_capacity(items.len());
-    for item in items {
+    for (index, item) in items.into_iter().enumerate() {
+        probe_interrupt(index, lc.list.span)?;
         let mut local = row.clone();
         local.set(lc.variable.name.clone(), item.clone());
         if let Some(pred) = &lc.predicate {
@@ -1615,7 +1628,8 @@ fn eval_quantifier(
 
     let mut true_count = 0usize;
     let mut any_null = false;
-    for item in items {
+    for (index, item) in items.into_iter().enumerate() {
+        probe_interrupt(index, q.list.span)?;
         let mut local = row.clone();
         local.set(q.variable.name.clone(), item);
         match evaluate(&q.predicate, &local, params)?.as_bool() {
@@ -1681,6 +1695,44 @@ mod tests {
             _ => panic!(),
         };
         evaluate(item, row, params).unwrap()
+    }
+
+    /// `reduce`, list comprehensions and quantifiers clone the row per
+    /// element; with the deadline (or the cancel flag) already fired their
+    /// loops must stop on the first probe instead of walking the list.
+    #[tokio::test]
+    async fn list_binding_loops_stop_on_a_fired_guard() {
+        let mut params = Params::new();
+        params.insert(
+            "xs".into(),
+            RuntimeValue::List((0..10_000).map(RuntimeValue::Integer).collect()),
+        );
+        let exprs = [
+            "reduce(acc = 0, x IN $xs | acc + x)",
+            "[x IN $xs WHERE x > 0 | x * 2]",
+            "all(x IN $xs WHERE x >= 0)",
+        ];
+        for src in exprs {
+            let q = parse(&format!("RETURN {} AS r", src)).unwrap();
+            let item = match &q.head.clauses[0] {
+                crate::parser::Clause::Return(r) => r.items[0].expression.clone(),
+                _ => panic!(),
+            };
+            let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
+            let err = namidb_storage::cancel::with_deadline(Some(past), async {
+                evaluate(&item, &Row::new(), &params).unwrap_err()
+            })
+            .await;
+            assert_eq!(err.kind, EvalErrorKind::Timeout, "{src}: {err:?}");
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let err = namidb_storage::cancel::with_cancel_flag(flag, async {
+                evaluate(&item, &Row::new(), &params).unwrap_err()
+            })
+            .await;
+            assert_eq!(err.kind, EvalErrorKind::Cancelled, "{src}: {err:?}");
+            // Unguarded the same expression evaluates.
+            assert!(evaluate(&item, &Row::new(), &params).is_ok(), "{src}");
+        }
     }
 
     #[test]
