@@ -4609,22 +4609,22 @@ async fn backup_source_version(
     src_store: &Arc<dyn object_store::ObjectStore>,
     src_paths: &namidb_storage::NamespacePaths,
     req: &BackupRequest,
-) -> std::result::Result<Option<u64>, Response> {
+) -> std::result::Result<Option<u64>, Box<Response>> {
     let as_of = match (&req.as_of, req.version) {
         (None, version) => return Ok(version),
         (Some(_), Some(_)) => {
-            return Err(coded_error(
+            return Err(Box::new(coded_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_as_of",
                 "pass either `version` or `as_of`, not both".into(),
                 serde_json::Value::Null,
-            ))
+            )))
         }
         (Some(AsOfParam::Version(v)), None) => namidb_storage::AsOf::Version(*v),
         (Some(AsOfParam::Time(raw)), None) => match chrono::DateTime::parse_from_rfc3339(raw) {
             Ok(t) => namidb_storage::AsOf::Time(t.with_timezone(&chrono::Utc)),
             Err(e) => {
-                return Err(coded_error(
+                return Err(Box::new(coded_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_as_of",
                     format!(
@@ -4632,27 +4632,29 @@ async fn backup_source_version(
                              2026-11-03T10:00:00Z) or a manifest version: {e}"
                     ),
                     serde_json::Value::Null,
-                ))
+                )))
             }
         },
     };
     let history = ManifestStore::new(src_store.clone(), src_paths.clone());
     match namidb_storage::resolve_restore_point(&history, as_of).await {
         Ok(namidb_storage::RestorePointResolution::Found(point)) => Ok(Some(point.version)),
-        Ok(namidb_storage::RestorePointResolution::OutOfWindow(window)) => Err(coded_error(
-            StatusCode::NOT_FOUND,
-            "restore_point_unavailable",
-            format!(
-                "`as_of` is outside the restore point window (versions {} to {}, \
+        Ok(namidb_storage::RestorePointResolution::OutOfWindow(window)) => {
+            Err(Box::new(coded_error(
+                StatusCode::NOT_FOUND,
+                "restore_point_unavailable",
+                format!(
+                    "`as_of` is outside the restore point window (versions {} to {}, \
                  committed {} to {})",
-                window.earliest.version,
-                window.latest.version,
-                window.earliest.created_at.to_rfc3339(),
-                window.latest.created_at.to_rfc3339()
-            ),
-            serde_json::json!({ "earliest": window.earliest, "latest": window.latest }),
-        )),
-        Ok(namidb_storage::RestorePointResolution::InFuture { now }) => Err(coded_error(
+                    window.earliest.version,
+                    window.latest.version,
+                    window.earliest.created_at.to_rfc3339(),
+                    window.latest.created_at.to_rfc3339()
+                ),
+                serde_json::json!({ "earliest": window.earliest, "latest": window.latest }),
+            )))
+        }
+        Ok(namidb_storage::RestorePointResolution::InFuture { now }) => Err(Box::new(coded_error(
             StatusCode::BAD_REQUEST,
             "as_of_in_future",
             format!(
@@ -4660,8 +4662,8 @@ async fn backup_source_version(
                 now.to_rfc3339()
             ),
             serde_json::Value::Null,
-        )),
-        Err(e) => Err(history_error_response(e, "backup")),
+        ))),
+        Err(e) => Err(Box::new(history_error_response(e, "backup"))),
     }
 }
 
@@ -4690,7 +4692,7 @@ async fn run_backup_copy(
 ) -> Response {
     let version = match backup_source_version(&src_store, &src_paths, req).await {
         Ok(version) => version,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let (dst_store, dst_paths) = match namidb_storage::parse_uri(&req.to) {
         Ok(parsed) => parsed,
