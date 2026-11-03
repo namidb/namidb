@@ -11952,7 +11952,7 @@ mod tests {
                 distinct: true,
             },
         )];
-        let group_a = vec![(var("a"), "a".to_string())];
+        let group_a = [(var("a"), "a".to_string())];
         let collect = vec![(
             "c".to_string(),
             AggregateExpr::Collect {

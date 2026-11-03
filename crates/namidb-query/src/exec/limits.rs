@@ -236,7 +236,7 @@ mod tests {
     async fn interruptible_sort_matches_the_stable_sort() {
         for n in [0, 1, 5, SORT_RUN, SORT_RUN + 1, 3 * SORT_RUN + 17] {
             let mut expected = pseudo_random(n);
-            expected.sort_by(|a, b| a.0.cmp(&b.0));
+            expected.sort_by_key(|a| a.0);
             let later = Instant::now() + Duration::from_secs(600);
             let got = namidb_storage::cancel::with_deadline(Some(later), async {
                 let mut items = pseudo_random(n);
