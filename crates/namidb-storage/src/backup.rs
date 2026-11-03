@@ -21,9 +21,10 @@
 //! which the orphan sweep's retention horizon would otherwise try to load.
 //!
 //! While the copy runs it holds a **retention pin lease** on the source
-//! (`manifest/pins/<uuid>.json`, [`crate::pin`]): the orphan sweep unions
-//! every unexpired lease into its horizon, so a concurrent compaction plus
-//! sweep cannot delete the pinned closure mid-copy. The lease is renewed as
+//! (`manifest/pins/<uuid>.json`, [`crate::pin`], scoped to the one version
+//! it copies): the orphan sweep keeps every unexpired lease's closure, so a
+//! concurrent compaction plus sweep cannot delete the pinned closure
+//! mid-copy. The lease is renewed as
 //! the copy progresses and released when it finishes (or errors); a crashed
 //! copy leaks a lease that simply expires. Residual window: a sweep already
 //! past its own pin listing when the lease lands can still reclaim a version
@@ -41,13 +42,16 @@ use crate::error::{Error, Result};
 use crate::fence::Epoch;
 use crate::manifest::{Manifest, ManifestPointer, ManifestStore};
 use crate::paths::NamespacePaths;
-use crate::pin::{RetentionPin, DEFAULT_PIN_TTL};
+use crate::pin::{PinScope, RetentionPin, DEFAULT_PIN_TTL};
 
 /// Outcome of a completed [`copy_namespace_snapshot`].
 #[derive(Debug, Clone)]
 pub struct SnapshotCopyReport {
     /// The source manifest version that was copied (before renumbering).
     pub source_version: u64,
+    /// When that version was committed (its manifest's `created_at`): the
+    /// instant the copy is a snapshot of.
+    pub source_created_at: chrono::DateTime<chrono::Utc>,
     /// Objects written to the destination, including the manifest body and
     /// the pointer.
     pub objects_copied: usize,
@@ -111,13 +115,16 @@ pub async fn copy_namespace_snapshot(
     };
     let source_version = manifest.version;
 
-    // Make the pin durable: a lease object the source's orphan sweep unions
-    // into its horizon, so the pinned closure stays alive across processes
-    // while the copy runs.
-    let mut pin = RetentionPin::acquire(
+    // Make the pin durable: a lease object the source's orphan sweep honours,
+    // so the pinned closure stays alive across processes while the copy runs.
+    // A point lease: the copy reads this version's closure and nothing newer,
+    // so pinning an old restore point does not make every sweep load every
+    // manifest between it and current (a floor would).
+    let mut pin = RetentionPin::acquire_scoped(
         src_store.clone(),
         &src_paths,
         source_version,
+        PinScope::Point,
         DEFAULT_PIN_TTL,
     )
     .await?;
@@ -237,6 +244,7 @@ async fn copy_snapshot_pinned(
     pin: &mut RetentionPin,
 ) -> Result<SnapshotCopyReport> {
     let source_version = manifest.version;
+    let source_created_at = manifest.created_at;
     let mut objects_copied = 0usize;
     let mut bytes_copied = 0u64;
 
@@ -544,6 +552,7 @@ async fn copy_snapshot_pinned(
 
     Ok(SnapshotCopyReport {
         source_version,
+        source_created_at,
         objects_copied,
         bytes_copied,
     })

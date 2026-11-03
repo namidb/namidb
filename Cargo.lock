@@ -2269,6 +2269,7 @@ name = "namidb-cli"
 version = "3.2.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "console",
  "indicatif",

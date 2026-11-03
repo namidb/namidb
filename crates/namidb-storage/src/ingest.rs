@@ -1140,6 +1140,13 @@ impl WriterSession {
         self.next_lsn
     }
 
+    /// The manifest store this writer commits through (its object store and
+    /// namespace paths). Lets callers read the namespace's committed history
+    /// without taking the writer lock.
+    pub fn manifest_store(&self) -> &ManifestStore {
+        &self.manifest_store
+    }
+
     /// Current manifest version visible to this writer.
     pub fn manifest_version(&self) -> u64 {
         self.current.manifest.version

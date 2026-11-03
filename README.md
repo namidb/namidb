@@ -775,6 +775,13 @@ only. The horizon protects readers exactly; the age window protects a body
 uploaded just before its CAS, so lower it only when that object-store race
 window is well understood.
 
+To keep that history on purpose, set `NAMIDB_RESTORE_POINT_RETENTION` (e.g.
+`7d`): every committed version of the window stays restorable, `GET
+/v0/admin/restore-points` lists them, and `POST /v0/admin/backup` with
+`"as_of": "<RFC 3339 instant>"` copies the namespace exactly as it was then.
+The cost is what the namespace writes during the window; see
+[`docs/architecture/restore-points.md`](./docs/architecture/restore-points.md).
+
 The server also takes durability/backpressure knobs for critical workloads:
 
 | Flag (env var) | Default | What it does |
@@ -785,6 +792,7 @@ The server also takes durability/backpressure knobs for critical workloads:
 | `--query-timeout` (`NAMIDB_QUERY_TIMEOUT`) | 30s | Wall-clock budget for a single read query (HTTP and Bolt); a runaway scan aborts with a timeout error instead of pinning a worker. `0s` = unbounded. |
 | `--write-timeout` (`NAMIDB_WRITE_TIMEOUT`) | 60s | Wall-clock budget for a single write statement — its own default, deliberately larger than the read budget. For a bulk load, set `NAMIDB_WRITE_TIMEOUT=0s` (unbounded) or chunk the writes into smaller statements. `0s` = unbounded. |
 | `--fence-policy` (`NAMIDB_FENCE_POLICY`) | `steal` | What a writer does when another process claims its namespace. `steal` reopens and takes it back, which suits a single server. `yield` leaves it to the new owner and keeps the writer degraded until the process (or, in multi-tenant mode, the namespace) is opened again; use it when a control plane decides which node owns each namespace. |
+| `--restore-point-retention` (`NAMIDB_RESTORE_POINT_RETENTION`) | 0 (off) | Keep every committed version of this long (e.g. `24h`, `7d`) restorable for a point-in-time backup (`as_of`). Storage grows by what the namespace writes in the window. Needs `NAMIDB_COMPACTION_INTERVAL` above zero. |
 | `NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` (env only) | 0 (off) | In `--multi-tenant` mode, cap the concurrent reads of each namespace inside the process-wide read gate (`NAMIDB_MAX_CONCURRENT_QUERIES`), so one busy tenant cannot take every permit. |
 
 A poisoned writer, or a fenced one under the default `steal` policy, reopens itself automatically, and `/v0/health` reports `writer: degraded` (503) until it recovers. Under `--fence-policy=yield` a fenced writer does not reopen and stays degraded. Either way a rolling deploy or an accidental second replica on the same bucket drains cleanly instead of serving stale reads behind a green check.

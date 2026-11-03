@@ -682,6 +682,7 @@ mod tests {
         let expired = crate::PinLease {
             version: pin.version(),
             expires_at_unix: 0,
+            scope: crate::PinScope::Floor,
         };
         store
             .put(pin.path(), serde_json::to_vec(&expired).unwrap().into())

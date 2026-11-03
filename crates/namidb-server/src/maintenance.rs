@@ -207,6 +207,34 @@ pub(crate) enum CompactionPass {
     },
 }
 
+/// Advance this namespace's restore point window lease before a sweep
+/// ([`namidb_storage::restore_point`]), or release it when `retention` is
+/// zero. The lease lives `retention` plus twice the maintenance `interval`
+/// (at least the default pin TTL) past each refresh, so it cannot lapse
+/// between two ticks. A failed refresh leaves the previous lease in force
+/// (it is still unexpired), so the sweep that follows stays safe; it is
+/// logged and retried on the next tick.
+pub(crate) async fn keep_restore_point_window(
+    manifest_store: &namidb_storage::ManifestStore,
+    retention: std::time::Duration,
+    interval: std::time::Duration,
+    namespace: &str,
+) {
+    let margin = interval
+        .saturating_mul(2)
+        .max(namidb_storage::DEFAULT_PIN_TTL);
+    match namidb_storage::refresh_restore_point_lease(manifest_store, retention, margin).await {
+        Ok(Some(lease)) => tracing::debug!(
+            namespace,
+            floor = lease.floor.version,
+            since = %lease.floor.created_at,
+            "restore point window refreshed"
+        ),
+        Ok(None) => {}
+        Err(e) => error!(namespace, error = %e, "restore point window refresh failed"),
+    }
+}
+
 /// Request compaction for one namespace.
 ///
 /// Returns a handle only when this request starts the namespace's sole worker.

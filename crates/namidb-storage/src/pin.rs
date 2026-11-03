@@ -15,13 +15,25 @@
 //! wall-clock (`expires_at_unix`), which assumes loosely synchronised clocks
 //! between the holder and the janitor — the generous default TTL plus
 //! half-TTL renewal leaves minutes of skew budget.
+//!
+//! A lease also names its [`PinScope`]: what the sweep keeps for `version`.
+//! The original (and default) scope is a *floor* — every manifest version from
+//! `version` to current stays loadable, exactly like an in-process reader
+//! horizon. A *point* lease keeps one version's closure (a backup of an old
+//! restore point needs nothing newer, and a floor would make every sweep load
+//! every manifest between it and current). A *window* lease is the restore
+//! point window ([`crate::restore_point`]). Old janitors ignore the scope and
+//! honour every lease as a floor, which keeps strictly more, so mixing
+//! releases is safe; a scope this build does not recognise is read as a floor
+//! for the same reason.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, Utc};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
@@ -43,6 +55,52 @@ pub struct PinLease {
     /// Unix seconds after which the lease is void. The sweep ignores and
     /// deletes leases past this instant.
     pub expires_at_unix: i64,
+    /// What the sweep keeps for `version`. Absent on leases written before
+    /// scopes existed, which are floors.
+    #[serde(
+        default,
+        skip_serializing_if = "PinScope::is_floor",
+        deserialize_with = "scope_or_floor"
+    )]
+    pub scope: PinScope,
+}
+
+/// What a [`PinLease`] holds alive (see the module docs).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PinScope {
+    /// Every manifest version from the lease's version to current, and every
+    /// object they reference. The sweep lowers its horizon to the version.
+    #[default]
+    Floor,
+    /// Exactly the lease's version: its manifest body and every object it
+    /// references. Newer versions are left to the other horizons.
+    Point,
+    /// The restore point window ([`crate::restore_point`]): every manifest
+    /// body from the lease's version up stays, the version's own closure
+    /// stays, and so does every SST, side-car or WAL object written since
+    /// `since` minus the sweep's `min_age`. `since` is the floor version's
+    /// `created_at`. Keeping by write time is what lets the sweep honour a
+    /// window of thousands of versions after loading one extra manifest:
+    /// every object a version in the window references either belongs to the
+    /// floor version or was uploaded after it (less the upload-to-commit
+    /// window `min_age` already bounds).
+    Window { since: DateTime<Utc> },
+}
+
+impl PinScope {
+    pub fn is_floor(&self) -> bool {
+        matches!(self, PinScope::Floor)
+    }
+}
+
+/// Decode a lease scope, reading anything unrecognised (a scope from a newer
+/// release) as [`PinScope::Floor`], the scope that keeps the most.
+fn scope_or_floor<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<PinScope, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or(PinScope::Floor))
 }
 
 /// A live retention pin: a lease object this handle wrote and is responsible
@@ -54,6 +112,7 @@ pub struct RetentionPin {
     store: Arc<dyn ObjectStore>,
     path: Path,
     version: u64,
+    scope: PinScope,
     ttl: Duration,
     /// The `expires_at_unix` of the last lease written. Renewal and lapse
     /// are judged against it on the wall clock, the one the sweep uses: a
@@ -73,11 +132,24 @@ impl RetentionPin {
         version: u64,
         ttl: Duration,
     ) -> Result<Self> {
+        Self::acquire_scoped(store, paths, version, PinScope::Floor, ttl).await
+    }
+
+    /// [`Self::acquire`] with an explicit [`PinScope`]. A backup pins a
+    /// [`PinScope::Point`]: it reads one version's closure and nothing newer.
+    pub async fn acquire_scoped(
+        store: Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+        version: u64,
+        scope: PinScope,
+        ttl: Duration,
+    ) -> Result<Self> {
         let path = paths.pin_object(&Uuid::new_v4().to_string());
         let mut pin = Self {
             store,
             path,
             version,
+            scope,
             ttl,
             expires_at_unix: 0,
         };
@@ -128,6 +200,7 @@ impl RetentionPin {
         let lease = PinLease {
             version: self.version,
             expires_at_unix: unix_now().saturating_add(self.ttl_secs()),
+            scope: self.scope,
         };
         self.store
             .put(&self.path, PutPayload::from(serde_json::to_vec(&lease)?))
@@ -218,6 +291,57 @@ mod tests {
             after.expires_at_unix > before.expires_at_unix,
             "renewal must push the expiry forward"
         );
+    }
+
+    #[test]
+    fn scopes_round_trip_and_unknown_or_missing_scopes_read_as_floors() {
+        // A lease written before scopes existed is a floor.
+        let legacy: PinLease =
+            serde_json::from_str(r#"{"version":4,"expires_at_unix":10}"#).unwrap();
+        assert_eq!(legacy.scope, PinScope::Floor);
+        // A floor is written without the field, byte-identical to before.
+        let floor = serde_json::to_string(&legacy).unwrap();
+        assert!(!floor.contains("scope"), "{floor}");
+
+        for scope in [
+            PinScope::Point,
+            PinScope::Window {
+                since: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            },
+        ] {
+            let lease = PinLease {
+                version: 9,
+                expires_at_unix: 11,
+                scope,
+            };
+            let back: PinLease =
+                serde_json::from_slice(&serde_json::to_vec(&lease).unwrap()).unwrap();
+            assert_eq!(back.scope, scope);
+        }
+
+        // A scope from a newer release keeps the most: a floor.
+        let future: PinLease = serde_json::from_str(
+            r#"{"version":4,"expires_at_unix":10,"scope":{"kind":"something_new","x":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(future.scope, PinScope::Floor);
+
+        // An older reader that knows only {version, expires_at_unix} still
+        // decodes a scoped lease, and honours it as a floor.
+        #[derive(serde::Deserialize)]
+        struct OldLease {
+            version: u64,
+            expires_at_unix: i64,
+        }
+        let window = PinLease {
+            version: 3,
+            expires_at_unix: 99,
+            scope: PinScope::Window {
+                since: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            },
+        };
+        let old: OldLease = serde_json::from_slice(&serde_json::to_vec(&window).unwrap()).unwrap();
+        assert_eq!((old.version, old.expires_at_unix), (3, 99));
     }
 
     #[tokio::test]

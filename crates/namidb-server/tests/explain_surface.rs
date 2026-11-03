@@ -32,6 +32,7 @@ async fn boot() -> String {
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
         sweep_delete: false,
+        restore_point_retention: Duration::ZERO,
         bolt_listen: None,
         bolt_max_message_bytes: 64 << 20,
         bolt_tx_timeout: Duration::ZERO,
