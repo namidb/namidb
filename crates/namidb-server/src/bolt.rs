@@ -1827,6 +1827,10 @@ fn map_exec_err_ref(e: &ExecError) -> BackendError {
             other => BackendError::Storage(format!("storage: {other}")),
         },
         ExecError::Eval(err) => BackendError::Eval(err.to_string()),
+        // Rows the writer dropped before any commit were not applied: a
+        // TransientError, so drivers retry the write instead of treating it
+        // as a client bug.
+        ExecError::Runtime(m) if m == crate::GROUP_ROWS_DROPPED => BackendError::Storage(m.clone()),
         ExecError::Runtime(m) => BackendError::Eval(format!("runtime: {m}")),
     }
 }
@@ -2762,6 +2766,15 @@ mod tests {
         drop(write);
         assert_eq!(pool.reserved_bytes(), 0);
         backend.rollback_tx().await.unwrap();
+    }
+
+    /// Rows dropped before any commit were not applied: Bolt reports them
+    /// as a TransientError so drivers retry, not as a client error.
+    #[test]
+    fn dropped_group_rows_map_to_a_transient_bolt_error() {
+        let err = map_exec_err_ref(&ExecError::Runtime(crate::GROUP_ROWS_DROPPED.into()));
+        assert_eq!(err.code(), "Neo.TransientError.General.DatabaseUnavailable");
+        assert_eq!(err.message(), crate::GROUP_ROWS_DROPPED);
     }
 
     /// A Bolt state under group commit with a 10 s write deadline and its

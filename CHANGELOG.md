@@ -37,10 +37,11 @@ crates.io release will establish and document that API explicitly.
   up next to the periodic L0 compaction, whose ticks line up with flush
   ticks (the default 5 min compaction interval is ten 30 s flush intervals);
   compaction itself holds the writer only briefly and was not the cause.
-  The flush now commits the group and answers its writes before it starts. A Bolt `BEGIN` that took the writer while grouped writes
-  were staged had the same effect on `COMMIT`, and on `ROLLBACK` (or a failed
-  statement) it discarded those other connections' rows; `BEGIN` now commits
-  and answers them first.
+  The flush now commits the group and answers its writes before it starts.
+  A Bolt `BEGIN` that took the writer while grouped writes were staged had
+  the same effect on `COMMIT`, and on `ROLLBACK` (or a failed statement) it
+  discarded those other connections' rows; `BEGIN` now commits and answers
+  them first.
 - **Group commit never reports dropped rows as committed.** A grouped write
   whose staged rows were dropped before any commit (a writer session
   reopened after a fence or a poisoned commit, or a discarded batch) waited
@@ -50,8 +51,11 @@ crates.io release will establish and document that API explicitly.
   durable watermark and drop count: a write whose rows are durable gets its
   ACK, and a write whose rows were dropped fails at once with "the write was
   rolled back before it became durable (the writer dropped its staged
-  batch); it was not applied and can be retried". `WriterSession` gains
-  `durable_lsn()` and `dropped_batches()` for this.
+  batch); it was not applied and can be retried". It is a transient error:
+  HTTP 503 with `code: "write_rolled_back"` and
+  `Neo.TransientError.General.DatabaseUnavailable` on HTTP and Bolt, so
+  drivers retry it. `WriterSession` gains `durable_lsn()` and
+  `dropped_batches()` for this.
 
 ## [3.3.0] - 2026-11-03
 

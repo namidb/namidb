@@ -1969,6 +1969,11 @@ fn exec_error_classification(
             (StatusCode::CONFLICT, Some("cancelled"))
         }
         ExecError::RowCap(_) => (StatusCode::PAYLOAD_TOO_LARGE, Some("row_cap")),
+        // A grouped write whose staged rows the writer dropped before any
+        // commit: definitely not applied, so retrying it is safe (503).
+        ExecError::Runtime(m) if m == GROUP_ROWS_DROPPED => {
+            (StatusCode::SERVICE_UNAVAILABLE, Some("write_rolled_back"))
+        }
         // Working-memory budget (#203). The query's own budget is
         // deterministic, like the row cap: 413, do not retry unchanged. A
         // full shared pool or the process ceiling is the same transient
@@ -2020,6 +2025,11 @@ fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'st
             ("Neo.TransientError.Transaction.Terminated", "57014")
         }
         ExecError::RowCap(_) => ("Neo.ClientError.Statement.ResourceLimitExceeded", "54000"),
+        // Same class as the shared commit failure it stands next to: a
+        // transient error drivers may retry, since nothing was applied.
+        ExecError::Runtime(m) if m == GROUP_ROWS_DROPPED => {
+            ("Neo.TransientError.General.DatabaseUnavailable", "53000")
+        }
         ExecError::MemoryLimit(exceeded) if exceeded.is_transient() => {
             ("Neo.TransientError.General.DatabaseUnavailable", "53000")
         }
@@ -9301,6 +9311,13 @@ mod tests {
                     .unwrap_or_default()
                     .contains("rolled back"),
                 "reopen={reopen}: {json}"
+            );
+            // Not applied, so retry-safe: a 503 with a TransientError class.
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "reopen={reopen}");
+            assert_eq!(json["code"], "write_rolled_back", "reopen={reopen}");
+            assert_eq!(
+                json["neo4j_code"], "Neo.TransientError.General.DatabaseUnavailable",
+                "reopen={reopen}"
             );
             assert_eq!(
                 count_label(&app, Some("tok"), "Dx").await,

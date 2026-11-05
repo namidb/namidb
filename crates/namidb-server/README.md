@@ -455,6 +455,7 @@ without string-matching the message:
 | Query timeout | 504 | `timeout` | `Neo.ClientError.Transaction.TransactionTimedOut` | `57014` |
 | Row cap / search result caps / per-query working-memory budget | 413 | `row_cap`, `search_result_limit`, `search_document_limit`, `query_memory_limit` | `Neo.ClientError.Statement.ResourceLimitExceeded` | `54000` |
 | Transient resource pressure | 503 | `search_index_cache_capacity`, `search_workspace_capacity`, `memory_pressure` | `Neo.TransientError.General.DatabaseUnavailable` | `53000` |
+| Grouped write rolled back before it became durable (the writer dropped its staged batch; not applied) | 503 | `write_rolled_back` | `Neo.TransientError.General.DatabaseUnavailable` | `53000` |
 | Unclassified server fault | 500 | — | `Neo.DatabaseError.General.UnknownError` | `50N42` |
 
 The same classes drive the Bolt `FAILURE` code, so official Neo4j drivers —
