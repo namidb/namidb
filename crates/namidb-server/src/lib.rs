@@ -1426,6 +1426,24 @@ pub async fn run_with_memory_limits(
                         lock_started.elapsed(),
                         true,
                     );
+                    // `flush` commits a staged group batch first; settle it
+                    // through the group so its waiters are ACKed now. On a
+                    // failed group commit every waiter has its error and the
+                    // session has recovered; flush on the next tick.
+                    if let Some(group) = &state_for_flush.group_commit {
+                        if commit_group_locked(
+                            group,
+                            &mut w,
+                            &state_for_flush.snapshot,
+                            &state_for_flush.writer_health,
+                            &state_for_flush.namespace,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            continue;
+                        }
+                    }
                     let schema = w.snapshot().manifest().manifest.schema.clone();
                     match w.flush(schema.clone()).await {
                         Ok(_) => {
@@ -1951,6 +1969,11 @@ fn exec_error_classification(
             (StatusCode::CONFLICT, Some("cancelled"))
         }
         ExecError::RowCap(_) => (StatusCode::PAYLOAD_TOO_LARGE, Some("row_cap")),
+        // A grouped write whose staged rows the writer dropped before any
+        // commit: definitely not applied, so retrying it is safe (503).
+        ExecError::Runtime(m) if m == GROUP_ROWS_DROPPED => {
+            (StatusCode::SERVICE_UNAVAILABLE, Some("write_rolled_back"))
+        }
         // Working-memory budget (#203). The query's own budget is
         // deterministic, like the row cap: 413, do not retry unchanged. A
         // full shared pool or the process ceiling is the same transient
@@ -2002,6 +2025,11 @@ fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'st
             ("Neo.TransientError.Transaction.Terminated", "57014")
         }
         ExecError::RowCap(_) => ("Neo.ClientError.Statement.ResourceLimitExceeded", "54000"),
+        // Same class as the shared commit failure it stands next to: a
+        // transient error drivers may retry, since nothing was applied.
+        ExecError::Runtime(m) if m == GROUP_ROWS_DROPPED => {
+            ("Neo.TransientError.General.DatabaseUnavailable", "53000")
+        }
         ExecError::MemoryLimit(exceeded) if exceeded.is_transient() => {
             ("Neo.TransientError.General.DatabaseUnavailable", "53000")
         }
@@ -2370,17 +2398,33 @@ pub(crate) async fn bounded_group_ack(
 /// commit is durable AND the snapshot republished (RFC-021/026 preserved).
 /// A `window` of zero disables the whole path: writes take today's inline
 /// stage+commit, which is the shipped default.
+///
+/// The committer is not the only writer-lock holder that can end the staged
+/// batch: `WriterSession::flush` commits it first, a Bolt explicit
+/// transaction would seal or discard it with its own rows, and a recovery
+/// reopen drops it. Those holders call [`commit_group_locked`] before they
+/// touch the batch, and every pass of the committer settles waiters against
+/// the writer's durable watermark ([`GroupCommit::settle`]), so no waiter is
+/// left to time out on a batch that is already gone.
 pub(crate) struct GroupCommit {
     pub(crate) window: Duration,
     notify: tokio::sync::Notify,
-    #[allow(clippy::type_complexity)]
-    waiters: std::sync::Mutex<
-        Vec<(
-            u64,
-            tokio::sync::oneshot::Sender<Result<(), SharedCommitError>>,
-        )>,
-    >,
+    waiters: std::sync::Mutex<Vec<GroupWaiter>>,
 }
+
+/// One registered write: the last LSN it staged, the writer's
+/// [`WriterSession::dropped_batches`] count when it registered, and where to
+/// send its ACK.
+struct GroupWaiter {
+    lsn: u64,
+    dropped_batches: u64,
+    tx: tokio::sync::oneshot::Sender<Result<(), SharedCommitError>>,
+}
+
+/// The error a grouped write gets when its staged rows were dropped before
+/// any commit made them durable.
+pub(crate) const GROUP_ROWS_DROPPED: &str = "the write was rolled back before it became \
+     durable (the writer dropped its staged batch); it was not applied and can be retried";
 
 /// The one commit error a whole group shares (shared fate: a merged WAL
 /// segment cannot be partially durable).
@@ -2412,17 +2456,34 @@ impl GroupCommit {
         }
     }
 
-    /// Register a waiter for the staged rows up to `lsn`. MUST be called
-    /// while still holding the writer lock (see the struct docs).
+    /// Register a waiter for everything `writer` has staged so far. MUST be
+    /// called while still holding the writer lock (see the struct docs).
+    ///
+    /// With nothing staged the ACK resolves at once: the request changed
+    /// nothing (a `MERGE` that matched, an empty `UNWIND`, a `DELETE` that
+    /// matched nothing) and every row it read is already committed, so
+    /// there is no commit to wait for. Such a waiter used to be keyed at
+    /// LSN 0 and never woken, because the committer runs no commit for an
+    /// empty batch; the write then failed at the write deadline.
     pub(crate) fn register(
         &self,
-        lsn: u64,
+        writer: &WriterSession,
     ) -> tokio::sync::oneshot::Receiver<Result<(), SharedCommitError>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiters
-            .lock()
-            .expect("group commit waiters lock poisoned")
-            .push((lsn, tx));
+        match writer.staged_last_lsn() {
+            None => {
+                let _ = tx.send(Ok(()));
+            }
+            Some(lsn) => self
+                .waiters
+                .lock()
+                .expect("group commit waiters lock poisoned")
+                .push(GroupWaiter {
+                    lsn,
+                    dropped_batches: writer.dropped_batches(),
+                    tx,
+                }),
+        }
         rx
     }
 
@@ -2430,17 +2491,37 @@ impl GroupCommit {
         self.notify.notify_one();
     }
 
-    fn wake_committed(&self, watermark: u64) {
+    /// Answer every waiter whose rows are no longer staged, judged under the
+    /// writer lock the caller holds. Unchanged `dropped_batches` and an LSN
+    /// at or below the durable watermark mean a commit made the rows
+    /// durable, whoever ran it. A changed `dropped_batches` means staged rows
+    /// were dropped since the waiter registered; every path that commits the
+    /// batch settles first, so a waiter still registered then lost its rows
+    /// and gets [`GROUP_ROWS_DROPPED`]. Waiters whose rows are still staged
+    /// keep waiting for the commit.
+    fn settle(&self, writer: &WriterSession) {
+        let durable = writer.durable_lsn();
+        let dropped = writer.dropped_batches();
         let mut waiters = self
             .waiters
             .lock()
             .expect("group commit waiters lock poisoned");
+        let mut lost: Option<SharedCommitError> = None;
         let mut keep = Vec::new();
-        for (lsn, tx) in waiters.drain(..) {
-            if lsn <= watermark {
-                let _ = tx.send(Ok(()));
+        for waiter in waiters.drain(..) {
+            if waiter.dropped_batches != dropped {
+                let error = lost
+                    .get_or_insert_with(|| {
+                        SharedCommitError(Arc::new(namidb_query::exec::ExecError::Runtime(
+                            GROUP_ROWS_DROPPED.into(),
+                        )))
+                    })
+                    .clone();
+                let _ = waiter.tx.send(Err(error));
+            } else if waiter.lsn <= durable {
+                let _ = waiter.tx.send(Ok(()));
             } else {
-                keep.push((lsn, tx));
+                keep.push(waiter);
             }
         }
         *waiters = keep;
@@ -2451,8 +2532,58 @@ impl GroupCommit {
             .waiters
             .lock()
             .expect("group commit waiters lock poisoned");
-        for (_, tx) in waiters.drain(..) {
-            let _ = tx.send(Err(error.clone()));
+        for waiter in waiters.drain(..) {
+            let _ = waiter.tx.send(Err(error.clone()));
+        }
+    }
+}
+
+/// Commit the staged group batch under the caller's writer guard and settle
+/// every waiter registered for it. The committer runs this on each pass, and
+/// so must any other writer-lock holder before it ends the staged batch
+/// itself: `WriterSession::flush` commits it implicitly and a Bolt explicit
+/// transaction would seal or discard it with its own rows, neither of which
+/// knows about the waiters. Before this existed, a periodic flush that took
+/// the lock inside the group window made the rows durable and left their
+/// waiters to answer "outcome unknown" at the write deadline.
+///
+/// `Err` carries the shared commit error when the group's commit failed: the
+/// batch was discarded, a fenced or poisoned session recovered in place, and
+/// every waiter got that error.
+pub(crate) async fn commit_group_locked(
+    group: &GroupCommit,
+    writer: &mut WriterSession,
+    snapshot: &SnapshotCell,
+    writer_health: &WriterHealth,
+    namespace: &str,
+) -> Result<(), SharedCommitError> {
+    // Waiters whose rows a reopen or a discard dropped, or that some path
+    // committed without settling, are answered before anything else.
+    group.settle(writer);
+    if writer.pending_len() == 0 {
+        return Ok(());
+    }
+    match writer.commit_batch().await {
+        Ok(_) => {
+            writer_health.clear_persistence_degraded();
+            // ACK ordering (RFC-021): republish BEFORE waking, so a
+            // waiter's next read sees its committed rows.
+            snapshot.store(writer.owned_snapshot());
+            group.settle(writer);
+            Ok(())
+        }
+        Err(e) => {
+            // Shared fate: the merged batch failed as a unit. Discard it
+            // (nothing is durable until the pointer CAS), recover a
+            // fenced/poisoned session in place, and hand every waiter the
+            // same error.
+            writer.discard_batch();
+            let error = namidb_query::exec::ExecError::Storage(e);
+            recovery::recover_after_write_error(writer, snapshot, writer_health, namespace, &error)
+                .await;
+            let shared = SharedCommitError(Arc::new(error));
+            group.wake_all_err(shared.clone());
+            Err(shared)
         }
     }
 }
@@ -2493,46 +2624,20 @@ pub(crate) async fn group_committer_loop(
             tokio::time::sleep(handles.group.window).await;
         }
         let mut writer = handles.writer.lock().await;
-        if writer.pending_len() == 0 {
-            continue;
-        }
-        let Some(watermark) = writer.staged_last_lsn() else {
-            continue;
-        };
-        match writer.commit_batch().await {
-            Ok(_) => {
-                handles.writer_health.clear_persistence_degraded();
-                // ACK ordering (RFC-021): republish BEFORE waking, so a
-                // waiter's next read sees its committed rows.
-                handles.snapshot.store(writer.owned_snapshot());
-                if let Some(gauge) = &handles.memtable_bytes_gauge {
-                    gauge.store(
-                        writer.memtable_bytes(),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }
-                drop(writer);
-                handles.group.wake_committed(watermark);
-            }
-            Err(e) => {
-                // Shared fate: the merged batch failed as a unit. Discard it
-                // (nothing is durable until the pointer CAS), recover a
-                // fenced/poisoned session in place, and hand every waiter
-                // the same error.
-                writer.discard_batch();
-                let error = namidb_query::exec::ExecError::Storage(e);
-                recovery::recover_after_write_error(
-                    &mut writer,
-                    &handles.snapshot,
-                    &handles.writer_health,
-                    &handles.namespace,
-                    &error,
-                )
-                .await;
-                drop(writer);
-                handles
-                    .group
-                    .wake_all_err(SharedCommitError(Arc::new(error)));
+        let committed = commit_group_locked(
+            &handles.group,
+            &mut writer,
+            &handles.snapshot,
+            &handles.writer_health,
+            &handles.namespace,
+        )
+        .await;
+        if committed.is_ok() {
+            if let Some(gauge) = &handles.memtable_bytes_gauge {
+                gauge.store(
+                    writer.memtable_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
     }
@@ -3667,8 +3772,7 @@ async fn run_write_section(
         {
             Ok(outcome) => {
                 writer.commit_staged_request();
-                let lsn = writer.staged_last_lsn().unwrap_or(0);
-                let ack = group.register(lsn);
+                let ack = group.register(&writer);
                 let stall = state.after_commit_backpressure(&writer);
                 drop(writer);
                 group.notify_committer();
@@ -5216,6 +5320,21 @@ async fn run_restore_copy(
     response
 }
 
+/// The admin flush's answer when committing the staged group batch ahead of
+/// it failed (every grouped writer already got that error).
+fn group_commit_failed_flush_response(shared: &SharedCommitError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            error: format!(
+                "flush failed: committing the staged writes ahead of it failed: {}",
+                shared.0
+            ),
+        }),
+    )
+        .into_response()
+}
+
 async fn run_admin_flush(state: AppState) -> Response {
     let Ok(flush_permit) =
         tokio::time::timeout(ADMIN_FLUSH_WAIT, state.memory.admin_flush_permit()).await
@@ -5230,6 +5349,21 @@ async fn run_admin_flush(state: AppState) -> Response {
     let Some(mut w) = lock_writer_bounded(&state.writer, bound).await else {
         return writer_busy_response();
     };
+    // Settle a staged group batch before `flush` commits it (see
+    // `commit_group_locked`).
+    if let Some(group) = &state.group_commit {
+        if let Err(shared) = commit_group_locked(
+            group,
+            &mut w,
+            &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
+        )
+        .await
+        {
+            return group_commit_failed_flush_response(&shared);
+        }
+    }
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
         Ok(outcome) => {
@@ -5487,8 +5621,7 @@ async fn run_write_section_multi(
         {
             Ok(outcome) => {
                 writer.commit_staged_request();
-                let lsn = writer.staged_last_lsn().unwrap_or(0);
-                let ack = group.register(lsn);
+                let ack = group.register(&writer);
                 let bytes = writer.memtable_bytes();
                 if shared.memtable_flush_bytes > 0 && bytes >= shared.memtable_flush_bytes {
                     ns_state.flush_notify.notify_one();
@@ -6029,6 +6162,21 @@ async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Res
     if ns_state.is_retired() {
         drop(w);
         return namespace_retired_response();
+    }
+    // Settle a staged group batch before `flush` commits it (see
+    // `commit_group_locked`).
+    if let Some(group) = &ns_state.group_commit {
+        if let Err(shared) = commit_group_locked(
+            group,
+            &mut w,
+            &ns_state.snapshot,
+            &ns_state.writer_health,
+            &ns_state.namespace,
+        )
+        .await
+        {
+            return group_commit_failed_flush_response(&shared);
+        }
     }
     let schema = w.snapshot().manifest().manifest.schema.clone();
     match w.flush(schema).await {
@@ -8969,6 +9117,287 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// Poll until a grouped write has staged rows and released the writer.
+    async fn wait_until_staged(state: &AppState) {
+        let started = std::time::Instant::now();
+        loop {
+            if state.writer.lock().await.pending_len() > 0 {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the write never staged"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn count_label(app: &Router, token: Option<&str>, label: &str) -> serde_json::Value {
+        let response = post_cypher(
+            app,
+            token,
+            &format!("MATCH (n:{label}) RETURN count(n) AS c"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_json(response).await["rows"][0]["c"].clone()
+    }
+
+    /// A grouped write that stages no mutation (a repeated MERGE, an empty
+    /// UNWIND, a DELETE or SET matching nothing) has nothing to make durable.
+    /// It must ACK at once. It used to register at LSN 0, the committer ran
+    /// no commit for the empty batch, and the write answered 500 "group
+    /// commit still in flight past the write timeout" at the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouped_noop_writes_ack_without_waiting_for_the_deadline() {
+        let (store, paths) = namidb_storage::parse_uri("memory://group-noop").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, Some("tok".into()), "group-noop".into())
+            .with_group_commit(Duration::from_millis(5))
+            .with_write_timeout(Duration::from_secs(10));
+        state.spawn_group_committer();
+        let app = build_router(state);
+
+        for query in [
+            "MERGE (n:X {i: 1})",
+            // Matches the committed node and stages nothing.
+            "MERGE (n:X {i: 1})",
+            "UNWIND [] AS x CREATE (:X)",
+            "MATCH (n:Nope) DELETE n",
+            "MATCH (n:X {i: 2}) SET n.j = 1",
+        ] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                post_cypher(&app, Some("tok"), query),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{query}: no ACK within 3 s (write deadline 10 s)"));
+            let status = response.status();
+            let json = body_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {json}");
+        }
+        assert_eq!(count_label(&app, Some("tok"), "X").await, 1);
+    }
+
+    /// A flush that commits the staged batch behind the committer's back
+    /// (here called directly on the writer, as any lock holder could) must
+    /// not strand the waiter: the committer's next pass finds the batch
+    /// empty and ACKs every waiter the durable watermark covers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouped_write_acks_when_a_flush_commits_its_rows_first() {
+        let (store, paths) = namidb_storage::parse_uri("memory://group-flush").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        // A wide window keeps the committer asleep while the flush runs.
+        let state = AppState::new(writer, Some("tok".into()), "group-flush".into())
+            .with_group_commit(Duration::from_millis(300))
+            .with_write_timeout(Duration::from_secs(10));
+        state.spawn_group_committer();
+        let app = build_router(state.clone());
+
+        let write = {
+            let app = app.clone();
+            tokio::spawn(async move { post_cypher(&app, Some("tok"), "CREATE (:Fl {i: 1})").await })
+        };
+        wait_until_staged(&state).await;
+        {
+            let mut w = state.writer.lock().await;
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.flush(schema).await.unwrap();
+            state.snapshot.store(w.owned_snapshot());
+        }
+        let response = tokio::time::timeout(Duration::from_secs(3), write)
+            .await
+            .expect("write not ACKed within 3 s after a flush committed its rows")
+            .unwrap();
+        let status = response.status();
+        let json = body_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(count_label(&app, Some("tok"), "Fl").await, 1);
+    }
+
+    /// `POST /v0/admin/flush` taking the writer inside the group window must
+    /// commit and ACK the staged group first, not leave it to the deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admin_flush_acks_the_grouped_writes_it_commits() {
+        let (store, paths) = namidb_storage::parse_uri("memory://group-admin-flush").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        // The window is far longer than the asserted ACK bound, so only the
+        // flush itself can answer the write in time.
+        let state = AppState::new(writer, None, "group-admin-flush".into())
+            .with_group_commit(Duration::from_secs(3))
+            .with_write_timeout(Duration::from_secs(10));
+        state.spawn_group_committer();
+        let app = build_router(state.clone());
+
+        let started = std::time::Instant::now();
+        let write = {
+            let app = app.clone();
+            tokio::spawn(async move { post_cypher(&app, None, "CREATE (:Af)").await })
+        };
+        wait_until_staged(&state).await;
+        let flush = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/admin/flush")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(flush.status(), StatusCode::OK);
+        let response = tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .expect("the flush committed the write; its ACK must not wait for the window")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(count_label(&app, None, "Af").await, 1);
+    }
+
+    /// Rows dropped before any commit made them durable (a discarded batch
+    /// or a reopened session) must fail their write promptly, and a later
+    /// commit at a higher LSN must never report them as committed. Before,
+    /// such a waiter stayed registered at its LSN and the next group commit
+    /// answered it 200 for rows that were never stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouped_write_whose_rows_are_dropped_fails_and_is_never_acked_ok() {
+        for reopen in [false, true] {
+            let uri = format!("memory://group-dropped-{reopen}");
+            let (store, paths) = namidb_storage::parse_uri(&uri).unwrap();
+            let writer = WriterSession::open(store, paths).await.unwrap();
+            let state = AppState::new(writer, Some("tok".into()), "group-dropped".into())
+                .with_group_commit(Duration::from_millis(300))
+                .with_write_timeout(Duration::from_secs(10));
+            state.spawn_group_committer();
+            let app = build_router(state.clone());
+
+            let lost = {
+                let app = app.clone();
+                tokio::spawn(
+                    async move { post_cypher(&app, Some("tok"), "CREATE (:Dx {i: 1})").await },
+                )
+            };
+            wait_until_staged(&state).await;
+            {
+                let mut w = state.writer.lock().await;
+                if reopen {
+                    w.reopen().await.unwrap();
+                } else {
+                    assert_eq!(w.discard_batch(), 1);
+                }
+            }
+            // A later write commits at a higher LSN than the dropped rows.
+            let kept = post_cypher(&app, Some("tok"), "CREATE (:Dx {i: 2})").await;
+            assert_eq!(kept.status(), StatusCode::OK, "reopen={reopen}");
+
+            let response = tokio::time::timeout(Duration::from_secs(3), lost)
+                .await
+                .expect("a dropped write must fail promptly, not at the write deadline")
+                .unwrap();
+            let status = response.status();
+            let json = body_json(response).await;
+            assert_ne!(
+                status,
+                StatusCode::OK,
+                "reopen={reopen}: dropped rows were ACKed: {json}"
+            );
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("rolled back"),
+                "reopen={reopen}: {json}"
+            );
+            // Not applied, so retry-safe: a 503 with a TransientError class.
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "reopen={reopen}");
+            assert_eq!(json["code"], "write_rolled_back", "reopen={reopen}");
+            assert_eq!(
+                json["neo4j_code"], "Neo.TransientError.General.DatabaseUnavailable",
+                "reopen={reopen}"
+            );
+            assert_eq!(
+                count_label(&app, Some("tok"), "Dx").await,
+                1,
+                "reopen={reopen}"
+            );
+        }
+    }
+
+    /// A periodic flush that takes the writer between a grouped write's
+    /// staging and the committer must ACK that write, not leave it waiting.
+    /// `flush` commits the staged batch itself; before the fix the committer
+    /// then found an empty batch and the write answered "group commit still
+    /// in flight past the write timeout" at the deadline although its row
+    /// was durable. A group window far longer than the flush interval makes
+    /// the flush win that race every time, and the ACK bound below the
+    /// window shows the flush itself answers the write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn periodic_flush_acks_a_grouped_write_it_commits() {
+        let (store, _) = namidb_storage::parse_uri("memory://mt-group-flush").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig {
+                group_commit_window: Duration::from_secs(3),
+                flush_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        ));
+        let write_timeout = Duration::from_secs(10);
+        let shared = SharedAppState::new_with_memory(
+            registry.clone(),
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            write_timeout,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::new(memory::MemoryGovernor::new(0)),
+            Duration::ZERO,
+            "acme".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+        let post = |app: Router, query: &'static str| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/acme/v0/cypher")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "query": query })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let response = post(app.clone(), "CREATE (:F)").await;
+            let elapsed = started.elapsed();
+            let status = response.status();
+            let json = body_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "the flush committed the write; its ACK must not wait for the group \
+                 window or the deadline (took {elapsed:?})"
+            );
+        }
+        let read = post(app.clone(), "MATCH (f:F) RETURN count(f) AS c").await;
+        assert_eq!(body_json(read).await["rows"][0]["c"], 3);
     }
 
     /// RFC-034 group commit: N concurrent writes coalesce into fewer
