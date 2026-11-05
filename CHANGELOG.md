@@ -15,6 +15,44 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Group commit: a write that changes nothing no longer fails at the write
+  timeout.** With `--group-commit-window` above zero, a write statement that
+  staged no mutation (a `MERGE` that matched an existing node,
+  `UNWIND [] AS x CREATE (:X)`, a `DELETE` or `SET` that matched nothing)
+  joined a group commit that never ran. It waited the whole
+  `NAMIDB_WRITE_TIMEOUT` and then failed with HTTP 500 / a Bolt `FAILURE`,
+  GQLSTATUS `50N42`, "group commit still in flight past the write timeout;
+  outcome unknown". With the write timeout at `0s`, a Bolt write never
+  answered. Such a write now answers as soon as it has run, on HTTP and
+  Bolt, single- and multi-tenant.
+- **Group commit: a write whose rows a flush commits is answered at once.**
+  `WriterSession::flush` commits the staged batch before it writes SSTs.
+  When the periodic flush, the memtable-size flush trigger or
+  `POST /v0/admin/flush` took the writer inside the group window, the rows
+  became durable but nothing answered their writes: each failed at the write
+  timeout with the same `50N42` error although its data was stored. It hit
+  any write whose group window a flush tick fell into, so it tended to show
+  up next to the periodic L0 compaction, whose ticks line up with flush
+  ticks (the default 5 min compaction interval is ten 30 s flush intervals);
+  compaction itself holds the writer only briefly and was not the cause.
+  The flush now commits the group and answers its writes before it starts. A Bolt `BEGIN` that took the writer while grouped writes
+  were staged had the same effect on `COMMIT`, and on `ROLLBACK` (or a failed
+  statement) it discarded those other connections' rows; `BEGIN` now commits
+  and answers them first.
+- **Group commit never reports dropped rows as committed.** A grouped write
+  whose staged rows were dropped before any commit (a writer session
+  reopened after a fence or a poisoned commit, or a discarded batch) waited
+  until the write timeout, and a later group commit at a higher LSN could
+  answer it as committed although its rows were never stored. Every pass of
+  the committer now settles the registered writes against the writer's
+  durable watermark and drop count: a write whose rows are durable gets its
+  ACK, and a write whose rows were dropped fails at once with "the write was
+  rolled back before it became durable (the writer dropped its staged
+  batch); it was not applied and can be retried". `WriterSession` gains
+  `durable_lsn()` and `dropped_batches()` for this.
+
 ## [3.3.0] - 2026-11-03
 
 ### Added

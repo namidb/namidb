@@ -926,8 +926,7 @@ impl ServerBackend {
                 // longer revokes them, mirroring the inline path's
                 // non-cancellable commit tail.
                 writer.commit_staged_request();
-                let lsn = writer.staged_last_lsn().unwrap_or(0);
-                let ack = group.register(lsn);
+                let ack = group.register(&writer);
                 let stall = self.state.after_commit_backpressure(&writer);
                 drop(writer);
                 group.notify_committer();
@@ -1550,6 +1549,25 @@ impl Backend for ServerBackend {
             lock_started.elapsed(),
             true,
         );
+        // Grouped auto-commit writes may have staged rows and released the
+        // lock while the committer waits out its window. This transaction's
+        // COMMIT would make them durable without answering their waiters,
+        // and its ROLLBACK (or a failed statement) would discard them, so
+        // commit and settle them before the transaction stages anything.
+        let mut writer = writer;
+        if let Some(group) = &self.state.group_commit {
+            if let Err(shared) = crate::commit_group_locked(
+                group,
+                &mut writer,
+                &self.state.snapshot,
+                &self.state.writer_health,
+                &self.state.namespace,
+            )
+            .await
+            {
+                return Err(map_exec_err_ref(shared.0.as_ref()));
+            }
+        }
         *slot = Some(TxState::Write {
             writer,
             staged: false,
@@ -2744,6 +2762,109 @@ mod tests {
         drop(write);
         assert_eq!(pool.reserved_bytes(), 0);
         backend.rollback_tx().await.unwrap();
+    }
+
+    /// A Bolt state under group commit with a 10 s write deadline and its
+    /// committer running.
+    async fn grouped_bolt_state(uri: &str, window: std::time::Duration) -> AppState {
+        let (store, paths) = namidb_storage::parse_uri(uri).unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "bolt-grouped".into())
+            .with_group_commit(window)
+            .with_write_timeout(std::time::Duration::from_secs(10));
+        state.spawn_group_committer();
+        state
+    }
+
+    async fn bolt_count(backend: &ServerBackend, label: &str) -> i64 {
+        let outcome = backend
+            .run(
+                &format!("MATCH (n:{label}) RETURN count(n) AS c"),
+                Params::new(),
+            )
+            .await
+            .unwrap();
+        match outcome.rows[0].get("c") {
+            Some(namidb_query::RuntimeValue::Integer(n)) => *n,
+            other => panic!("count is not an integer: {other:?}"),
+        }
+    }
+
+    /// Bolt auto-commit under group commit: a write that stages nothing must
+    /// ACK at once instead of failing at the write deadline with "group
+    /// commit still in flight past the write timeout".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bolt_grouped_noop_writes_ack_without_waiting_for_the_deadline() {
+        let state = grouped_bolt_state(
+            "memory://bolt-group-noop",
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        let backend = ServerBackend::new(state, Arc::new(std::sync::Mutex::new(None)));
+        for query in [
+            "MERGE (n:X {i: 1})",
+            "MERGE (n:X {i: 1})",
+            "UNWIND [] AS x CREATE (:X)",
+            "MATCH (n:Nope) DELETE n",
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                backend.run(query, Params::new()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{query}: no ACK within 3 s (write deadline 10 s)"))
+            .unwrap_or_else(|e| panic!("{query}: {e:?}"));
+        }
+        assert_eq!(bolt_count(&backend, "X").await, 1);
+    }
+
+    /// A Bolt explicit transaction that takes the writer while grouped
+    /// auto-commit rows are staged must commit and ACK them first. Before,
+    /// its COMMIT sealed them without waking their waiters and its ROLLBACK
+    /// discarded them, and either way the grouped write failed at the
+    /// write deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bolt_begin_settles_grouped_writes_staged_ahead_of_it() {
+        for commit in [false, true] {
+            let uri = format!("memory://bolt-group-begin-{commit}");
+            let state = grouped_bolt_state(&uri, std::time::Duration::from_millis(500)).await;
+            let grouped = Arc::new(ServerBackend::new(
+                state.clone(),
+                Arc::new(std::sync::Mutex::new(None)),
+            ));
+            let tx = ServerBackend::new(state.clone(), Arc::new(std::sync::Mutex::new(None)));
+
+            let write = {
+                let grouped = Arc::clone(&grouped);
+                tokio::spawn(async move { grouped.run("CREATE (:G)", Params::new()).await })
+            };
+            let started = std::time::Instant::now();
+            while state.writer.lock().await.pending_len() == 0 {
+                assert!(started.elapsed() < std::time::Duration::from_secs(5));
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // BEGIN lands inside the committer's 500 ms window.
+            tx.begin_tx().await.unwrap();
+            tx.run_in_tx("CREATE (:T)", Params::new()).await.unwrap();
+            if commit {
+                tx.commit_tx().await.unwrap();
+            } else {
+                tx.rollback_tx().await.unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(3), write)
+                .await
+                .unwrap_or_else(|_| panic!("commit={commit}: grouped write not ACKed in 3 s"))
+                .unwrap()
+                .unwrap_or_else(|e| panic!("commit={commit}: {e:?}"));
+            assert_eq!(bolt_count(&tx, "G").await, 1, "commit={commit}");
+            assert_eq!(
+                bolt_count(&tx, "T").await,
+                i64::from(commit),
+                "commit={commit}"
+            );
+        }
     }
 
     #[tokio::test]

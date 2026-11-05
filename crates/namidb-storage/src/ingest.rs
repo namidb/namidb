@@ -287,6 +287,15 @@ pub struct WriterSession {
     /// the writer (RFC-021). Refreshed by [`Self::refresh_published`].
     published_memtable: Arc<MemtableSnapshot>,
     next_lsn: u64,
+    /// Every record this session staged at or below this LSN is durable:
+    /// recovered at open, advanced by each successful commit. Unlike
+    /// `next_lsn - 1` it never covers records that were staged and then
+    /// discarded. See [`Self::durable_lsn`].
+    durable_lsn: u64,
+    /// How many times staged records were dropped without being committed
+    /// ([`Self::discard_batch`] of a non-empty batch, or a reopen). Carried
+    /// across reopens. See [`Self::dropped_batches`].
+    dropped_batches: u64,
     next_wal_seq: u64,
     pending: WalSegment,
     pending_payloads: Vec<(MemKey, u64, MemOp)>,
@@ -543,6 +552,8 @@ impl WriterSession {
             memtable: recovered.memtable,
             published_memtable,
             next_lsn,
+            durable_lsn: next_lsn.saturating_sub(1),
+            dropped_batches: 0,
             next_wal_seq,
             pending: WalSegment::new(next_wal_seq),
             pending_payloads: Vec::new(),
@@ -1140,6 +1151,27 @@ impl WriterSession {
         self.next_lsn
     }
 
+    /// Highest LSN up to which everything this session staged is durable.
+    /// Recovered at open and advanced by every successful commit (including
+    /// the one [`Self::flush`] runs first). Records staged and then dropped
+    /// are never covered by it unless a later commit passes their LSN, so
+    /// pair it with [`Self::dropped_batches`] to tell a committed record
+    /// from a dropped one.
+    pub fn durable_lsn(&self) -> u64 {
+        self.durable_lsn
+    }
+
+    /// Number of times staged, not yet durable records were dropped: a
+    /// [`Self::discard_batch`] that discarded at least one record, or a
+    /// [`Self::reopen`] (which drops the pending batch and may start from a
+    /// different LSN high-water). Monotonic for the life of the value,
+    /// reopens included. A caller that remembers it next to a staged LSN
+    /// knows the record was committed iff this count is unchanged and
+    /// [`Self::durable_lsn`] has reached that LSN.
+    pub fn dropped_batches(&self) -> u64 {
+        self.dropped_batches
+    }
+
     /// The manifest store this writer commits through (its object store and
     /// namespace paths). Lets callers read the namespace's committed history
     /// without taking the writer lock.
@@ -1355,7 +1387,9 @@ impl WriterSession {
             node_cache: self.node_cache.clone(),
             adjacency_cache: self.adjacency_cache.clone(),
         };
+        let dropped_batches = self.dropped_batches.saturating_add(1);
         *self = Self::open_claiming(store, paths, caches, yield_above).await?;
+        self.dropped_batches = dropped_batches;
         Ok(())
     }
 
@@ -1369,6 +1403,9 @@ impl WriterSession {
     /// harmless (reads always pick the strictly-higher LSN).
     pub fn discard_batch(&mut self) -> usize {
         let discarded = self.pending.records.len();
+        if discarded > 0 {
+            self.dropped_batches = self.dropped_batches.saturating_add(1);
+        }
         self.pending = WalSegment::new(self.pending.seq);
         self.pending_payloads.clear();
         self.staged_memtable = Memtable::new();
@@ -1916,6 +1953,7 @@ impl WriterSession {
         self.staged_memtable = Memtable::new();
         self.pending_node_mutations = false;
         self.pending = WalSegment::new(committed_seq.saturating_add(1));
+        self.durable_lsn = self.durable_lsn.max(last_lsn);
 
         self.current = new_current;
         self.next_wal_seq = committed_seq.saturating_add(1);
@@ -3758,6 +3796,64 @@ mod tests {
             "fixture must expose a real two-L0 compaction"
         );
         session
+    }
+
+    /// `durable_lsn` advances only on commit and `dropped_batches` counts
+    /// every drop of staged records, so together they tell a committed
+    /// record from a discarded one. Both survive a reopen correctly.
+    #[tokio::test]
+    async fn durable_lsn_and_dropped_batches_track_commits_and_drops() {
+        let store = make_store();
+        let paths = make_paths("ingest-durable-lsn");
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        assert_eq!(session.durable_lsn(), 0);
+        assert_eq!(session.dropped_batches(), 0);
+
+        session
+            .upsert_node("Person", sorted_node_id(1), &node_record("a", None))
+            .unwrap();
+        let committed = session.staged_last_lsn().unwrap();
+        assert!(session.durable_lsn() < committed);
+        session.commit_batch().await.unwrap();
+        assert_eq!(session.durable_lsn(), committed);
+        assert_eq!(session.dropped_batches(), 0);
+
+        // Discarding nothing is not a drop.
+        assert_eq!(session.discard_batch(), 0);
+        assert_eq!(session.dropped_batches(), 0);
+
+        session
+            .upsert_node("Person", sorted_node_id(2), &node_record("b", None))
+            .unwrap();
+        let discarded = session.staged_last_lsn().unwrap();
+        assert_eq!(session.discard_batch(), 1);
+        assert!(session.next_lsn() > discarded);
+        assert_eq!(session.durable_lsn(), committed);
+        assert_eq!(session.dropped_batches(), 1);
+
+        // `flush` commits a staged batch first; that advances durable_lsn.
+        session
+            .upsert_node("Person", sorted_node_id(3), &node_record("c", None))
+            .unwrap();
+        let flushed = session.staged_last_lsn().unwrap();
+        session.flush(Schema::empty()).await.unwrap();
+        assert_eq!(session.durable_lsn(), flushed);
+
+        // A reopen drops whatever is staged and counts as a drop; the
+        // recovered durable_lsn is the durable high-water.
+        session
+            .upsert_node("Person", sorted_node_id(4), &node_record("d", None))
+            .unwrap();
+        session.reopen().await.unwrap();
+        assert_eq!(session.pending_len(), 0);
+        assert_eq!(session.dropped_batches(), 2);
+        assert_eq!(session.durable_lsn(), flushed);
+
+        drop(session);
+        let reopened = WriterSession::open(store, paths).await.unwrap();
+        assert_eq!(reopened.durable_lsn(), flushed);
     }
 
     #[tokio::test]

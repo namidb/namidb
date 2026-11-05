@@ -511,6 +511,25 @@ impl NamespaceRegistry {
                             drop(w);
                             return;
                         }
+                        // `flush` commits a staged group batch first; settle
+                        // it through the group so its waiters are ACKed now
+                        // instead of at the write deadline. On a failed group
+                        // commit every waiter has its error and the session
+                        // has recovered; flush on the next tick.
+                        if let Some(group) = &s.group_commit {
+                            if crate::commit_group_locked(
+                                group,
+                                &mut w,
+                                &s.snapshot,
+                                &s.writer_health,
+                                &ns,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                continue;
+                            }
+                        }
                         let schema = w.snapshot().manifest().manifest.schema.clone();
                         match w.flush(schema.clone()).await {
                             Ok(_) => {
