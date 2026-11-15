@@ -310,8 +310,10 @@ class Client:
         current one. Each SST keeps exactly its rows, is read back and
         compared row by row, and is swapped in by its own commit, so an
         interrupted run keeps what it finished and the next call resumes.
-        `progress(step)` is called after each SST. Raises
-        `PermissionError` on a `read_only` client."""
+        `progress(step)` is called after each SST. Queries, writes and
+        compactions keep running meanwhile; a compaction waits for at most
+        the one SST being rewritten. Raises `PermissionError` on a
+        `read_only` client."""
 
     # ── Bulk APIs (batched under one runtime + lock hop) ────────────
 

@@ -112,7 +112,9 @@ either fully migrated or untouched, never both or neither. Running
 those. The objects of an attempt that never committed, and the replaced
 SSTs, are unreferenced garbage for the orphan sweep. Reads keep running
 during a migration, and writes too: only the install of each SST takes the
-writer lock. Migration needs free space for one rewritten SST at a time on
+writer lock. In Python a compaction (`compact()`, or the one `flush()`
+triggers) also keeps running: the migration holds the compaction lock for
+one SST at a time, so a compaction waits for at most that SST. Migration needs free space for one rewritten SST at a time on
 top of the namespace.
 
 The migration is explicit only. A compaction does not rewrite a lone,

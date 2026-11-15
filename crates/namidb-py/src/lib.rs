@@ -700,8 +700,9 @@ impl Client {
     /// rewritten with exactly the same rows, read back and compared row by
     /// row, then swapped in by its own manifest commit, so an interrupted
     /// run (an exception, Ctrl-C, a crash) keeps what it finished and the
-    /// next call resumes with what is left. Reads and writes keep running
-    /// meanwhile. `progress` is called with a dict after each SST. With
+    /// next call resumes with what is left. Reads, writes and compactions
+    /// keep running meanwhile; a compaction waits for at most the one SST
+    /// being rewritten. `progress` is called with a dict after each SST. With
     /// `dry_run=True` it only reports what it would rewrite. The replaced
     /// SSTs are left for the sweep (the automatic one when
     /// `auto_sweep_min_age_secs` is set, else `sweep()`).

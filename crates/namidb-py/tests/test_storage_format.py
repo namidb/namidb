@@ -234,3 +234,37 @@ def test_a_2x_namespace_with_only_wal_data_needs_opt_in(tmp_path: Path):
     assert fmt["legacy_wal_segments"] == 1
     client = namidb.Client(uri, upgrade=True)
     assert rows(client, "MATCH (d:Doc {n: 3}) RETURN d.embedding AS e") == [([3.0, 0.5],)]
+
+
+def test_compaction_and_flush_run_while_a_migration_is_in_progress(legacy_uri: str):
+    """The migration holds the compaction lock for one SST at a time, so a
+    compaction (or a flush that triggers one) from the progress callback or
+    another thread proceeds instead of waiting for the whole run. Holding it
+    for the whole run deadlocked a callback that compacted."""
+    import threading
+
+    client = namidb.Client(legacy_uri, upgrade=True, auto_sweep_min_age_secs=None)
+    docs = rows(client, DOCS)
+    compacted = []
+
+    def on_step(step):
+        client.cypher("CREATE (:Note {step: $s})", {"s": step["done"]})
+        client.commit()
+        client.flush()
+        compacted.append(client.compact())
+
+    result = {}
+
+    def run():
+        result["report"] = client.migrate(progress=on_step)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout=120)
+    assert not worker.is_alive(), "migrate() deadlocked against compact()"
+    report = result["report"]
+    assert report["migrated"] + report["skipped"] == 2
+    assert report["remaining"] == 0
+    assert len(compacted) == report["migrated"]
+    assert rows(client, DOCS) == docs
+    assert rows(client, "MATCH (n:Note) RETURN count(n) AS c") == [(report["migrated"],)]

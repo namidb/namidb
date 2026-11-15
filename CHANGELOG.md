@@ -41,8 +41,10 @@ crates.io release will establish and document that API explicitly.
   rewrites each such SST with exactly the same rows at the same level, reads
   the new SST back and compares it with the old one row by row, and swaps
   it in with its own manifest commit. A crash, an error or Ctrl-C keeps
-  every SST it finished; running it again resumes with the rest. Reads and
-  writes keep running meanwhile. `namidb migrate --dry-run` and
+  every SST it finished; running it again resumes with the rest. Reads,
+  writes and compactions keep running meanwhile: in Python a compaction,
+  including the one a `flush()` triggers, waits for at most the SST being
+  rewritten. `namidb migrate --dry-run` and
   `Client.storage_format()` report the stamp and how many node SSTs, rows
   and bytes are still in the 2.x layout; `migrate(progress=...)` reports
   each SST. On a store of 20,000 `:Doc` nodes with 384-float embeddings

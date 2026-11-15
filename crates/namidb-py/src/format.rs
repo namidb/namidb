@@ -11,8 +11,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
 use namidb_storage::{
-    inspect_storage_format, FormatInspection, Manifest, NamespacePaths, StorageFormat,
-    STORAGE_FORMAT_VERSION,
+    inspect_storage_format, FormatInspection, Manifest, NamespacePaths, NodeLayoutMigration,
+    StorageFormat, STORAGE_FORMAT_VERSION,
 };
 
 use crate::Writer;
@@ -112,6 +112,55 @@ fn step_dict<'py>(py: Python<'py>, step: &Step, started: Instant) -> PyResult<Bo
     Ok(d)
 }
 
+/// Attempts per SST: an install can lose a race with a concurrent schema or
+/// index change (a `Precondition` while the SST is still in the manifest);
+/// the step is then prepared again from the new manifest.
+const MIGRATE_ATTEMPTS: usize = 3;
+
+/// Rewrite and install one 2.x-layout node SST. `None` when a compaction
+/// merged it away first: its rows are already in the current layout.
+///
+/// The compaction lock is held for this one SST only, so an automatic pass
+/// (the one `flush()` triggers) never prepares against an SST being replaced,
+/// yet waits for at most one SST rewrite rather than the whole migration.
+async fn migrate_one(
+    writer: &Arc<Writer>,
+    compaction_lock: &Arc<Mutex<()>>,
+    sst_id: uuid::Uuid,
+) -> namidb_storage::Result<Option<NodeLayoutMigration>> {
+    let _compaction_guard = compaction_lock.lock().await;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let basis = writer.lock().await.compaction_basis();
+        let (prepared, migration) = match basis.prepare_node_layout_migration(sst_id).await {
+            Ok(done) => done,
+            Err(namidb_storage::Error::Precondition(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut guard = writer.lock().await;
+        match guard.install_prepared_compaction(prepared).await {
+            Ok(_) => return Ok(Some(migration)),
+            Err(namidb_storage::Error::Precondition(e)) => {
+                let still_there = guard
+                    .snapshot()
+                    .manifest()
+                    .manifest
+                    .ssts
+                    .iter()
+                    .any(|desc| desc.id == sst_id);
+                if !still_there {
+                    return Ok(None);
+                }
+                if attempt >= MIGRATE_ATTEMPTS {
+                    return Err(namidb_storage::Error::Precondition(e));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Rewrite every 2.x-layout node SST into the current layout, one SST per
 /// manifest commit. Each SST is prepared and verified off the writer lock,
 /// and installed under it, like a compaction pass. Interrupted at any point
@@ -126,10 +175,6 @@ pub(crate) fn migrate(
     dry_run: bool,
 ) -> PyResult<Py<PyDict>> {
     let started = Instant::now();
-    // Hold the compaction lock for the whole run, so no automatic pass
-    // prepares against an SST this run is replacing.
-    let compaction_guard =
-        py.allow_threads(|| runtime.block_on(compaction_lock.clone().lock_owned()));
     let basis =
         py.allow_threads(|| runtime.block_on(async { writer.lock().await.compaction_basis() }));
     let legacy = py
@@ -155,25 +200,8 @@ pub(crate) fn migrate(
             // Ctrl-C between SSTs stops here with everything before it
             // committed.
             py.check_signals()?;
-            let outcome = py.allow_threads(|| {
-                runtime.block_on(async {
-                    let basis = writer.lock().await.compaction_basis();
-                    let (prepared, migration) =
-                        match basis.prepare_node_layout_migration(sst.id).await {
-                            Ok(done) => done,
-                            // A compaction merged it away since the listing:
-                            // its rows are already in the current layout.
-                            Err(namidb_storage::Error::Precondition(_)) => return Ok(None),
-                            Err(e) => return Err(e),
-                        };
-                    let mut guard = writer.lock().await;
-                    match guard.install_prepared_compaction(prepared).await {
-                        Ok(_) => Ok(Some(migration)),
-                        Err(namidb_storage::Error::Precondition(_)) => Ok(None),
-                        Err(e) => Err(e),
-                    }
-                })
-            });
+            let outcome =
+                py.allow_threads(|| runtime.block_on(migrate_one(writer, compaction_lock, sst.id)));
             let Some(migration) = outcome.map_err(crate::map_storage_err)? else {
                 skipped += 1;
                 continue;
@@ -194,7 +222,6 @@ pub(crate) fn migrate(
             }
         }
     }
-    drop(compaction_guard);
     let basis =
         py.allow_threads(|| runtime.block_on(async { writer.lock().await.compaction_basis() }));
     let remaining = if dry_run {
