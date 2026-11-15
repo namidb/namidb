@@ -741,6 +741,7 @@ impl Client {
         }
         Ok(report)
     }
+
     /// Look up a single node by `(label, id)`.
     fn lookup_node<'py>(
         &self,
