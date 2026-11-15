@@ -22,6 +22,7 @@ pub mod compact;
 pub mod error;
 pub mod fence;
 pub mod flush;
+pub mod format;
 pub mod ingest;
 pub mod janitor;
 pub mod local;
@@ -68,11 +69,15 @@ pub use cache_budget::{
 };
 pub use compact::{
     compact_l0_to_l1, install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome,
-    PreparedCompaction,
+    NodeLayoutMigration, PreparedCompaction,
 };
 pub use error::{Error, Result};
 pub use fence::{Epoch, WriterFence};
 pub use flush::{flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord};
+pub use format::{
+    inspect_storage_format, FormatInspection, FormatUpgrade, NodeSstLayout, StorageFormat,
+    LEGACY_STORAGE_FORMAT_VERSION, STORAGE_FORMAT_VERSION,
+};
 pub use ingest::{
     clear_shared_caches, prune_shared_caches, CommitOutcome, SessionCaches, StageMark, StagedValue,
     WriterSession,

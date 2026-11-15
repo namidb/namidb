@@ -302,6 +302,232 @@ impl CompactionBasis {
     }
 }
 
+/// One node SST rewritten from the 2.x layout into the current one by
+/// [`CompactionBasis::prepare_node_layout_migration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeLayoutMigration {
+    /// The 2.x-layout SST the rewrite replaces.
+    pub source_id: Uuid,
+    /// The current-layout SST that replaces it, at the same level.
+    pub output_id: Uuid,
+    pub level: u32,
+    /// Rows in both SSTs: the rewrite keeps every row, tombstones and all.
+    pub rows: u64,
+    pub source_bytes: u64,
+    pub output_bytes: u64,
+}
+
+impl CompactionBasis {
+    /// Node SSTs of this basis still in the NamiDB 2.x layout (embeddings in
+    /// the overflow JSON). Reads each node SST's Parquet footer.
+    pub async fn legacy_node_ssts(&self) -> Result<Vec<crate::format::NodeSstLayout>> {
+        let inspection = crate::format::inspect_storage_format(
+            self.manifest_store.store(),
+            self.manifest_store.paths(),
+            &self.base.manifest,
+        )
+        .await?;
+        Ok(inspection.legacy_node_ssts().cloned().collect())
+    }
+
+    /// Rewrite node SST `sst_id` into the current layout, off the writer
+    /// lock: the same rows (every id, LSN and tombstone, nothing merged or
+    /// collected) at the same level, with current sidecars. The output is
+    /// read back from the object store and compared row by row with the
+    /// source before this returns, so a [`PreparedCompaction`] only exists
+    /// for a verified rewrite. Install it with
+    /// [`crate::WriterSession::install_prepared_compaction`]; that commit is
+    /// the single step that swaps the SSTs, so a crash at any point leaves
+    /// either the old SST or the new one in the manifest, never both or
+    /// neither. Objects of an attempt that never installs are orphans for
+    /// the sweep.
+    pub async fn prepare_node_layout_migration(
+        &self,
+        sst_id: Uuid,
+    ) -> Result<(PreparedCompaction, NodeLayoutMigration)> {
+        prepare_node_layout_rewrite(&self.manifest_store, &self.fence, &self.base, sst_id).await
+    }
+}
+
+async fn prepare_node_layout_rewrite(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    base: &LoadedManifest,
+    sst_id: Uuid,
+) -> Result<(PreparedCompaction, NodeLayoutMigration)> {
+    fence.assert_alive(base.manifest.epoch)?;
+    let schema = base.manifest.schema.clone();
+    let source = base
+        .manifest
+        .ssts
+        .iter()
+        .find(|desc| desc.id == sst_id && desc.kind == SstKind::Nodes)
+        .cloned()
+        .ok_or_else(|| {
+            Error::precondition(format!(
+                "node SST {sst_id} is not in manifest v{}",
+                base.manifest.version
+            ))
+        })?;
+    let store = manifest_store.store().clone();
+    let paths = manifest_store.paths();
+    let label = source.scope.clone();
+    let label_def = schema.label(&label).cloned().unwrap_or_else(|| LabelDef {
+        name: label.clone(),
+        properties: vec![],
+    });
+    // Same sidecar definition as a compaction of this bucket, so the output
+    // carries every unique/equality/composite sidecar the schema declares.
+    let sidecar_def = if label.is_empty() {
+        crate::flush::union_indexed_props(&schema)
+    } else {
+        label_def.clone()
+    };
+    let body = get_sst_body(store.as_ref(), paths, &source).await?;
+    let output_sst_id = Uuid::now_v7();
+    let merge_input = NodeMergeInput {
+        body: body.clone(),
+        min_key: source.min_key,
+    };
+    let merge_def = label_def.clone();
+    let merge_schema = schema.clone();
+    let merge_dict = base.manifest.label_dict.clone();
+    let merge_scope = label.clone();
+    // One source and no tombstone GC: every row comes out as it went in.
+    // Search indexes are not rebuilt; their corpus does not change.
+    let out = run_cpu(move || {
+        merge_node_sources(
+            vec![merge_input],
+            &merge_def,
+            &sidecar_def,
+            false,
+            &merge_schema,
+            &merge_dict,
+            &merge_scope,
+            output_sst_id,
+            NodeMergeIndexSpecs::default(),
+        )
+    })
+    .await??;
+    if out.finish.stats.row_count != source.row_count {
+        return Err(Error::invariant(format!(
+            "layout rewrite of node SST {} produced {} rows, expected {}",
+            source.id, out.finish.stats.row_count, source.row_count
+        )));
+    }
+    let (mut descriptor, wrote_bloom) = put_node_sst_leveled(
+        store.clone(),
+        paths,
+        source.level.as_u32(),
+        &label,
+        output_sst_id,
+        out.sidecars,
+        out.finish,
+    )
+    .await?;
+    descriptor.max_lsn = source.max_lsn;
+    if descriptor.min_key != source.min_key
+        || descriptor.max_key != source.max_key
+        || descriptor.min_lsn != source.min_lsn
+        || descriptor.row_count != source.row_count
+    {
+        return Err(Error::invariant(format!(
+            "layout rewrite of node SST {} changed its key, LSN or row range",
+            source.id
+        )));
+    }
+    let written = get_sst_body(store.as_ref(), paths, &descriptor).await?;
+    let verify_def = label_def.clone();
+    let verified =
+        run_cpu(move || verify_node_layout_rewrite(&verify_def, body, written)).await??;
+    if verified != source.row_count {
+        return Err(Error::invariant(format!(
+            "layout rewrite of node SST {} verified {verified} rows, expected {}",
+            source.id, source.row_count
+        )));
+    }
+    let migration = NodeLayoutMigration {
+        source_id: source.id,
+        output_id: descriptor.id,
+        level: source.level.as_u32(),
+        rows: source.row_count,
+        source_bytes: source.size_bytes,
+        output_bytes: descriptor.size_bytes,
+    };
+    let prepared = PreparedCompaction {
+        new_descs: vec![descriptor.clone()],
+        removed_ids: vec![source.id],
+        bloom_count: usize::from(wrote_bloom),
+        base_version: base.manifest.version,
+        base_schema: base.manifest.schema.clone(),
+        base_vector_indexes: base.manifest.vector_indexes.clone(),
+        base_text_indexes: base.manifest.text_indexes.clone(),
+        base_search_lsm: base.manifest.search_lsm.clone(),
+        node_rewrites: vec![PreparedNodeRewrite {
+            inputs: vec![source],
+            output: Some(descriptor),
+        }],
+        search_compactions: Vec::new(),
+        search_build_states: Vec::new(),
+        consolidated_base_markers: Vec::new(),
+        unadoptable_search_markers: Vec::new(),
+        search_lsm_activations: Vec::new(),
+        replaced_search_lsm: Vec::new(),
+    };
+    Ok((prepared, migration))
+}
+
+/// Compare a rewritten node SST with its source, row by row: the same ids,
+/// LSNs, tombstones, labels and property values in the same order, with the
+/// output in the current layout. Returns the number of rows compared. Holds
+/// one bounded batch per side, never a whole SST.
+fn verify_node_layout_rewrite(label_def: &LabelDef, source: Bytes, output: Bytes) -> Result<u64> {
+    let output_schema = ParquetRecordBatchReaderBuilder::try_new(output.clone())
+        .map_err(|e| Error::invariant(format!("parquet open: {e}")))?
+        .schema()
+        .clone();
+    if output_schema
+        .column_with_name(crate::sst::nodes::BINARY_PROPS)
+        .is_none()
+    {
+        return Err(Error::invariant(
+            "layout rewrite produced a node SST without the binary property column",
+        ));
+    }
+    let mut old = NodeSourceCursor::open(label_def, source)?;
+    let mut new = NodeSourceCursor::open(label_def, output)?;
+    old.ensure_positioned()?;
+    new.ensure_positioned()?;
+    let mut rows = 0_u64;
+    loop {
+        match (old.peek(), new.peek()) {
+            (None, None) => return Ok(rows),
+            (Some(a), Some(b)) if a == b => {
+                let (old_row, _) = old.materialize_current(label_def)?;
+                let (new_row, _) = new.materialize_current(label_def)?;
+                // Both payloads are re-encodings of the decoded records, so
+                // equal bytes mean equal properties, labels and schema
+                // version, float bits included.
+                if old_row.op != new_row.op {
+                    return Err(Error::invariant(format!(
+                        "layout rewrite changed node row {rows}: its record differs from the \
+                         source"
+                    )));
+                }
+                old.advance()?;
+                new.advance()?;
+                rows += 1;
+            }
+            (a, b) => {
+                return Err(Error::invariant(format!(
+                    "layout rewrite diverges from its source at row {rows}: source key \
+                     {a:?}, output key {b:?}"
+                )));
+            }
+        }
+    }
+}
+
 /// `true` when any `(kind, scope)` bucket of `ssts` would plan a merge under
 /// the given budgets — a metadata-only mirror of the per-bucket
 /// [`plan_bucket_merge`] calls the prepare phase makes, with no object-store

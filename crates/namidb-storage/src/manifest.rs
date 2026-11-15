@@ -42,6 +42,7 @@ use namidb_core::{LabelDictionary, Schema};
 
 use crate::error::{Error, Result};
 use crate::fence::{Epoch, WriterFence};
+use crate::format::StorageFormat;
 use crate::paths::NamespacePaths;
 use crate::search_lsm::SearchLsmState;
 use crate::sst::bloom::BloomDescriptor;
@@ -108,6 +109,11 @@ pub struct Manifest {
     /// and therefore empty by default.
     #[serde(default)]
     pub search_lsm: Vec<SearchLsmState>,
+    /// Storage format stamp (see [`crate::format`]). `None` in manifests
+    /// committed by NamiDB 3.3.1 and older; every version this build
+    /// commits carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_format: Option<StorageFormat>,
 }
 
 impl Manifest {
@@ -126,6 +132,7 @@ impl Manifest {
             text_indexes: Vec::new(),
             search_index_builds: Vec::new(),
             search_lsm: Vec::new(),
+            storage_format: Some(StorageFormat::current()),
         }
     }
 
@@ -146,6 +153,7 @@ impl Manifest {
             text_indexes: self.text_indexes.clone(),
             search_index_builds: self.search_index_builds.clone(),
             search_lsm: self.search_lsm.clone(),
+            storage_format: Some(StorageFormat::successor(self.storage_format.as_ref())),
         }
     }
 }
@@ -1026,6 +1034,7 @@ impl ManifestStore {
         let res = self.store.get(&path).await?;
         let body = res.bytes().await?;
         let manifest: Manifest = serde_json::from_slice(&body)?;
+        crate::format::ensure_readable(&manifest)?;
         Ok(manifest)
     }
 
@@ -1038,6 +1047,7 @@ impl ManifestStore {
         let manifest_res = self.store.get(&manifest_path).await?;
         let manifest_body = manifest_res.bytes().await?;
         let manifest: Manifest = serde_json::from_slice(&manifest_body)?;
+        crate::format::ensure_readable(&manifest)?;
 
         if manifest.version != pointer.version {
             return Err(Error::Corrupted {
@@ -1246,6 +1256,7 @@ impl ManifestStore {
         new_manifest: &Manifest,
     ) -> Result<ManifestPointer> {
         fence.assert_alive(base.manifest.epoch)?;
+        crate::format::ensure_writable(&base.manifest)?;
         if new_manifest.version != base.manifest.version + 1 {
             return Err(Error::invariant(format!(
                 "new manifest version {} must be {} (base + 1)",
@@ -1607,6 +1618,10 @@ impl ManifestStore {
         if orphan.version != version || orphan.epoch < base.manifest.epoch {
             return Ok(None);
         }
+        // An interrupted commit of a newer release: this build can judge
+        // neither whether it is complete nor what it references, so it must
+        // neither publish nor delete it.
+        crate::format::ensure_writable(&orphan)?;
 
         // Every SST the orphan adds over the base must still be durable.
         // Flush/compaction PUT SSTs strictly before the manifest body, so
@@ -2453,6 +2468,38 @@ mod tests {
         let next = loaded.manifest.next_version(fence.writer_id);
         let committed = ms.commit(&fence, &loaded, next).await.unwrap();
         assert_eq!(committed.manifest.version, 3);
+    }
+
+    #[tokio::test]
+    async fn stalled_commit_of_a_newer_format_is_neither_published_nor_deleted() {
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut orphan = base.manifest.next_version(Uuid::now_v7());
+        orphan.storage_format = Some(crate::format::StorageFormat {
+            version: crate::format::STORAGE_FORMAT_VERSION + 1,
+            min_reader_version: crate::format::STORAGE_FORMAT_VERSION + 1,
+            min_writer_version: crate::format::STORAGE_FORMAT_VERSION + 1,
+            written_by: "namidb 9.0.0".into(),
+        });
+        let body_path = paths.manifest_version(orphan.version);
+        store
+            .put(
+                &body_path,
+                Bytes::from(serde_json::to_vec(&orphan).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+        let err = ms.repair_stalled_commit(&base).await.unwrap_err();
+        assert!(matches!(err, Error::NewerStorageFormat { .. }), "{err}");
+        assert!(store.head(&body_path).await.is_ok(), "orphan body deleted");
+        assert!(
+            store
+                .head(&paths.pointer_version(orphan.version))
+                .await
+                .is_err(),
+            "orphan published"
+        );
     }
 
     #[tokio::test]
