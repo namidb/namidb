@@ -78,6 +78,12 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     // lowered disjunction filter and can do better still — goes first; the
     // second fixpoint then pushes the remaining predicates into every branch.
     let split = label_scan::split_label_disjunction(settled.clone(), catalog);
+    // A hop from a fresh scan to a node an earlier clause bound
+    // (`MATCH (c:Call) MATCH (d)<-[:R]-(c)`) walks from the bound node
+    // instead of probing it against every scanned node. Also only once the
+    // fixpoint has settled: a scan the lookups turned into an id seek or an
+    // index probe (`WHERE id(d) = $x`) is cheaper still and must keep it.
+    let split = anchor_choice::apply_bound_endpoint_start(split, catalog);
     if split == settled {
         return settled;
     }

@@ -337,6 +337,168 @@ fn deanchor_one(plan: &LogicalPlan, catalog: &StatsCatalog) -> Option<LogicalPla
     })
 }
 
+/// Rewrite every single hop from a fresh scan to an already-bound node into
+/// a hop from the bound node, when that reads fewer rows.
+///
+/// `MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c)` (or `… WITH c MATCH …`)
+/// lowers from the pattern's first node: a scan of every `d` cross-joined
+/// with every `c` row, then an edge probe per pair — rows × nodes work and
+/// memory before the hop prunes anything. Walking the hop from `c` instead
+/// reads each `c`'s own edges. The rewrite keeps the scan side when the scan
+/// is labelled and the catalog cannot show the hop's average degree from
+/// the bound side to be below that label's node count; an unlabelled scan
+/// reads every node, so the walk always wins. It also keeps a scan that
+/// carries storage-level predicates (`WHERE d.kind = 1` folded into the
+/// scan), which an Expand target cannot take; a `Filter` on the scanned
+/// alias moves above the walk. Runs after the optimizer fixpoint, so a scan
+/// the lookups turned into an id seek or an index probe is never touched.
+pub fn apply_bound_endpoint_start(mut plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
+    visit_bound(&mut plan, catalog);
+    plan
+}
+
+fn visit_bound(plan: &mut LogicalPlan, catalog: &StatsCatalog) {
+    for child in plan.children_mut() {
+        visit_bound(child, catalog);
+    }
+    if let Some(rewritten) = start_from_bound_end(plan, catalog) {
+        *plan = rewritten;
+    }
+}
+
+/// `true` when walking the hop from the bound node (`degree` rows per bound
+/// row) is no costlier than probing it from every node of the scan.
+fn bound_start_wins(
+    catalog: &StatsCatalog,
+    scan_label: Option<&str>,
+    edge_type: Option<&[String]>,
+    direction_from_bound: RelationshipDirection,
+) -> bool {
+    let Some(label) = scan_label else {
+        return true;
+    };
+    let Some(scan_rows) = catalog.label(label).map(|stats| stats.node_count) else {
+        return false;
+    };
+    match known_degree(catalog, edge_type, direction_from_bound) {
+        Some(degree) => degree <= scan_rows as f64,
+        None => false,
+    }
+}
+
+fn start_from_bound_end(plan: &LogicalPlan, catalog: &StatsCatalog) -> Option<LogicalPlan> {
+    let LogicalPlan::Expand {
+        input,
+        source,
+        edge_type,
+        direction,
+        rel_alias,
+        target_alias,
+        target_labels,
+        length: None,
+        optional: false,
+        back_reference: true,
+        shortest: ShortestMode::None,
+        path_binding: None,
+        unique_rels,
+    } = plan
+    else {
+        return None;
+    };
+    if source == target_alias {
+        return None;
+    }
+    let LogicalPlan::CrossProduct { left, right } = input.as_ref() else {
+        return None;
+    };
+    // One side scans the hop's source and nothing else: a bare scan, or a
+    // filter on that alias alone over it.
+    let scan_side = |side: &LogicalPlan| -> Option<(Option<String>, Option<Expression>)> {
+        let (scan, filter) = match side {
+            LogicalPlan::Filter { input, predicate } => (input.as_ref(), Some(predicate.clone())),
+            other => (other, None),
+        };
+        let LogicalPlan::NodeScan {
+            label,
+            alias,
+            predicates,
+            ..
+        } = scan
+        else {
+            return None;
+        };
+        if alias != source || !predicates.is_empty() {
+            return None;
+        }
+        if filter
+            .as_ref()
+            .is_some_and(|f| super::expression_aliases(f).iter().any(|a| a != source))
+        {
+            return None;
+        }
+        Some((label.clone(), filter))
+    };
+    let (bound, (scan_label, scan_filter)) = match (scan_side(right), scan_side(left)) {
+        (Some(scan), _) => (left.as_ref(), scan),
+        (None, Some(scan)) => (right.as_ref(), scan),
+        (None, None) => return None,
+    };
+    let produced = super::produced_aliases(bound);
+    if !produced.contains(target_alias)
+        || produced.contains(source)
+        || rel_alias.as_ref().is_some_and(|r| produced.contains(r))
+    {
+        return None;
+    }
+    let from_bound = invert(*direction);
+    if !bound_start_wins(
+        catalog,
+        scan_label.as_deref(),
+        edge_type.as_deref(),
+        from_bound,
+    ) {
+        return None;
+    }
+    // The bound node's own labels were the old hop's target check.
+    let span = scan_filter
+        .as_ref()
+        .map(|f| f.span)
+        .unwrap_or_else(|| crate::parser::SourceSpan::point(0));
+    let bound_labels: Vec<Expression> = target_labels
+        .iter()
+        .map(|l| crate::plan::lower::build_label_eq(target_alias, l, span))
+        .collect();
+    let bound_input = match and_chain(bound_labels) {
+        Some(predicate) => LogicalPlan::Filter {
+            input: Box::new(bound.clone()),
+            predicate,
+        },
+        None => bound.clone(),
+    };
+    let walk = LogicalPlan::Expand {
+        input: Box::new(bound_input),
+        source: target_alias.clone(),
+        edge_type: edge_type.clone(),
+        direction: from_bound,
+        rel_alias: rel_alias.clone(),
+        target_alias: source.clone(),
+        target_labels: scan_label.into_iter().collect(),
+        length: None,
+        optional: false,
+        back_reference: false,
+        shortest: ShortestMode::None,
+        path_binding: None,
+        unique_rels: unique_rels.clone(),
+    };
+    Some(match scan_filter {
+        Some(predicate) => LogicalPlan::Filter {
+            input: Box::new(walk),
+            predicate,
+        },
+        None => walk,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cost::{EdgeTypeStats, LabelStats, StatsCatalog};
@@ -539,12 +701,64 @@ mod tests {
     }
 
     #[test]
+    fn a_hop_to_a_bound_node_walks_from_it() {
+        for q in [
+            "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) RETURN d",
+            "MATCH (c:Call) WITH c MATCH (d)<-[:ON_DEVICE]-(c) RETURN d",
+            "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) WHERE d.name STARTS WITH 'x' RETURN d",
+            // Labelled: one ON_DEVICE edge per call against 4 devices.
+            "MATCH (c:Call) MATCH (d:Device)<-[:ON_DEVICE]-(c) RETURN d",
+        ] {
+            let p = plan_with(q, &hubs());
+            assert!(!p.contains("CrossProduct"), "{q}\n{p}");
+            assert!(
+                p.contains("Expand source=c edge_type=ON_DEVICE dir=->"),
+                "{q}\n{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hop_to_a_bound_node_keeps_a_seek_on_the_new_end() {
+        // The id pin on the new end is a point seek; walking every edge of
+        // the bound node would read more.
+        let p = plan_with(
+            "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) WHERE id(d) = $x RETURN d",
+            &hubs(),
+        );
+        assert!(p.contains("NodeById"), "{p}");
+        let p = plan_with(
+            "MATCH (c:Call) OPTIONAL MATCH (d)<-[:ON_DEVICE]-(c) WHERE elementId(d) = $x RETURN d",
+            &hubs(),
+        );
+        assert!(p.contains("NodeById"), "{p}");
+    }
+
+    #[test]
+    fn a_hop_from_a_bound_hub_keeps_the_small_scan() {
+        // From each device the walk reads 600k edges on average; probing
+        // the 2,958 calls against it is cheaper.
+        let p = plan_with(
+            "MATCH (d:Device) MATCH (c:Call)-[:ON_DEVICE]->(d) RETURN c",
+            &hubs(),
+        );
+        assert!(p.contains("NodeScan label=Call alias=c"), "{p}");
+        // Unknown statistics keep the spelled plan too.
+        let p = plan_with(
+            "MATCH (c:Call) MATCH (d:Device)<-[:NOPE]-(c) RETURN d",
+            &hubs(),
+        );
+        assert!(p.contains("NodeScan label=Device alias=d"), "{p}");
+    }
+
+    #[test]
     fn deanchoring_is_a_fixpoint() {
         for q in [
             "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $hubs RETURN c.ts",
             "MATCH (c:Call)-[:ON_DEVICE]->(d:Device) WHERE elementId(d) = $hub RETURN c",
             "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call)-[:TO]->(x:Contact) \
              WHERE elementId(d) IN $hubs RETURN x",
+            "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) RETURN d",
         ] {
             let parsed = crate::parse(q).unwrap();
             let once = crate::plan(&parsed, &hubs()).unwrap();
