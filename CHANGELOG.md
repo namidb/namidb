@@ -15,6 +15,81 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A label written in `WHERE` no longer scans every node.**
+  `MATCH (n:Device)` read only the `:Device` nodes, but
+  `MATCH (n) WHERE n:Device` planned a scan of every node of every label
+  (`NodeScan label=*` under `Filter(__label_eq(n, 'Device'))`), and so did
+  `n:A OR n:B` and the `(n:A|B)` pattern. On a 2.4M-node graph each of those
+  went past 6 GB of memory within half a minute; they now answer in 0.2 to
+  630 ms under 170 MB (`count` of a label from `WHERE n:Device` in 0.2 ms, as
+  from the pattern). The planner now plans them from labels:
+  - a label conjunct scopes the scan to that label. With several (`n:A:B`,
+    `n:A AND n:B`) it scans the one with the fewest nodes and keeps the others
+    as filters, as it keeps `NOT n:L` and any other predicate;
+  - a disjunction in which every branch requires a label (`n:A OR n:B`,
+    `(n:A AND n.x > 1) OR n:B`, `(n:A|B)`) becomes a `UNION ALL` of label
+    scans whose branches are disjoint (branch *i* drops the nodes an earlier
+    branch already returned), so nothing is returned twice and no
+    de-duplication state is needed;
+  - `WHERE m:L` on the far end of a single hop becomes that hop's own label
+    check, so it is proved before the neighbour is read.
+
+  It applies to any pattern variable, after `WITH` and inside `OPTIONAL
+  MATCH`. A predicate that can hold for a node without any particular label
+  (`NOT n:L` alone, `n:A OR n.x = 1`) still scans every node, since there is
+  no label to start from.
+- **`WHERE (n:A OR n:B)` and `WHERE (n:A AND n.x = 1)` parse.** A
+  parenthesised predicate that opened with a label test was taken for a
+  pattern and failed with "expected `)`, found `OR`".
+- **A hop from an id-pinned hub starts at the other end.**
+  `MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $ids` always
+  started at the pinned nodes and walked every one of their edges, checking
+  each neighbour for `:Call`. When the pinned node is a hub (here 1.7M
+  `ON_DEVICE` edges against 2,958 `:Call` nodes) it now scans `:Call`, follows
+  each call's edge to its device and keeps the pinned ones. The choice is
+  costed from the edge type's per-direction average degree and the label's
+  node count, and the scan must be at least 4x cheaper; with missing
+  statistics, an untyped hop or an unlabelled far end the pinned start stays.
+  Anchor inversion, which re-anchors a scan at an id-pinned target, asks the
+  same question, so the two rewrites never undo each other. With the two
+  fixes below, that query went from 5.8 s to 1.3 s on a 2.4M-node graph, and
+  the `WHERE elementId(d) IN $ids AND c:Call` spelling, which ran for more
+  than 150 s, takes 1.5 s.
+- **A projected scan of a small label reads each property page once.** A
+  scan that names the properties it needs (`MATCH (c:Call) RETURN c.ts`) over
+  a compacted node SST with property pages probed the pages once per
+  ~1,000-row Parquet batch, for the members of the label in that batch. A
+  label of a few thousand nodes spread over a 2.4M-row SST paid a page read
+  per member: `MATCH (c:Call) RETURN c.ts, c.duration` (2,958 rows) took
+  6.9 s, longer than returning the whole nodes, and takes 0.9 s now. The
+  members of up to 65,536 rows share one probe, and on a compacted SST with
+  no newer versions the rows outside the label are no longer kept as shadow
+  entries. A store whose node SST was written by 2.x, with the embeddings in
+  the overflow JSON, gets the same gain (9.7 s to 1.1 s); returning whole
+  nodes still costs more there (1.3 s against 0.8 s for the 2,958 `:Call`
+  nodes), since every embedding is parsed from JSON text.
+- **An Expand over many seeds reads their first hop concurrently.** Each
+  seed's adjacency read is a few dependent range reads of the edge SST, about
+  0.35 ms each on local disk and more on object storage, and seeds were read
+  one after another: 2,958 calls following one `ON_DEVICE` edge each spent
+  over a second waiting on reads. When the edge SSTs' degree histograms bound
+  every partner list by 1,024, the first hop of all seeds is now read with 16
+  reads in flight, within the operator's existing 1M-edge memo budget; a run
+  of hubs is still read one at a time. A single-hop Expand-Into (both ends
+  already bound) runs its edge probes the same way.
+
+### Added
+
+- `namidb-bench graph-shape-generate` writes a deterministic hub-shaped graph
+  (2.4M nodes by default: four `:Device` hubs, the largest holding 1.7M
+  `ON_DEVICE` edges, 2,958 `:Call` nodes, 64-float embeddings) straight into a
+  namespace, or as NDJSON that `bench/load_ndjson.py` loads through any
+  released Python package, to compare layouts written by older releases.
+  `namidb-bench graph-shape-query` times a read query against it and reports
+  the plan, rows, run times and peak RSS. See `bench/README.md`.
+
 ## [3.3.1] - 2026-11-05
 
 ### Fixed
