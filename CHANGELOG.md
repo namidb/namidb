@@ -44,6 +44,17 @@ crates.io release will establish and document that API explicitly.
     buffer still spills within its budget) and reported in a warning. A
     single node mutation larger than the flush's before-image chunk budget
     likewise forms a chunk of its own instead of failing the flush.
+- **A search index at its segment cap no longer stalls flushes until the
+  next compaction tick.** Each flush adds a delta segment to every changed
+  full-text or vector index and refuses to add one past
+  `NAMIDB_SEARCH_LSM_MAX_SEGMENTS` (8), failing with `search index '…' has 8
+  active segments … compact it before flushing another delta`. The server
+  requested a compaction after a flush only when the L0 high-water mark
+  tripped, so under a sustained load into a search-indexed label every flush
+  failed until the periodic compaction ran (up to its interval), and writes
+  queued behind the retried flush. The flush loop now requests a compaction
+  whenever a search index has enough delta segments to merge, including
+  right after a flush refused at the cap.
 
 ## [3.3.1] - 2026-11-05
 
