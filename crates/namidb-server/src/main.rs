@@ -359,8 +359,10 @@ struct Cli {
 
     /// Largest JSON body `/v0/cypher` accepts, in bytes; larger requests get
     /// HTTP 413. Each request reserves about 16x its size of working memory
-    /// before decoding, so the process memory limit still bounds what many
-    /// large requests can take together.
+    /// before decoding (16x this limit without a `Content-Length`), so the
+    /// process memory limit still bounds what many large requests can take
+    /// together. Capped so one maximum-size request reserves at most 1/4 of
+    /// `NAMIDB_MEMORY_MAX_BYTES` when that is set (never below 2 MiB).
     #[arg(
         long,
         env = "NAMIDB_HTTP_MAX_BODY_BYTES",

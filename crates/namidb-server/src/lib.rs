@@ -1056,6 +1056,65 @@ pub async fn run_with_memory_max_bytes(
     run_with_memory_limits(config, memory_max_bytes, query_memory_max_bytes).await
 }
 
+/// Build an off-lock flush (`BackgroundFlush::build`) without letting the
+/// memtable grow past `stall_bytes` meanwhile.
+///
+/// While the writer is free, writes keep committing into the memtable, which
+/// still holds every row being flushed until the install. The write stall
+/// past `stall_bytes` is only a short delay per write, so on its own nothing
+/// would bound how far a long build (a slow store, a large full-text delta)
+/// lets the memtable grow: the bound the flush used to give by holding the
+/// writer throughout. Each committed write past the flush threshold wakes
+/// `flush_notify`; on each wake the memtable is measured, and once it has
+/// reached `stall_bytes` the writer is taken and held until the build ends,
+/// so writes wait (and fail at the writer-lock timeout) exactly as they did
+/// behind the synchronous flush. The held guard is returned for the install.
+/// `stall_bytes == 0` disables the bound.
+pub(crate) async fn build_background_flush_bounded<'w>(
+    ticket: namidb_storage::BackgroundFlush,
+    writer: &'w tokio::sync::Mutex<WriterSession>,
+    flush_notify: &tokio::sync::Notify,
+    stall_bytes: usize,
+) -> (
+    namidb_storage::Result<namidb_storage::BuiltBackgroundFlush>,
+    Option<tokio::sync::MutexGuard<'w, WriterSession>>,
+) {
+    let build = ticket.build();
+    tokio::pin!(build);
+    if stall_bytes == 0 {
+        return (build.await, None);
+    }
+    let mut woken = false;
+    let outcome = loop {
+        tokio::select! {
+            built = &mut build => break (built, None),
+            () = flush_notify.notified() => {
+                woken = true;
+                // Keep the build running while the writer is acquired.
+                let guard = tokio::select! {
+                    built = &mut build => break (built, None),
+                    guard = writer.lock() => guard,
+                };
+                if guard.memtable_bytes() >= stall_bytes {
+                    tracing::debug!(
+                        memtable_bytes = guard.memtable_bytes(),
+                        stall_bytes,
+                        "memtable reached the stall threshold during an off-lock flush; \
+                         holding the writer until it installs"
+                    );
+                    break (build.await, Some(guard));
+                }
+            }
+        }
+    };
+    if woken {
+        // The wake-ups consumed here were meant for the flush loop: rows
+        // committed during the build may already be past the flush threshold.
+        flush_notify.notify_one();
+    }
+    outcome
+}
+
 /// Fraction of the process memory limit the memtable may reach before a
 /// committed write triggers a flush (1/16) or is stalled (1/8).
 const MEMTABLE_FLUSH_DIVISOR: usize = 16;
@@ -1091,6 +1150,34 @@ pub fn memtable_thresholds_within(
     )
 }
 
+/// The `/v0/cypher` body limit before 3.4: what a request without a
+/// `Content-Length` reserved before (32 MiB of projected working set), and
+/// the floor [`http_body_limit_within`] never lowers a limit below.
+const LEGACY_HTTP_CYPHER_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// Fraction of the process memory limit one maximum-size `/v0/cypher`
+/// request may reserve before its body is read (1/4).
+const HTTP_BODY_RESERVATION_DIVISOR: usize = 4;
+
+/// The `/v0/cypher` body limit a process with `memory_max_bytes` of memory
+/// (`0` = no limit) can admit.
+///
+/// Admission reserves `16 x` the body size before decoding, and a request
+/// without a `Content-Length` (a chunked upload) reserves `16 x` the LIMIT,
+/// whatever it actually sends. At the 16 MiB default that is 256 MiB per
+/// such request: in a 256 MiB container every one of them would be refused
+/// with 503, and in 1 GiB only two or three could run at once. The limit is
+/// therefore capped so one maximum-size request reserves at most a quarter of
+/// the memory limit, and never below the 2 MiB limit earlier releases had.
+pub fn http_body_limit_within(limit: usize, memory_max_bytes: usize) -> usize {
+    if memory_max_bytes == 0 {
+        return limit;
+    }
+    let fitting = (memory_max_bytes / HTTP_BODY_RESERVATION_DIVISOR)
+        .saturating_sub(HTTP_MEMORY_BASE_BYTES)
+        / HTTP_MEMORY_BYTES_PER_WIRE_BYTE;
+    limit.min(fitting.max(LEGACY_HTTP_CYPHER_BODY_LIMIT_BYTES))
+}
+
 /// Boot the server with an explicit process ceiling and per-query
 /// working-memory budget (issue #203; `0` disables the budget). The
 /// standalone binary uses this entry point for its CLI/env-parsed values.
@@ -1120,6 +1207,14 @@ pub async fn run_with_memory_limits(
     }
     if config.http_max_body_bytes == 0 {
         anyhow::bail!("NAMIDB_HTTP_MAX_BODY_BYTES must be greater than zero");
+    }
+    let http_max_body_bytes = http_body_limit_within(config.http_max_body_bytes, memory_max_bytes);
+    if http_max_body_bytes != config.http_max_body_bytes {
+        info!(
+            memory_max_bytes,
+            http_max_body_bytes, "HTTP body limit lowered to fit the process memory limit"
+        );
+        config.http_max_body_bytes = http_max_body_bytes;
     }
     // The restore point window is kept by the maintenance loop, before each
     // sweep. Without the loop nothing would keep it, and restore points
@@ -1334,6 +1429,7 @@ pub async fn run_with_memory_limits(
             group_commit_window: config.group_commit_window,
             fence_policy: config.fence_policy,
             max_concurrent_queries_per_namespace: max_concurrent_queries_per_namespace(),
+            memtable_stall_bytes: config.memtable_stall_bytes,
         };
         let registry = NamespaceRegistry::new(
             store,
@@ -1533,15 +1629,28 @@ pub async fn run_with_memory_limits(
                             Ok(None) => Ok(None),
                             Ok(Some(ticket)) => {
                                 drop(w);
-                                match ticket.build().await {
+                                let (built, held) = build_background_flush_bounded(
+                                    ticket,
+                                    &state_for_flush.writer,
+                                    &state_for_flush.flush_notify,
+                                    state_for_flush.memtable_stall_bytes,
+                                )
+                                .await;
+                                match built {
                                     Ok(built) => {
-                                        let lock_started = std::time::Instant::now();
-                                        w = state_for_flush.writer.lock().await;
-                                        state_for_flush.metrics.observe_writer_lock(
-                                            WriterLockKind::Flush,
-                                            lock_started.elapsed(),
-                                            true,
-                                        );
+                                        w = match held {
+                                            Some(held) => held,
+                                            None => {
+                                                let lock_started = std::time::Instant::now();
+                                                let w = state_for_flush.writer.lock().await;
+                                                state_for_flush.metrics.observe_writer_lock(
+                                                    WriterLockKind::Flush,
+                                                    lock_started.elapsed(),
+                                                    true,
+                                                );
+                                                w
+                                            }
+                                        };
                                         // Writes grouped while the flush was
                                         // built are answered through the group
                                         // before the install commits them.
@@ -7859,6 +7968,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn http_body_limit_fits_the_memory_limit() {
+        const MIB: usize = 1024 * 1024;
+        let default = DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES;
+        // No limit, or a large one: the configured value stands.
+        assert_eq!(http_body_limit_within(default, 0), default);
+        assert_eq!(http_body_limit_within(default, 8192 * MIB), default);
+        // A 1 GiB container (90% ceiling): one maximum-size request reserves
+        // at most a quarter of it.
+        let max = 1024 * MIB * 9 / 10;
+        let limit = http_body_limit_within(default, max);
+        assert!(limit < default && limit > 8 * MIB, "{limit}");
+        assert!(estimated_http_request_memory_bytes(limit) <= max / 4);
+        // Never below the limit earlier releases had, and never raised.
+        assert_eq!(
+            http_body_limit_within(default, 64 * MIB),
+            LEGACY_HTTP_CYPHER_BODY_LIMIT_BYTES
+        );
+        assert_eq!(http_body_limit_within(MIB, 8192 * MIB), MIB);
+    }
+
+    /// A small chunked request (no `Content-Length`) reserves 16x the body
+    /// limit. Under a modest memory limit the raw 16 MiB default refuses every
+    /// one of them; the limit derived from the memory limit admits them.
+    #[tokio::test]
+    async fn chunked_requests_are_admitted_under_a_modest_memory_limit() {
+        async fn chunked_status(limit: usize, governor: Arc<memory::MemoryGovernor>) -> StatusCode {
+            let (store, paths) = namidb_storage::parse_uri("memory://chunked-admission").unwrap();
+            let writer = WriterSession::open(store, paths).await.unwrap();
+            let state = AppState::new(writer, None, "chunked-admission".into())
+                .with_memory_governor(governor)
+                .with_http_body_limit(limit);
+            build_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v0/cypher")
+                        .header("content-type", "application/json")
+                        .body(Body::from_stream(futures::stream::once(async {
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(
+                                br#"{"query":"RETURN 1 AS n"}"#,
+                            ))
+                        })))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+        let Some(resident) = memory::MemoryGovernor::new(0).sample() else {
+            return; // no RSS source on this platform: admission is a no-op
+        };
+        // Room for well over the 2 MiB-era reservation, not for 256 MiB.
+        let max = resident + 192 * 1024 * 1024;
+        let governor = || Arc::new(memory::MemoryGovernor::new(max));
+        assert_eq!(
+            chunked_status(DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES, governor()).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the raw default reserves 256 MiB for any chunked request"
+        );
+        assert_eq!(
+            chunked_status(
+                http_body_limit_within(DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES, max),
+                governor()
+            )
+            .await,
+            StatusCode::OK
+        );
     }
 
     #[test]

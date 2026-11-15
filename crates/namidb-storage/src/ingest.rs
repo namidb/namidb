@@ -1877,21 +1877,11 @@ impl WriterSession {
         let commit_started = std::time::Instant::now();
         let next = self.build_next(base_seq, last_lsn);
 
-        // The previous commit's advisory `current.json` PUT, if it still
-        // owes one, rides in the same round trip (see
-        // `ManifestStore::cas_pointer_deferring_advisory`).
-        let (wal_result, body_result, advisory_result) = tokio::join!(
+        let (wal_result, body_result) = tokio::join!(
             self.wal_store.append_segment(&self.pending),
             self.manifest_store
                 .put_body(&self.fence, &self.current, &next),
-            self.manifest_store.publish_pending_advisory(),
         );
-        if let Err(error) = advisory_result {
-            tracing::warn!(
-                error = %error,
-                "advisory current.json PUT failed; it stays owed to the next commit"
-            );
-        }
 
         // Inspect `wal_result` by value WITHOUT `?` so an orphan-WAL
         // `Precondition` routes to the retry instead of propagating.
@@ -1900,12 +1890,29 @@ impl WriterSession {
                 let pointer = body_result?;
                 let probe = PointerCasProbe::for_manifest(&next);
                 // Two round trips, not three: the advisory for this version
-                // is published with the next commit or flush.
-                let new_current = match self
-                    .manifest_store
-                    .cas_pointer_deferring_advisory(&self.fence, &self.current, next, pointer)
-                    .await
-                {
+                // is published with the next commit or flush. The previous
+                // commit's advisory, if still owed, rides with this pointer
+                // create. It is sent only now that this commit's Create-only
+                // body landed, which proves no writer has committed past the
+                // owed version: a fenced writer never rolls `current.json`
+                // back (see `ManifestStore::publish_pending_advisory`).
+                let owed_advisory = self.manifest_store.publish_pending_advisory_unchecked();
+                let (cas_result, advisory_result) = tokio::join!(
+                    self.manifest_store.cas_pointer_deferring_advisory(
+                        &self.fence,
+                        &self.current,
+                        next,
+                        pointer
+                    ),
+                    owed_advisory,
+                );
+                if let Err(error) = advisory_result {
+                    tracing::warn!(
+                        error = %error,
+                        "advisory current.json PUT failed; it stays owed to the next commit"
+                    );
+                }
+                let new_current = match cas_result {
                     Ok(current) => current,
                     // Determinate outcomes (a competitor took the version /
                     // we are fenced) keep today's semantics.

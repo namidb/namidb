@@ -1383,9 +1383,9 @@ impl ManifestStore {
     /// advisory is only a non-LIST lower bound for
     /// [`Self::max_pointer_version`], and the forward probe advances from any
     /// older advisory to the true current. The owed PUT is sent by the next
-    /// [`Self::publish_pending_advisory`] (which `WriterSession::commit_batch`
-    /// overlaps with the next commit's WAL and body PUTs, and every flush
-    /// runs) or superseded by a newer inline write. Meanwhile the janitor
+    /// commit (overlapped with its pointer create, once its body has landed),
+    /// by [`Self::publish_pending_advisory`] (which every flush runs), or is
+    /// superseded by a newer inline write. Meanwhile the janitor
     /// keeps every pointer at or above the version `current.json` names, so
     /// a stale advisory still resolves.
     pub async fn cas_pointer_deferring_advisory(
@@ -1867,22 +1867,83 @@ impl ManifestStore {
             .is_some()
     }
 
-    /// Send the advisory `current.json` PUT a deferred commit owes, if any.
+    /// Send the advisory `current.json` PUT a deferred commit owes, if any,
+    /// unless the namespace has already moved past it.
+    ///
+    /// The owed version is only worth publishing while it is still the
+    /// newest one: a writer that was fenced (or partitioned) while it owed an
+    /// advisory must not, when it next ticks, roll `current.json` back below
+    /// versions its successor committed. The janitor keeps pointers at or
+    /// above the advisory it reads, but one it already reclaimed under a newer
+    /// advisory cannot come back, and a reader whose LIST is stale would then
+    /// find an advisory that names a missing pointer. So the PUT is sent only
+    /// when the next pointer does not exist yet; when it does, the owed
+    /// advisory is dropped (a lagging advisory is a valid lower bound, a
+    /// regressed one is not needed by anyone).
     ///
     /// A failure keeps it owed (unless a newer one was deferred meanwhile)
     /// and is returned; callers on the write path log it and carry on, since
     /// the commit it describes is already durable and discoverable.
     pub async fn publish_pending_advisory(&self) -> Result<()> {
-        let pending = self
-            .advisory
+        let Some((version, bytes)) = self.pending_advisory() else {
+            return Ok(());
+        };
+        match self
+            .store
+            .head(&self.paths.pointer_version(version.saturating_add(1)))
+            .await
+        {
+            Ok(_) => {
+                self.drop_pending_advisory(version);
+                return Ok(());
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(other) => return Err(Error::ObjectStore(other)),
+        }
+        self.write_advisory_current(version, bytes).await
+    }
+
+    /// [`Self::publish_pending_advisory`] for a caller that has just proven
+    /// the owed version is still the newest: `WriterSession::commit_batch`
+    /// sends it only after its Create-only manifest body for the next version
+    /// landed, which no writer could have done had anyone committed past it.
+    /// It then rides in the same round trip as the pointer create.
+    ///
+    /// The owed version is captured when this is CALLED, not when the
+    /// returned future is first polled, so a pointer create running beside
+    /// it can never have its own, just-deferred advisory sent here.
+    pub(crate) fn publish_pending_advisory_unchecked(
+        &self,
+    ) -> impl std::future::Future<Output = Result<()>> + '_ {
+        let pending = self.pending_advisory();
+        async move {
+            match pending {
+                Some((version, bytes)) => self.write_advisory_current(version, bytes).await,
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn pending_advisory(&self) -> Option<(u64, Bytes)> {
+        self.advisory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending
-            .clone();
-        let Some((version, bytes)) = pending else {
-            return Ok(());
-        };
-        self.write_advisory_current(version, bytes).await
+            .clone()
+    }
+
+    fn drop_pending_advisory(&self, version: u64) {
+        let mut advisory = self
+            .advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if advisory
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending == version)
+        {
+            advisory.pending = None;
+        }
     }
 }
 

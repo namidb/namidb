@@ -132,9 +132,10 @@ Types:
       b. manifest_store.put_body(fence, base, next)  (PutMode::Create)
    The WAL path is fully determined by seq, so both can fly at once —
    turning WAL + body + pointer (3 RTs) into max(WAL,body) + pointer (2).
-   c. the advisory current.json the PREVIOUS commit still owes (if any).
 3. On WAL Ok: pointer = body_result?; cas_pointer_deferring_advisory(...)
-   publishes p<v+1> and leaves this version's current.json PUT owed.
+   publishes p<v+1> and leaves this version's current.json PUT owed. The
+   advisory the PREVIOUS commit still owes (if any) is PUT alongside it: the
+   Create-only body of v+1 just landed, so v is still the newest version.
 4. Only AFTER the pointer CAS lands: drain pending_payloads into the live
    memtable, advance current/seq, refresh_published() (new Arc snapshot).
 ```
@@ -142,10 +143,15 @@ Types:
 A commit therefore waits two sequential round trips, not three. The advisory
 `current.json` is not part of the commit: the version is durable and
 discoverable once its pointer exists, and the forward probe advances from any
-older advisory. The owed PUT rides with the next commit's WAL/body PUTs, and
+older advisory. The owed PUT rides with the next commit's pointer create, and
 every flush (the periodic one included, so an idle writer settles it within one
 flush interval) publishes it; the janitor keeps every pointer at or above the
-version `current.json` names, so a lagging advisory always resolves.
+version `current.json` names, so a lagging advisory always resolves. An owed
+advisory is never sent once the namespace has moved past it (the flush path
+first checks that `p<v+1>` does not exist): a writer fenced while it owed one
+must not roll `current.json` back below a pointer the janitor already reclaimed
+under the successor's newer advisory, since an EC-LIST reader would then find
+an advisory naming a missing pointer.
 
 The periodic flush (`begin_background_flush` → `BackgroundFlush::build` →
 `install_background_flush`) holds the writer only to commit the pending batch

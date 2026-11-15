@@ -110,7 +110,16 @@ impl Session {
 
     async fn close(&self) -> PyResult<()> {
         match self {
-            Session::Writer(_) => Ok(()),
+            // The last commit's advisory `current.json` may still be owed:
+            // settle it so the next process starts from an exact lower bound.
+            // Best effort and never blocking on a running write: the commit
+            // it describes is already durable and found by the forward probe.
+            Session::Writer(w) => {
+                if let Ok(session) = w.session.try_lock() {
+                    let _ = session.manifest_store().publish_pending_advisory().await;
+                }
+                Ok(())
+            }
             Session::Reader(r) => r.lock().await.release().await.map_err(map_storage_err),
         }
     }

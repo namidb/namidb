@@ -64,6 +64,10 @@ pub struct MaintenanceConfig {
     /// Concurrent reads one namespace may run, inside the process-wide
     /// read gate. `0` (the default) means no per-namespace cap.
     pub max_concurrent_queries_per_namespace: usize,
+    /// Memtable bytes at which an off-lock flush build takes the writer back
+    /// until it installs (see `build_background_flush_bounded`). `0` (the
+    /// default) never does.
+    pub memtable_stall_bytes: usize,
 }
 
 impl Default for MaintenanceConfig {
@@ -78,6 +82,7 @@ impl Default for MaintenanceConfig {
             group_commit_window: Duration::ZERO,
             fence_policy: recovery::FencePolicy::Steal,
             max_concurrent_queries_per_namespace: 0,
+            memtable_stall_bytes: 0,
         }
     }
 }
@@ -473,6 +478,7 @@ impl NamespaceRegistry {
             let mut cancel = state.cancel_tx.subscribe();
             let interval = maint.flush_interval;
             let l0_trigger = maint.compaction_l0_trigger;
+            let memtable_stall_bytes = maint.memtable_stall_bytes;
             let ns = state.namespace.clone();
             let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
@@ -541,15 +547,28 @@ impl NamespaceRegistry {
                                 Ok(None) => Ok(None),
                                 Ok(Some(ticket)) => {
                                     drop(w);
-                                    match ticket.build().await {
+                                    let (built, held) = crate::build_background_flush_bounded(
+                                        ticket,
+                                        &s.writer,
+                                        &s.flush_notify,
+                                        memtable_stall_bytes,
+                                    )
+                                    .await;
+                                    match built {
                                         Ok(built) => {
-                                            let lock_started = Instant::now();
-                                            w = s.writer.lock().await;
-                                            metrics.observe_writer_lock(
-                                                WriterLockKind::Flush,
-                                                lock_started.elapsed(),
-                                                true,
-                                            );
+                                            w = match held {
+                                                Some(held) => held,
+                                                None => {
+                                                    let lock_started = Instant::now();
+                                                    let w = s.writer.lock().await;
+                                                    metrics.observe_writer_lock(
+                                                        WriterLockKind::Flush,
+                                                        lock_started.elapsed(),
+                                                        true,
+                                                    );
+                                                    w
+                                                }
+                                            };
                                             if s.is_retired() {
                                                 drop(w);
                                                 return;

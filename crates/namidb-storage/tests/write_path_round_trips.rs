@@ -281,6 +281,56 @@ async fn a_lagging_advisory_still_resolves_the_current_version() {
     assert_eq!(rows.len(), 3);
 }
 
+/// A writer that is fenced while it still owes an advisory must never roll
+/// `current.json` back below what its successor committed: the janitor may
+/// already have reclaimed the pointer the stale advisory would name.
+#[tokio::test]
+async fn a_fenced_writer_never_rolls_the_advisory_back() {
+    for via_commit in [false, true] {
+        let counting = CountingStore::new();
+        let store: Arc<dyn ObjectStore> = counting.clone();
+        let ns = paths(if via_commit {
+            "advisory-fenced-commit"
+        } else {
+            "advisory-fenced-flush"
+        });
+        let mut zombie = WriterSession::open(store.clone(), ns.clone())
+            .await
+            .unwrap();
+        zombie.upsert_node("Doc", NodeId::new(), &doc("z")).unwrap();
+        zombie.commit_batch().await.unwrap();
+        assert!(zombie.manifest_store().has_pending_advisory());
+
+        // A successor takes the namespace over, commits, and settles its
+        // own advisory.
+        let mut successor = WriterSession::open(store.clone(), ns.clone())
+            .await
+            .unwrap();
+        successor
+            .upsert_node("Doc", NodeId::new(), &doc("s"))
+            .unwrap();
+        successor.commit_batch().await.unwrap();
+        successor.flush(Schema::empty()).await.unwrap();
+        let settled = successor.manifest_version();
+        assert_eq!(read_advisory(successor.manifest_store()).await, settled);
+
+        // The zombie wakes up: its next commit, or its next flush tick.
+        if via_commit {
+            zombie
+                .upsert_node("Doc", NodeId::new(), &doc("z2"))
+                .unwrap();
+            assert!(zombie.commit_batch().await.is_err());
+        } else {
+            assert!(zombie.flush(Schema::empty()).await.is_err());
+        }
+        assert_eq!(
+            read_advisory(successor.manifest_store()).await,
+            settled,
+            "the fenced writer rolled current.json back (via_commit={via_commit})"
+        );
+    }
+}
+
 async fn read_advisory(manifests: &ManifestStore) -> u64 {
     let body = manifests
         .store()

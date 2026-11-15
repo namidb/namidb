@@ -30,11 +30,15 @@ crates.io release will establish and document that API explicitly.
   re-running a 500-row `MERGE` from 617 ms to 342 ms.
 - **A commit waits two object-store round trips instead of three.** The
   advisory `current.json` PUT no longer runs after the pointer is created: the
-  next commit sends it together with its WAL segment and manifest body, and
-  every flush sends it too, so an idle writer settles it within one flush
-  interval. The version is durable and found by readers as soon as its pointer
-  exists; the sweep keeps every pointer at or above the version `current.json`
-  names, so a lagging advisory still resolves.
+  next commit sends it together with its own pointer create, and every flush
+  (and the Python client's `close()`) sends it too, so an idle writer settles
+  it within one flush interval. The version is durable and found by readers as
+  soon as its pointer exists; the sweep keeps every pointer at or above the
+  version `current.json` names, so a lagging advisory still resolves. An owed
+  advisory is sent only while it is still the newest version (after the next
+  commit's Create-only manifest body landed, or when the next pointer does not
+  exist yet), so a writer fenced by a successor never rolls `current.json`
+  back below versions the successor committed.
 - **The periodic flush no longer holds the writer while it builds and uploads
   SSTs.** It takes the writer only to commit the pending batch and checkpoint
   the memtable, and again to commit the manifest that adds the new SSTs.
@@ -43,7 +47,11 @@ crates.io release will establish and document that API explicitly.
   are not rejected at the writer-lock timeout) while a large memtable is
   flushed. Rows written during the flush stay in the memtable and their WAL
   segments; a flush whose base changed meanwhile (a compaction or DDL
-  committed) is discarded and the next one runs under the writer. With a
+  committed) is discarded and the next one runs under the writer. The
+  memtable stays bounded meanwhile: once writes made during the build bring
+  it to `NAMIDB_MEMTABLE_STALL_BYTES`, the flush takes the writer back until
+  it installs, so further writes wait as they did behind the synchronous
+  flush instead of growing it by a short stall per write. With a
   full-text and a vector index on the loaded label, a document load and a
   vector load running at the same time went from 79 to 535 documents/s and
   from 5.9 to 66 vectors/s (1 GiB container, 20-40 ms per store request).
@@ -66,8 +74,11 @@ crates.io release will establish and document that API explicitly.
   bodies up to `NAMIDB_HTTP_MAX_BODY_BYTES` (`--http-max-body-bytes`, default
   16 MiB, was a fixed 2 MiB), enough for several hundred 1024-dimension
   embeddings per request. Each request still reserves about 16x its size of
-  working memory before its JSON is decoded. A larger body gets 413 with the
-  setting's name in the message.
+  working memory before its JSON is decoded, and a request without a
+  `Content-Length` reserves 16x the limit; with `NAMIDB_MEMORY_MAX_BYTES` set,
+  the limit is therefore capped so one maximum-size request reserves at most a
+  quarter of it (never below the old 2 MiB), and the server logs the value it
+  uses. A larger body gets 413 with the setting's name in the message.
 - **Faster full-text delta builds.** The external sorters of the full-text
   builders grew their buffers by one record per term occurrence, which cost a
   reallocation per token of every indexed document at flush; they now grow

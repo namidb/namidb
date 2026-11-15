@@ -115,7 +115,14 @@ impl ObjectStore for StallSstUploads {
     }
 }
 
+/// The store layer is process-wide: tests that install one run one at a time.
+static LAYER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn boot(store_uri: String) -> String {
+    boot_with_memtable(store_uri, 0, 0).await
+}
+
+async fn boot_with_memtable(store_uri: String, flush_bytes: usize, stall_bytes: usize) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
@@ -146,8 +153,8 @@ async fn boot(store_uri: String) -> String {
         compaction_l0_trigger: 0,
         write_stall_l0: 0,
         write_stall_delay: Duration::ZERO,
-        memtable_flush_bytes: 0,
-        memtable_stall_bytes: 0,
+        memtable_flush_bytes: flush_bytes,
+        memtable_stall_bytes: stall_bytes,
         // A write that has to wait for the writer this long fails with 503.
         writer_lock_timeout: Duration::from_secs(2),
         tls_cert: None,
@@ -189,6 +196,7 @@ async fn cypher(base: &str, query: &str) -> (u16, serde_json::Value) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_commit_while_a_flush_upload_is_stalled() {
+    let _serial = LAYER_LOCK.lock().await;
     let gate = Arc::new(Gate::default());
     {
         let gate = Arc::clone(&gate);
@@ -242,4 +250,82 @@ async fn writes_commit_while_a_flush_upload_is_stalled() {
     let (status, body) = cypher(&base, "MATCH (r:Row) RETURN count(r) AS n").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["rows"][0]["n"], 81);
+}
+
+/// Writes that keep committing during an off-lock flush must not grow the
+/// memtable without bound: once it reaches the stall threshold, the flush
+/// takes the writer back until it installs, so further writes wait (and fail
+/// at the writer-lock timeout) as they did behind the synchronous flush. No
+/// row is lost either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_flush_bounds_the_memtable_at_the_stall_threshold() {
+    let _serial = LAYER_LOCK.lock().await;
+    let gate = Arc::new(Gate::default());
+    {
+        let gate = Arc::clone(&gate);
+        namidb_storage::uri::set_store_layer(Some(Arc::new(move |inner| {
+            Arc::new(StallSstUploads {
+                inner,
+                gate: Arc::clone(&gate),
+            }) as Arc<dyn ObjectStore>
+        })));
+    }
+    // Every commit is past the flush threshold; the stall threshold is a few
+    // of the batches below.
+    let base = boot_with_memtable("memory://flush-off-lock-bound".to_string(), 1, 32 * 1024).await;
+    namidb_storage::uri::set_store_layer(None);
+
+    gate.hold.store(true, Ordering::SeqCst);
+    let (status, body) = cypher(&base, "UNWIND range(1, 50) AS i CREATE (:Row {i: i})").await;
+    assert_eq!(status, 200, "{body}");
+    for _ in 0..200 {
+        if gate.stalled.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        gate.stalled.load(Ordering::SeqCst) > 0,
+        "the flush never started uploading"
+    );
+
+    // Write while the upload is stuck until a write is refused.
+    let mut committed = 50u64;
+    let mut refused = false;
+    for round in 0..200 {
+        let (status, body) = cypher(
+            &base,
+            &format!(
+                "UNWIND range(1, 50) AS i \
+                 CREATE (:Row {{i: 1000 * {round} + i, pad: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'}})"
+            ),
+        )
+        .await;
+        if status == 200 {
+            committed += 50;
+        } else {
+            assert_eq!(status, 503, "{body}");
+            refused = true;
+            break;
+        }
+    }
+    assert!(
+        refused,
+        "200 writes committed while the flush was stuck: the memtable grew without bound"
+    );
+
+    gate.hold.store(false, Ordering::SeqCst);
+    gate.released.notify_waiters();
+    let mut n = serde_json::Value::Null;
+    for _ in 0..100 {
+        let (status, body) = cypher(&base, "MATCH (r:Row) RETURN count(r) AS n").await;
+        if status == 200 {
+            n = body["rows"][0]["n"].clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(n, committed, "every committed row survives the flush");
+    let (status, body) = cypher(&base, "CREATE (:Row {i: -1})").await;
+    assert_eq!(status, 200, "writes resume once the flush installs: {body}");
 }
