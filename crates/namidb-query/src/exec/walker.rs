@@ -1912,38 +1912,55 @@ pub(crate) async fn execute_expand(
     // Each adjacency read or Expand-Into probe is a few dependent range reads
     // of the edge SST; one seed after the other they add up to a
     // millisecond-scale wait per seed (2,958 seeds of a degree-1 hop took
-    // over a second). Read the first hop of every seed with bounded
-    // concurrency up front instead; see `prefetch_seed_neighbours`.
+    // over a second). Read the first hop of the seeds ahead with bounded
+    // concurrency instead, one window of input rows at a time, so the
+    // read-ahead state stays bounded by the window whatever the input size;
+    // see `prefetch_seed_neighbours` / `prefetch_exact_edges`.
     let mut exact_memo: HashMap<(NodeId, NodeId), Vec<EdgeView>> = HashMap::new();
-    if cap.is_none() && shortest == crate::plan::ShortestMode::None && rows.len() > 1 {
-        if back_reference && max == 1 {
-            exact_memo = prefetch_exact_edges(
-                &rows,
-                source,
-                target_alias,
-                &edge_types,
-                direction,
-                snapshot,
-                edge_read_mode,
-            )
-            .await?;
-        } else {
-            prefetch_seed_neighbours(
-                &rows,
-                source,
-                &edge_types,
-                direction,
-                snapshot,
-                edge_read_mode,
-                &mut neighbour_memo,
-                &mut neighbour_memo_edges,
-                NEIGHBOUR_MEMO_MAX_EDGES,
-            )
-            .await?;
-        }
-    }
+    let prefetch = cap.is_none() && shortest == crate::plan::ShortestMode::None && rows.len() > 1;
+    let exact_prefetch = prefetch && back_reference && max == 1;
+    let mut seed_prefetch = prefetch
+        && !exact_prefetch
+        && !edge_types.is_empty()
+        && persisted_degree_bound(snapshot, &edge_types, direction)
+            .is_some_and(|bound| bound <= SEED_PREFETCH_MAX_DEGREE);
+    let mut prefetched_until = 0usize;
     let mut meter = crate::exec::memory::GrowthMeter::new();
-    for row in rows {
+    let mut rows = rows;
+    for row_index in 0..rows.len() {
+        if row_index >= prefetched_until && (exact_prefetch || seed_prefetch) {
+            let window_end = row_index
+                .saturating_add(SEED_PREFETCH_WINDOW)
+                .min(rows.len());
+            let window = &rows[row_index..window_end];
+            if exact_prefetch {
+                exact_memo = prefetch_exact_edges(
+                    window,
+                    source,
+                    target_alias,
+                    &edge_types,
+                    direction,
+                    snapshot,
+                    edge_read_mode,
+                )
+                .await?;
+            } else {
+                seed_prefetch = prefetch_seed_neighbours(
+                    window,
+                    source,
+                    &edge_types,
+                    direction,
+                    snapshot,
+                    edge_read_mode,
+                    &mut neighbour_memo,
+                    &mut neighbour_memo_edges,
+                    NEIGHBOUR_MEMO_MAX_EDGES,
+                )
+                .await?;
+            }
+            prefetched_until = window_end;
+        }
+        let row = std::mem::take(&mut rows[row_index]);
         // Deadline + row-cap guards: a multi-seed (or variable-length)
         // expansion is the most expensive operator, so bound it at every
         // seed boundary and fail fast before `out` grows past the cap.
@@ -7070,13 +7087,21 @@ fn persisted_degree_bound(
     bound
 }
 
-/// Read the first-hop adjacency of every distinct seed in `rows` with
-/// [`SEED_PREFETCH_CONCURRENCY`] reads in flight, into the Expand's
-/// neighbour memo. Only when the edge statistics bound every seed's partner
-/// list by [`SEED_PREFETCH_MAX_DEGREE`], and only up to the memo's edge
-/// budget; seeds left out are read on demand by the per-row loop, exactly
-/// as without the prefetch. The memo is keyed by node alone, so a later
-/// hop reuses an entry just like the loop's own memo hits.
+/// Input rows of one Expand whose first hop is read ahead at a time. The
+/// read-ahead state (the window's distinct seeds or endpoint pairs, and the
+/// probe results of the Expand-Into form) is bounded by this, not by the
+/// operator's input size.
+const SEED_PREFETCH_WINDOW: usize = 4_096;
+
+/// Read the first-hop adjacency of every distinct seed in `rows` (one window
+/// of an Expand's input) with [`SEED_PREFETCH_CONCURRENCY`] reads in flight,
+/// into the Expand's neighbour memo. The caller only asks when the edge
+/// statistics bound every seed's partner list by
+/// [`SEED_PREFETCH_MAX_DEGREE`]. Stops at the memo's edge budget; seeds left
+/// out are read on demand by the per-row loop, exactly as without the
+/// prefetch. The memo is keyed by node alone, so a later hop reuses an entry
+/// just like the loop's own memo hits. Returns `false` once the budget is
+/// spent, so later windows do not read ahead only to discard.
 #[allow(clippy::too_many_arguments)]
 async fn prefetch_seed_neighbours(
     rows: &[Row],
@@ -7088,14 +7113,8 @@ async fn prefetch_seed_neighbours(
     memo: &mut HashMap<NodeId, Arc<Vec<EdgeView>>>,
     memo_edges: &mut usize,
     max_memo_edges: usize,
-) -> Result<(), ExecError> {
+) -> Result<bool, ExecError> {
     use futures::stream::{self, StreamExt};
-    if edge_types.is_empty()
-        || persisted_degree_bound(snapshot, edge_types, direction)
-            .is_none_or(|bound| bound > SEED_PREFETCH_MAX_DEGREE)
-    {
-        return Ok(());
-    }
     let mut seen = std::collections::HashSet::new();
     let seeds: Vec<NodeId> = rows
         .iter()
@@ -7106,7 +7125,7 @@ async fn prefetch_seed_neighbours(
         .filter(|id| !memo.contains_key(id) && seen.insert(*id))
         .collect();
     if seeds.len() < 2 {
-        return Ok(());
+        return Ok(true);
     }
     let mut reads = stream::iter(seeds)
         .map(|id| async move {
@@ -7119,18 +7138,19 @@ async fn prefetch_seed_neighbours(
         crate::exec::limits::check_deadline()?;
         let (id, edges) = read?;
         if memo_edges.saturating_add(edges.len()) > max_memo_edges {
-            break;
+            return Ok(false);
         }
         *memo_edges += edges.len();
         memo.insert(id, Arc::new(edges));
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Run the Expand-Into probe of every input row of a single-hop,
-/// back-referencing Expand with [`SEED_PREFETCH_CONCURRENCY`] probes in
-/// flight. Each probe is a point read whatever the endpoints' degrees, and
-/// returns at most one edge per type and direction, so the map stays small.
+/// Run the Expand-Into probe of every row of `rows` (one window of a
+/// single-hop, back-referencing Expand's input) with
+/// [`SEED_PREFETCH_CONCURRENCY`] probes in flight. Each probe is a point read
+/// whatever the endpoints' degrees, and returns at most one edge per type and
+/// direction, so the map holds at most a window's worth of small entries.
 async fn prefetch_exact_edges(
     rows: &[Row],
     source: &str,
