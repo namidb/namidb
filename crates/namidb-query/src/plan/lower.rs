@@ -2902,7 +2902,7 @@ fn build_eq(alias: &str, key: &str, value: Expression, span: SourceSpan) -> Expr
     }
 }
 
-fn build_label_eq(alias: &str, label: &str, span: SourceSpan) -> Expression {
+pub(crate) fn build_label_eq(alias: &str, label: &str, span: SourceSpan) -> Expression {
     // `labels(alias) STARTS WITH label`? No — semantics want label
     // membership. We encode as a pseudo-call `__label_eq(alias, "Label")`
     // and let the executor short-circuit. Future RFC may add an explicit

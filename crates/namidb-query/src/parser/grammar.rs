@@ -2392,12 +2392,43 @@ impl<'src> Parser<'src> {
             }
             Some(Token::LParen) => {
                 if self.starts_pattern_node() {
-                    let element = self.parse_pattern_element()?;
-                    let span = element.span;
-                    Ok(Expression {
-                        kind: ExpressionKind::Exists(Box::new(element)),
-                        span,
-                    })
+                    // `(n:A OR n:B)` and `(n:A AND n.x = 1)` open like a node
+                    // pattern but are parenthesised label predicates. A
+                    // pattern predicate needs at least one relationship, so
+                    // a lone node pattern — or one that does not parse —
+                    // falls back to a paren expression when that parses.
+                    let (pos, depth) = (self.pos, self.depth);
+                    let pattern = self.parse_pattern_element();
+                    if let Ok(element) = &pattern {
+                        if !element.chain.is_empty() {
+                            let element = pattern?;
+                            let span = element.span;
+                            return Ok(Expression {
+                                kind: ExpressionKind::Exists(Box::new(element)),
+                                span,
+                            });
+                        }
+                    }
+                    let (after_pattern, depth_after) = (self.pos, self.depth);
+                    self.pos = pos;
+                    self.depth = depth;
+                    self.bump();
+                    let inner = self
+                        .parse_expression()
+                        .and_then(|inner| self.expect(&Token::RParen).map(|_| inner));
+                    match (inner, pattern) {
+                        (Ok(inner), _) => Ok(inner),
+                        (Err(_), Ok(element)) => {
+                            self.pos = after_pattern;
+                            self.depth = depth_after;
+                            let span = element.span;
+                            Ok(Expression {
+                                kind: ExpressionKind::Exists(Box::new(element)),
+                                span,
+                            })
+                        }
+                        (Err(_), Err(pattern_error)) => Err(pattern_error),
+                    }
                 } else {
                     self.bump();
                     let inner = self.parse_expression()?;

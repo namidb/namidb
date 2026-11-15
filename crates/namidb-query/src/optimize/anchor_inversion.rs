@@ -41,6 +41,7 @@ use crate::cost::StatsCatalog;
 use crate::parser::RelationshipDirection;
 use crate::plan::LogicalPlan;
 
+use super::anchor_choice::{id_anchor_wins, id_rows, invert, CostHop};
 use super::unique_lookup::{extract_indexed_conjunct, extract_node_id_conjunct, id_seek};
 
 pub fn apply_anchor_inversion(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
@@ -432,13 +433,30 @@ fn try_invert(
     // An id seek is at most one row per id and proves the target exists, so
     // it anchors, labelled or not, unless a literal id list is longer than
     // the source scan it would replace.
+    // It does not anchor either when the anchor is a hub: when walking the
+    // chain from the ids touches far more rows than walking it from the
+    // scan (`anchor_choice`), the scan-side plan stays.
+    let cost_hops: Vec<CostHop<'_>> = hops
+        .iter()
+        .map(|h| CostHop {
+            edge_type: h.edge_type.as_deref(),
+            direction_from_anchor: invert(h.direction),
+        })
+        .collect();
     let id_anchor = extract_node_id_conjunct(predicate, target_alias, None).filter(|seek| {
-        match (&seek.value.kind, source_count) {
+        let short_enough = match (&seek.value.kind, source_count) {
             (crate::parser::ast::ExpressionKind::List(ids), Some(count)) if seek.many => {
                 ids.len() as u64 <= count
             }
             _ => true,
-        }
+        };
+        short_enough
+            && id_anchor_wins(
+                catalog,
+                id_rows(&seek.value, seek.many),
+                &cost_hops,
+                source_count,
+            )
     });
     let (anchor, residual) = match id_anchor {
         Some(seek) => id_seek(

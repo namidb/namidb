@@ -590,6 +590,48 @@ impl LogicalPlan {
         }
     }
 
+    /// Mutable twin of [`Self::children`], in the same order. Lets a rewrite
+    /// that only cares about a few operator shapes walk the whole tree
+    /// without restating every variant.
+    pub fn children_mut(&mut self) -> Vec<&mut LogicalPlan> {
+        match self {
+            LogicalPlan::NodeScan { .. }
+            | LogicalPlan::Empty
+            | LogicalPlan::Argument { .. }
+            | LogicalPlan::MultiwayJoin { .. }
+            | LogicalPlan::EdgeTypeCount { .. }
+            | LogicalPlan::VectorSearch { .. }
+            | LogicalPlan::CallProcedure { .. } => vec![],
+            LogicalPlan::NodeById { input, .. }
+            | LogicalPlan::NodeByPropertyValue { input, .. }
+            | LogicalPlan::NodeByPropertyTuple { input, .. }
+            | LogicalPlan::Expand { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::DiscardResult { input }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::TopN { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Unwind { input, .. }
+            | LogicalPlan::Create { input, .. }
+            | LogicalPlan::Merge { input, .. }
+            | LogicalPlan::Set { input, .. }
+            | LogicalPlan::Remove { input, .. }
+            | LogicalPlan::Delete { input, .. } => vec![input.as_mut()],
+            LogicalPlan::Union { left, right, .. } | LogicalPlan::CrossProduct { left, right } => {
+                vec![left.as_mut(), right.as_mut()]
+            }
+            LogicalPlan::HashJoin { build, probe, .. } => vec![build.as_mut(), probe.as_mut()],
+            LogicalPlan::HashSemiJoin { outer, inner, .. } => vec![outer.as_mut(), inner.as_mut()],
+            LogicalPlan::SemiApply { input, subplan, .. }
+            | LogicalPlan::Apply { input, subplan, .. }
+            | LogicalPlan::PatternList { input, subplan, .. } => {
+                vec![input.as_mut(), subplan.as_mut()]
+            }
+            LogicalPlan::Foreach { input, body, .. } => vec![input.as_mut(), body.as_mut()],
+        }
+    }
+
     /// True if `self` (or any descendant) is a write-side operator.
     /// CLI dispatch and tooling use this to decide between
     /// `execute(plan, &Snapshot, _)` and

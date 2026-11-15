@@ -26,11 +26,13 @@ use crate::parser::ast::{
 use crate::parser::SourceSpan;
 use crate::plan::logical::{CreateElement, LogicalPlan, ProjectionItem};
 
+pub mod anchor_choice;
 pub mod anchor_inversion;
 pub mod decorrelation;
 pub mod edge_count_pushdown;
 pub mod join_conversion;
 pub mod join_reorder;
+pub mod label_scan;
 pub mod multiway_join;
 pub mod normalize;
 pub mod parquet_pushdown;
@@ -69,6 +71,20 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     // projection pushdown reshape the NodeScan); downstream passes treat the
     // resulting EdgeTypeCount as an opaque leaf.
     let plan = apply_edge_count_pushdown(plan);
+    let settled = optimize_to_fixpoint(plan, catalog);
+    // A label DISJUNCTION on an unlabelled scan (`WHERE n:A OR n:B`, a
+    // `(n:A|B)` pattern) becomes a disjoint UNION ALL of label scans. Only
+    // after the first fixpoint, so anchor inversion — which understands the
+    // lowered disjunction filter and can do better still — goes first; the
+    // second fixpoint then pushes the remaining predicates into every branch.
+    let split = label_scan::split_label_disjunction(settled.clone(), catalog);
+    if split == settled {
+        return settled;
+    }
+    optimize_to_fixpoint(split, catalog)
+}
+
+fn optimize_to_fixpoint(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     let mut current = plan;
     for _ in 0..MAX_FIXPOINT_ROUNDS {
         // Indexed equality runs first. Unique properties / elementId remain
@@ -81,6 +97,11 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         // `(p:Person)-[w]->(c:Company {cid: 0})` plans like the
         // `(c {cid: 0})<-[w]-(p)` form the user could have written.
         let unique_lookup = anchor_inversion::apply_anchor_inversion(unique_lookup, catalog);
+        // The reverse: an id-anchored hop whose anchor is a hub (its average
+        // degree on that edge type dwarfs the hop target's label) starts
+        // from a scan of the target label instead. Both passes decide with
+        // `anchor_choice::id_anchor_wins`, so neither undoes the other.
+        let unique_lookup = anchor_choice::apply_hub_deanchor(unique_lookup, catalog);
         // RFC-030 (`vector-index`): collapse a flat KNN shape into a
         // VectorSearch when a backing index exists. Runs after unique_lookup so
         // point-selective filters keep their cheaper exact plan; the rewrite
@@ -88,6 +109,13 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         #[cfg(feature = "vector-index")]
         let unique_lookup = vector_search::apply_vector_search(unique_lookup, catalog);
         let pushed = normalize_filters(predicate_pushdown(unique_lookup));
+        // `WHERE n:L` on an unlabelled scan scopes the scan to `L`, and
+        // `WHERE m:L` on a plain Expand target becomes the Expand's own label
+        // check: both run where pushdown just left the predicate, so the next
+        // round's lookups and inversion see the labelled shape.
+        let pushed = label_scan::fold_expand_target_labels(label_scan::scope_label_conjunct(
+            pushed, catalog,
+        ));
         let hashed = convert_cross_to_hash(pushed, catalog);
         let decorrelated = convert_semi_apply_to_hash_semi_join(hashed, catalog);
         // RFC-016: reorder HashJoin orientations using the now-final
