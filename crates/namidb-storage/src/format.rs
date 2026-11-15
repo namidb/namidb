@@ -793,6 +793,70 @@ mod tests {
         assert_eq!(inspection.effective_format(), STORAGE_FORMAT_VERSION);
     }
 
+    /// A 2.x tombstone SST above older live rows keeps shadowing them after
+    /// its rewrite, and writes flushed between prepare and install survive
+    /// the install.
+    #[tokio::test]
+    async fn layout_migration_keeps_tombstones_and_concurrent_flushes() {
+        let (store, paths) = ns("migrate-tombstones");
+        let ids = write_store(&store, &paths, true, 2, 10).await;
+        let mut session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        {
+            // A third 2.x SST holding only tombstones for five live rows.
+            let _layout = LegacyNodeLayout::on();
+            for id in &ids[..5] {
+                session.tombstone_node("Doc", *id).unwrap();
+            }
+            session.commit_batch().await.unwrap();
+            let schema = session.snapshot().manifest().manifest.schema.clone();
+            session.flush(schema).await.unwrap();
+        }
+        let expected = docs(&session).await;
+        assert_eq!(expected.len(), 15);
+        let legacy = session.compaction_basis().legacy_node_ssts().await.unwrap();
+        assert_eq!(legacy.len(), 3);
+
+        for sst in &legacy {
+            let (prepared, _) = session
+                .compaction_basis()
+                .prepare_node_layout_migration(sst.id)
+                .await
+                .unwrap();
+            // A write lands and flushes while the rewrite waits to install.
+            session
+                .upsert_node("Doc", NodeId::new(), &doc(1000))
+                .unwrap();
+            session.commit_batch().await.unwrap();
+            let schema = session.snapshot().manifest().manifest.schema.clone();
+            session.flush(schema).await.unwrap();
+            session.install_prepared_compaction(prepared).await.unwrap();
+        }
+        assert!(session
+            .compaction_basis()
+            .legacy_node_ssts()
+            .await
+            .unwrap()
+            .is_empty());
+        let after = docs(&session).await;
+        assert_eq!(after.len(), 15 + legacy.len());
+        let old: Vec<_> = after
+            .iter()
+            .filter(|(_, props)| props.get("n") != Some(&Value::I64(1000)))
+            .cloned()
+            .collect();
+        assert_eq!(old, expected);
+        for id in &ids[..5] {
+            assert!(after.iter().all(|(row, _)| row != id), "tombstone lost");
+        }
+        drop(session);
+        let session = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        assert_eq!(docs(&session).await, after);
+    }
+
     #[tokio::test]
     async fn a_migration_step_whose_sst_was_compacted_away_is_refused() {
         let (store, paths) = ns("migrate-race");
