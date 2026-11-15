@@ -30,8 +30,12 @@ so you can diff the two backends directly.
     forward/inverse paged graph SSTs. It builds through the external-memory
     writers and queries through instrumented immutable byte ranges with
     explicit zero/sized search caches.
+  - `graph-shape-generate` / `graph-shape-query`: a hub-shaped graph for
+    planner work — see [Hub-shaped graph](#hub-shaped-graph).
 - `bench/kuzu_runner.py`: a Python harness that runs the same CSVs
   against Kuzu (via the `kuzu` PyPI package).
+- `bench/load_ndjson.py`: loads a `graph-shape-generate --ndjson-dir` graph
+  through whichever `namidb` Python package the interpreter imports.
 
 ## End-to-end workflow
 
@@ -401,6 +405,37 @@ harness additions:
 - External-dataset validation against the ann-benchmarks HDF5 corpora
   (`sift-128-euclidean`, `glove-100-angular`, `gist-960`) as the publishable
   parity follow-up; the synthetic generator stays the fast CI / iteration path.
+
+## Hub-shaped graph
+
+`graph-shape-generate` (`crates/namidb-bench/src/graph_shape.rs`) writes a
+deterministic graph that stresses where a pattern starts: 2.4M nodes, four
+`:Device` hubs with every other node attached by one `ON_DEVICE` edge (the
+largest hub holds 1.7M of them), a small `:Call` label (2,958 nodes), and the
+bulk in `:Message` / `:Contact` / `:Location`, with a 64-float `embedding` on
+messages and calls. Every size is a flag.
+
+```bash
+# Write it straight into a namespace with the current engine (~25 min,
+# ~4 GB on disk at the default size), flushing and compacting as it goes:
+cargo run --release -p namidb-bench -- graph-shape-generate \
+    --uri 'file:///data/shape?ns=shape'
+
+# Or emit NDJSON and load it with any released Python package, for example
+# to compare on-disk layouts written by an older release:
+cargo run --release -p namidb-bench -- graph-shape-generate --ndjson-dir /data/shape-json
+python -m venv /tmp/old && /tmp/old/bin/pip install 'namidb==2.6.19'
+/tmp/old/bin/python bench/load_ndjson.py /data/shape-json 'file:///data/shape-old?ns=shape'
+
+# Time one read query (read-only; `$hubs` / `$hub` are bound to the device ids):
+cargo run --release -p namidb-bench -- graph-shape-query \
+    --uri 'file:///data/shape?ns=shape' --repeat 3 \
+    --query 'MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $hubs RETURN c.ts'
+```
+
+`graph-shape-query` prints the plan, the row count, the wall time of each
+run and the process peak RSS as JSON; with `NAMIDB_PROFILE_DUMP=1` it also
+prints the per-stage profile table to stderr.
 
 ## What this bench does **not** cover yet
 

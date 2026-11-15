@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 #[cfg(feature = "vector-index")]
 mod ann_bench;
 mod dataset;
+mod graph_shape;
 mod loader;
 #[cfg(feature = "object-native")]
 mod object_native;
@@ -178,6 +179,51 @@ enum Cmd {
         #[arg(short = 'S', long, default_value_t = 42)]
         seed: u64,
     },
+    /// Write the hub-shaped graph (`graph_shape.rs`): a few `:Device` hubs,
+    /// one holding most `ON_DEVICE` edges, and a small `:Call` label. Writes
+    /// into `--uri` with the current engine, or NDJSON for
+    /// `bench/load_ndjson.py` with `--ndjson-dir`.
+    GraphShapeGenerate {
+        /// Namespace URI, e.g. `file:///data/shape?ns=shape`.
+        #[arg(long)]
+        uri: Option<String>,
+        /// Emit NDJSON here instead of writing a namespace.
+        #[arg(long)]
+        ndjson_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 2_400_000)]
+        nodes: u64,
+        #[arg(long, default_value_t = 4)]
+        hubs: u64,
+        #[arg(long, default_value_t = 1_700_000)]
+        hub_max_degree: u64,
+        #[arg(long, default_value_t = 2_958)]
+        calls: u64,
+        #[arg(long, default_value_t = 64)]
+        embedding_dim: usize,
+        #[arg(long, default_value_t = 250_000)]
+        flush_every: u64,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
+    },
+    /// Run one read query read-only against a namespace and print a JSON
+    /// report (plan, rows, wall time per run, peak RSS). `$hubs` / `$hub`
+    /// are bound to the `:Device` ids automatically.
+    GraphShapeQuery {
+        #[arg(long)]
+        uri: String,
+        #[arg(long)]
+        query: String,
+        /// Extra parameters as a JSON object.
+        #[arg(long)]
+        params: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
+        /// SST cache size; the Python client's default is 64 MiB.
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        cache_bytes: usize,
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
     /// Gate V5/FT3, incremental VG6/FT4 and paged forward/inverse graph SSTs.
     ///
     /// Corpus generation and builders are streaming. Search readers use an
@@ -266,6 +312,51 @@ async fn main() -> Result<()> {
                 "generated dataset @ scale={scale} seed={seed} into {}: {sizes:?}",
                 out.display()
             );
+        }
+        Cmd::GraphShapeGenerate {
+            uri,
+            ndjson_dir,
+            nodes,
+            hubs,
+            hub_max_degree,
+            calls,
+            embedding_dim,
+            flush_every,
+            seed,
+        } => {
+            let cfg = graph_shape::ShapeConfig {
+                nodes,
+                hubs,
+                hub_max_degree,
+                calls,
+                embedding_dim,
+                flush_every,
+                seed,
+            };
+            match (uri, ndjson_dir) {
+                (Some(uri), None) => graph_shape::write_direct(&cfg, &uri).await?,
+                (None, Some(dir)) => graph_shape::write_ndjson(&cfg, &dir)?,
+                _ => anyhow::bail!("pass exactly one of --uri or --ndjson-dir"),
+            }
+        }
+        Cmd::GraphShapeQuery {
+            uri,
+            query,
+            params,
+            repeat,
+            cache_bytes,
+            timeout_ms,
+        } => {
+            let report = graph_shape::run_query(
+                &uri,
+                &query,
+                params.as_deref(),
+                repeat,
+                cache_bytes,
+                timeout_ms,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Cmd::Run {
             scale,
