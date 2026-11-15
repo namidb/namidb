@@ -1512,6 +1512,21 @@ impl<S: AsyncReadExt + AsyncWriteExt + Unpin> Session<S> {
                                 return Err(error);
                             }
                             self.prefetched_bytes = next_bytes;
+                            // RESET and GOODBYE interrupt the running
+                            // statement (as in Neo4j): cancel it now instead
+                            // of letting it run to completion before the
+                            // queued RESET is even looked at. The statement
+                            // fails; the RESET is then replayed and returns
+                            // the session to READY.
+                            if matches!(
+                                raw_request_tag(&body.body),
+                                Some(
+                                    crate::value::struct_tag::RESET
+                                        | crate::value::struct_tag::GOODBYE
+                                )
+                            ) {
+                                cancellation.cancel();
+                            }
                             self.prefetched_messages.push_back(body);
                         }
                         Err(error) => {

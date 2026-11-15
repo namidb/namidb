@@ -26,6 +26,7 @@ pub mod ingest;
 pub mod janitor;
 pub mod local;
 pub mod manifest;
+pub mod mem_estimate;
 pub mod memtable;
 pub mod node_cache;
 pub mod parquet_loader;

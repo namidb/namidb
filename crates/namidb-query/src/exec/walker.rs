@@ -115,6 +115,10 @@ impl From<namidb_storage::Error> for ExecError {
             // mid-decode (cooperative cancellation); surface it as the
             // executor's Timeout, not a generic storage error.
             namidb_storage::Error::Timeout => ExecError::Timeout,
+            // The query's memory hook refused a storage read's rows (or a
+            // probe saw the process at its ceiling): report the figures the
+            // budget recorded.
+            namidb_storage::Error::MemoryLimit => crate::exec::memory::scoped_memory_error(),
             other => ExecError::Storage(other),
         }
     }
@@ -2115,7 +2119,13 @@ pub(crate) async fn execute_expand(
             // (2 k+ uncached lookups × 4.2 ms each in the SF1 profile).
             let mut step_neighbours: Vec<(Step, Arc<Vec<EdgeView>>)> =
                 Vec::with_capacity(frontier.len());
+            // Cooperative cancellation for the loops below that only touch
+            // memoised adjacency or already-hydrated targets (no storage
+            // read, so no storage probe): over a hub's neighbourhood they
+            // ran for seconds after a cancel.
+            let mut probe = crate::exec::limits::DeadlineProbe::new();
             for step in frontier.drain(..) {
+                probe.tick()?;
                 let neighbours: Arc<Vec<EdgeView>> = if back_reference && max == 1 {
                     Arc::new(match existing_target_id {
                         Some(target) => {
@@ -2200,6 +2210,7 @@ pub(crate) async fn execute_expand(
                     let mut edge_index = 0usize;
                     for (step, ns) in step_neighbours.iter() {
                         for edge in ns.iter() {
+                            probe.tick()?;
                             let i = edge_index;
                             edge_index += 1;
                             if i < wave_start {

@@ -4537,14 +4537,31 @@ impl<'mt> Snapshot<'mt> {
             return Ok(Vec::new());
         }
         let chunk = batch_lookup_chunk_size();
+        // The caller keeps every resolved view: charge them to the query's
+        // memory account chunk by chunk, so a lookup over a hub's whole
+        // neighbourhood stops at the limit instead of after resolving it.
+        let mut retained = crate::cancel::RetainMeter::new();
+        let mut charge = |views: &[Option<NodeView>]| -> Result<()> {
+            if retained.active() {
+                for view in views.iter().flatten() {
+                    retained.add(view.estimated_bytes())?;
+                }
+            }
+            Ok(())
+        };
         if ids.len() > chunk {
             let mut out = Vec::with_capacity(ids.len());
             for slice in ids.chunks(chunk) {
-                out.extend(self.batch_lookup_nodes_chunk(label, slice).await?);
+                crate::cancel::check()?;
+                let views = self.batch_lookup_nodes_chunk(label, slice).await?;
+                charge(&views)?;
+                out.extend(views);
             }
             return Ok(out);
         }
-        self.batch_lookup_nodes_chunk(label, ids).await
+        let views = self.batch_lookup_nodes_chunk(label, ids).await?;
+        charge(&views)?;
+        Ok(views)
     }
 
     async fn batch_lookup_nodes_chunk(
@@ -5872,8 +5889,13 @@ impl<'mt> Snapshot<'mt> {
                     .map_err(E::from)?;
                 for batch in batches {
                     let mut rows = Vec::new();
-                    consume_limited_node_batches(std::iter::once(batch), &context, &mut rows)
-                        .map_err(E::from)?;
+                    consume_limited_node_batches(
+                        std::iter::once(batch),
+                        &context,
+                        &mut rows,
+                        &mut crate::cancel::RetainMeter::disabled(),
+                    )
+                    .map_err(E::from)?;
                     for row in rows {
                         visitor(row)?;
                     }
@@ -5903,8 +5925,13 @@ impl<'mt> Snapshot<'mt> {
                 while let Some(batches) = stream.next_row_group().await.map_err(E::from)? {
                     for batch in batches {
                         let mut rows = Vec::new();
-                        consume_limited_node_batches(std::iter::once(batch), &context, &mut rows)
-                            .map_err(E::from)?;
+                        consume_limited_node_batches(
+                            std::iter::once(batch),
+                            &context,
+                            &mut rows,
+                            &mut crate::cancel::RetainMeter::disabled(),
+                        )
+                        .map_err(E::from)?;
                         for row in rows {
                             visitor(row)?;
                         }
@@ -6258,6 +6285,7 @@ impl<'mt> Snapshot<'mt> {
             projection.map(|columns| columns.iter().map(String::as_str).collect());
         let result_limit = limit.unwrap_or(usize::MAX);
         let mut out = Vec::with_capacity(result_limit.min(64));
+        let mut retained = crate::cancel::RetainMeter::new();
 
         for &idx in descriptors {
             if !node_sst_can_contain_label(&self.manifest.manifest, idx, label)
@@ -6301,6 +6329,9 @@ impl<'mt> Snapshot<'mt> {
                     if let Some(requested) = &requested_projection {
                         view.properties
                             .retain(|property, _| requested.contains(property.as_str()));
+                    }
+                    if retained.active() {
+                        retained.add(view.estimated_bytes())?;
                     }
                     out.push(view);
                     if out.len() == result_limit {
@@ -6415,6 +6446,7 @@ impl<'mt> Snapshot<'mt> {
             projection.map(|columns| columns.iter().map(String::as_str).collect());
         let result_limit = limit.unwrap_or(usize::MAX);
         let mut out = Vec::with_capacity(result_limit.min(64));
+        let mut retained = crate::cancel::RetainMeter::new();
         // Unlike the disjoint route, a candidate here can be a superseded
         // version and be skipped. Every skip widens the next batch, so a run
         // of stale postings costs a few doubling lookups, not one each. On a
@@ -6486,6 +6518,9 @@ impl<'mt> Snapshot<'mt> {
                 if let Some(requested) = &requested_projection {
                     view.properties
                         .retain(|property, _| requested.contains(property.as_str()));
+                }
+                if retained.active() {
+                    retained.add(view.estimated_bytes())?;
                 }
                 out.push(view);
                 if out.len() == result_limit {
@@ -6765,6 +6800,7 @@ impl<'mt> Snapshot<'mt> {
         let mut range_bytes = 0u64;
 
         let after_bytes = after.map(|id| *id.as_bytes());
+        let mut retained = crate::cancel::RetainMeter::new();
         for idx in descriptors {
             if label.is_some_and(|label| {
                 !node_sst_can_contain_label(&self.manifest.manifest, idx, label)
@@ -6869,6 +6905,9 @@ impl<'mt> Snapshot<'mt> {
                                         requested.contains(property.as_str())
                                     });
                                 }
+                                if retained.active() {
+                                    retained.add(view.estimated_bytes())?;
+                                }
                                 out.push(view);
                             }
                         }
@@ -6905,7 +6944,8 @@ impl<'mt> Snapshot<'mt> {
                 };
                 let reader = NodeSstReader::open(sst_label_def.clone(), body)?;
                 let batches = reader.scan_iter_after(predicates, decode_projection, after_bytes)?;
-                let work = consume_limited_node_batches(batches, &batch_context, &mut out)?;
+                let work =
+                    consume_limited_node_batches(batches, &batch_context, &mut out, &mut retained)?;
                 decoded_rows = decoded_rows.saturating_add(work.decoded_rows);
                 examined_rows = examined_rows.saturating_add(work.examined_rows);
             } else {
@@ -6939,7 +6979,12 @@ impl<'mt> Snapshot<'mt> {
                         break;
                     };
                     row_groups = row_groups.saturating_add(1);
-                    let work = consume_limited_node_batches(batches, &batch_context, &mut out)?;
+                    let work = consume_limited_node_batches(
+                        batches,
+                        &batch_context,
+                        &mut out,
+                        &mut retained,
+                    )?;
                     decoded_rows = decoded_rows.saturating_add(work.decoded_rows);
                     examined_rows = examined_rows.saturating_add(work.examined_rows);
                 }
@@ -7372,6 +7417,7 @@ impl<'mt> Snapshot<'mt> {
         let Some(reader) = self.node_property_reader(desc).await? else {
             return Ok(false);
         };
+        let mut retained = crate::cancel::RetainMeter::new();
         for chunk in rows.chunks(PROBE_BATCH) {
             crate::cancel::check()?;
             let ids = chunk
@@ -7404,6 +7450,11 @@ impl<'mt> Snapshot<'mt> {
                     return Ok(false);
                 }
                 out[*position].properties = projected_node_properties(property_row);
+                if retained.active() {
+                    retained.add(crate::mem_estimate::map_heap_bytes(
+                        &out[*position].properties,
+                    ))?;
+                }
             }
         }
         Ok(true)
@@ -7422,35 +7473,54 @@ impl<'mt> Snapshot<'mt> {
         let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
         let sst_label_def = self.label_def_for_node_sst(desc);
         let metadata = self.node_sst_metadata(desc, &absolute).await?;
-        let ordinals = rows.iter().map(|(_, ordinal)| *ordinal).collect::<Vec<_>>();
-        let batches = self
-            .decode_node_rows_by_ordinals(desc, &absolute, &sst_label_def, &metadata, &ordinals)
-            .await?;
+        // Decode a bounded run of ordinals at a time: decoding every selected
+        // row of the SST up front held all of its columns (wide values
+        // included) at once, however few of them the query could keep.
+        const DECODE_CHUNK: usize = 8192;
         let projection_set: Option<BTreeSet<&str>> =
             projection.map(|columns| columns.iter().map(String::as_str).collect());
-        let mut rows = rows.iter();
-        for batch in &batches {
+        let mut retained = crate::cancel::RetainMeter::new();
+        for chunk in rows.chunks(DECODE_CHUNK) {
             crate::cancel::check()?;
-            let id_col = batch
-                .column_by_name(COL_NODE_ID)
-                .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
-                .ok_or_else(|| Error::invariant("node_id column missing"))?;
-            for row in 0..batch.num_rows() {
-                let Some((position, _)) = rows.next() else {
-                    return Ok(false);
-                };
-                if id_col.value(row) != out[*position].id.as_bytes() {
-                    return Ok(false);
+            let ordinals = chunk
+                .iter()
+                .map(|(_, ordinal)| *ordinal)
+                .collect::<Vec<_>>();
+            let batches = self
+                .decode_node_rows_by_ordinals(desc, &absolute, &sst_label_def, &metadata, &ordinals)
+                .await?;
+            let mut rows = chunk.iter();
+            for batch in &batches {
+                crate::cancel::check()?;
+                let id_col = batch
+                    .column_by_name(COL_NODE_ID)
+                    .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                    .ok_or_else(|| Error::invariant("node_id column missing"))?;
+                for row in 0..batch.num_rows() {
+                    let Some((position, _)) = rows.next() else {
+                        return Ok(false);
+                    };
+                    if id_col.value(row) != out[*position].id.as_bytes() {
+                        return Ok(false);
+                    }
+                    out[*position].properties = decode_node_row_properties(
+                        batch,
+                        row,
+                        &sst_label_def,
+                        projection_set.as_ref(),
+                    )?;
+                    if retained.active() {
+                        retained.add(crate::mem_estimate::map_heap_bytes(
+                            &out[*position].properties,
+                        ))?;
+                    }
                 }
-                out[*position].properties = decode_node_row_properties(
-                    batch,
-                    row,
-                    &sst_label_def,
-                    projection_set.as_ref(),
-                )?;
+            }
+            if rows.next().is_some() {
+                return Ok(false);
             }
         }
-        Ok(rows.next().is_none())
+        Ok(true)
     }
 
     async fn scan_nodes_with_optional_label(
@@ -7527,6 +7597,9 @@ impl<'mt> Snapshot<'mt> {
         // contains `label` (filtered at the end).
         let mut latest: BTreeMap<NodeId, (u64, Option<NodeView>)> = BTreeMap::new();
         let label_id = label.and_then(|label| dict.id(label));
+        // Every candidate stays in `latest` until reconciliation ends, so the
+        // query's memory account hears about each one as it is kept.
+        let mut retained = crate::cancel::RetainMeter::new();
 
         // 1. Memtable rows. Keep the complete winner candidate until every
         // source has been reconciled; predicate evaluation belongs after LWW.
@@ -7543,6 +7616,10 @@ impl<'mt> Snapshot<'mt> {
                         .filter(|view| label.is_none_or(|label| view.labels.contains(label)))
                 }
             };
+            let view = drop_unless_matches(view, predicates);
+            if let Some(view) = view.as_ref().filter(|_| retained.active()) {
+                retained.add(view.estimated_bytes())?;
+            }
             update_node_winner(&mut latest, *id, entry.lsn, view);
         }
 
@@ -7554,9 +7631,16 @@ impl<'mt> Snapshot<'mt> {
             let sst_label_def = self.label_def_for_node_sst(desc);
             if let Some(projected_properties) = decode_projection {
                 if let Some(candidates) = self
-                    .try_read_projected_node_sst(desc, &sst_label_def, projected_properties, label)
+                    .try_read_projected_node_sst(
+                        desc,
+                        &sst_label_def,
+                        projected_properties,
+                        label,
+                        predicates,
+                    )
                     .await?
                 {
+                    // Already charged while they were read.
                     for (row_id, lsn, view) in candidates {
                         update_node_winner(&mut latest, row_id, lsn, view);
                     }
@@ -7577,9 +7661,14 @@ impl<'mt> Snapshot<'mt> {
             };
 
             let mut decoded_label_rows = 0;
-            for batch in
-                reader.scan_with_predicates_and_projection(reader_predicates, decode_projection)?
+            // Decode lazily, one batch at a time: collecting the whole SST
+            // first held every decoded column of it alongside the rows built
+            // from them.
+            for batch in reader
+                .scan_iter_with_predicates_and_projection(reader_predicates, decode_projection)?
             {
+                let batch = batch
+                    .map_err(|error| Error::invariant(format!("node SST scan read: {error}")))?;
                 // Cooperative cancellation (query timeout): one large SST can
                 // decode into many batches, so probe the deadline per batch.
                 crate::cancel::check()?;
@@ -7632,7 +7721,11 @@ impl<'mt> Snapshot<'mt> {
                         lsn,
                         schema_version: sv_col.value(row),
                     };
-                    update_node_winner(&mut latest, row_id, lsn, Some(view));
+                    let view = drop_unless_matches(Some(view), predicates);
+                    if let Some(view) = view.as_ref().filter(|_| retained.active()) {
+                        retained.add(view.estimated_bytes())?;
+                    }
+                    update_node_winner(&mut latest, row_id, lsn, view);
                 }
             }
             if let Some(cache) = self.cache.as_ref().filter(|_| label.is_some()) {
@@ -7739,6 +7832,7 @@ impl<'mt> Snapshot<'mt> {
     #[instrument(skip(self), fields(edge_type = edge_type))]
     pub async fn scan_edge_type(&self, edge_type: &str) -> Result<Vec<EdgeView>> {
         let mut latest: BTreeMap<(NodeId, NodeId), (u64, Option<EdgeView>)> = BTreeMap::new();
+        let mut retained = crate::cancel::RetainMeter::new();
 
         // 1. Memtable, then the writer's staged overlay (RFC-026 edge RYOW).
         for (mk, entry) in self.edge_mem_entries_for_type(edge_type) {
@@ -7766,6 +7860,9 @@ impl<'mt> Snapshot<'mt> {
                     })
                 }
             };
+            if let Some(view) = view.as_ref().filter(|_| retained.active()) {
+                retained.add(view.estimated_bytes())?;
+            }
             update_edge_winner(&mut latest, (*src, *dst), entry.lsn, view);
         }
 
@@ -7819,6 +7916,9 @@ impl<'mt> Snapshot<'mt> {
                         lsn: row.lsn,
                     })
                 };
+                if let Some(view) = view.as_ref().filter(|_| retained.active()) {
+                    retained.add(view.estimated_bytes())?;
+                }
                 update_edge_winner(&mut latest, (src, dst), row.lsn, view);
             }
         }
@@ -10346,6 +10446,7 @@ impl<'mt> Snapshot<'mt> {
         sst_label_def: &LabelDef,
         projection: &[String],
         label: Option<&str>,
+        predicates: &[ScanPredicate],
     ) -> Result<Option<Vec<ProjectedNodeCandidate>>> {
         let Some(reader) = self.node_property_reader(desc).await? else {
             return Ok(None);
@@ -10378,6 +10479,7 @@ impl<'mt> Snapshot<'mt> {
                 .min(4096),
         );
         let mut next_ordinal = 0_u64;
+        let mut retained = crate::cancel::RetainMeter::new();
         while let Some(batches) = stream.next_row_group().await? {
             for batch in batches {
                 let batch = batch.map_err(|error| {
@@ -10397,6 +10499,16 @@ impl<'mt> Snapshot<'mt> {
                 else {
                     return Ok(None);
                 };
+                // The whole SST's candidates are kept until its pages have
+                // validated: charge them to the query as they accumulate, so
+                // a wide label stops at the query's memory limit instead of
+                // after the SST is fully decoded.
+                for (_, _, view) in &mut batch_candidates {
+                    *view = drop_unless_matches(view.take(), predicates);
+                    if let Some(view) = view.as_ref().filter(|_| retained.active()) {
+                        retained.add(view.estimated_bytes())?;
+                    }
+                }
                 candidates.append(&mut batch_candidates);
                 next_ordinal = next_ordinal
                     .checked_add(batch.num_rows() as u64)
@@ -10555,6 +10667,7 @@ fn consume_limited_node_batches<I, E>(
     batches: I,
     context: &LimitedNodeBatchContext<'_>,
     out: &mut Vec<NodeView>,
+    retained: &mut crate::cancel::RetainMeter,
 ) -> Result<LimitedNodeBatchWork>
 where
     I: IntoIterator<Item = std::result::Result<RecordBatch, E>>,
@@ -10567,7 +10680,7 @@ where
         work.decoded_rows = work.decoded_rows.saturating_add(batch.num_rows());
         work.examined_rows = work
             .examined_rows
-            .saturating_add(append_limited_node_batch(&batch, context, out)?);
+            .saturating_add(append_limited_node_batch(&batch, context, out, retained)?);
         if out.len() == context.limit {
             break;
         }
@@ -10580,6 +10693,7 @@ fn append_limited_node_batch(
     batch: &RecordBatch,
     context: &LimitedNodeBatchContext<'_>,
     out: &mut Vec<NodeView>,
+    retained: &mut crate::cancel::RetainMeter,
 ) -> Result<usize> {
     let sst_label_def = context.sst_label_def;
     let desc = context.desc;
@@ -10669,6 +10783,9 @@ fn append_limited_node_batch(
         if let Some(requested) = requested_projection {
             view.properties
                 .retain(|property, _| requested.contains(property.as_str()));
+        }
+        if retained.active() {
+            retained.add(view.estimated_bytes())?;
         }
         out.push(view);
     }
@@ -10768,6 +10885,16 @@ fn decode_edge_properties(
         }
     }
     Ok(out)
+}
+
+/// A reconciled scan's candidate, reduced to a shadow (`None`) when it
+/// cannot satisfy `predicates`. Only the winning version of an id may be
+/// filtered, and a shadow keeps its LSN, so it still hides any older
+/// version exactly as the matching view would: filtering here instead of
+/// after reconciliation returns the same rows, but keeps only the rows the
+/// query can return, not every row of the label.
+fn drop_unless_matches(view: Option<NodeView>, predicates: &[ScanPredicate]) -> Option<NodeView> {
+    view.filter(|view| predicates.is_empty() || node_view_matches_predicates(view, predicates))
 }
 
 fn update_node_winner<T>(

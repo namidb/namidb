@@ -57,6 +57,39 @@ class QueryRowCapError(RuntimeError):
     """A Cypher read produced more rows than its `max_rows`."""
 
 
+class QueryCancelledError(RuntimeError):
+    """A Cypher query was cancelled through its `CancelToken`."""
+
+
+class QueryMemoryError(MemoryError):
+    """A Cypher query needed more memory than its limit allows.
+
+    `scope` is `"query"` (the per-query budget, deterministic: the same
+    query fails the same way again), `"shared"` (this client's concurrent
+    queries hold the shared pool) or `"process"` (the process reached
+    `memory_max_bytes`); the last two are transient."""
+
+    scope: str
+    required_bytes: int
+    limit_bytes: int
+
+
+class CancelToken:
+    """Cancellation handle for `Client.cypher` / `Client.acypher`.
+
+    Call `cancel()` from any thread (or a signal handler): every query
+    running with the token stops within milliseconds and raises
+    `QueryCancelledError`. A token stays cancelled once cancelled."""
+
+    def __init__(self) -> None: ...
+    def cancel(self) -> None:
+        """Stop every query running with this token. Never blocks."""
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether `cancel()` was called."""
+
+
 class NodeIter(Iterator[dict[str, Any]]):
     """Returned by [`Client.iter_label`]: one node dict per step, read
     from storage a batch at a time."""
@@ -139,6 +172,8 @@ class Client:
         spool_dir: Optional[str] = None,
         auto_sweep_min_age_secs: Optional[int] = 60,
         compaction_l0_trigger: int = 8,
+        query_memory_max_bytes: Optional[int] = None,
+        memory_max_bytes: Optional[int] = None,
     ) -> None:
         """`spool_dir` holds compaction scratch files; it defaults to
         `NAMIDB_SPOOL_DIR`, then `<root>/.namidb-spool` for `file://`
@@ -151,7 +186,28 @@ class Client:
         once a bucket holds `compaction_l0_trigger` L0 SSTs (`0`
         disables). A `read_only` client never compacts or sweeps, so
         these three options do nothing there and no spool dir is
-        created."""
+        created.
+
+        Every Cypher statement runs under two memory limits.
+        `query_memory_max_bytes` bounds one statement's working memory
+        (the rows its steps hold, sort / grouping / `collect()` / DISTINCT
+        state, the rows a scan decodes); a statement that needs more
+        raises `QueryMemoryError` instead of growing. `memory_max_bytes`
+        stops a running statement once the process's resident memory
+        reaches it, and the client's concurrent statements share 75% of
+        it. Each defaults to its environment variable
+        (`NAMIDB_QUERY_MEMORY_MAX_BYTES`, `NAMIDB_MEMORY_MAX_BYTES`, each a
+        byte count, `0` or `auto`), then to `auto`: 25% and 80% of the
+        memory available to the process (the smaller of physical memory
+        and a container limit). `0` disables a limit."""
+
+    @property
+    def query_memory_max_bytes(self) -> int:
+        """The resolved default per-query memory budget (`0` = none)."""
+
+    @property
+    def memory_max_bytes(self) -> int:
+        """The resolved process memory ceiling (`0` = none)."""
 
     def refresh(self) -> bool:
         """Move a `read_only` client to the newest committed version.
@@ -347,6 +403,8 @@ class Client:
         *,
         timeout_ms: Optional[int] = ...,
         max_rows: Optional[int] = ...,
+        max_memory_bytes: Optional[int] = ...,
+        cancel: Optional[CancelToken] = ...,
     ) -> QueryResult:
         """Run a Cypher query synchronously.
 
@@ -360,7 +418,15 @@ class Client:
         time has passed since the call, waiting for the client's lock
         included (a timed-out write is discarded).
         `max_rows` raises `QueryRowCapError` when a read produces more
-        rows than that; writes ignore it."""
+        rows than that; writes ignore it.
+
+        `max_memory_bytes` replaces the client's `query_memory_max_bytes`
+        for this call (`0` = no per-query budget); a query that needs more
+        raises `QueryMemoryError`. `cancel=CancelToken()` lets another
+        thread stop the query (`QueryCancelledError`). Ctrl-C while this
+        call waits stops the query, then raises `KeyboardInterrupt`. The
+        query runs on a worker thread of its own, so a long query never
+        holds up other queries or the calling thread's signal handling."""
 
     def acypher(
         self,
@@ -369,11 +435,15 @@ class Client:
         *,
         timeout_ms: Optional[int] = ...,
         max_rows: Optional[int] = ...,
+        max_memory_bytes: Optional[int] = ...,
+        cancel: Optional[CancelToken] = ...,
     ) -> Coroutine[Any, Any, QueryResult]:
         """Async sibling of [`Client.cypher`]. Returns a Python
         coroutine. Backed by the `pyo3-async-runtimes` tokio
         bridge; mixing sync + async calls on the same Client is
-        safe — both share the same tokio runtime."""
+        safe — both share the same tokio runtime. Cancelling the
+        awaiting task (`task.cancel()`, `asyncio.wait_for` timing out,
+        Ctrl-C under `asyncio.run`) stops the query."""
 
     # ── Diagnostics ────────────────────────────────────────────────
 

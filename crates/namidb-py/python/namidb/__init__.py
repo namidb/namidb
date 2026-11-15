@@ -9,9 +9,12 @@ alongside the extension.
 from __future__ import annotations
 
 from ._lib import (
+    CancelToken,
     Client,
     EdgeIter,
     NodeIter,
+    QueryCancelledError,
+    QueryMemoryError,
     QueryResult,
     QueryRowCapError,
     QueryTimeoutError,
@@ -19,9 +22,12 @@ from ._lib import (
 )
 
 __all__ = [
+    "CancelToken",
     "Client",
     "EdgeIter",
     "NodeIter",
+    "QueryCancelledError",
+    "QueryMemoryError",
     "QueryResult",
     "QueryRowCapError",
     "QueryTimeoutError",

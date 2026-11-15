@@ -335,7 +335,9 @@ struct Cli {
     /// stops with a 413 `query_memory_limit` (Bolt
     /// `Neo.ClientError.Statement.ResourceLimitExceeded`) instead of growing
     /// until the kernel kills the process. `auto` (the default) is 50% of
-    /// `--memory-max-bytes`, and off when that is `0`. With a memory ceiling,
+    /// `--memory-max-bytes`, or 25% of the memory available to the process
+    /// (physical memory, or a smaller cgroup limit) when that is `0`. With a
+    /// memory ceiling,
     /// all running queries together also share a pool of 75% of it, and a
     /// running query is stopped with a retryable 503 `memory_pressure` when
     /// the pool is full or the process reaches the ceiling. `0` disables the

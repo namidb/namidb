@@ -104,6 +104,71 @@ committed.
 `max_rows` fails a read once any step of the plan produces more rows than
 that. Writes ignore it.
 
+### Memory limits
+
+Every Cypher statement runs under two memory limits, so one bad query cannot
+take all of the machine's memory:
+
+```python
+import namidb
+
+client = namidb.Client(
+    "file:///data/graph",
+    query_memory_max_bytes=2 * 1024**3,  # one statement's working memory
+    memory_max_bytes=12 * 1024**3,       # the whole process's resident memory
+)
+try:
+    client.cypher("MATCH (a), (b) RETURN a, b", max_memory_bytes=512 * 1024**2)
+except namidb.QueryMemoryError as e:   # a MemoryError subclass
+    print(e.scope, e.required_bytes, e.limit_bytes)
+```
+
+| Knob | Default | What it bounds |
+|---|---|---|
+| `Client(query_memory_max_bytes=...)` / `NAMIDB_QUERY_MEMORY_MAX_BYTES` | `auto`: 25% of the memory available to the process | One statement's working memory: the rows each step holds, sort / grouping / `collect()` / DISTINCT state, and the rows a scan or lookup decodes for it, estimated conservatively as they grow. Over it the statement raises `QueryMemoryError` with `scope == "query"`; the same statement fails the same way again. |
+| `cypher(..., max_memory_bytes=...)` / `acypher(...)` | the client's `query_memory_max_bytes` | The same budget for one call. |
+| `Client(memory_max_bytes=...)` / `NAMIDB_MEMORY_MAX_BYTES` | `auto`: 80% of the memory available to the process | A running statement stops (`scope == "process"`) once the process's resident memory reaches it, and the client's concurrent statements share a pool of 75% of it (`scope == "shared"`). Both are transient: retry once memory falls. |
+
+"The memory available to the process" is physical memory, or a smaller
+container (cgroup) limit. Each knob takes a byte count, `0` (no limit) or
+`auto`; an explicit argument wins over the environment variable. Where
+memory cannot be read (outside Linux) `auto` means no limit. Statements
+stop at the limit, typically before they allocate more than a few
+megabytes past it; queries that fit are not affected.
+
+### Cancelling a query
+
+A statement can be stopped while it runs, from anywhere:
+
+```python
+import threading
+import namidb
+
+token = namidb.CancelToken()
+threading.Timer(5.0, token.cancel).start()      # from any thread
+try:
+    client.cypher("MATCH p = (a)-[*]-(b) RETURN count(p)", cancel=token)
+except namidb.QueryCancelledError:               # a RuntimeError subclass
+    ...
+```
+
+- `CancelToken.cancel()` is thread-safe, never blocks and can be called from
+  a signal handler. Every statement running with the token stops; a token
+  stays cancelled, so use a new one per statement you want to stop alone.
+- Ctrl-C (`KeyboardInterrupt`) while `cypher` waits stops the statement, then
+  raises as usual.
+- With `acypher`, cancelling the awaiting task (`task.cancel()`,
+  `asyncio.wait_for` timing out, Ctrl-C under `asyncio.run`) stops the
+  statement; `cancel=` works there too.
+- `timeout_ms` stops it the same way when the time is up
+  (`QueryTimeoutError`).
+
+The statement stops at its next cooperative check (every few thousand rows,
+inside storage reads too), typically within milliseconds, and releases its
+memory. A cancelled or timed-out write is discarded, not committed. Each
+statement runs on a worker thread of its own, so a long one never holds up
+the calling thread's signal handling or other threads' queries.
+
 ### Threads
 
 Every blocking call releases the GIL while it waits on storage, so other

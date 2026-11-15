@@ -88,7 +88,7 @@ fn disconnected_observation(
         kind,
         elapsed: started.elapsed(),
         result: Err(BackendError::Other(
-            "Bolt client disconnected while RUN was executing".into(),
+            "Bolt client disconnected or reset the session while RUN was executing".into(),
         )),
     }
 }
@@ -1044,22 +1044,30 @@ impl ServerBackend {
                     };
                 }
             };
-            let snap = owned.borrow();
             // Working-memory budget (#203). The finished rows are handed to
             // the session and streamed record by record on PULL; the budget
             // goes with them, so its shared-pool reservation keeps counting
             // the rows until the client has pulled or discarded them.
             let budget = self.state.memory.query_budget();
-            let read = namidb_query::with_query_memory(
-                budget.clone(),
-                execute_with_limits(
-                    &plan,
-                    &snap,
-                    &params,
-                    self.state.query_deadline(),
-                    self.state.query_row_cap(),
-                ),
-            );
+            // On a thread of its own, so this connection task keeps reading
+            // the socket while the query runs: a RESET, GOODBYE or EOF
+            // cancels `cancellation`, the select below drops `read`, and
+            // dropping it cancels the query mid-operator.
+            let plan = std::sync::Arc::new(plan);
+            let read = crate::isolate::run_read_isolated({
+                let plan = std::sync::Arc::clone(&plan);
+                let budget = budget.clone();
+                let deadline = self.state.query_deadline();
+                let row_cap = self.state.query_row_cap();
+                async move {
+                    let snap = owned.borrow();
+                    namidb_query::with_query_memory(
+                        budget,
+                        execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                    )
+                    .await
+                }
+            });
             tokio::pin!(read);
             let rows = tokio::select! {
                 rows = &mut read => rows,
@@ -1265,7 +1273,8 @@ impl ServerBackend {
                     writer.discard_batch();
                     *tx_staged = false;
                     Err(BackendError::Other(
-                        "Bolt client disconnected while RUN was executing".into(),
+                        "Bolt client disconnected or reset the session while RUN was executing"
+                            .into(),
                     ))
                 }
             };
@@ -1327,7 +1336,11 @@ impl ServerBackend {
             // goes with them, so its shared-pool reservation keeps counting
             // the rows until the client has pulled or discarded them.
             let budget = self.state.memory.query_budget();
-            let read = namidb_query::with_query_memory(
+            // The statement borrows the transaction, so it cannot move to a
+            // thread of its own like an auto-commit read; it hands this
+            // worker's other tasks to the rest of the runtime instead, so a
+            // long in-transaction read does not stall other connections.
+            let read = crate::isolate::run_inline_unblocking(namidb_query::with_query_memory(
                 budget.clone(),
                 execute_with_limits(
                     &plan,
@@ -1336,7 +1349,7 @@ impl ServerBackend {
                     self.state.query_deadline(),
                     self.state.query_row_cap(),
                 ),
-            );
+            ));
             tokio::pin!(read);
             let rows = tokio::select! {
                 rows = &mut read => rows,

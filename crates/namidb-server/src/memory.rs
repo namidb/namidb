@@ -32,6 +32,13 @@ pub const AUTO_QUERY_MEMORY_PERCENT: usize = 50;
 /// per-query accounting does not see: memtables, caches, flush and
 /// compaction buffers, connection state.
 pub const QUERY_MEMORY_POOL_PERCENT: usize = 75;
+/// Share of the memory available to the process (the smaller of physical
+/// memory and a finite cgroup limit) one query may use when
+/// `NAMIDB_QUERY_MEMORY_MAX_BYTES` is `auto` and no process ceiling is
+/// configured. Before this default a server without
+/// `NAMIDB_MEMORY_MAX_BYTES` had no per-query bound at all, so one query
+/// could grow until the kernel killed the process.
+pub const AUTO_QUERY_MEMORY_SYSTEM_PERCENT: usize = 25;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const SELF_CGROUP: &str = "/proc/self/cgroup";
@@ -93,13 +100,28 @@ pub fn resolve_memory_max_bytes(raw: &str) -> Result<usize, String> {
 /// Parse the per-query working-memory budget (`NAMIDB_QUERY_MEMORY_MAX_BYTES`).
 ///
 /// `auto` derives it from the process ceiling: [`AUTO_QUERY_MEMORY_PERCENT`]
-/// of `memory_max_bytes`, or disabled when that ceiling is disabled, so a
-/// server that never opted into memory limits behaves exactly as before.
-/// `0` disables the budget; any other value is an exact byte count and also
-/// applies without a process ceiling.
+/// of `memory_max_bytes`. Without a ceiling it is
+/// [`AUTO_QUERY_MEMORY_SYSTEM_PERCENT`] of the memory available to the
+/// process (physical memory, or a smaller cgroup limit), so a single query
+/// can never take the whole machine by default; it is off only where that
+/// memory cannot be read. `0` disables the budget; any other value is an
+/// exact byte count and also applies without a process ceiling.
 pub fn resolve_query_memory_max_bytes(raw: &str, memory_max_bytes: usize) -> Result<usize, String> {
+    resolve_query_memory_max_bytes_with(raw, memory_max_bytes, namidb_query::system_memory_bytes())
+}
+
+/// [`resolve_query_memory_max_bytes`] with the available memory passed in.
+pub fn resolve_query_memory_max_bytes_with(
+    raw: &str,
+    memory_max_bytes: usize,
+    system_memory_bytes: Option<usize>,
+) -> Result<usize, String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        if memory_max_bytes == 0 {
+            return Ok(system_memory_bytes
+                .map_or(0, |bytes| percent(bytes, AUTO_QUERY_MEMORY_SYSTEM_PERCENT)));
+        }
         return Ok(percent(memory_max_bytes, AUTO_QUERY_MEMORY_PERCENT));
     }
     raw.parse::<usize>().map_err(|error| {

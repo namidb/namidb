@@ -15,6 +15,75 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Python: per-query memory limits.** Every `Client.cypher` / `acypher`
+  statement now runs under a working-memory budget and a process ceiling,
+  so one bad query can no longer take all of the machine's memory. A
+  statement that needs more raises the new `namidb.QueryMemoryError` (a
+  `MemoryError` subclass with `scope`, `required_bytes` and `limit_bytes`)
+  instead of growing. `Client(query_memory_max_bytes=...)` /
+  `NAMIDB_QUERY_MEMORY_MAX_BYTES` bound one statement (default `auto`: 25% of
+  the memory available to the process, physical or cgroup), `cypher(...,
+  max_memory_bytes=...)` overrides it per call, and
+  `Client(memory_max_bytes=...)` / `NAMIDB_MEMORY_MAX_BYTES` (default `auto`:
+  80%) stops a running statement once the process's resident memory reaches
+  it, with the client's concurrent statements sharing 75% of it. `0`
+  disables a limit.
+- **Python: query cancellation.** `namidb.CancelToken` stops a running
+  statement from any thread (`cypher(..., cancel=token)` /
+  `acypher(..., cancel=token)`, then `token.cancel()`), raising the new
+  `namidb.QueryCancelledError`. Ctrl-C while `cypher` waits now stops the
+  statement and raises `KeyboardInterrupt` within milliseconds; before, it
+  was only noticed once the statement finished (94 s on a long
+  variable-length path count). Cancelling an `acypher` task
+  (`task.cancel()`, `asyncio.wait_for`) stops the statement's work too. Each
+  statement runs on a worker thread of its own.
+
+### Changed
+
+- **Server: `NAMIDB_QUERY_MEMORY_MAX_BYTES=auto` bounds queries without a
+  process ceiling.** With `NAMIDB_MEMORY_MAX_BYTES` at its default `0`,
+  `auto` used to disable the per-query budget, so one query could grow
+  until the kernel killed the process. It is now 25% of the memory
+  available to the process (physical memory, or a smaller cgroup limit);
+  with a ceiling it stays 50% of it. Set `0` for the old behaviour.
+- **Server: reads run on threads of their own.** An auto-commit read (HTTP
+  and Bolt) no longer executes on an async runtime worker, so a long or
+  CPU-heavy query cannot starve health checks and other queries: with one
+  runtime worker, a trivial query next to an endless one used to wait for
+  it, and now answers in milliseconds. A read inside a Bolt explicit
+  transaction hands its worker's other connections to the rest of the
+  runtime while it runs. Concurrency stays bounded by
+  `NAMIDB_MAX_CONCURRENT_QUERIES`.
+
+### Fixed
+
+- **A query stops when its client goes away.** An HTTP client that
+  disconnected (or the HTTP request timeout) left its read running to
+  completion; the read now stops at its next cooperative check, within
+  milliseconds. A Bolt `RESET` or `GOODBYE` sent while a statement runs
+  interrupts it, as in Neo4j: the statement fails and the session returns
+  to READY, where the `RESET` used to be read only after the statement had
+  finished.
+- **Storage reads count toward the query's memory budget.** The per-query
+  budget only saw rows once an operator returned them, so the rows a scan
+  or lookup decoded were invisible until it finished: `MATCH (n:L) RETURN
+  DISTINCT n.p`, a projected scan, or an expansion into a hub whose
+  neighbours are looked up in batches could hold the whole label in memory
+  before the budget noticed (memory grew with the data, not with the
+  budget). Scans, projected scans, batched node lookups and edge scans now
+  charge the rows they keep as they decode them, a scan with a predicate
+  keeps only the rows that can match (the last-write-wins result is
+  unchanged), and a label scan's Parquet fallback decodes a bounded run of
+  rows at a time. Every cooperative check also consults the budget, and an
+  embedded client re-samples the process's resident memory there. A
+  "query of death" suite (cartesian products, unbounded variable-length
+  paths, `collect()` / `ORDER BY` / DISTINCT / grouping over everything,
+  huge `UNWIND` and `range()`, hub expansions) asserts that each stops with
+  the memory error while the real heap stays within a few batches of the
+  budget.
+
 ## [3.3.1] - 2026-11-05
 
 ### Fixed

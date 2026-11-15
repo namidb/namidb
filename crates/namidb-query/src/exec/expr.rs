@@ -1534,6 +1534,14 @@ fn probe_interrupt(index: usize, span: SourceSpan) -> Result<(), EvalError> {
         Some(namidb_storage::cancel::Interrupt::Cancelled) => {
             Err(EvalError::interrupted(EvalErrorKind::Cancelled, span))
         }
+        Some(namidb_storage::cancel::Interrupt::MemoryLimit) => {
+            match crate::exec::memory::scoped_memory_error() {
+                crate::exec::walker::ExecError::MemoryLimit(exceeded) => Err(
+                    EvalError::interrupted(EvalErrorKind::MemoryLimit(exceeded), span),
+                ),
+                _ => Err(EvalError::interrupted(EvalErrorKind::Cancelled, span)),
+            }
+        }
     }
 }
 

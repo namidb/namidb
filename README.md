@@ -598,7 +598,7 @@ cache, and admission guarantees are specified in the
 | `NAMIDB_SEARCH_MAX_RESULT_BYTES` | `67108864` (64 MiB) | Materialised-result ceiling for legacy unbounded (`k = None`) FTS APIs. Crossing it is an explicit error, never silent truncation; finite `k` stays bounded by its heap. |
 | `NAMIDB_BM25_MAX_DOCUMENT_BYTES` | `1048576` (1 MiB) | Maximum UTF-8 bytes across one document's configured string fields in the exact BM25 fallback. Tokenization is streaming, but the unique-term map reserves a conservative 160× document allowance together with result memory; raise this and `NAMIDB_SEARCH_WORKSPACE_MAX_BYTES` together with matching process headroom. |
 | `NAMIDB_MEMORY_MAX_BYTES` | `0` (disabled); `auto` in the official Compose example | Server-only total RSS/working-set admission ceiling. An exact byte count is accepted; `auto` selects 90% of a finite cgroup limit and fails startup if no hard limit exists. A 500 ms watchdog clears reconstructible caches at 90% of the resulting rail even without incoming work; at the ceiling new Cypher receives a retryable 503/Bolt transient error until memory falls. |
-| `NAMIDB_QUERY_MEMORY_MAX_BYTES` | `auto`: 50% of `NAMIDB_MEMORY_MAX_BYTES`, off when that is `0` | Server-only working-memory budget of one running query: materialised rows plus sort, grouping, `collect()`, DISTINCT and cross-product state, estimated conservatively as they grow, plus the HTTP body's copies of the result (charged before a write commits); a Bolt result keeps its budget until it is pulled. Over budget the query fails with 413 `query_memory_limit` (Bolt `ResourceLimitExceeded`) instead of the process being OOM-killed. With a ceiling, running queries also share a pool of 75% of it and re-sample RSS as they grow; hitting either fails the query with a retryable 503 `memory_pressure`. An exact byte count works without a ceiling; `0` disables. |
+| `NAMIDB_QUERY_MEMORY_MAX_BYTES` | `auto`: 50% of `NAMIDB_MEMORY_MAX_BYTES`, or 25% of the memory available to the process (physical memory, or a smaller cgroup limit) when that is `0` | Working-memory budget of one running query: materialised rows plus sort, grouping, `collect()`, DISTINCT and cross-product state, the rows a storage scan or lookup decodes for it, estimated conservatively as they grow, plus the HTTP body's copies of the result (charged before a write commits); a Bolt result keeps its budget until it is pulled. Over budget the query fails with 413 `query_memory_limit` (Bolt `ResourceLimitExceeded`) instead of the process being OOM-killed. With a ceiling, running queries also share a pool of 75% of it and re-sample RSS as they grow; hitting either fails the query with a retryable 503 `memory_pressure`. An exact byte count works without a ceiling; `0` disables. |
 | `NAMIDB_BOLT_MEMORY_BUDGET_BYTES` | half of `NAMIDB_MEMORY_MAX_BYTES`, or `1073807360` (~1 GiB) when that governor is disabled | Process-wide admission budget shared by framed, decoded, converted and prefetched authenticated Bolt data. An incomplete frame holds `64 KiB + 2 × wire body bytes`; at its terminator a data frame must atomically upgrade to `64 KiB + 16 × wire body bytes` or fail retryably. Use smaller batches or raise this only with matching process/cgroup headroom. |
 | `NAMIDB_BOLT_PARTIAL_MESSAGE_TIMEOUT` | `120s` | Deadline from the first byte of an authenticated partial frame through framing/budget admission. `0s` disables it; a completely idle connection holds no message-memory permit and has no partial-frame deadline. |
 | `NAMIDB_CORRELATED_WRITE_CHUNK_ROWS` | `128` (hard-clamped to `1024`) | Existing-node rows point-probed and hydrated at once for a write-only `UNWIND … MATCH (n {unique_key: …}) SET …`. The request parameters remain caller-owned, while old wide node values (including embeddings) are released one bounded chunk at a time. |
@@ -728,7 +728,9 @@ configured byte ceiling. Queries that are already running are bounded by the
 per-query working-memory budget (`NAMIDB_QUERY_MEMORY_MAX_BYTES`, by default
 half of this ceiling, with a shared pool of three quarters of it for all
 running queries) and stop with a typed 413/503 rather than growing until the
-kernel kills the process. A process-wide 500 ms watchdog performs the same
+kernel kills the process. Without a ceiling the per-query budget still
+defaults to a quarter of the memory available to the process, so a single
+query can never take the whole machine. A process-wide 500 ms watchdog performs the same
 single-flight reclamation while the server is idle or a background
 flush/compaction is running; reclamation no longer waits for the next request.
 Authenticated `POST /v0/admin/flush` remains available as a pressure-relief
@@ -741,9 +743,9 @@ a cold namespace that has no live memtable to release. Flush and compaction
 can temporarily amplify memory, so this rail does not replace an OS-enforced
 container/cgroup limit or correctly-sized headroom for an already-running
 operation. The official Compose example supplies a 4 GiB hard limit and uses
-`auto`, so both safeguards are active by default there. The setting belongs to
-`namidb-server`; embedded Rust and Python
-clients do not install this admission governor.
+`auto`, so both safeguards are active by default there. The admission governor belongs to
+`namidb-server`; the embedded Python client has its own per-query limits
+(see [`crates/namidb-py/README.md`](./crates/namidb-py/README.md)).
 
 Authenticated `POST /v0/admin/compact` is the companion catch-up operation: it
 drains L0 completely and blocks until the drain has landed, rather than waiting
@@ -796,6 +798,30 @@ The server also takes durability/backpressure knobs for critical workloads:
 | `NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` (env only) | 0 (off) | In `--multi-tenant` mode, cap the concurrent reads of each namespace inside the process-wide read gate (`NAMIDB_MAX_CONCURRENT_QUERIES`), so one busy tenant cannot take every permit. |
 
 A poisoned writer, or a fenced one under the default `steal` policy, reopens itself automatically, and `/v0/health` reports `writer: degraded` (503) until it recovers. Under `--fence-policy=yield` a fenced writer does not reopen and stays degraded. Either way a rolling deploy or an accidental second replica on the same bucket drains cleanly instead of serving stale reads behind a green check.
+
+### Long and heavy queries
+
+Every read runs on a thread of its own, outside the async runtime that
+serves connections, so a long or CPU-heavy query shares the CPU with the
+others instead of pinning a runtime worker: health checks and short queries
+keep answering while it runs, and concurrency stays bounded by
+`NAMIDB_MAX_CONCURRENT_QUERIES`. A running read stops at its next
+cooperative check (every few thousand rows, inside storage decode loops
+too), typically within milliseconds, when any of these happens:
+
+- its `--query-timeout` (`NAMIDB_QUERY_TIMEOUT`) passes (HTTP 504, Bolt
+  `TransactionTimedOut`);
+- it needs more working memory than `NAMIDB_QUERY_MEMORY_MAX_BYTES`, or the
+  shared pool or process ceiling is reached (413 / retryable 503);
+- an operator cancels it with `POST /v0/admin/queries/:id/cancel`;
+- the HTTP client disconnects, or the HTTP request timeout
+  (`NAMIDB_HTTP_REQUEST_TIMEOUT`) fires;
+- the Bolt client sends `RESET` or `GOODBYE`, or closes the connection (the
+  statement fails and `RESET` returns the session to READY, as in Neo4j).
+
+A read inside a Bolt explicit transaction borrows the transaction and runs
+on its connection's worker, which hands its other connections to the rest
+of the runtime for the duration; it is stopped by the same limits.
 
 <br />
 
