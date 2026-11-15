@@ -83,6 +83,9 @@ const AUTO_PROCESS_MEMORY_PERCENT: usize = 80;
 /// Share of the process ceiling that all concurrent queries of one client
 /// may hold together.
 const QUERY_POOL_PERCENT: usize = 75;
+/// Stack size of the runtime threads Cypher statements run on: twice the
+/// usual 8 MiB main-thread stack the calling thread used to give them.
+const QUERY_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// How often a thread waiting for a query checks for Ctrl-C.
 const SIGNAL_POLL: Duration = Duration::from_millis(50);
 
@@ -491,6 +494,13 @@ impl Client {
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            // Cypher statements run on this runtime's blocking threads (so a
+            // long query never holds the caller's thread). Parsing, planning,
+            // evaluating and dropping a long left-deep expression (`a OR b OR
+            // ...`, `1 + 1 + ...`) recurses once per operand; tokio's 2 MiB
+            // default overflowed — and aborted the whole Python process —
+            // on statements the caller's own 8 MiB thread used to run.
+            .thread_stack_size(QUERY_THREAD_STACK_BYTES)
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
         let cache = SstCache::new(cache_bytes.unwrap_or(64 * 1024 * 1024));

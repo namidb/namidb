@@ -303,3 +303,27 @@ def test_a_long_query_does_not_hold_up_other_threads() -> None:
     token.cancel()
     worker.join(timeout=5)
     assert not worker.is_alive()
+
+
+def test_a_long_left_deep_expression_does_not_overflow_the_query_thread() -> None:
+    """Statements run on the client's worker threads. A left-deep chain of
+    operators (`1 + 1 + ...`, long generated `OR` lists) recurses once per
+    operand while it is planned, evaluated and dropped; on a default 2 MiB
+    worker stack 1,000 operands aborted the whole process, where the
+    calling thread used to run it. Run in a child so an overflow fails this
+    test instead of killing the test run."""
+    code = textwrap.dedent(
+        """
+        import uuid, namidb
+        c = namidb.Client(f"memory://deep-{uuid.uuid4().hex[:8]}")
+        n = 1500
+        rows = c.cypher("RETURN " + " + ".join(["1"] * n) + " AS x").rows()
+        assert rows == [{"x": n}], rows
+        print("ok")
+        """
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert child.returncode == 0, (child.returncode, child.stderr[-2000:])
+    assert child.stdout.strip() == "ok"

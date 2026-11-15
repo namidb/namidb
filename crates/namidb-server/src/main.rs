@@ -510,6 +510,12 @@ fn main() -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Statements are parsed on the runtime workers and reads execute on
+        // its blocking threads. Planning, evaluating and dropping a long
+        // left-deep expression (`1 + 1 + ...`, a generated `OR` list)
+        // recurses once per operand, and tokio's 2 MiB default stack
+        // overflowed — aborting the whole server — at about a thousand.
+        .thread_stack_size(16 * 1024 * 1024)
         .build()?;
     rt.block_on(namidb_server::run_with_memory_limits(
         config,

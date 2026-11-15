@@ -4172,10 +4172,16 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
-        let _admission = match acquire_read_admission(&plan, state.query_gate.as_ref()).await {
-            Ok(admission) => admission,
-            Err(gate) => return admission_exhausted_observation(started, gate),
-        };
+        // Shared with the isolated thread: a client that goes away releases
+        // its share at once, but the permits stay held until the query has
+        // actually stopped, so disconnect churn cannot run more reads than
+        // the admission gates allow.
+        let admission = Arc::new(
+            match acquire_read_admission(&plan, state.query_gate.as_ref()).await {
+                Ok(admission) => admission,
+                Err(gate) => return admission_exhausted_observation(started, gate),
+            },
+        );
         // Working-memory budget (#203): held until the response body is
         // built below, which charges its own copies of the result.
         let budget = state.memory.query_budget();
@@ -4187,7 +4193,9 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             let budget = budget.clone();
             let deadline = state.query_deadline();
             let row_cap = state.query_row_cap();
+            let admission = Arc::clone(&admission);
             async move {
+                let _admission = admission;
                 let snap = owned.borrow();
                 namidb_query::with_query_memory(
                     budget,
@@ -6035,10 +6043,16 @@ async fn run_cypher_multi(
         }
     } else {
         // Read path.
-        let _admission = match acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await {
-            Ok(admission) => admission,
-            Err(gate) => return admission_exhausted_observation(started, gate),
-        };
+        // Shared with the isolated thread: a client that goes away releases
+        // its share at once, but the permits stay held until the query has
+        // actually stopped, so disconnect churn cannot run more reads than
+        // the admission gates allow.
+        let admission = Arc::new(
+            match acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await {
+                Ok(admission) => admission,
+                Err(gate) => return admission_exhausted_observation(started, gate),
+            },
+        );
         // Working-memory budget (#203): held until the response body is
         // built below, which charges its own copies of the result.
         let budget = shared.memory.query_budget();
@@ -6050,7 +6064,9 @@ async fn run_cypher_multi(
             let budget = budget.clone();
             let deadline = shared.query_deadline();
             let row_cap = shared.query_row_cap();
+            let admission = Arc::clone(&admission);
             async move {
+                let _admission = admission;
                 let snap = owned.borrow();
                 namidb_query::with_query_memory(
                     budget,

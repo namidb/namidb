@@ -826,15 +826,68 @@ fn cgroup_memory_limit_bytes() -> Option<usize> {
 /// A [`MemoryProbe`] that reports the process at its ceiling once its
 /// resident set reaches `max_bytes`. `None` when the platform cannot read
 /// the resident set or `max_bytes` is zero.
+///
+/// The allocator keeps memory a finished (or stopped) query freed, and it
+/// still counts as resident: without giving it back, one query that reached
+/// the ceiling left the process above it, and every later query stopped at
+/// its first probe. So at the ceiling the probe first asks the allocator to
+/// return its free pages (at most once per [`TRIM_INTERVAL_NANOS`] across
+/// the process) and stops the query only if the process is still there.
 pub fn resident_memory_probe(max_bytes: usize) -> Option<MemoryProbe> {
     if max_bytes == 0 || process_resident_bytes().is_none() {
         return None;
     }
     Some(Arc::new(move || {
-        process_resident_bytes()
-            .filter(|resident| *resident >= max_bytes)
-            .map(|resident| (resident, max_bytes))
+        let resident = process_resident_bytes()?;
+        if resident < max_bytes {
+            return None;
+        }
+        if trim_allocator_rate_limited() {
+            let resident = process_resident_bytes()?;
+            return (resident >= max_bytes).then_some((resident, max_bytes));
+        }
+        Some((resident, max_bytes))
     }))
+}
+
+/// Minimum time between two allocator trims requested by
+/// [`resident_memory_probe`]. A trim walks the allocator's free lists, so a
+/// process that really is at its ceiling must not trim on every probe.
+const TRIM_INTERVAL_NANOS: u64 = 1_000_000_000;
+
+/// Return free allocator pages to the operating system unless another probe
+/// did so less than [`TRIM_INTERVAL_NANOS`] ago. `true` when it trimmed.
+fn trim_allocator_rate_limited() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        // Nanoseconds since `EPOCH` of the last trim, plus one (0 = never).
+        static LAST_TRIM: AtomicU64 = AtomicU64::new(0);
+        let epoch = *EPOCH.get_or_init(Instant::now);
+        let now = u64::try_from(epoch.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let last = LAST_TRIM.load(Ordering::Acquire);
+        if last != 0 && now.saturating_sub(last) < TRIM_INTERVAL_NANOS {
+            return false;
+        }
+        if LAST_TRIM
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        // SAFETY: `malloc_trim(0)` has no pointer preconditions; it only asks
+        // the process-global glibc allocator to release wholly free pages.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+        true
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
 }
 
 // ───────────────────────────── estimators ─────────────────────────────
@@ -1084,6 +1137,34 @@ pub fn estimate_rows_text_bytes(rows: &[Row]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resident_probe_reports_only_a_process_still_at_its_ceiling() {
+        // A ceiling far above this process: never reported.
+        let roomy = resident_memory_probe(usize::MAX).expect("Linux reads its resident set");
+        assert_eq!(roomy(), None);
+        // A ceiling below anything the process can trim down to: reported
+        // with the figures, trim or no trim, on every probe.
+        let tight = resident_memory_probe(1).expect("Linux reads its resident set");
+        for _ in 0..3 {
+            let (resident, max) = tight().expect("a process is always above one byte");
+            assert!(resident >= 1);
+            assert_eq!(max, 1);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn allocator_trims_are_rate_limited_across_the_process() {
+        // Whatever earlier probes did, two trims in a row never both run.
+        let first = trim_allocator_rate_limited();
+        let second = trim_allocator_rate_limited();
+        assert!(
+            !(first && second),
+            "two trims within {TRIM_INTERVAL_NANOS} ns"
+        );
+    }
 
     fn int_row(i: i64) -> Row {
         Row::new()

@@ -83,6 +83,23 @@ crates.io release will establish and document that API explicitly.
   huge `UNWIND` and `range()`, hub expansions) asserts that each stops with
   the memory error while the real heap stays within a few batches of the
   budget.
+- **Python: a long expression no longer aborts the process.** Statements
+  now run on the client's worker threads, whose default 2 MiB stack
+  overflowed on a left-deep chain of about a thousand operands (`1 + 1 +
+  ...`, a generated `OR` list) that the calling thread used to run. Those
+  threads now get 16 MiB, as do the server's runtime threads, where the
+  same statement could abort the whole server.
+- **Python: the process ceiling no longer wedges a client.** Memory a
+  finished or stopped statement freed stays resident until the allocator
+  returns it, so after one statement reached `memory_max_bytes` every later
+  statement stopped at its first check. The probe now asks the allocator to
+  return free pages (at most once a second) before deciding the process is
+  still at its ceiling.
+- **Server: an abandoned read keeps its admission slot until it stops.** A
+  read whose client disconnected released `NAMIDB_MAX_CONCURRENT_QUERIES`
+  (and the namespace and scan gates) at once while its thread ran on to the
+  next cooperative check, so clients that disconnected over and over could
+  keep more reads running than the gates allow.
 
 ## [3.3.1] - 2026-11-05
 

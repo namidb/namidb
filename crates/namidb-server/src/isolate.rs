@@ -140,6 +140,34 @@ mod tests {
         assert!(flag.load(Ordering::Relaxed));
     }
 
+    // What the read owns (the call sites move their admission permits in)
+    // stays held until the work has really stopped, not only until the
+    // caller gave up: otherwise clients that disconnect over and over could
+    // keep more reads running than the admission gates allow.
+    #[tokio::test(flavor = "current_thread")]
+    async fn what_the_read_owns_outlives_an_abandoned_caller() {
+        let permit = Arc::new(());
+        let held = Arc::clone(&permit);
+        let read = run_read_isolated(async move {
+            let _held = held;
+            spin_until_cancelled().await;
+            // A stretch without a cooperative check after the cancel.
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let outcome = tokio::time::timeout(Duration::from_millis(100), read).await;
+        assert!(outcome.is_err(), "the read finished on its own");
+        assert_eq!(
+            Arc::strong_count(&permit),
+            2,
+            "released before the read stopped"
+        );
+        let started = Instant::now();
+        while Arc::strong_count(&permit) > 1 {
+            assert!(started.elapsed() < Duration::from_secs(5), "never released");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn the_output_comes_back() {
         assert_eq!(run_read_isolated(async { 42 }).await, 42);

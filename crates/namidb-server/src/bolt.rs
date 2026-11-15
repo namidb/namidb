@@ -1032,7 +1032,9 @@ impl ServerBackend {
                     return disconnected_observation(started, Some(QueryKind::Read));
                 }
             };
-            let _admission = match admission {
+            // Shared with the isolated thread, so a RESET or a disconnect
+            // releases the gates only once the query has really stopped.
+            let admission = std::sync::Arc::new(match admission {
                 Ok(admission) => admission,
                 Err(gate) => {
                     return RunObservation {
@@ -1043,7 +1045,7 @@ impl ServerBackend {
                         ))),
                     };
                 }
-            };
+            });
             // Working-memory budget (#203). The finished rows are handed to
             // the session and streamed record by record on PULL; the budget
             // goes with them, so its shared-pool reservation keeps counting
@@ -1059,7 +1061,9 @@ impl ServerBackend {
                 let budget = budget.clone();
                 let deadline = self.state.query_deadline();
                 let row_cap = self.state.query_row_cap();
+                let admission = std::sync::Arc::clone(&admission);
                 async move {
+                    let _admission = admission;
                     let snap = owned.borrow();
                     namidb_query::with_query_memory(
                         budget,
