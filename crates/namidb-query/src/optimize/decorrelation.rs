@@ -172,6 +172,27 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
         LogicalPlan::Apply { input, .. } => {
             collect_outer_labels(input, out);
         }
+        // Each branch binds the union's aliases with its own operators, so an
+        // alias's label holds for every row only when both branches agree on
+        // it. A label disjunction `WHERE n:A OR n:B` plans as a union of an
+        // `A` scan and a `B` scan: neither label covers all of `n`, and an
+        // inner side scanning just one of them would drop the other's rows.
+        LogicalPlan::Union { left, right, .. } => {
+            let mut left_labels = BTreeMap::new();
+            let mut right_labels = BTreeMap::new();
+            collect_outer_labels(left, &mut left_labels);
+            collect_outer_labels(right, &mut right_labels);
+            for (alias, label) in left_labels {
+                let agreed = match right_labels.remove(&alias) {
+                    Some(other) if other == label => label,
+                    _ => None,
+                };
+                out.insert(alias, agreed);
+            }
+            for alias in right_labels.into_keys() {
+                out.insert(alias, None);
+            }
+        }
         _ => {
             for c in plan.children() {
                 collect_outer_labels(c, out);
@@ -783,6 +804,34 @@ mod tests {
         );
         let out = convert_semi_apply_to_hash_semi_join(plan, &catalog());
         assert!(matches!(out, LogicalPlan::SemiApply { .. }));
+    }
+
+    #[test]
+    fn union_of_different_labels_keeps_the_semi_apply() {
+        // `WHERE (a:Person OR a:Robot) AND (a)-[:KNOWS]->()`: the outer binds
+        // `a` from a Person scan in one branch and a Robot scan in the other.
+        // An inner side scanning either label alone would drop the other
+        // branch's rows from the join, so the correlated form stays.
+        let outer = LogicalPlan::Union {
+            left: Box::new(scan("Person", "a")),
+            right: Box::new(scan("Robot", "a")),
+            all: true,
+        };
+        let plan = semi_apply(outer, expand(argument(&["a"]), "a", "KNOWS", "b"), false);
+        let out = convert_semi_apply_to_hash_semi_join(plan, &catalog());
+        assert!(matches!(out, LogicalPlan::SemiApply { .. }), "{out:?}");
+    }
+
+    #[test]
+    fn union_whose_branches_agree_on_the_label_still_converts() {
+        let outer = LogicalPlan::Union {
+            left: Box::new(scan("Person", "a")),
+            right: Box::new(scan("Person", "a")),
+            all: true,
+        };
+        let plan = semi_apply(outer, expand(argument(&["a"]), "a", "KNOWS", "b"), false);
+        let out = convert_semi_apply_to_hash_semi_join(plan, &catalog());
+        assert!(matches!(out, LogicalPlan::HashSemiJoin { .. }), "{out:?}");
     }
 
     #[test]

@@ -7553,8 +7553,17 @@ impl<'mt> Snapshot<'mt> {
             let desc = &self.manifest.manifest.ssts[idx];
             let sst_label_def = self.label_def_for_node_sst(desc);
             if let Some(projected_properties) = decode_projection {
+                // With one physical version per id and no node memtable rows,
+                // a row outside `label` (or a tombstone) cannot hide another
+                // version of its id, so it needs no shadow entry.
                 if let Some(candidates) = self
-                    .try_read_projected_node_sst(desc, &sst_label_def, projected_properties, label)
+                    .try_read_projected_node_sst(
+                        desc,
+                        &sst_label_def,
+                        projected_properties,
+                        label,
+                        !can_prune_before_lww,
+                    )
                     .await?
                 {
                     for (row_id, lsn, view) in candidates {
@@ -10340,12 +10349,21 @@ impl<'mt> Snapshot<'mt> {
     /// fetched. The complete per-SST result is retained until every requested
     /// page has validated, so an optional-sidecar failure can restart from
     /// Parquet without exposing a partial answer.
+    ///
+    /// The wanted rows of many record batches share one property-page probe
+    /// (up to [`PROJECTED_PROBE_ROWS`] ids): probing per batch re-read the
+    /// same pages for every ~1k-row batch, which for a small label spread
+    /// over a large SST cost a page read per member. `keep_shadows: false`
+    /// (only sound when no other version of any id exists elsewhere) leaves
+    /// tombstones and rows outside `label` out of the result instead of
+    /// returning them as LWW shadows.
     async fn try_read_projected_node_sst(
         &self,
         desc: &SstDescriptor,
         sst_label_def: &LabelDef,
         projection: &[String],
         label: Option<&str>,
+        keep_shadows: bool,
     ) -> Result<Option<Vec<ProjectedNodeCandidate>>> {
         let Some(reader) = self.node_property_reader(desc).await? else {
             return Ok(None);
@@ -10372,11 +10390,15 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
+        let dict = &self.manifest.manifest.label_dict;
+        let label_id = label.and_then(|label| dict.id(label));
+        let probe_rows = PROJECTED_PROBE_ROWS.min(reader.max_query_rows()).max(1);
         let mut candidates = Vec::with_capacity(
             usize::try_from(desc.row_count)
                 .unwrap_or(usize::MAX)
                 .min(4096),
         );
+        let mut pending: Vec<PendingProjectedRow> = Vec::new();
         let mut next_ordinal = 0_u64;
         while let Some(batches) = stream.next_row_group().await? {
             for batch in batches {
@@ -10384,26 +10406,79 @@ impl<'mt> Snapshot<'mt> {
                     Error::invariant(format!("projected Parquet scan read: {error}"))
                 })?;
                 crate::cancel::check()?;
-                let Some(mut batch_candidates) = self
-                    .project_node_property_batch(
-                        reader.as_ref(),
-                        desc,
-                        projection,
-                        &batch,
-                        next_ordinal,
-                        label,
-                    )
-                    .await?
-                else {
-                    return Ok(None);
-                };
-                candidates.append(&mut batch_candidates);
+                let id_col = batch
+                    .column_by_name(COL_NODE_ID)
+                    .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                    .ok_or_else(|| Error::invariant("node_id column missing"))?;
+                let tomb_col = batch
+                    .column_by_name(COL_TOMBSTONE)
+                    .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+                    .ok_or_else(|| Error::invariant("tombstone column missing"))?;
+                let lsn_col = batch
+                    .column_by_name(COL_LSN)
+                    .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or_else(|| Error::invariant("lsn column missing"))?;
+                let schema_version_col = batch
+                    .column_by_name(SCHEMA_VERSION)
+                    .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or_else(|| Error::invariant("__schema_version column missing"))?;
+                for row in 0..batch.num_rows() {
+                    let id: [u8; 16] = id_col
+                        .value(row)
+                        .try_into()
+                        .map_err(|_| Error::invariant("node_id row length != 16"))?;
+                    let lsn = lsn_col.value(row);
+                    // Only live rows that carry `label` need property pages.
+                    let wanted = !tomb_col.value(row)
+                        && label.is_none_or(|label| {
+                            row_carries_label(&batch, row, label, label_id, dict, &desc.scope)
+                        });
+                    if !wanted {
+                        if keep_shadows {
+                            candidates.push((NodeId::from_uuid(Uuid::from_bytes(id)), lsn, None));
+                        }
+                        continue;
+                    }
+                    pending.push(PendingProjectedRow {
+                        id,
+                        ordinal: next_ordinal
+                            .checked_add(row as u64)
+                            .ok_or_else(|| Error::invariant("node property ordinal exceeds u64"))?,
+                        lsn,
+                        schema_version: schema_version_col.value(row),
+                        labels: decode_node_labels(&batch, row, dict, &desc.scope),
+                    });
+                }
                 next_ordinal = next_ordinal
                     .checked_add(batch.num_rows() as u64)
                     .ok_or_else(|| Error::invariant("node property ordinal exceeds u64"))?;
+                if pending.len() >= probe_rows {
+                    let rows = std::mem::take(&mut pending);
+                    if !self
+                        .project_pending_rows(
+                            &reader,
+                            desc,
+                            projection,
+                            label,
+                            rows,
+                            &mut candidates,
+                        )
+                        .await?
+                    {
+                        return Ok(None);
+                    }
+                }
             }
         }
-        if next_ordinal != desc.row_count || candidates.len() as u64 != desc.row_count {
+        if !self
+            .project_pending_rows(&reader, desc, projection, label, pending, &mut candidates)
+            .await?
+        {
+            return Ok(None);
+        }
+        if next_ordinal != desc.row_count
+            || (keep_shadows && candidates.len() as u64 != desc.row_count)
+        {
             tracing::warn!(
                 sst_id = %desc.id,
                 expected = desc.row_count,
@@ -10413,6 +10488,69 @@ impl<'mt> Snapshot<'mt> {
             return Ok(None);
         }
         Ok(Some(candidates))
+    }
+
+    /// Probe the property pages for `rows` (in physical order) in one call
+    /// and append their views to `out`. `false` when the pages disagree with
+    /// the Parquet rows, so the caller falls back to Parquet.
+    async fn project_pending_rows(
+        &self,
+        reader: &NodePropertyPageReader,
+        desc: &SstDescriptor,
+        projection: &[String],
+        label: Option<&str>,
+        rows: Vec<PendingProjectedRow>,
+        out: &mut Vec<ProjectedNodeCandidate>,
+    ) -> Result<bool> {
+        if rows.is_empty() {
+            return Ok(true);
+        }
+        let ids: Vec<[u8; 16]> = rows.iter().map(|row| row.id).collect();
+        let projected = match reader.project_node_ids(projection, &ids).await {
+            Ok((projected, _)) => projected,
+            Err(error) if optional_accelerator_fallback(&error) => {
+                tracing::warn!(
+                    sst_id = %desc.id,
+                    %error,
+                    "node property page probe failed; using exact Parquet fallback"
+                );
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(cache) = self.cache.as_ref().filter(|_| label.is_some()) {
+            cache.record_label_selected_node_rows(projected.len());
+        }
+        if projected.len() != rows.len() {
+            return Ok(false);
+        }
+        out.reserve(rows.len());
+        for (row, property_row) in rows.into_iter().zip(&projected) {
+            if property_row.node_id != row.id
+                || property_row
+                    .ordinal
+                    .is_some_and(|found| found != row.ordinal)
+            {
+                tracing::warn!(
+                    sst_id = %desc.id,
+                    "node property row binding mismatch; using exact Parquet fallback"
+                );
+                return Ok(false);
+            }
+            let node_id = NodeId::from_uuid(Uuid::from_bytes(row.id));
+            out.push((
+                node_id,
+                row.lsn,
+                Some(NodeView {
+                    id: node_id,
+                    labels: row.labels,
+                    properties: projected_node_properties(property_row),
+                    lsn: row.lsn,
+                    schema_version: row.schema_version,
+                }),
+            ));
+        }
+        Ok(true)
     }
 
     /// Open one immutable UUID sidecar through the shared generation-pinned
@@ -10525,6 +10663,21 @@ struct LimitedNodeBatchContext<'a> {
 }
 
 type ProjectedNodeCandidate = (NodeId, u64, Option<NodeView>);
+
+/// NodeIds one projected structural scan sends to the property pages at a
+/// time. Large enough that a small label spread over a large SST probes each
+/// page once, small enough to bound the buffered rows.
+const PROJECTED_PROBE_ROWS: usize = 65_536;
+
+/// A live row of a projected structural scan whose properties are still to
+/// be read from the property pages.
+struct PendingProjectedRow {
+    id: [u8; 16],
+    ordinal: u64,
+    lsn: u64,
+    schema_version: u64,
+    labels: BTreeSet<String>,
+}
 
 /// Phase-1 winner of a two-phase label scan: the structural view, plus the
 /// `(sst index, physical ordinal)` its properties live at. Memtable rows carry
@@ -16657,6 +16810,122 @@ mod tests {
                 assert_eq!(rows[1].properties["name"], Value::Str("renamed".into()));
             }
             assert_eq!(cache.metadata_inserts(), 0, "{projection:?}");
+        }
+    }
+
+    /// A projected scan of a small label over a compacted (disjoint) node SST
+    /// with property pages: the structural pass probes the pages for every
+    /// member in one call and keeps no shadow per non-member, and still
+    /// returns exactly the rows of the unprojected scan. With node rows in
+    /// the memtable the shadows come back and a relabel still hides the
+    /// older version.
+    #[tokio::test]
+    async fn small_label_projected_scan_over_a_compacted_sst_matches_the_full_scan() {
+        let store = make_store();
+        let paths = make_paths("small-label-projected-disjoint");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let mut base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        base.manifest.label_dict.intern("Device");
+        base.manifest.label_dict.intern("Other");
+        let fence = WriterFence::new(base.manifest.epoch);
+        let schema = SchemaBuilder::new().label(device_label()).unwrap().build();
+        let upsert = |name: &str, labels: Vec<u32>| MemOp::Upsert(labelled_payload(name, labels));
+        // 6,000 rows over several record batches; every 300th is a Device.
+        let rows = (0..6000_u16)
+            .map(|i| {
+                let label = if i % 300 == 0 { DEVICE } else { OTHER };
+                (
+                    spread_node_id(i),
+                    u64::from(i) + 1,
+                    upsert(&format!("n{i}"), vec![label]),
+                )
+            })
+            .collect();
+        let first = flush_batch(&ms, &fence, &base, &schema, rows).await;
+        let second = flush_batch(
+            &ms,
+            &fence,
+            &first,
+            &schema,
+            vec![
+                (spread_node_id(300), 7000, upsert("renamed", vec![DEVICE])),
+                (spread_node_id(600), 7001, MemOp::Tombstone),
+                (
+                    spread_node_id(601),
+                    7002,
+                    upsert("joined", vec![DEVICE, OTHER]),
+                ),
+            ],
+        )
+        .await;
+        let compacted = crate::compact::compact_l0_to_l1(&ms, &fence, &second, &schema)
+            .await
+            .unwrap()
+            .committed;
+        assert_eq!(compacted.index.node_descriptors().len(), 1);
+        assert!(compacted.manifest.ssts.iter().all(|desc| {
+            crate::manifest::node_property_pages_sidecar(desc).is_some()
+                || desc.kind != SstKind::Nodes
+        }));
+
+        let mut live = Memtable::new();
+        live.apply(
+            MemKey::Node {
+                id: spread_node_id(900),
+            },
+            8000,
+            upsert("moved", vec![OTHER]),
+        );
+        let empty = Memtable::new();
+        for (memtable, disjoint) in [(&empty, true), (&live, false)] {
+            let view = memtable.snapshot_view();
+            for ranged in [true, false] {
+                let cache = SstCache::new(16 * 1024 * 1024);
+                let snap = Snapshot::new(compacted.clone(), &view, store.clone(), paths.clone())
+                    .with_ranged_reads(ranged)
+                    .with_cache(cache.clone());
+                assert_eq!(snap.disjoint_node_descriptors().is_some(), disjoint);
+                let full = snap
+                    .scan_label_with_predicates_and_projection("Device", &[], None)
+                    .await
+                    .unwrap();
+                let projected = snap
+                    .scan_label_with_predicates_and_projection(
+                        "Device",
+                        &[],
+                        Some(&["name".to_string()]),
+                    )
+                    .await
+                    .unwrap();
+                let mut expected: Vec<u16> = (0..6000).step_by(300).collect();
+                expected.retain(|i| *i != 600 && !(*i == 900 && !disjoint));
+                expected.push(601);
+                let mut expected: Vec<NodeId> = expected.into_iter().map(spread_node_id).collect();
+                expected.sort();
+                assert_eq!(
+                    view_ids(&full),
+                    expected,
+                    "ranged={ranged} disjoint={disjoint}"
+                );
+                assert_eq!(
+                    view_ids(&projected),
+                    expected,
+                    "ranged={ranged} disjoint={disjoint}"
+                );
+                for (whole, narrow) in full.iter().zip(&projected) {
+                    assert_eq!(whole.labels, narrow.labels);
+                    assert_eq!(whole.lsn, narrow.lsn);
+                    assert_eq!(
+                        narrow.properties,
+                        BTreeMap::from([("name".to_string(), whole.properties["name"].clone())])
+                    );
+                }
+                let renamed = projected
+                    .iter()
+                    .find(|row| row.id == spread_node_id(300))
+                    .unwrap();
+                assert_eq!(renamed.properties["name"], Value::Str("renamed".into()));
+            }
         }
     }
 
