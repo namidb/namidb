@@ -302,6 +302,18 @@ impl CompactionBasis {
     }
 }
 
+/// `true` when a Search-LSM generation has accumulated enough delta segments
+/// that compaction should consolidate them (metadata only, no I/O). A flush
+/// adds one delta segment per changed search index and refuses to add one
+/// past the hard segment cap, so waiting for the periodic tick once this is
+/// due can leave every flush of the namespace failing until it fires.
+pub(crate) fn search_compaction_due(manifest: &crate::manifest::Manifest) -> bool {
+    search_lsm_compact::search_compaction_needed(
+        manifest,
+        search_lsm_compact::SearchCompactionPolicy::for_scheduling(),
+    )
+}
+
 /// `true` when any `(kind, scope)` bucket of `ssts` would plan a merge under
 /// the given budgets — a metadata-only mirror of the per-bucket
 /// [`plan_bucket_merge`] calls the prepare phase makes, with no object-store

@@ -536,7 +536,8 @@ impl NamespaceRegistry {
                                 retry_after = None;
                                 s.writer_health.clear_persistence_degraded();
                                 s.snapshot.store(w.owned_snapshot());
-                                l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger
+                                (l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger)
+                                    || w.search_compaction_due()
                             }
                             Err(e) => {
                                 error!(namespace = %ns, error = %e, "periodic flush failed");
@@ -560,7 +561,11 @@ impl NamespaceRegistry {
                                     )
                                     .await;
                                 }
-                                false
+                                // A search index at its segment cap refuses
+                                // every flush until a compaction merges its
+                                // deltas: request it now, not at the next
+                                // periodic tick.
+                                !s.is_retired() && w.search_compaction_due()
                             }
                         }
                     };
