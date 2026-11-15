@@ -1184,6 +1184,14 @@ impl WriterSession {
         self.current.manifest.version
     }
 
+    /// True when a search index of the current manifest has enough delta
+    /// segments to compact. Servers request a compaction after a flush when
+    /// this holds — also after a flush that failed because a search index
+    /// reached its segment cap, which only a compaction can clear.
+    pub fn search_compaction_due(&self) -> bool {
+        crate::compact::search_compaction_due(&self.current.manifest)
+    }
+
     /// The largest number of L0 SSTs in any single `(kind, scope)` bucket
     /// of the current manifest. A point lookup on a bucket pays an
     /// `O(L0 count)` candidate scan, so this is the worst-case read

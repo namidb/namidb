@@ -15,6 +15,47 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A bulk load into a label with search indexes no longer wedges every
+  flush of the namespace.** Two shapes made the periodic flush fail on every
+  attempt, so the memtable could only grow, writes queued behind the
+  retried flush (write timeouts, then memory-pressure rejections) and the
+  process could finally be killed for memory, replaying the same writes on
+  restart:
+  - *More distinct values of a native search filter than the per-segment
+    cap.* An explicitly indexed, non-unique Bool/String property on the
+    label of a full-text or vector index (for example a `CREATE INDEX` on
+    `n.id` without a `UNIQUE` constraint) is a native search filter. A flush
+    or compaction that saw more than 4096 distinct values of it failed with
+    `text v4 filter property id exceeds explicit distinct-value cap 4096`
+    (or `vector native filter 'id' exceeds 4096 distinct values`). The
+    segment now omits that property whole and advertises only the filters
+    it carries completely; a filtered search on the omitted property takes
+    the exact fallback path, as it does for any segment without the filter.
+    Low-cardinality filters in the same segment stay native.
+  - *One large document.* The full-text builder refused any document whose
+    conservative tokenization estimate (64 bytes per byte of text, before
+    plus after image) exceeded a per-record workspace carved from
+    `NAMIDB_INDEX_BUILD_MEMORY_BYTES` divided across every search index of
+    the namespace — about 100 KiB of text with a 128 MiB budget and five
+    indexes — with `one text v4 mutation can require more than the
+    N-byte per-record workspace`. Such a document is now indexed (the sort
+    buffer still spills within its budget) and reported in a warning. A
+    single node mutation larger than the flush's before-image chunk budget
+    likewise forms a chunk of its own instead of failing the flush.
+- **A search index at its segment cap no longer stalls flushes until the
+  next compaction tick.** Each flush adds a delta segment to every changed
+  full-text or vector index and refuses to add one past
+  `NAMIDB_SEARCH_LSM_MAX_SEGMENTS` (8), failing with `search index '…' has 8
+  active segments … compact it before flushing another delta`. The server
+  requested a compaction after a flush only when the L0 high-water mark
+  tripped, so under a sustained load into a search-indexed label every flush
+  failed until the periodic compaction ran (up to its interval), and writes
+  queued behind the retried flush. The flush loop now requests a compaction
+  whenever a search index has enough delta segments to merge, including
+  right after a flush refused at the cap.
+
 ## [3.3.1] - 2026-11-05
 
 ### Fixed

@@ -1453,7 +1453,8 @@ pub async fn run_with_memory_limits(
                             state_for_flush
                                 .memtable_bytes_gauge
                                 .store(w.memtable_bytes(), std::sync::atomic::Ordering::Relaxed);
-                            l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger
+                            (l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger)
+                                || w.search_compaction_due()
                         }
                         Err(e) => {
                             error!(error = %e, "periodic flush failed");
@@ -1474,7 +1475,10 @@ pub async fn run_with_memory_limits(
                                 &e,
                             )
                             .await;
-                            false
+                            // A search index at its segment cap refuses every
+                            // flush until a compaction merges its deltas:
+                            // request it now, not at the next periodic tick.
+                            w.search_compaction_due()
                         }
                     }
                 };
