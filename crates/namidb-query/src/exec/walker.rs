@@ -1909,6 +1909,39 @@ pub(crate) async fn execute_expand(
     const NEIGHBOUR_MEMO_MAX_EDGES: usize = 1_000_000;
     let mut neighbour_memo: HashMap<NodeId, Arc<Vec<EdgeView>>> = HashMap::new();
     let mut neighbour_memo_edges: usize = 0;
+    // Each adjacency read or Expand-Into probe is a few dependent range reads
+    // of the edge SST; one seed after the other they add up to a
+    // millisecond-scale wait per seed (2,958 seeds of a degree-1 hop took
+    // over a second). Read the first hop of every seed with bounded
+    // concurrency up front instead; see `prefetch_seed_neighbours`.
+    let mut exact_memo: HashMap<(NodeId, NodeId), Vec<EdgeView>> = HashMap::new();
+    if cap.is_none() && shortest == crate::plan::ShortestMode::None && rows.len() > 1 {
+        if back_reference && max == 1 {
+            exact_memo = prefetch_exact_edges(
+                &rows,
+                source,
+                target_alias,
+                &edge_types,
+                direction,
+                snapshot,
+                edge_read_mode,
+            )
+            .await?;
+        } else {
+            prefetch_seed_neighbours(
+                &rows,
+                source,
+                &edge_types,
+                direction,
+                snapshot,
+                edge_read_mode,
+                &mut neighbour_memo,
+                &mut neighbour_memo_edges,
+                NEIGHBOUR_MEMO_MAX_EDGES,
+            )
+            .await?;
+        }
+    }
     let mut meter = crate::exec::memory::GrowthMeter::new();
     for row in rows {
         // Deadline + row-cap guards: a multi-seed (or variable-length)
@@ -2118,6 +2151,9 @@ pub(crate) async fn execute_expand(
             for step in frontier.drain(..) {
                 let neighbours: Arc<Vec<EdgeView>> = if back_reference && max == 1 {
                     Arc::new(match existing_target_id {
+                        Some(target) if exact_memo.contains_key(&(step.tail, target)) => {
+                            exact_memo[&(step.tail, target)].clone()
+                        }
                         Some(target) => {
                             exact_edges_between_any(
                                 snapshot,
@@ -6989,6 +7025,150 @@ async fn neighbours_of_any(
         all.extend(edges);
     }
     Ok(all)
+}
+
+/// Reads of one Expand's first hop in flight at once.
+const SEED_PREFETCH_CONCURRENCY: usize = 16;
+
+/// Largest partner list, per seed, that [`prefetch_seed_neighbours`] reads
+/// ahead. Above it the seeds are read one at a time as before, so a run of
+/// hubs never holds `SEED_PREFETCH_CONCURRENCY` huge lists at once.
+const SEED_PREFETCH_MAX_DEGREE: u64 = 1_024;
+
+/// Upper bound of the partner count any one node can have over `edge_types`
+/// in `direction` across the persisted edge SSTs: the sum of every matching
+/// SST's maximum degree. Memtable edges are not counted (they are already
+/// resident). `None` when no SST of those types exists.
+fn persisted_degree_bound(
+    snapshot: &Snapshot<'_>,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+) -> Option<u64> {
+    use namidb_storage::manifest::{KindSpecificStats, SstKind};
+    let wanted = |kind: SstKind| match direction {
+        RelationshipDirection::Right => kind == SstKind::EdgesFwd,
+        RelationshipDirection::Left => kind == SstKind::EdgesInv,
+        RelationshipDirection::Both => matches!(kind, SstKind::EdgesFwd | SstKind::EdgesInv),
+    };
+    let mut bound: Option<u64> = None;
+    for desc in &snapshot.manifest().manifest.ssts {
+        if !wanted(desc.kind) || !edge_types.contains(&desc.scope) {
+            continue;
+        }
+        let KindSpecificStats::Edges {
+            degree_histogram, ..
+        } = &desc.kind_specific
+        else {
+            continue;
+        };
+        bound = Some(
+            bound
+                .unwrap_or(0)
+                .saturating_add(degree_histogram.max_degree),
+        );
+    }
+    bound
+}
+
+/// Read the first-hop adjacency of every distinct seed in `rows` with
+/// [`SEED_PREFETCH_CONCURRENCY`] reads in flight, into the Expand's
+/// neighbour memo. Only when the edge statistics bound every seed's partner
+/// list by [`SEED_PREFETCH_MAX_DEGREE`], and only up to the memo's edge
+/// budget; seeds left out are read on demand by the per-row loop, exactly
+/// as without the prefetch. The memo is keyed by node alone, so a later
+/// hop reuses an entry just like the loop's own memo hits.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_seed_neighbours(
+    rows: &[Row],
+    source: &str,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    snapshot: &Snapshot<'_>,
+    mode: EdgeReadMode,
+    memo: &mut HashMap<NodeId, Arc<Vec<EdgeView>>>,
+    memo_edges: &mut usize,
+    max_memo_edges: usize,
+) -> Result<(), ExecError> {
+    use futures::stream::{self, StreamExt};
+    if edge_types.is_empty()
+        || persisted_degree_bound(snapshot, edge_types, direction)
+            .is_none_or(|bound| bound > SEED_PREFETCH_MAX_DEGREE)
+    {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let seeds: Vec<NodeId> = rows
+        .iter()
+        .filter_map(|row| match row.get(source) {
+            Some(RuntimeValue::Node(n)) => Some(n.id),
+            _ => None,
+        })
+        .filter(|id| !memo.contains_key(id) && seen.insert(*id))
+        .collect();
+    if seeds.len() < 2 {
+        return Ok(());
+    }
+    let mut reads = stream::iter(seeds)
+        .map(|id| async move {
+            neighbours_of_any(snapshot, edge_types, direction, id, mode)
+                .await
+                .map(|edges| (id, edges))
+        })
+        .buffered(SEED_PREFETCH_CONCURRENCY);
+    while let Some(read) = reads.next().await {
+        crate::exec::limits::check_deadline()?;
+        let (id, edges) = read?;
+        if memo_edges.saturating_add(edges.len()) > max_memo_edges {
+            break;
+        }
+        *memo_edges += edges.len();
+        memo.insert(id, Arc::new(edges));
+    }
+    Ok(())
+}
+
+/// Run the Expand-Into probe of every input row of a single-hop,
+/// back-referencing Expand with [`SEED_PREFETCH_CONCURRENCY`] probes in
+/// flight. Each probe is a point read whatever the endpoints' degrees, and
+/// returns at most one edge per type and direction, so the map stays small.
+async fn prefetch_exact_edges(
+    rows: &[Row],
+    source: &str,
+    target: &str,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    snapshot: &Snapshot<'_>,
+    mode: EdgeReadMode,
+) -> Result<HashMap<(NodeId, NodeId), Vec<EdgeView>>, ExecError> {
+    use futures::stream::{self, StreamExt};
+    let mut seen = std::collections::HashSet::new();
+    let pairs: Vec<(NodeId, NodeId)> = rows
+        .iter()
+        .filter_map(|row| match (row.get(source), row.get(target)) {
+            (Some(RuntimeValue::Node(from)), Some(RuntimeValue::Node(to))) => {
+                Some((from.id, to.id))
+            }
+            _ => None,
+        })
+        .filter(|pair| seen.insert(*pair))
+        .collect();
+    let mut out = HashMap::with_capacity(pairs.len());
+    if pairs.len() < 2 {
+        return Ok(out);
+    }
+    let mut probes = stream::iter(pairs)
+        .map(|(from, to)| async move {
+            exact_edges_between_any(snapshot, edge_types, direction, from, to, mode)
+                .await
+                .map(|edges| ((from, to), edges))
+        })
+        .buffered(SEED_PREFETCH_CONCURRENCY);
+    while let Some(probe) = probes.next().await {
+        crate::exec::limits::check_deadline()?;
+        let (pair, edges) = probe?;
+        out.insert(pair, edges);
+    }
+    Ok(out)
 }
 
 /// Exact Expand-Into probe for a pattern whose two endpoint aliases are
