@@ -32,7 +32,10 @@ crates.io release will establish and document that API explicitly.
     `(n:A AND n.x > 1) OR n:B`, `(n:A|B)`) becomes a `UNION ALL` of label
     scans whose branches are disjoint (branch *i* drops the nodes an earlier
     branch already returned), so nothing is returned twice and no
-    de-duplication state is needed;
+    de-duplication state is needed. A pattern predicate on such a variable
+    (`WHERE (n:A OR n:B) AND (n)-[:R]->()`) stays a correlated check per
+    row: decorrelating it would build its inner side from one branch's label
+    and drop the other branch's rows;
   - `WHERE m:L` on the far end of a single hop becomes that hop's own label
     check, so it is proved before the neighbour is read.
 
@@ -42,7 +45,12 @@ crates.io release will establish and document that API explicitly.
   no label to start from.
 - **`WHERE (n:A OR n:B)` and `WHERE (n:A AND n.x = 1)` parse.** A
   parenthesised predicate that opened with a label test was taken for a
-  pattern and failed with "expected `)`, found `OR`".
+  pattern and failed with "expected `)`, found `OR`". Such a parenthesis is
+  now tried as a pattern and as an expression, and the outcome at each
+  position is remembered, so the parse time no longer doubles with every
+  level those parentheses nest (tried naively, a 1 KB query of nested
+  `(n)--(m {a: …} x)` would take 2^depth steps before execution and its
+  timeout even began).
 - **A hop from an id-pinned hub starts at the other end.**
   `MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $ids` always
   started at the pinned nodes and walked every one of their edges, checking
@@ -78,7 +86,18 @@ crates.io release will establish and document that API explicitly.
   every partner list by 1,024, the first hop of all seeds is now read with 16
   reads in flight, within the operator's existing 1M-edge memo budget; a run
   of hubs is still read one at a time. A single-hop Expand-Into (both ends
-  already bound) runs its edge probes the same way.
+  already bound) runs its edge probes the same way. The reads run ahead one
+  window of 4,096 input rows at a time, so the read-ahead state is bounded
+  by the window, never by the size of the operator's input.
+- **A hop to a node an earlier clause bound starts from that node.**
+  `MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c)` (or `… WITH c MATCH …`, or
+  inside `OPTIONAL MATCH`) planned a scan of every node for `d`, a cross
+  product with every `c` row, and an edge probe per pair: rows × nodes work
+  and memory before anything was pruned. The hop now walks each `c`'s own
+  edges. With a labelled far end (`(d:Device)`) it does so only when the
+  edge type's average degree from the bound side is no larger than the
+  label's node count; an id seek or index lookup on the far end, and a
+  literal property filter folded into its scan, keep the plan as before.
 
 ### Added
 
