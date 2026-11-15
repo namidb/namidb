@@ -54,12 +54,16 @@ use crate::recovery::WriterHealth;
 use crate::registry::{NamespaceRegistry, NamespaceState};
 use crate::shared::SharedAppState;
 
-/// Explicit limit for the JSON body accepted by `/v0/cypher`.
+/// Default limit for the JSON body accepted by `/v0/cypher`
+/// (`--http-max-body-bytes` / `NAMIDB_HTTP_MAX_BODY_BYTES`).
 ///
-/// Axum's `Json` extractor currently defaults to the same two MiB, but wiring
-/// the value into both the body-limit layer and pre-decode memory reservation
-/// prevents those independently evolving into contradictory bounds.
-const HTTP_CYPHER_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// 16 MiB holds a batch of several hundred 1024-dimension embeddings, which
+/// is what a vector bulk load sends; the old 2 MiB fit about 100. The same
+/// value drives both the body-limit layer and the pre-decode memory
+/// reservation, so the two can never become contradictory bounds, and every
+/// request still reserves its projected working set (16x its wire size)
+/// before its JSON is decoded.
+pub const DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 /// Conservative serde_json + RuntimeValue + execution amplification charged
 /// before the JSON extractor allocates. This mirrors Bolt's measured 16x
 /// decode working-set rail.
@@ -86,6 +90,7 @@ enum HttpBodyAdmissionError {
 /// header.
 fn http_cypher_wire_bytes(
     request: &axum::extract::Request,
+    limit: usize,
 ) -> Result<usize, HttpBodyAdmissionError> {
     let content_length = request
         .headers()
@@ -100,8 +105,8 @@ fn http_cypher_wire_bytes(
         .transpose()?;
     let observed = content_length
         .or_else(|| request.body().size_hint().upper())
-        .unwrap_or(HTTP_CYPHER_BODY_LIMIT_BYTES as u64);
-    if observed > HTTP_CYPHER_BODY_LIMIT_BYTES as u64 {
+        .unwrap_or(limit as u64);
+    if observed > limit as u64 {
         return Err(HttpBodyAdmissionError::TooLarge { observed });
     }
     usize::try_from(observed).map_err(|_| HttpBodyAdmissionError::TooLarge { observed })
@@ -230,6 +235,9 @@ pub struct Config {
     /// flush/compaction/recovery always wait as long as it takes.
     /// `Duration::ZERO` disables the bound.
     pub writer_lock_timeout: Duration,
+    /// Largest JSON body `/v0/cypher` accepts, in bytes (HTTP 413 above
+    /// it). Must be non-zero.
+    pub http_max_body_bytes: usize,
     /// Ceiling on a whole HTTP request (body read + handler). `None` derives
     /// a default that can never truncate the configured query/write budgets;
     /// `ZERO` disables the layer. An explicit value BELOW `query_timeout` or
@@ -329,6 +337,8 @@ pub struct AppState {
     /// Foreground writer-lock acquisition bound (see `Config`). `ZERO`
     /// disables it.
     writer_lock_timeout: Duration,
+    /// Largest `/v0/cypher` JSON body (see `Config::http_max_body_bytes`).
+    http_body_limit: usize,
     /// Wakes the periodic flush task early when the byte threshold is
     /// crossed by a committed write.
     pub flush_notify: Arc<tokio::sync::Notify>,
@@ -410,6 +420,7 @@ impl AppState {
                 memory::DEFAULT_MEMORY_MAX_BYTES,
             )),
             writer_lock_timeout: Duration::ZERO,
+            http_body_limit: DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
             flush_notify: Arc::new(tokio::sync::Notify::new()),
             memtable_bytes_gauge: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             metrics: Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO),
@@ -482,6 +493,7 @@ impl AppState {
             memtable_stall_bytes: shared.memtable_stall_bytes,
             memory: shared.memory.clone(),
             writer_lock_timeout: shared.writer_lock_timeout,
+            http_body_limit: shared.http_body_limit,
             flush_notify: ns.flush_notify.clone(),
             // Per-view gauge: the multi-tenant health path reports memtable
             // bytes from the writer itself, so the gauge is only a
@@ -566,6 +578,13 @@ impl AppState {
     /// `Duration::ZERO` disables it.
     pub fn with_writer_lock_timeout(mut self, timeout: Duration) -> Self {
         self.writer_lock_timeout = timeout;
+        self
+    }
+
+    /// Set the largest `/v0/cypher` JSON body accepted (builder style).
+    /// Call it before [`build_router`], which reads it.
+    pub fn with_http_body_limit(mut self, bytes: usize) -> Self {
+        self.http_body_limit = bytes.max(1);
         self
     }
 
@@ -718,7 +737,7 @@ pub fn build_router(state: AppState) -> Router {
     // before its JSON extractor and retains it through the complete response.
     let admitted = Router::new()
         .route("/v0/cypher", post(cypher))
-        .layer(DefaultBodyLimit::max(HTTP_CYPHER_BODY_LIMIT_BYTES))
+        .layer(DefaultBodyLimit::max(state.http_body_limit))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_memory_admission,
@@ -907,7 +926,7 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
     let namespace_admitted = Router::new()
         .route("/:namespace/v0/cypher", post(cypher_multi))
         .route("/v0/cypher", post(cypher_multi_unprefixed))
-        .layer(DefaultBodyLimit::max(HTTP_CYPHER_BODY_LIMIT_BYTES))
+        .layer(DefaultBodyLimit::max(shared.http_body_limit))
         .layer(middleware::from_fn_with_state(
             shared.clone(),
             require_memory_admission_multi,
@@ -1037,17 +1056,70 @@ pub async fn run_with_memory_max_bytes(
     run_with_memory_limits(config, memory_max_bytes, query_memory_max_bytes).await
 }
 
+/// Fraction of the process memory limit the memtable may reach before a
+/// committed write triggers a flush (1/16) or is stalled (1/8).
+const MEMTABLE_FLUSH_DIVISOR: usize = 16;
+const MEMTABLE_STALL_DIVISOR: usize = 8;
+
+/// The memtable flush and stall thresholds a process with `memory_max_bytes`
+/// of memory (`0` = no limit) can hold.
+///
+/// Each configured threshold is capped at its fraction of the limit; `0`
+/// (disabled) stays disabled. The defaults (64 MiB / 256 MiB) suit a host
+/// with several GiB. In a 1 GiB container a 256 MiB memtable, plus the copy
+/// an off-lock flush keeps while it uploads, plus a compaction and in-flight
+/// requests, is more than the process has, and a sustained load is killed
+/// before the stall ever throttles it.
+pub fn memtable_thresholds_within(
+    flush_bytes: usize,
+    stall_bytes: usize,
+    memory_max_bytes: usize,
+) -> (usize, usize) {
+    if memory_max_bytes == 0 {
+        return (flush_bytes, stall_bytes);
+    }
+    let cap = |bytes: usize, divisor: usize| {
+        if bytes == 0 {
+            0
+        } else {
+            bytes.min((memory_max_bytes / divisor).max(1))
+        }
+    };
+    (
+        cap(flush_bytes, MEMTABLE_FLUSH_DIVISOR),
+        cap(stall_bytes, MEMTABLE_STALL_DIVISOR),
+    )
+}
+
 /// Boot the server with an explicit process ceiling and per-query
 /// working-memory budget (issue #203; `0` disables the budget). The
 /// standalone binary uses this entry point for its CLI/env-parsed values.
 pub async fn run_with_memory_limits(
-    config: Config,
+    mut config: Config,
     memory_max_bytes: usize,
     query_memory_max_bytes: usize,
 ) -> anyhow::Result<()> {
     namidb_storage::validate_cache_configuration().map_err(anyhow::Error::msg)?;
+    let (flush_bytes, stall_bytes) = memtable_thresholds_within(
+        config.memtable_flush_bytes,
+        config.memtable_stall_bytes,
+        memory_max_bytes,
+    );
+    if (flush_bytes, stall_bytes) != (config.memtable_flush_bytes, config.memtable_stall_bytes) {
+        info!(
+            memory_max_bytes,
+            memtable_flush_bytes = flush_bytes,
+            memtable_stall_bytes = stall_bytes,
+            "memtable thresholds lowered to fit the process memory limit"
+        );
+        config.memtable_flush_bytes = flush_bytes;
+        config.memtable_stall_bytes = stall_bytes;
+    }
     if config.bolt_max_message_bytes == 0 {
         anyhow::bail!("NAMIDB_BOLT_MAX_MESSAGE_BYTES must be greater than zero");
+    }
+    if config.http_max_body_bytes == 0 {
+        anyhow::bail!("NAMIDB_HTTP_MAX_BODY_BYTES must be greater than zero");
     }
     // The restore point window is kept by the maintenance loop, before each
     // sweep. Without the loop nothing would keep it, and restore points
@@ -1288,7 +1360,8 @@ pub async fn run_with_memory_limits(
             config.default_namespace.clone(),
         )
         .with_authz(authz.clone())
-        .with_backup_target(config.backup_target_uri.clone());
+        .with_backup_target(config.backup_target_uri.clone())
+        .with_http_body_limit(config.http_max_body_bytes);
         if shared.backup_target_prefix.is_some() {
             info!("multi-tenant admin backup endpoint enabled");
         }
@@ -1365,6 +1438,7 @@ pub async fn run_with_memory_limits(
         .with_memtable_thresholds(config.memtable_flush_bytes, config.memtable_stall_bytes)
         .with_memory_governor(memory)
         .with_writer_lock_timeout(config.writer_lock_timeout)
+        .with_http_body_limit(config.http_max_body_bytes)
         .with_slow_query_threshold(config.slow_query_threshold)
         .with_fence_policy(config.fence_policy)
         .with_group_commit(config.group_commit_window);
@@ -1402,7 +1476,8 @@ pub async fn run_with_memory_limits(
                                // available and the degraded state can be observed; the next
                                // attempt after the window self-heals once the disk clears.
             let mut retry_after: Option<std::time::Instant> = None;
-            loop {
+            let mut flush_superseded = false;
+            'tick: loop {
                 // Flush on the timer OR when a committed write crossed the
                 // memtable byte threshold (`after_commit_backpressure`
                 // notifies), so a burst loader's working set is bounded by
@@ -1418,7 +1493,7 @@ pub async fn run_with_memory_limits(
                 // when the L0 high-water mark trips. The scheduler captures
                 // a fresh basis inside its sole worker, so a queued follow-up
                 // neither retains a stale manifest nor allocates another task.
-                let should_compact = {
+                let should_compact = 'flush: {
                     let lock_started = std::time::Instant::now();
                     let mut w = state_for_flush.writer.lock().await;
                     state_for_flush.metrics.observe_writer_lock(
@@ -1441,12 +1516,92 @@ pub async fn run_with_memory_limits(
                         .await
                         .is_err()
                         {
-                            continue;
+                            continue 'tick;
                         }
                     }
-                    let schema = w.snapshot().manifest().manifest.schema.clone();
-                    match w.flush(schema.clone()).await {
-                        Ok(_) => {
+                    // The SST build and upload run with the writer lock
+                    // released (`WriterSession::begin_background_flush`):
+                    // writes keep committing while a large memtable is
+                    // encoded and uploaded, instead of queueing behind it.
+                    // After a superseded attempt the next one flushes under
+                    // the lock, so a busy compactor can never starve flushes.
+                    let flushed = if std::mem::take(&mut flush_superseded) {
+                        let schema = w.snapshot().manifest().manifest.schema.clone();
+                        w.flush(schema).await.map(|_| None)
+                    } else {
+                        match w.begin_background_flush().await {
+                            Ok(None) => Ok(None),
+                            Ok(Some(ticket)) => {
+                                drop(w);
+                                match ticket.build().await {
+                                    Ok(built) => {
+                                        let lock_started = std::time::Instant::now();
+                                        w = state_for_flush.writer.lock().await;
+                                        state_for_flush.metrics.observe_writer_lock(
+                                            WriterLockKind::Flush,
+                                            lock_started.elapsed(),
+                                            true,
+                                        );
+                                        // Writes grouped while the flush was
+                                        // built are answered through the group
+                                        // before the install commits them.
+                                        if let Some(group) = &state_for_flush.group_commit {
+                                            if commit_group_locked(
+                                                group,
+                                                &mut w,
+                                                &state_for_flush.snapshot,
+                                                &state_for_flush.writer_health,
+                                                &state_for_flush.namespace,
+                                            )
+                                            .await
+                                            .is_err()
+                                            {
+                                                continue 'tick;
+                                            }
+                                        }
+                                        w.install_background_flush(built).await.map(Some)
+                                    }
+                                    Err(e) => {
+                                        // Nothing changed: the rows are still in
+                                        // the memtable and its WAL segments.
+                                        error!(error = %e, "periodic flush build failed");
+                                        if e.is_local_persistence() {
+                                            state_for_flush
+                                                .writer_health
+                                                .mark_persistence_degraded(
+                                                    persistence_degraded_reason(&e),
+                                                );
+                                            retry_after = Some(
+                                                std::time::Instant::now()
+                                                    + FLUSH_FAILURE_RETRY_BACKOFF,
+                                            );
+                                        }
+                                        // A search index at its delta-segment
+                                        // cap fails every flush until a
+                                        // compaction consolidates it: ask for
+                                        // one now (a no-op when none is due).
+                                        break 'flush true;
+                                    }
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }
+                    };
+                    match flushed {
+                        Ok(installed) => {
+                            if matches!(
+                                installed,
+                                Some(namidb_storage::BackgroundFlushInstall::Superseded)
+                            ) {
+                                // A compaction/DDL committed meanwhile; the
+                                // rows stay in the memtable for the next pass,
+                                // which runs at once and under the lock.
+                                tracing::debug!(
+                                    "periodic flush superseded; retrying under the writer lock"
+                                );
+                                flush_superseded = true;
+                                state_for_flush.flush_notify.notify_one();
+                            }
                             retry_after = None;
                             state_for_flush.writer_health.clear_persistence_degraded();
                             state_for_flush.snapshot.store(w.owned_snapshot());
@@ -1808,10 +1963,11 @@ async fn wait_for_shutdown_signal() -> ShutdownCause {
 /// are still rejected without disclosing process-pressure telemetry.
 async fn admit_http_cypher_request(
     memory: &Arc<memory::MemoryGovernor>,
+    limit: usize,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let wire_bytes = match http_cypher_wire_bytes(&req) {
+    let wire_bytes = match http_cypher_wire_bytes(&req, limit) {
         Ok(bytes) => bytes,
         Err(HttpBodyAdmissionError::InvalidContentLength) => {
             return (
@@ -1828,7 +1984,7 @@ async fn admit_http_cypher_request(
                 Json(ErrorBody {
                     error: format!(
                         "Cypher JSON body is {observed} bytes; maximum is \
-                         {HTTP_CYPHER_BODY_LIMIT_BYTES} bytes"
+                         {limit} bytes (NAMIDB_HTTP_MAX_BODY_BYTES); split the batch"
                     ),
                 }),
             )
@@ -1855,7 +2011,7 @@ async fn require_memory_admission(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    admit_http_cypher_request(&state.memory, req, next).await
+    admit_http_cypher_request(&state.memory, state.http_body_limit, req, next).await
 }
 
 /// Multi-tenant twin of [`require_memory_admission`]. It runs before namespace
@@ -1866,7 +2022,7 @@ async fn require_memory_admission_multi(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    admit_http_cypher_request(&shared.memory, req, next).await
+    admit_http_cypher_request(&shared.memory, shared.http_body_limit, req, next).await
 }
 
 async fn require_auth_multi(
@@ -6476,6 +6632,7 @@ mod tests {
         Config {
             store_uri: format!("memory://{ns}"),
             listen: "127.0.0.1:0".parse().unwrap(),
+            http_max_body_bytes: crate::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
             http_request_timeout: None,
             auth_token: None,
             auth_tokens_file: None,
@@ -7590,13 +7747,19 @@ mod tests {
             .header(axum::http::header::CONTENT_LENGTH, "123")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(http_cypher_wire_bytes(&exact), Ok(123));
+        assert_eq!(
+            http_cypher_wire_bytes(&exact, DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES),
+            Ok(123)
+        );
 
         let hinted = Request::builder()
             .uri("/v0/cypher")
             .body(Body::from("small"))
             .unwrap();
-        assert_eq!(http_cypher_wire_bytes(&hinted), Ok(5));
+        assert_eq!(
+            http_cypher_wire_bytes(&hinted, DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES),
+            Ok(5)
+        );
 
         let unknown = Request::builder()
             .uri("/v0/cypher")
@@ -7605,8 +7768,8 @@ mod tests {
             })))
             .unwrap();
         assert_eq!(
-            http_cypher_wire_bytes(&unknown),
-            Ok(HTTP_CYPHER_BODY_LIMIT_BYTES),
+            http_cypher_wire_bytes(&unknown, DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES),
+            Ok(DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES),
             "chunked/unknown bodies reserve the exact extractor ceiling instead of bypassing it"
         );
 
@@ -7614,14 +7777,14 @@ mod tests {
             .uri("/v0/cypher")
             .header(
                 axum::http::header::CONTENT_LENGTH,
-                (HTTP_CYPHER_BODY_LIMIT_BYTES + 1).to_string(),
+                (DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES + 1).to_string(),
             )
             .body(Body::empty())
             .unwrap();
         assert_eq!(
-            http_cypher_wire_bytes(&oversized),
+            http_cypher_wire_bytes(&oversized, DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES),
             Err(HttpBodyAdmissionError::TooLarge {
-                observed: HTTP_CYPHER_BODY_LIMIT_BYTES as u64 + 1
+                observed: DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES as u64 + 1
             })
         );
 
@@ -7631,7 +7794,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(
-            http_cypher_wire_bytes(&malformed),
+            http_cypher_wire_bytes(&malformed, DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES),
             Err(HttpBodyAdmissionError::InvalidContentLength)
         );
         assert_eq!(
@@ -7688,7 +7851,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header(
                         axum::http::header::CONTENT_LENGTH,
-                        (HTTP_CYPHER_BODY_LIMIT_BYTES + 1).to_string(),
+                        (DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES + 1).to_string(),
                     )
                     .body(Body::from("{}"))
                     .unwrap(),
@@ -7696,6 +7859,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn memtable_thresholds_fit_the_memory_limit() {
+        const MIB: usize = 1024 * 1024;
+        // No limit, or a large one: the configured values stand.
+        assert_eq!(
+            memtable_thresholds_within(64 * MIB, 256 * MIB, 0),
+            (64 * MIB, 256 * MIB)
+        );
+        assert_eq!(
+            memtable_thresholds_within(64 * MIB, 256 * MIB, 8192 * MIB),
+            (64 * MIB, 256 * MIB)
+        );
+        // A 1 GiB container (90% ceiling): flush at 1/16, stall at 1/8.
+        let max = 1024 * MIB * 9 / 10;
+        assert_eq!(
+            memtable_thresholds_within(64 * MIB, 256 * MIB, max),
+            ((64 * MIB).min(max / 16), max / 8)
+        );
+        // Disabled stays disabled.
+        assert_eq!(memtable_thresholds_within(0, 0, max), (0, 0));
+    }
+
+    /// 150 rows of 1024-dimension embeddings: about 3 MiB of JSON.
+    fn embedding_batch_body() -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = (0..150)
+            .map(|i| {
+                let embedding: Vec<f64> = (0..1024)
+                    .map(|d| ((i * 1024 + d) as f64 * 0.000_123_456_7).sin())
+                    .collect();
+                serde_json::json!({ "id": format!("v{i}"), "embedding": embedding })
+            })
+            .collect();
+        serde_json::json!({
+            "query": "UNWIND $rows AS r CREATE (:Emb {id: r.id, embedding: r.embedding})",
+            "params": { "rows": rows },
+        })
+    }
+
+    #[tokio::test]
+    async fn http_accepts_a_150_embedding_batch_by_default() {
+        let body = embedding_batch_body();
+        assert!(serde_json::to_vec(&body).unwrap().len() > 2 * 1024 * 1024);
+        let app = fixture(None).await;
+        let (status, text) = post_json(&app, "/v0/cypher", body).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let (status, text) = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "MATCH (e:Emb) RETURN count(e) AS n" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(text.contains("150"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn http_body_limit_is_configurable() {
+        let (store, paths) = namidb_storage::parse_uri("memory://body-limit").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state =
+            AppState::new(writer, None, "body-limit".into()).with_http_body_limit(1024 * 1024);
+        let app = build_router(state);
+        let (status, text) = post_json(&app, "/v0/cypher", embedding_batch_body()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{text}");
+        assert!(text.contains("NAMIDB_HTTP_MAX_BODY_BYTES"), "{text}");
     }
 
     #[test]

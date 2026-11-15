@@ -541,22 +541,25 @@ impl Client {
     }
 
     /// Flush the memtable into L0 SSTs, then run a compaction pass when a
-    /// bucket has reached `compaction_l0_trigger` L0 SSTs.
+    /// bucket has reached `compaction_l0_trigger` L0 SSTs or a search index
+    /// has as many delta segments as a pass consolidates.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let session = self.session.writer()?;
-        let l0 = py.allow_threads(|| {
+        let (l0, search_due) = py.allow_threads(|| {
             self.runtime.block_on(async {
                 let mut session = session.lock().await;
                 let schema = session.snapshot().manifest().manifest.schema.clone();
                 session.flush(schema).await.map_err(map_storage_err)?;
-                Ok::<_, PyErr>(session.max_l0_bucket_len())
+                Ok::<_, PyErr>((session.max_l0_bucket_len(), session.search_compaction_due()))
             })
         })?;
         // Embedded mode has no maintenance loop, so without this L0 grows
         // until someone calls compact() and every read fans out across it.
         // The flush is already durable, so a failed pass is only a warning:
         // raising would read as "data not persisted" to a retrying caller.
-        if self.compaction_l0_trigger > 0 && l0 >= self.compaction_l0_trigger {
+        // A search index's delta segments are consolidated before they reach
+        // the cap at which every later flush would fail.
+        if self.compaction_l0_trigger > 0 && (l0 >= self.compaction_l0_trigger || search_due) {
             let session = session.clone();
             let compaction_lock = self.compaction_lock.clone();
             let auto_sweep = self.auto_sweep();

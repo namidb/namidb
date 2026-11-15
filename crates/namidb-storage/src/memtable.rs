@@ -202,6 +202,46 @@ impl Memtable {
         FrozenMemtable { inner, bytes }
     }
 
+    /// Copy the current contents into a [`FrozenMemtable`] WITHOUT draining
+    /// them: O(1), the persistent map shares structure with the live one.
+    ///
+    /// This is the off-lock flush's freeze. The rows stay in the live
+    /// memtable, so every read keeps seeing them while their SSTs are built
+    /// and uploaded without the writer lock; once the manifest that adds those
+    /// SSTs is committed, [`release_flushed`](Self::release_flushed) drops
+    /// exactly the entries the flush covered.
+    pub fn checkpoint(&self) -> FrozenMemtable {
+        FrozenMemtable {
+            inner: self.inner.clone(),
+            bytes: self.bytes,
+        }
+    }
+
+    /// Drop every entry a committed flush of `flushed` made durable in SSTs:
+    /// those whose key still holds the very version (same LSN) the checkpoint
+    /// saw. A key re-written after the checkpoint carries a higher LSN and
+    /// stays, so no write made while the flush ran is lost.
+    pub fn release_flushed(&mut self, flushed: &FrozenMemtable) -> usize {
+        let mut released = 0usize;
+        for (key, entry) in flushed.inner.iter() {
+            let same_version = self
+                .inner
+                .get(key)
+                .is_some_and(|live| live.lsn == entry.lsn);
+            if same_version {
+                if let Some(removed) = self.inner.remove(key) {
+                    let bytes = key.approx_bytes() + removed.op.approx_bytes() + 24;
+                    self.bytes = self.bytes.saturating_sub(bytes);
+                    released += 1;
+                }
+            }
+        }
+        if self.inner.is_empty() {
+            self.bytes = 0;
+        }
+        released
+    }
+
     /// Restore a previously [`freeze`](Self::freeze)d batch back into the live
     /// memtable after a **failed** flush. The frozen entries were drained out
     /// of the live memtable but never made durable in an SST (the manifest CAS
@@ -355,6 +395,29 @@ impl FrozenMemtable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_then_release_keeps_writes_made_after_the_checkpoint() {
+        let mut mt = Memtable::new();
+        let a = MemKey::Node { id: nid(1) };
+        let b = MemKey::Node { id: nid(2) };
+        let c = MemKey::Node { id: nid(3) };
+        mt.apply(a.clone(), 1, MemOp::Upsert(Bytes::from_static(b"a1")));
+        mt.apply(b.clone(), 2, MemOp::Upsert(Bytes::from_static(b"b2")));
+        let checkpoint = mt.checkpoint();
+        assert_eq!(mt.len(), 2, "a checkpoint drains nothing");
+        // Written while the flush runs: `b` again, and a new `c`.
+        mt.apply(b.clone(), 3, MemOp::Upsert(Bytes::from_static(b"b3")));
+        mt.apply(c.clone(), 4, MemOp::Tombstone);
+        assert_eq!(mt.release_flushed(&checkpoint), 1);
+        assert!(mt.get(&a).is_none(), "the flushed version is released");
+        assert_eq!(mt.get(&b).map(|e| e.lsn), Some(3), "a newer version stays");
+        assert_eq!(mt.get(&c).map(|e| e.lsn), Some(4));
+        let mut expected = Memtable::new();
+        expected.apply(b, 3, MemOp::Upsert(Bytes::from_static(b"b3")));
+        expected.apply(c, 4, MemOp::Tombstone);
+        assert_eq!(mt.bytes_estimate(), expected.bytes_estimate());
+    }
 
     fn nid(byte: u8) -> NodeId {
         NodeId::from_uuid(uuid::Uuid::from_bytes([byte; 16]))

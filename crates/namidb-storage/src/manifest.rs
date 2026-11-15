@@ -868,6 +868,17 @@ pub struct WalSegmentDescriptor {
 pub struct ManifestStore {
     store: Arc<dyn ObjectStore>,
     paths: NamespacePaths,
+    /// The advisory `current.json` this store has written and the one it
+    /// still owes (see [`Self::cas_pointer_deferring_advisory`]).
+    advisory: Arc<std::sync::Mutex<AdvisoryState>>,
+}
+
+#[derive(Debug, Default)]
+struct AdvisoryState {
+    /// Highest pointer version this store has published to `current.json`.
+    written: Option<u64>,
+    /// A newer pointer whose advisory publication was deferred.
+    pending: Option<(u64, Bytes)>,
 }
 
 impl std::fmt::Debug for ManifestStore {
@@ -922,7 +933,11 @@ impl LoadedManifest {
 
 impl ManifestStore {
     pub fn new(store: Arc<dyn ObjectStore>, paths: NamespacePaths) -> Self {
-        Self { store, paths }
+        Self {
+            store,
+            paths,
+            advisory: Arc::new(std::sync::Mutex::new(AdvisoryState::default())),
+        }
     }
 
     pub fn paths(&self) -> &NamespacePaths {
@@ -1006,7 +1021,8 @@ impl ManifestStore {
 
         // Publish the advisory `current.json` for the freshly-bootstrapped
         // namespace (see `write_advisory_current`).
-        self.write_advisory_current(pointer_bytes).await?;
+        self.write_advisory_current(pointer.version, pointer_bytes)
+            .await?;
 
         Ok(LoadedManifest::new(
             pointer,
@@ -1355,6 +1371,42 @@ impl ManifestStore {
         new_manifest: Manifest,
         pointer: ManifestPointer,
     ) -> Result<LoadedManifest> {
+        self.cas_pointer_inner(fence, base, new_manifest, pointer, false)
+            .await
+    }
+
+    /// [`Self::cas_pointer`] that returns as soon as the pointer create has
+    /// landed, leaving the advisory `current.json` PUT owed instead of
+    /// waiting a third round trip for it.
+    ///
+    /// The version is durable and authoritative once its pointer exists; the
+    /// advisory is only a non-LIST lower bound for
+    /// [`Self::max_pointer_version`], and the forward probe advances from any
+    /// older advisory to the true current. The owed PUT is sent by the next
+    /// [`Self::publish_pending_advisory`] (which `WriterSession::commit_batch`
+    /// overlaps with the next commit's WAL and body PUTs, and every flush
+    /// runs) or superseded by a newer inline write. Meanwhile the janitor
+    /// keeps every pointer at or above the version `current.json` names, so
+    /// a stale advisory still resolves.
+    pub async fn cas_pointer_deferring_advisory(
+        &self,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        new_manifest: Manifest,
+        pointer: ManifestPointer,
+    ) -> Result<LoadedManifest> {
+        self.cas_pointer_inner(fence, base, new_manifest, pointer, true)
+            .await
+    }
+
+    async fn cas_pointer_inner(
+        &self,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        new_manifest: Manifest,
+        pointer: ManifestPointer,
+        defer_advisory: bool,
+    ) -> Result<LoadedManifest> {
         let pointer_path = self.paths.pointer_version(pointer.version);
         let pointer_bytes: Bytes = serde_json::to_vec(&pointer)?.into();
         let put_res = match self.put_create(&pointer_path, pointer_bytes.clone()).await {
@@ -1386,11 +1438,16 @@ impl ManifestStore {
 
         // Publish the advisory `current.json` so the version is findable via
         // a non-LIST read on EC stores even after the janitor reclaims `p0`.
-        // See `write_advisory_current`. A failure here is a commit failure:
-        // the pointer Create already succeeded (the version is durable), but
-        // until the advisory lands it is not reliably discoverable, so we
-        // surface the error rather than leave a half-published version.
-        self.write_advisory_current(pointer_bytes.clone()).await?;
+        // See `write_advisory_current`. Inline, a failure here is a commit
+        // failure: the pointer Create already succeeded (the version is
+        // durable), but we surface the error rather than leave the advisory
+        // behind. Deferred, the PUT is owed to the next publication instead.
+        if defer_advisory {
+            self.defer_advisory(pointer.version, pointer_bytes);
+        } else {
+            self.write_advisory_current(pointer.version, pointer_bytes)
+                .await?;
+        }
 
         Ok(LoadedManifest::new(
             pointer,
@@ -1563,7 +1620,7 @@ impl ManifestStore {
                             "adopted orphan manifest body: published the pointer of an \
                              interrupted commit"
                         );
-                        self.write_advisory_current(pointer_bytes).await?;
+                        self.write_advisory_current(version, pointer_bytes).await?;
                     }
                     // Someone (possibly the interrupted writer itself)
                     // published first; the pointer advances either way.
@@ -1763,13 +1820,69 @@ impl ManifestStore {
     /// body, and the forward probe in `load_pointer` then advances to the
     /// true current. Its failure is treated as a commit failure: until it is
     /// durable the version is not reliably findable on an EC store.
-    async fn write_advisory_current(&self, pointer_bytes: Bytes) -> Result<()> {
+    async fn write_advisory_current(&self, version: u64, pointer_bytes: Bytes) -> Result<()> {
         let path = self.paths.current_pointer();
         self.store
             .put(&path, PutPayload::from(pointer_bytes))
             .await
             .map_err(Error::ObjectStore)?;
+        let mut advisory = self
+            .advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        advisory.written = Some(advisory.written.map_or(version, |w| w.max(version)));
+        if advisory
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending <= version)
+        {
+            advisory.pending = None;
+        }
         Ok(())
+    }
+
+    fn defer_advisory(&self, version: u64, pointer_bytes: Bytes) {
+        let mut advisory = self
+            .advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if advisory.written.is_some_and(|written| written >= version) {
+            return;
+        }
+        if advisory
+            .pending
+            .as_ref()
+            .is_none_or(|(pending, _)| *pending < version)
+        {
+            advisory.pending = Some((version, pointer_bytes));
+        }
+    }
+
+    /// Whether a deferred advisory `current.json` PUT is still owed.
+    pub fn has_pending_advisory(&self) -> bool {
+        self.advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .is_some()
+    }
+
+    /// Send the advisory `current.json` PUT a deferred commit owes, if any.
+    ///
+    /// A failure keeps it owed (unless a newer one was deferred meanwhile)
+    /// and is returned; callers on the write path log it and carry on, since
+    /// the commit it describes is already durable and discoverable.
+    pub async fn publish_pending_advisory(&self) -> Result<()> {
+        let pending = self
+            .advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .clone();
+        let Some((version, bytes)) = pending else {
+            return Ok(());
+        };
+        self.write_advisory_current(version, bytes).await
     }
 }
 

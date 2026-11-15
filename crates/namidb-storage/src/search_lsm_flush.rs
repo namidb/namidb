@@ -777,7 +777,7 @@ impl TextWork {
             if let Some(payload) = &after_payload {
                 self.live_total_len = self
                     .live_total_len
-                    .checked_add(crate::text::tokenize(&payload.text).len() as u64)
+                    .checked_add(crate::text::visit_tokens(&payload.text, |_| {}) as u64)
                     .ok_or_else(|| Error::invariant("FT4 live token count overflows"))?;
             }
         }

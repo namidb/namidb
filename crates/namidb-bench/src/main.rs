@@ -19,6 +19,10 @@ use clap::{Parser, Subcommand};
 #[cfg(feature = "vector-index")]
 mod ann_bench;
 mod dataset;
+#[cfg(feature = "http-load")]
+mod http_load;
+#[cfg(feature = "http-load")]
+mod latency_store;
 mod loader;
 #[cfg(feature = "object-native")]
 mod object_native;
@@ -253,6 +257,80 @@ enum Cmd {
         /// Execution ceiling and gate for concurrent immutable range fetches.
         #[arg(long, default_value_t = 16)]
         max_in_flight: u64,
+    },
+    /// Run the real HTTP server on a store with simulated object-store
+    /// latency (see `http-load`).
+    #[cfg(feature = "http-load")]
+    Serve {
+        /// Storage URI, e.g. `file:///tmp/nb?ns=bench` (`?ns=` optional with
+        /// `--multi-tenant`).
+        #[arg(long)]
+        store: String,
+        #[arg(long, default_value = "127.0.0.1:18480")]
+        listen: std::net::SocketAddr,
+        /// Per-request latency lower bound, in milliseconds.
+        #[arg(long, default_value_t = 20)]
+        latency_min_ms: u64,
+        /// Per-request latency upper bound, in milliseconds.
+        #[arg(long, default_value_t = 40)]
+        latency_max_ms: u64,
+        /// Transfer rate charged on bodies, in MiB/s (0 = unlimited).
+        #[arg(long, default_value_t = 100)]
+        bandwidth_mib_per_sec: u64,
+        #[arg(long)]
+        multi_tenant: bool,
+        #[arg(long, default_value = "0s", value_parser = humantime::parse_duration)]
+        group_commit_window: std::time::Duration,
+        /// `NAMIDB_MEMORY_MAX_BYTES` semantics: bytes, `auto` (90% of the
+        /// cgroup limit) or `0` (off).
+        #[arg(long, default_value = "auto")]
+        memory_max_bytes: String,
+        #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
+        flush_interval: std::time::Duration,
+        #[arg(long, default_value = "300s", value_parser = humantime::parse_duration)]
+        compaction_interval: std::time::Duration,
+        /// Where to publish the store request counters (JSON, every 100 ms).
+        #[arg(long)]
+        counters_file: Option<PathBuf>,
+    },
+    /// Drive a server over HTTP and report write throughput / vector search.
+    #[cfg(feature = "http-load")]
+    HttpLoad {
+        #[arg(long, default_value = "http://127.0.0.1:18480")]
+        url: String,
+        /// Multi-tenant namespace (`/<ns>/v0/cypher`); omit for single-tenant.
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, value_enum)]
+        scenario: http_load::Scenario,
+        /// Rows to load (`bulk`, `vectors`) or the corpus size (`vector-search`).
+        #[arg(long, default_value_t = 10_000)]
+        count: usize,
+        #[arg(long, default_value_t = 500)]
+        batch: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Approximate JSON size of one document node.
+        #[arg(long, default_value_t = 3000)]
+        node_bytes: usize,
+        #[arg(long, default_value_t = 1024)]
+        dim: usize,
+        #[arg(long, default_value_t = 256)]
+        clusters: usize,
+        #[arg(long, default_value_t = 100)]
+        queries: usize,
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = 64)]
+        ef: usize,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
+        /// The `serve --counters-file`, to report store requests per step.
+        #[arg(long)]
+        counters_file: Option<PathBuf>,
+        /// Create the constraint and the vector/fulltext indexes first.
+        #[arg(long)]
+        setup: bool,
     },
 }
 
@@ -604,6 +682,75 @@ async fn main() -> Result<()> {
             if !passed {
                 anyhow::bail!("object-native gates failed: {}", failures.join("; "));
             }
+        }
+        #[cfg(feature = "http-load")]
+        Cmd::Serve {
+            store,
+            listen,
+            latency_min_ms,
+            latency_max_ms,
+            bandwidth_mib_per_sec,
+            multi_tenant,
+            group_commit_window,
+            memory_max_bytes,
+            flush_interval,
+            compaction_interval,
+            counters_file,
+        } => {
+            http_load::serve(http_load::ServeConfig {
+                store,
+                listen,
+                latency: latency_store::LatencyModel::new(
+                    latency_min_ms,
+                    latency_max_ms,
+                    bandwidth_mib_per_sec,
+                ),
+                multi_tenant,
+                group_commit_window,
+                memory_max_bytes,
+                flush_interval,
+                compaction_interval,
+                counters_file,
+            })
+            .await?;
+        }
+        #[cfg(feature = "http-load")]
+        Cmd::HttpLoad {
+            url,
+            namespace,
+            scenario,
+            count,
+            batch,
+            concurrency,
+            node_bytes,
+            dim,
+            clusters,
+            queries,
+            k,
+            ef,
+            seed,
+            counters_file,
+            setup,
+        } => {
+            let report = http_load::http_load(http_load::LoadConfig {
+                url,
+                namespace,
+                scenario,
+                count,
+                batch,
+                concurrency,
+                node_bytes,
+                dim,
+                clusters,
+                queries,
+                k,
+                ef,
+                seed,
+                counters_file,
+                setup,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())

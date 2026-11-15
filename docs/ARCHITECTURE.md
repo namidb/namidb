@@ -132,10 +132,32 @@ Types:
       b. manifest_store.put_body(fence, base, next)  (PutMode::Create)
    The WAL path is fully determined by seq, so both can fly at once —
    turning WAL + body + pointer (3 RTs) into max(WAL,body) + pointer (2).
-3. On WAL Ok: pointer = body_result?; cas_pointer(...) publishes p<v+1>.
+   c. the advisory current.json the PREVIOUS commit still owes (if any).
+3. On WAL Ok: pointer = body_result?; cas_pointer_deferring_advisory(...)
+   publishes p<v+1> and leaves this version's current.json PUT owed.
 4. Only AFTER the pointer CAS lands: drain pending_payloads into the live
    memtable, advance current/seq, refresh_published() (new Arc snapshot).
 ```
+
+A commit therefore waits two sequential round trips, not three. The advisory
+`current.json` is not part of the commit: the version is durable and
+discoverable once its pointer exists, and the forward probe advances from any
+older advisory. The owed PUT rides with the next commit's WAL/body PUTs, and
+every flush (the periodic one included, so an idle writer settles it within one
+flush interval) publishes it; the janitor keeps every pointer at or above the
+version `current.json` names, so a lagging advisory always resolves.
+
+The periodic flush (`begin_background_flush` → `BackgroundFlush::build` →
+`install_background_flush`) holds the writer only to commit the pending batch
+and checkpoint the memtable (an O(1) clone of the persistent map), and again to
+commit the manifest that adds the uploaded SSTs and retires exactly the WAL
+segments the checkpoint covered. Encoding the SSTs and search deltas and
+uploading them run without the writer, so writes keep committing meanwhile;
+the checkpointed rows stay readable in the memtable until the install releases
+the entries whose LSN it flushed. An install whose base changed beyond WAL
+commits (compaction, DDL, a reopen) is refused and the next flush runs under
+the lock. Immutable SST objects are HEADed once per process
+(`range_cache::head_create_only`), not once per published snapshot.
 
 The ordering — **WAL durable and manifest committed before the memtable is touched and before the client is acked** — is the core invariant: a failed commit never ACKs a record it did not make durable and reference, and the memtable is untouched until the pointer CAS succeeds, so recovery never resurrects an unacked write nor drops an acked one.
 
@@ -147,7 +169,7 @@ Failure handling is precise. A WAL `Precondition` (seq collision with an orphan)
 
 The linearization point is the **Create-only pointer family** `manifest/pointer/p<N>.json`, where `N` equals the manifest version and the *current pointer is the highest `N` present*. `cas_pointer` creates `p<v+1>.json` with `PutMode::Create`: whoever creates it first owns version `v+1`. Both commit phases now use the same primitive (PUT-if-absent), removing the engine's former dependency on `If-Match` overwrite. This matches the Delta Lake / SlateDB model (monotonic commit files + LIST for current + writer epoch).
 
-`load_current` → `load_pointer`: `max_pointer_version` LISTs `pointer/`, takes the max `N`, then `probe_pointer_forward` galloping HEADs `p<N+1>, p<N+2>, …` (bounded `MAX_PROBE = 8192`) to close the window where a just-created pointer has not yet appeared in an eventually-consistent LIST. If LIST is empty, it falls back to a HEAD of `p0` (fresh namespace) and then to reading the advisory `current.json` (aged namespace whose low pointers the janitor reclaimed) — trusting the advisory only if the pointer at its version still HEADs. If the probe exhausts its window it returns the *retryable* `PointerResolveStale`. The advisory `current.json` is a plain unconditional PUT written on every commit/bootstrap; it is explicitly **not** part of the CAS contract, only a non-LIST discovery hint that prevents `WriterSession::open` from re-bootstrapping (and thereby erasing) a live namespace on an EC-LIST store.
+`load_current` → `load_pointer`: `max_pointer_version` LISTs `pointer/`, takes the max `N`, then `probe_pointer_forward` galloping HEADs `p<N+1>, p<N+2>, …` (bounded `MAX_PROBE = 8192`) to close the window where a just-created pointer has not yet appeared in an eventually-consistent LIST. If LIST is empty, it falls back to a HEAD of `p0` (fresh namespace) and then to reading the advisory `current.json` (aged namespace whose low pointers the janitor reclaimed) — trusting the advisory only if the pointer at its version still HEADs. If the probe exhausts its window it returns the *retryable* `PointerResolveStale`. The advisory `current.json` is a plain unconditional PUT written at bootstrap and, deferred by one commit, after every commit (see `commit_batch` above); it is explicitly **not** part of the CAS contract, only a non-LIST discovery hint that prevents `WriterSession::open` from re-bootstrapping (and thereby erasing) a live namespace on an EC-LIST store.
 
 Monotonicity invariants enforced in `put_body`: `new.version == base.version + 1`, `new.epoch >= base.epoch`, and `fence.assert_alive(base.epoch)` before any write.
 
@@ -690,7 +712,27 @@ The methodology's governing principle, stated in RFC-031, is that **recall on a 
 
 A separate track (`vector_recall.rs`) isolates the error introduced by int8 quantization *alone* — the arithmetic of encoding, dequantizing, and the asymmetric quantized distance — from the graph-navigation error, so the two sources of approximation can be attributed independently. This matters because the engine rescan-corrects quantized scores with the exact f32 metric on the candidate pool (§6): reported scores and ordering inside the reached pool are exact, while quantization and graph navigation affect which neighbours are reached, i.e. recall.
 
-### 10.4 What the measurements are for
+### 10.4 Write throughput and served search over a slow store
+
+The in-process harnesses above call the engine directly against a local
+store. `namidb-bench serve` / `namidb-bench http-load` (feature `http-load`)
+instead measure what a client sees: the real HTTP server, with every object
+store request delayed by a uniform 20-40 ms (`--latency-min-ms`,
+`--latency-max-ms`) and counted per operation (`GET`, ranged `GETR`, `HEAD`,
+`PUT`, `LIST`, multipart parts), so a result reports round trips as well as
+seconds. The server is meant to run in a memory-limited cgroup
+(`systemd-run --user --scope -p MemoryMax=1G ... --memory-max-bytes auto`)
+with the allocator settings of the container image. The scenarios are a
+mixed field workload (`field-report`), sustained document and vector loads
+with a configurable batch size and client concurrency (`bulk`, `vectors`;
+the clients retry 503 and transport errors and count only committed rows),
+and `vector-search`: recall@k against brute-force ground truth on the same
+seeded, clustered synthetic corpus, with p50/p95 latency per `ef`. Its
+results depend on `(count, dim, clusters, seed, ef, k)`, the memory limit,
+the latency model and whether the vector index has a compacted base or only
+deltas, and are reported with all of them.
+
+### 10.5 What the measurements are for
 
 The harness is an engineering instrument, not a marketing one: it exists to catch regressions (a recall floor that a code change drops below), to guide parameter defaults (the Vamana degree `R`, build beam `L`, and diversification `α`; the compaction level budgets), and to make the cost of a design decision visible before it ships. A researcher reproducing a NamiDB number should report the parameter vector alongside it and should distinguish an internal synthetic measurement from an external-dataset one, exactly as RFC-031 requires of the project itself.
 
