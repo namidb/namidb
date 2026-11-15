@@ -340,6 +340,10 @@ fn query() -> impl Strategy<Value = String> {
         "MATCH (d:Device) OPTIONAL MATCH (d)<-[:ON_DEVICE]-(n) WHERE {p} \
          RETURN d.name AS d, n.name AS v",
         "MATCH (n:Call|Contact) WHERE {p} RETURN n.name AS v",
+        "MATCH (n) WHERE ({p}) AND (n)-[:ON_DEVICE]->() RETURN n.name AS v",
+        "MATCH (n) WHERE ({p}) AND NOT (n)-[:ON_DEVICE]->(:Device) RETURN n.name AS v",
+        "MATCH (d:Device) CALL { WITH d MATCH (d)<-[:ON_DEVICE]-(n) WHERE {p} \
+         RETURN count(n) AS c } RETURN d.name AS d, c",
     ];
     (prop::sample::select(templates), predicate()).prop_map(|(t, p)| t.replace("{p}", &p))
 }
@@ -415,5 +419,358 @@ async fn multi_seed_expand_matches_one_seed_at_a_time() {
         assert_eq!(batch.len(), names.len(), "{pattern}: {batch:?}");
         assert_eq!(batch, single, "{pattern}");
         assert_eq!(into, single, "{pattern}");
+    }
+}
+
+/// A single hop from a fresh node to one an earlier clause bound walks from
+/// the bound node instead of scanning every node and probing each pair.
+#[tokio::test]
+async fn hop_to_a_bound_node_starts_from_it_and_agrees() {
+    let h = Harness::new().await;
+    for query in [
+        "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) WITH c MATCH (d)<-[:ON_DEVICE]-(c) RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) MATCH (d)-[:ON_DEVICE]-(c) RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) MATCH (d)<-[r:ON_DEVICE]-(c) RETURN type(r) AS t, d.name AS d",
+        "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) WHERE d.name STARTS WITH 'device' \
+         RETURN c.name AS c",
+        "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) WHERE d.kind = c.kind RETURN c.name AS c",
+        "MATCH (c:Call) MATCH (d)<--(c) RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) MATCH (d:Device)<-[:ON_DEVICE]-(c) RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) MATCH (d:Device:Nope)<-[:ON_DEVICE]-(c) RETURN count(*) AS n",
+        "MATCH (d:Device) MATCH (m)-[:ON_DEVICE]->(d) RETURN d.name AS d, count(*) AS n",
+        "MATCH (d:Device) MATCH (m)-[:ON_DEVICE]->(d) RETURN d.name AS d, m.name AS m",
+        "MATCH (d:Device) MATCH (c:Call)-[:ON_DEVICE]->(d) RETURN d.name AS d, c.name AS c",
+        "MATCH (c) WHERE c.name STARTS WITH 'n00' WITH c MATCH (d)<-[:ON_DEVICE]-(c:Call) \
+         RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call)-[r1:ON_DEVICE]->(x), (d)<-[r2:ON_DEVICE]-(c) RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call)-[r1:ON_DEVICE]->(x) MATCH (d)<-[r2:ON_DEVICE]-(c) \
+         RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) OPTIONAL MATCH (d)<-[:ON_DEVICE]-(c) WHERE d.name ENDS WITH '2' \
+         RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) OPTIONAL MATCH (d)-[:NOPE]->(c) RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) MATCH (e)<-[:ON_DEVICE]-(c) \
+         RETURN c.name AS c, d.name AS d, e.name AS e",
+        "UNWIND range(1, 2) AS i MATCH (n:Call) WITH n, i MATCH (d)<-[:ON_DEVICE]-(n) \
+         RETURN count(*) AS c",
+    ] {
+        let plan = h.assert_same(query).await;
+        assert!(
+            !plan.contains("label=* alias=d") && !plan.contains("label=* alias=m"),
+            "`{query}` must not scan every node:\n{plan}"
+        );
+    }
+    // Shapes that keep the scan (a literal filter folded into it, an id
+    // seek on the new end, a named path) must still agree.
+    for query in [
+        "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) WHERE d.kind = 1 RETURN c.name AS c",
+        "MATCH (c:Call) OPTIONAL MATCH (d)<-[:ON_DEVICE]-(c) WHERE d.kind = 2 \
+         RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c) WHERE elementId(d) IN $hubs \
+         RETURN c.name AS c, d.name AS d",
+        "MATCH (c:Call) MATCH p = (d)<-[:ON_DEVICE]-(c) \
+         RETURN c.name AS c, [x IN nodes(p) | x.name] AS names",
+    ] {
+        h.assert_same(query).await;
+    }
+}
+
+/// The walk from the bound node and the probe from the scanned node must
+/// agree on a self-loop and on edges in both directions between two nodes,
+/// for every direction of the hop.
+#[tokio::test]
+async fn hop_to_a_bound_node_agrees_on_self_loops_and_two_way_edges() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("bound-loop").unwrap());
+    let mut w = WriterSession::open(store, paths).await.unwrap();
+    let (a, b, c) = (NodeId::new(), NodeId::new(), NodeId::new());
+    w.upsert_node("X", a, &node("a".into(), vec![])).unwrap();
+    w.upsert_node("Y", b, &node("b".into(), vec![])).unwrap();
+    w.upsert_node("Y", c, &node("c".into(), vec![])).unwrap();
+    for (from, to) in [(a, a), (a, b), (b, a), (c, a)] {
+        w.upsert_edge("L", from, to, &EdgeWriteRecord::default())
+            .unwrap();
+    }
+    w.commit_batch().await.unwrap();
+    let schema = w.schema().clone();
+    w.flush(schema).await.unwrap();
+    let snapshot = w.snapshot();
+    let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+    for query in [
+        "MATCH (x:X) MATCH (o)-[:L]-(x) RETURN x.name AS x, o.name AS o",
+        "MATCH (x:X) MATCH (o)-[:L]->(x) RETURN x.name AS x, o.name AS o",
+        "MATCH (x:X) MATCH (o)<-[:L]-(x) RETURN x.name AS x, o.name AS o",
+        "MATCH (x:X) MATCH (o)-[r:L]-(x) RETURN x.name AS x, o.name AS o, type(r) AS t",
+        "MATCH (x) MATCH (o)-[:L]-(x) RETURN x.name AS x, o.name AS o",
+    ] {
+        let naive = lower(&parse(query).unwrap()).unwrap();
+        let optimized = optimize(naive.clone(), &catalog);
+        let fast = execute(&optimized, &snapshot, &Params::new())
+            .await
+            .unwrap();
+        let slow = execute(&naive, &snapshot, &Params::new()).await.unwrap();
+        assert_eq!(
+            multiset(&fast),
+            multiset(&slow),
+            "`{query}`\n{}",
+            explain(&optimized)
+        );
+    }
+}
+
+/// More input rows than one read-ahead window (4,096), with every seed
+/// repeated: the windowed prefetch of both Expand forms must still give every
+/// row exactly its own partners.
+#[tokio::test]
+async fn multi_seed_expand_across_read_ahead_windows() {
+    let h = Harness::new().await;
+    let count = |rows: Vec<String>| -> i64 {
+        rows[0]
+            .rsplit('=')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|e| panic!("{rows:?}: {e}"))
+    };
+    let (_, messages, _) = h.run("MATCH (n:Message) RETURN count(n) AS c").await;
+    let messages = count(messages);
+    assert!(messages * 6 > 4_096, "{messages}");
+    for (query, expected) in [
+        (
+            "UNWIND range(1, 6) AS i MATCH (n:Message) WITH n, i \
+             MATCH (n)-[:ON_DEVICE]->(d) RETURN count(*) AS c",
+            messages * 6,
+        ),
+        (
+            "UNWIND range(1, 6) AS i MATCH (n:Message) WITH n, i \
+             MATCH (d)<-[:ON_DEVICE]-(n) RETURN count(*) AS c",
+            messages * 6,
+        ),
+        (
+            "UNWIND range(1, 6) AS i MATCH (n:Message), (d:Device) WITH n, d, i \
+             MATCH (n)-[:ON_DEVICE]->(d) RETURN count(*) AS c",
+            messages * 6,
+        ),
+        (
+            "UNWIND range(1, 6) AS i MATCH (n:Message), (d:Device) WITH n, d, i \
+             MATCH (n)-[:ON_DEVICE]-(d) RETURN count(*) AS c",
+            messages * 6,
+        ),
+    ] {
+        // Optimized only: the counts are known, and the lowered form of a
+        // hop to a bound node is the rows x nodes cross product the
+        // optimizer exists to avoid.
+        let snapshot = h.writer.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+        let plan = optimize(lower(&parse(query).unwrap()).unwrap(), &catalog);
+        let rows = execute(&plan, &snapshot, &h.params).await.unwrap();
+        assert_eq!(
+            count(multiset(&rows)),
+            expected,
+            "`{query}`\n{}",
+            explain(&plan)
+        );
+    }
+}
+
+/// Shapes the rewrites meet inside other operators: subqueries, pattern
+/// comprehensions and predicates, UNION, ordering, DISTINCT, aggregation,
+/// variable-length and multi-hop patterns, and labels on both ends of a hop.
+#[tokio::test]
+async fn label_rewrites_agree_inside_subqueries_unions_and_multi_hop_patterns() {
+    let h = Harness::new().await;
+    for query in [
+        "MATCH (n) WHERE n:Call OR n:Call RETURN n.name AS v",
+        "MATCH (n) WHERE n:Call OR (n:Call AND n.ts > 3) RETURN n.name AS v",
+        "MATCH (n) WHERE (n:Call AND n.ts > 50) OR (n:Recorded AND n.ts < 60) RETURN n.name AS v",
+        "MATCH (n) WHERE (n:Recorded AND n.ts IS NULL) OR n:Call RETURN n.name AS v",
+        "MATCH (n) WHERE n:Call OR n:Recorded RETURN DISTINCT labels(n) AS l",
+        "MATCH (n) WHERE n:Call OR n:Contact RETURN labels(n) AS l, count(*) AS c",
+        "MATCH (n) WHERE n:Call OR n:Contact RETURN n.kind AS k, collect(n.name) AS names",
+        "MATCH (d:Device) WHERE EXISTS { MATCH (n) WHERE n:Call OR n:Contact } RETURN d.name AS d",
+        "MATCH (d:Device) WHERE EXISTS { MATCH (d)<-[:ON_DEVICE]-(n) WHERE n:Call OR n:Contact } \
+         RETURN d.name AS d",
+        "MATCH (d:Device) CALL { WITH d MATCH (n) WHERE (n:Call OR n:Contact) AND n.kind = d.kind \
+         RETURN count(n) AS c } RETURN d.name AS d, c",
+        "MATCH (d:Device) CALL { MATCH (n) WHERE n:Call OR n:Recorded RETURN count(n) AS c } \
+         RETURN d.name AS d, c",
+        "MATCH (d:Device) RETURN d.name AS d, [(d)<-[:ON_DEVICE]-(n) WHERE n:Call | n.name] AS calls",
+        "MATCH (n) WHERE (n:Call OR n:Contact) AND (n)-[:ON_DEVICE]->() RETURN n.name AS v",
+        "MATCH (n) WHERE n:Call AND NOT (n)-[:ON_DEVICE]->(:Device) RETURN n.name AS v",
+        "MATCH (n) WHERE n:Call RETURN n.name AS v \
+         UNION MATCH (n) WHERE n:Contact OR n:Call RETURN n.name AS v",
+        "MATCH (n) WHERE n:Call RETURN n.name AS v \
+         UNION ALL MATCH (n) WHERE n:Recorded OR n:Call RETURN n.name AS v",
+        "MATCH (d:Device) OPTIONAL MATCH (n) WHERE (n:Call OR n:Contact) AND n.kind = d.kind \
+         RETURN d.name AS d, n.name AS v",
+        "MATCH (d:Device) OPTIONAL MATCH (n) WHERE n:Nope OR n:Nope2 RETURN d.name AS d, n.name AS v",
+        "MATCH (d:Device) OPTIONAL MATCH (n) WHERE n:Nope RETURN d.name AS d, n.name AS v",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(n) WHERE NOT n:Call RETURN count(n) AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(n) WHERE n:Call OR n:Contact RETURN count(n) AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(n) WHERE n:Call AND n:Recorded RETURN n.name AS v",
+        "MATCH (a)-[:ON_DEVICE]->(d)<-[:ON_DEVICE]-(b) WHERE a:Recorded AND b:Call AND d:Device \
+         RETURN a.name AS a, b.name AS b",
+        "MATCH (d:Device)<-[:ON_DEVICE*1..1]-(n) WHERE n:Call RETURN count(n) AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE*0..1]-(n) WHERE n:Device RETURN count(n) AS c",
+        "MATCH p = (d:Device)<-[:ON_DEVICE]-(n) WHERE n:Call RETURN length(p) AS l, n.name AS v",
+        "MATCH (d:Device)<-[r:ON_DEVICE]-(n) WHERE n:Call RETURN type(r) AS t, n.name AS v",
+        "MATCH (n), (m) WHERE n:Device AND (m:Device OR m:Recorded) RETURN n.name AS a, m.name AS b",
+        "MATCH (n) WHERE n:Call WITH n, n.ts AS ts WHERE ts IS NULL OR ts > 40 \
+         MATCH (m) WHERE m:Device AND m.kind = n.kind RETURN n.name AS a, m.name AS b",
+        "UNWIND [1, 2] AS i MATCH (n) WHERE n:Device OR n:Recorded RETURN i, n.name AS v",
+        "MATCH (n) WHERE n:Call AND n:Call RETURN n.name AS v",
+        "MATCH (n) WHERE n:Call AND (n:Recorded OR n:Contact) RETURN n.name AS v",
+        "MATCH (n) WHERE NOT (NOT n:Call) RETURN n.name AS v",
+        "MATCH (n) WHERE n:Call XOR n:Recorded RETURN n.name AS v",
+        "MATCH (n) WHERE coalesce(n:Call, false) RETURN n.name AS v",
+        "MATCH (n) WHERE (n:Call OR n:Contact) AND n.kind IN [0, 1] RETURN n.name AS v",
+    ] {
+        h.assert_same(query).await;
+    }
+    // Ordered results must agree row for row, not only as a multiset.
+    for query in [
+        "MATCH (n) WHERE n:Call OR n:Contact RETURN n.name AS v ORDER BY v SKIP 3 LIMIT 7",
+        "MATCH (n) WHERE n:Call OR n:Recorded RETURN n.name AS v ORDER BY n.ts DESC, v LIMIT 9",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $hubs \
+         RETURN c.name AS c ORDER BY c LIMIT 5",
+    ] {
+        let snapshot = h.writer.snapshot();
+        let catalog = StatsCatalog::from_manifest(&snapshot.manifest().manifest);
+        let naive = lower(&parse(query).unwrap()).unwrap();
+        let optimized = optimize(naive.clone(), &catalog);
+        let fast = execute(&optimized, &snapshot, &h.params).await.unwrap();
+        let slow = execute(&naive, &snapshot, &h.params).await.unwrap();
+        let render_rows = |rows: &[Row]| -> Vec<String> {
+            rows.iter()
+                .map(|r| {
+                    r.bindings
+                        .iter()
+                        .map(|(k, v)| format!("{k}={}", render(v)))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .collect()
+        };
+        assert_eq!(
+            render_rows(&fast),
+            render_rows(&slow),
+            "`{query}`\n{}",
+            explain(&optimized)
+        );
+    }
+}
+
+/// Id lists with duplicates, NULLs, ids of the wrong label, undirected and
+/// multi-type hops, longer chains with relationship uniqueness, and an id
+/// anchor inside a subquery.
+#[tokio::test]
+async fn hub_deanchor_agrees_on_odd_id_lists_and_chains() {
+    let mut h = Harness::new().await;
+    let snapshot = h.writer.snapshot();
+    let hubs = match h.params.get("hubs") {
+        Some(RuntimeValue::List(items)) => items.clone(),
+        _ => unreachable!(),
+    };
+    drop(snapshot);
+    let some_call = {
+        let (_, rows, _) = h
+            .run("MATCH (c:Call) WHERE c.name = 'n001' RETURN elementId(c) AS id")
+            .await;
+        rows[0].strip_prefix("id=").unwrap().to_string()
+    };
+    h.params.insert(
+        "dups".into(),
+        RuntimeValue::List(vec![hubs[0].clone(), hubs[0].clone(), hubs[1].clone()]),
+    );
+    h.params.insert(
+        "mixed".into(),
+        RuntimeValue::List(vec![
+            hubs[0].clone(),
+            RuntimeValue::String(some_call),
+            RuntimeValue::Null,
+        ]),
+    );
+    h.params
+        .insert("nothing".into(), RuntimeValue::List(vec![]));
+    h.params.insert("null".into(), RuntimeValue::Null);
+    for query in [
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $dups RETURN c.name AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $mixed RETURN c.name AS c",
+        "MATCH (d)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $mixed RETURN c.name AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $nothing RETURN c.name AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $null RETURN c.name AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) = $null RETURN c.name AS c",
+        "MATCH (d:Device)-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $hubs RETURN c.name AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE|NOPE]-(c:Call) WHERE elementId(d) IN $hubs RETURN c.name AS c",
+        "MATCH (d:Device)<-[r1:ON_DEVICE]-(c:Call)-[r2:ON_DEVICE]->(e) WHERE elementId(d) IN $hubs \
+         RETURN c.name AS c, e.name AS e",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call)-[:ON_DEVICE]->(e:Device) WHERE elementId(d) IN $hubs \
+         RETURN c.name AS c, e.name AS e",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $hubs AND c.kind = d.kind \
+         RETURN c.name AS c",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $hubs \
+         RETURN DISTINCT d.name AS d",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $hubs \
+         RETURN d, count(c) AS n",
+        "MATCH (x:Device) WHERE x.kind = 0 CALL { WITH x MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) \
+         WHERE elementId(d) = elementId(x) RETURN count(c) AS n } RETURN x.name AS x, n",
+        "MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $hubs \
+         OPTIONAL MATCH (c)-[:ON_DEVICE]->(e:Device) RETURN c.name AS c, e.name AS e",
+    ] {
+        h.assert_same(query).await;
+    }
+}
+
+/// A write followed by a read in the same statement: the label scan the
+/// rewrite introduces must see the statement's own writes exactly as the
+/// full scan does.
+#[tokio::test]
+async fn label_rewrites_see_writes_of_the_same_statement() {
+    for query in [
+        "CREATE (:Call {name: 'created'}) WITH 1 AS one MATCH (n) WHERE n:Call \
+         RETURN count(n) AS c",
+        "CREATE (:Call {name: 'created'}) WITH 1 AS one MATCH (n) WHERE n:Call OR n:Device \
+         RETURN count(n) AS c",
+        "MATCH (m:Message) WHERE m.name = 'n020' SET m:Call WITH count(*) AS k \
+         MATCH (n) WHERE n:Call RETURN k, count(n) AS c",
+        "MATCH (m:Call) WHERE m.name = 'n001' REMOVE m:Call WITH count(*) AS k \
+         MATCH (n) WHERE n:Call OR n:Recorded RETURN k, count(n) AS c",
+        "MATCH (m:Call) WHERE m.name = 'n002' DETACH DELETE m WITH count(*) AS k \
+         MATCH (n) WHERE n:Call RETURN k, count(n) AS c",
+        "MATCH (n) WHERE n:Call OR n:Recorded SET n.seen = true RETURN count(n) AS c",
+        "MATCH (n) WHERE n:Call AND n.ts > 50 DETACH DELETE n RETURN count(*) AS c",
+        "MATCH (m:Message) WHERE m.name = 'n020' SET m:Call WITH count(*) AS k \
+         MATCH (d:Device)<-[:ON_DEVICE]-(n) WHERE n:Call RETURN k, count(n) AS c",
+        "CREATE (c:Call {name: 'z'})-[:ON_DEVICE]->(:Device {name: 'zd'}) WITH c \
+         MATCH (d)<-[:ON_DEVICE]-(c) RETURN d.name AS d",
+        "MATCH (d:Device {name: 'device-1'}) CREATE (:Message {name: 'late'})-[:ON_DEVICE]->(d) \
+         WITH d MATCH (m)-[:ON_DEVICE]->(d) RETURN count(m) AS c",
+    ] {
+        let mut outcomes = Vec::new();
+        for optimized in [true, false] {
+            let (mut writer, _) = fixture().await;
+            let catalog = StatsCatalog::from_manifest(&writer.snapshot().manifest().manifest);
+            let naive = lower(&parse(query).unwrap()).unwrap();
+            let plan = if optimized {
+                optimize(naive, &catalog)
+            } else {
+                naive
+            };
+            let outcome = namidb_query::execute_write(&plan, &mut writer, &Params::new())
+                .await
+                .unwrap_or_else(|e| panic!("`{query}` optimized={optimized}: {e:?}"));
+            let after = execute(
+                &lower(
+                    &parse("MATCH (n) RETURN labels(n) AS l, n.name AS v, n.seen AS s").unwrap(),
+                )
+                .unwrap(),
+                &writer.snapshot(),
+                &Params::new(),
+            )
+            .await
+            .unwrap();
+            outcomes.push((multiset(&outcome.rows), multiset(&after)));
+        }
+        assert_eq!(outcomes[0], outcomes[1], "`{query}`");
     }
 }
