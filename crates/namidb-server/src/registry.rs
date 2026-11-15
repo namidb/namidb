@@ -389,6 +389,12 @@ impl NamespaceRegistry {
                 namidb_storage::Error::PointerResolveStale => {
                     RegistryError::Unavailable(e.to_string())
                 }
+                // Data from a newer release: nothing is wrong with this
+                // server, it is too old for the namespace (409).
+                namidb_storage::Error::NewerStorageFormat { .. }
+                | namidb_storage::Error::StorageFormatUpgradeRequired { .. } => {
+                    RegistryError::UnsupportedFormat(e.to_string())
+                }
                 other => RegistryError::OpenFailed(other.to_string()),
             })?;
 
@@ -945,6 +951,11 @@ pub enum RegistryError {
     /// the client should retry. Mapped to 503, distinct from `OpenFailed`'s
     /// 500 so a retryable race is not reported as a server bug.
     Unavailable(String),
+    /// The namespace's storage format does not allow this build to open it
+    /// (see `namidb_storage::format`). Mapped to 409 with
+    /// `code: "unsupported_storage_format"`: retrying will not help, and it
+    /// is not a server fault.
+    UnsupportedFormat(String),
 }
 
 impl std::fmt::Display for RegistryError {
@@ -954,6 +965,7 @@ impl std::fmt::Display for RegistryError {
             Self::OpenFailed(msg) => write!(f, "failed to open namespace: {}", msg),
             Self::AtCapacity => write!(f, "namespace registry at capacity"),
             Self::Unavailable(msg) => write!(f, "namespace temporarily unavailable: {}", msg),
+            Self::UnsupportedFormat(msg) => write!(f, "cannot open namespace: {}", msg),
         }
     }
 }
@@ -970,6 +982,16 @@ impl IntoResponse for RegistryError {
                 "namespace registry at capacity".to_string(),
             ),
             Self::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            Self::UnsupportedFormat(msg) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": msg,
+                        "code": "unsupported_storage_format",
+                    })),
+                )
+                    .into_response();
+            }
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
@@ -991,6 +1013,62 @@ mod tests {
         let (store, _) = namidb_storage::parse_uri(&format!("memory://{uri_ns}")).unwrap();
         let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
         NamespaceRegistry::new(store, String::new(), 1, Duration::ZERO, metrics, maint)
+    }
+
+    /// A namespace a newer release wrote is refused with 409 and a stable
+    /// code, and left exactly as it was: the registry claims nothing.
+    #[tokio::test]
+    async fn a_namespace_in_a_newer_storage_format_is_refused_with_409() {
+        use namidb_storage::{ManifestStore, StorageFormat, WriterFence};
+        use object_store::ObjectStoreExt;
+        let (store, _) = namidb_storage::parse_uri("memory://registry-newer-format").unwrap();
+        let paths = NamespacePaths::new("", NamespaceId::new("future").unwrap());
+        drop(
+            WriterSession::open(store.clone(), paths.clone())
+                .await
+                .unwrap(),
+        );
+        let manifests = ManifestStore::new(store.clone(), paths.clone());
+        let base = manifests.load_current().await.unwrap();
+        let mut next = base.manifest.next_version(uuid::Uuid::now_v7());
+        next.storage_format = Some(StorageFormat {
+            version: 9,
+            min_reader_version: 9,
+            min_writer_version: 9,
+            written_by: "namidb 9.0.0".into(),
+        });
+        let stamped = manifests
+            .commit(&WriterFence::new(base.manifest.epoch), &base, next)
+            .await
+            .unwrap();
+
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let reg = NamespaceRegistry::new(
+            store.clone(),
+            String::new(),
+            4,
+            Duration::from_secs(60),
+            metrics,
+            MaintenanceConfig::default(),
+        );
+        let Err(err) = reg.get_or_open("future").await else {
+            panic!("a namespace in a newer format must be refused");
+        };
+        assert!(matches!(err, RegistryError::UnsupportedFormat(_)), "{err}");
+        assert!(err.to_string().contains("namidb 9.0.0"), "{err}");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "unsupported_storage_format");
+
+        // Untouched: the pointer still names the stamped version.
+        let pointer_after = store
+            .head(&paths.pointer_version(stamped.manifest.version + 1))
+            .await;
+        assert!(pointer_after.is_err(), "the registry must not claim it");
     }
 
     /// Open `ns`, retrying while the current occupant ages past the idle

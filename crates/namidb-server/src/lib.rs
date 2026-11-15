@@ -1955,6 +1955,22 @@ struct ErrorBody {
     error: String,
 }
 
+/// Response for a namespace the registry could not open: a 503, except for a
+/// namespace in a storage format this build cannot open, which is a 409 with
+/// `code: "unsupported_storage_format"` because retrying will not help.
+fn namespace_open_error(e: crate::registry::RegistryError) -> Response {
+    if matches!(e, crate::registry::RegistryError::UnsupportedFormat(_)) {
+        return e.into_response();
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorBody {
+            error: e.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 /// Classify an executor error for the HTTP response: the status code and the
 /// machine-readable `code`. A deliberately-unsupported feature is a 400 with
 /// `code: "unsupported"` (not a 500), so clients can tell "not implemented"
@@ -2817,12 +2833,17 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 struct VersionResponse {
     version: &'static str,
     build_target: &'static str,
+    /// Newest storage format this build reads, and the one it writes (see
+    /// `namidb_storage::format`). A namespace whose manifest stamp needs a
+    /// newer `min_reader_version` is refused with 409.
+    storage_format: u32,
 }
 
 async fn version() -> impl IntoResponse {
     Json(VersionResponse {
         version: env!("CARGO_PKG_VERSION"),
         build_target: env!("CARGO_PKG_NAME"),
+        storage_format: namidb_storage::STORAGE_FORMAT_VERSION,
     })
 }
 
@@ -4484,15 +4505,7 @@ async fn dispatch_admin_compact_multi(
     } else {
         match shared.registry.get_or_open(namespace).await {
             Ok(ns) => ns,
-            Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorBody {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
+            Err(e) => return namespace_open_error(e),
         }
     };
     // A namespace retired while we waited for the permit must not be revived
@@ -5488,13 +5501,7 @@ async fn dispatch_health_multi(shared: &SharedAppState, namespace: String) -> Re
             let m = &owned.manifest().manifest;
             health_response(namespace, m, &ns_state.writer_health, None, &shared.memory)
         }
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => namespace_open_error(e),
     }
 }
 
@@ -5535,15 +5542,7 @@ async fn dispatch_cypher_multi(
     // Get or create the namespace state.
     let ns_state = match shared.registry.get_or_open(namespace).await {
         Ok(ns) => ns,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorBody {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response();
-        }
+        Err(e) => return namespace_open_error(e),
     };
 
     let registered = shared
@@ -6139,15 +6138,7 @@ async fn run_admin_flush_multi(shared: SharedAppState, namespace: String) -> Res
     } else {
         match shared.registry.get_or_open(&namespace).await {
             Ok(ns) => ns,
-            Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorBody {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
+            Err(e) => return namespace_open_error(e),
         }
     };
     let bound = if shared.writer_lock_timeout.is_zero() {
@@ -10273,6 +10264,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["storage_format"],
+            namidb_storage::STORAGE_FORMAT_VERSION
+        );
     }
 
     #[tokio::test]
@@ -10549,6 +10548,98 @@ mod tests {
             listed.iter().any(|name| name.contains("coop-central")),
             "default namespace must come from the flag, got {listed:?}"
         );
+    }
+
+    /// A namespace a newer release wrote answers 409 with a stable code on
+    /// every multi-tenant route, while the other namespaces keep serving.
+    #[tokio::test]
+    async fn multi_tenant_namespace_in_a_newer_storage_format_is_a_409() {
+        use namidb_storage::{NamespacePaths, StorageFormat, WriterFence};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            namidb_storage::parse_store(&format!("file://{}", dir.path().display())).unwrap();
+        let paths = NamespacePaths::new("", namidb_core::NamespaceId::new("future").unwrap());
+        drop(
+            WriterSession::open(store.clone(), paths.clone())
+                .await
+                .unwrap(),
+        );
+        let manifests = ManifestStore::new(store.clone(), paths);
+        let base = manifests.load_current().await.unwrap();
+        let mut next = base.manifest.next_version(uuid::Uuid::now_v7());
+        next.storage_format = Some(StorageFormat {
+            version: 9,
+            min_reader_version: 9,
+            min_writer_version: 9,
+            written_by: "namidb 9.0.0".into(),
+        });
+        manifests
+            .commit(&WriterFence::new(base.manifest.epoch), &base, next)
+            .await
+            .unwrap();
+
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let registry = Arc::new(registry::NamespaceRegistry::new(
+            store,
+            String::new(),
+            0,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            registry::MaintenanceConfig::default(),
+        ));
+        let shared = SharedAppState::new_with_memory(
+            registry,
+            Arc::new(AuthConfig::open()),
+            metrics,
+            Duration::ZERO,
+            Duration::ZERO,
+            0,
+            0,
+            Duration::ZERO,
+            0,
+            0,
+            Arc::new(memory::MemoryGovernor::new(0)),
+            Duration::ZERO,
+            "default".to_string(),
+        );
+        let app = build_multi_tenant_router(shared);
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/future/v0/cypher",
+                r#"{"query": "RETURN 1 AS one"}"#,
+            ),
+            ("GET", "/future/v0/health", ""),
+            ("POST", "/future/v0/admin/flush", ""),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT, "{method} {uri}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                v["code"], "unsupported_storage_format",
+                "{method} {uri}: {v}"
+            );
+            assert!(
+                v["error"].as_str().unwrap().contains("namidb 9.0.0"),
+                "{method} {uri}: {v}"
+            );
+        }
+        let status = mt_cypher(&app, "/present/v0/cypher", None, "CREATE (:T {a: 1})").await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     async fn mt_cypher(
