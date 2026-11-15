@@ -105,12 +105,13 @@ jobs:
         target:
           - { os: linux,   arch: x86_64,  rust_target: x86_64-unknown-linux-gnu,    runner: ubuntu-22.04, manylinux: "2_28" }
           - { os: linux,   arch: aarch64, rust_target: aarch64-unknown-linux-gnu,   runner: ubuntu-22.04, manylinux: "2_28" }
-          - { os: macos,   arch: arm64,   rust_target: aarch64-apple-darwin,        runner: macos-14,     manylinux: "" }
+          - { os: macos,   arch: arm64,   rust_target: aarch64-apple-darwin,        runner: macos-15,     manylinux: "" }
           # Intel Macs and x86_64 Pythons on Apple silicon (Rosetta terminals,
           # python3-intel64) need their own wheel or pip falls back to the
-          # sdist and a Rust build. Cross-built on macos-14, since macos-13
+          # sdist and a Rust build. Cross-built on macos-15 (GitHub retired the
+          # macos-14 image in November 2026), since macos-13
           # runners are scarce.
-          - { os: macos,   arch: x86_64,  rust_target: x86_64-apple-darwin,         runner: macos-14,     manylinux: "" }
+          - { os: macos,   arch: x86_64,  rust_target: x86_64-apple-darwin,         runner: macos-15,     manylinux: "" }
           - { os: windows, arch: x86_64,  rust_target: x86_64-pc-windows-msvc,      runner: windows-2022, manylinux: "" }
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -230,10 +231,10 @@ jobs:
         include:
           - { os: ubuntu-22.04, python: "3.9",  artifact: wheel-linux-x86_64 }
           - { os: ubuntu-22.04, python: "3.13", artifact: wheel-linux-x86_64 }
-          - { os: macos-14,     python: "3.12", artifact: wheel-macos-arm64 }
+          - { os: macos-15,     python: "3.12", artifact: wheel-macos-arm64 }
           # An x64 Python on Apple silicon runs under Rosetta, which is the
           # setup that used to fall back to the sdist.
-          - { os: macos-14,     python: "3.12", artifact: wheel-macos-x86_64, arch: x64 }
+          - { os: macos-15,     python: "3.12", artifact: wheel-macos-x86_64, arch: x64 }
           - { os: windows-2022, python: "3.12", artifact: wheel-windows-x86_64 }
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -244,7 +245,7 @@ jobs:
           python-version: ${{ matrix.python }}
           architecture: ${{ matrix.arch }}
       # The macOS Python is a universal2 build, which starts as arm64 on
-      # macos-14 unless told otherwise. Put a wrapper first on PATH so every
+      # macos-15 unless told otherwise. Put a wrapper first on PATH so every
       # later `python` runs the x86_64 slice under Rosetta.
       - name: Run Python under Rosetta
         if: matrix.arch == 'x64'
@@ -296,10 +297,10 @@ jobs:
         shell: bash
         run: |
           python -m pip install pytest pytest-asyncio pandas
-          # polars 1.41.x SIGABRTs on the macos-14 / py3.12 runner during the
+          # polars 1.41.x SIGABRTs on the macos-15 / py3.12 runner during the
           # async cypher test (1.40.1 was fine on 2026-05-27); cap below 1.41
           # until the upstream regression clears. pip still picks the best
-          # 1.40.x per (OS, python) in the matrix. Rosetta on macos-14 has no
+          # 1.40.x per (OS, python) in the matrix. Rosetta on macos-15 has no
           # AVX, which the x86_64 polars wheel needs, so the x64 entry skips
           # it and the polars test skips itself.
           if [ "${{ matrix.arch }}" != "x64" ]; then
