@@ -147,6 +147,12 @@ pub struct TextV4ExternalBuildMetrics {
     pub spool_bytes_written: u64,
     pub filter_spool_bytes: u64,
     pub filter_value_count: u64,
+    /// Native-filter properties this segment does not advertise because
+    /// their values exceeded the distinct-value cap or directory budget.
+    pub omitted_filter_properties: u64,
+    /// Documents whose conservative tokenization estimate exceeded the
+    /// per-record workspace; they are indexed anyway (see `preflight_text`).
+    pub oversized_records: u64,
 }
 
 /// Authenticated coarse statistics for a reconciled FT4 DeltaRun.
@@ -588,14 +594,13 @@ impl TextV4ExternalBuilder {
                 "text v4 reconciled builder requires strictly ascending NodeIds",
             ));
         }
-        if after.as_ref().is_some_and(|payload| {
-            payload.text.len().saturating_mul(64) > self.config.sort_budget()
-        }) {
-            return Err(Error::precondition(format!(
-                "one text v4 reconciled payload can require more than the {}-byte per-record workspace",
-                self.config.sort_budget()
-            )));
-        }
+        self.observe_record_text(
+            source.node_id,
+            after
+                .as_ref()
+                .map(|payload| payload.text.len())
+                .unwrap_or(0),
+        );
         let after = after.as_ref().map(prepare_payload).transpose()?;
         self.validate_filter_keys(after.as_ref())?;
         let output_record = match (source.operation, after.as_ref()) {
@@ -718,7 +723,7 @@ impl TextV4ExternalBuilder {
         self.observe_memory()
     }
 
-    fn preflight_text(&self, mutation: &TextV4Mutation) -> Result<()> {
+    fn preflight_text(&mut self, mutation: &TextV4Mutation) -> Result<()> {
         let raw = mutation
             .before
             .as_ref()
@@ -732,15 +737,37 @@ impl TextV4ExternalBuilder {
                     .unwrap_or(0),
             )
             .ok_or_else(|| Error::precondition("text v4 mutation text length overflows"))?;
-        // Shared tokenization can allocate one String header per emitted token.
-        // 64× input bytes is a conservative preflight for Latin/CJK expansion.
-        if raw.saturating_mul(64) > self.config.sort_budget() {
-            return Err(Error::precondition(format!(
-                "one text v4 mutation can require more than the {}-byte per-record workspace",
-                self.config.sort_budget()
-            )));
-        }
+        self.observe_record_text(mutation.node_id, raw);
         Ok(())
+    }
+
+    /// Account one document's tokenization workspace.
+    ///
+    /// Shared tokenization can allocate one String header per emitted token;
+    /// 64x input bytes is a conservative estimate for Latin/CJK expansion.
+    /// The sort buffer stays bounded whatever the document size (it spills),
+    /// so the only unbounded part is this transient, which is proportional to
+    /// a document the write path has already accepted and holds in memory.
+    /// Refusing it here would fail every later flush of the namespace (the
+    /// document never leaves the memtable), so an oversized document is
+    /// indexed and reported instead of rejected.
+    fn observe_record_text(&mut self, node_id: [u8; 16], text_bytes: usize) {
+        let estimate = text_bytes.saturating_mul(64);
+        if estimate <= self.config.sort_budget() {
+            return;
+        }
+        self.metrics.oversized_records = self.metrics.oversized_records.saturating_add(1);
+        if self.metrics.oversized_records == 1 {
+            tracing::warn!(
+                index = %self.state.index_name,
+                node_id = %uuid::Uuid::from_bytes(node_id),
+                text_bytes,
+                estimated_workspace_bytes = estimate,
+                per_record_workspace_bytes = self.config.sort_budget(),
+                "text index document exceeds the per-record workspace; indexing it with a \
+                 transient proportional to the document"
+            );
+        }
     }
 
     fn validate_filter_keys(&self, payload: Option<&super::PreparedPayload>) -> Result<()> {
@@ -1050,11 +1077,19 @@ impl TextV4ExternalBuilder {
                 .saturating_add(max_dictionary_block_bytes.saturating_mul(3)),
         );
 
+        let emitted_filter_properties = self
+            .context
+            .complete_filter_properties
+            .iter()
+            .filter(|property| !assembly.omitted_filter_properties.contains(*property))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.metrics.omitted_filter_properties = assembly.omitted_filter_properties.len() as u64;
         let (filters, max_filter_emit_bytes, filter_output_directory_bytes) = emit_filter_blocks(
             &mut output,
             assembly.filter_spool,
             assembly.filter_entries,
-            &self.context.complete_filter_properties,
+            &emitted_filter_properties,
             self.live_count,
             &self.config,
         )?;
@@ -1092,7 +1127,7 @@ impl TextV4ExternalBuilder {
             live_payload_count: self.live_count,
             suppress_count: self.suppress_count,
             content_xxh3,
-            complete_filter_properties: self.context.complete_filter_properties,
+            complete_filter_properties: emitted_filter_properties,
             stats,
             equal_lsn_conflict_count: 0,
         };
@@ -1706,6 +1741,8 @@ struct ExternalAssembler<'a> {
     filter_directory_bytes: usize,
     max_filter_distinct_per_property: usize,
     directory_budget: usize,
+    filter_property: Option<FilterPropertyProgress>,
+    omitted_filter_properties: BTreeSet<String>,
     row_count: u64,
     mutation_count: u64,
     reconciled: bool,
@@ -1747,6 +1784,17 @@ struct ExternalAssembly {
     filter_entries: Vec<FilterSpoolEntry>,
     filter_directory_bytes: usize,
     max_filter_bytes: usize,
+    omitted_filter_properties: BTreeSet<String>,
+}
+
+/// Directory progress of the native-filter property currently being
+/// assembled. Filter sort keys group every value of one property together, so
+/// one property can be withdrawn from the segment as a unit.
+struct FilterPropertyProgress {
+    property: String,
+    first_entry: usize,
+    directory_bytes_before: usize,
+    distinct: usize,
 }
 
 #[derive(Debug)]
@@ -1896,6 +1944,8 @@ impl<'a> ExternalAssembler<'a> {
             filter_directory_bytes: 0,
             max_filter_distinct_per_property,
             directory_budget,
+            filter_property: None,
+            omitted_filter_properties: BTreeSet::new(),
             row_count,
             mutation_count,
             reconciled,
@@ -2054,6 +2104,41 @@ impl<'a> ExternalAssembler<'a> {
                 "one text v4 filter posting exceeds its block workspace",
             ));
         }
+        if self.omitted_filter_properties.contains(&property) {
+            return Ok(());
+        }
+        if self
+            .filter_property
+            .as_ref()
+            .is_none_or(|progress| progress.property != property)
+        {
+            self.filter_property = Some(FilterPropertyProgress {
+                property: property.clone(),
+                first_entry: self.filter_entries.len(),
+                directory_bytes_before: self.filter_directory_bytes,
+                distinct: 0,
+            });
+            self.filter_directory_bytes = self
+                .filter_directory_bytes
+                .saturating_add(size_of::<FilterBlockRef>())
+                .saturating_add(property.capacity());
+        }
+        let progress = self
+            .filter_property
+            .as_mut()
+            .ok_or_else(|| Error::invariant("text v4 filter property progress is absent"))?;
+        progress.distinct = progress.distinct.saturating_add(1);
+        let distinct = progress.distinct;
+        let entry_bytes = size_of::<FilterSpoolEntry>()
+            .saturating_add(property.capacity())
+            .saturating_add(filter_value_resident_bytes(&value));
+        let projected_directory = self.filter_directory_bytes.saturating_add(entry_bytes);
+        if distinct > self.max_filter_distinct_per_property
+            || projected_directory > self.directory_budget
+        {
+            self.omit_current_filter_property(distinct)?;
+            return Ok(());
+        }
         let offset = self.filter_spool_bytes;
         self.filter_spool.write_all(&accumulator.raw)?;
         self.filter_spool_bytes = self
@@ -2070,17 +2155,41 @@ impl<'a> ExternalAssembler<'a> {
                 .map_err(|_| Error::precondition("text v4 filter posting exceeds u32"))?,
             crc32: crc32fast::hash(&accumulator.raw),
         };
-        self.filter_directory_bytes = self
-            .filter_directory_bytes
-            .saturating_add(size_of::<FilterSpoolEntry>())
-            .saturating_add(entry.property.capacity())
-            .saturating_add(filter_value_resident_bytes(&entry.value));
-        if self.filter_directory_bytes > self.directory_budget {
-            return Err(Error::precondition(
-                "text v4 filter directory exceeds configured resident budget",
+        self.filter_directory_bytes = projected_directory;
+        self.filter_entries.push(entry);
+        Ok(())
+    }
+
+    /// Withdraw the property being assembled from this segment.
+    ///
+    /// A native filter is an optional accelerator: a segment that does not
+    /// advertise a property makes filtered searches on it take the exact
+    /// fallback path, while a failed build would leave the flush (and with it
+    /// every later write) stuck. So a property whose distinct values exceed
+    /// the explicit cap, or whose directory would leave the resident budget,
+    /// is omitted as a whole — never truncated — and the segment advertises
+    /// only the properties it carries completely.
+    fn omit_current_filter_property(&mut self, distinct: usize) -> Result<()> {
+        let progress = self
+            .filter_property
+            .take()
+            .ok_or_else(|| Error::invariant("text v4 filter property progress is absent"))?;
+        if progress.first_entry > self.filter_entries.len() {
+            return Err(Error::invariant(
+                "text v4 filter property progress outruns its directory",
             ));
         }
-        self.filter_entries.push(entry);
+        self.filter_entries.truncate(progress.first_entry);
+        self.filter_directory_bytes = progress.directory_bytes_before;
+        tracing::warn!(
+            property = %progress.property,
+            distinct_values_seen = distinct,
+            distinct_cap = self.max_filter_distinct_per_property,
+            directory_budget = self.directory_budget,
+            "text index segment omits a native filter whose values exceed its distinct-value \
+             cap or directory budget; filtered searches on it use the exact fallback path"
+        );
+        self.omitted_filter_properties.insert(progress.property);
         Ok(())
     }
 
@@ -2336,23 +2445,6 @@ impl<'a> ExternalAssembler<'a> {
                 "text v4 filter spool contains duplicate property/value postings",
             ));
         }
-        let mut previous_property: Option<&str> = None;
-        let mut property_distinct = 0usize;
-        for entry in &self.filter_entries {
-            if previous_property != Some(entry.property.as_str()) {
-                previous_property = Some(&entry.property);
-                property_distinct = 0;
-            }
-            property_distinct = property_distinct
-                .checked_add(1)
-                .ok_or_else(|| Error::precondition("text v4 filter distinct count overflows"))?;
-            if property_distinct > self.max_filter_distinct_per_property {
-                return Err(Error::precondition(format!(
-                    "text v4 filter property {} exceeds explicit distinct-value cap {}",
-                    entry.property, self.max_filter_distinct_per_property
-                )));
-            }
-        }
         let postings_end = self.output.stream_position()?;
         Ok(ExternalAssembly {
             term_spool,
@@ -2368,6 +2460,7 @@ impl<'a> ExternalAssembler<'a> {
             filter_entries: self.filter_entries,
             filter_directory_bytes: self.filter_directory_bytes,
             max_filter_bytes: self.max_filter_bytes,
+            omitted_filter_properties: self.omitted_filter_properties,
         })
     }
 }
@@ -2788,7 +2881,7 @@ mod tests {
     }
 
     #[test]
-    fn external_output_is_deterministic_and_invalid_single_record_fails_without_oom() {
+    fn external_output_is_deterministic_and_oversized_single_record_is_indexed() {
         fn build() -> (Vec<u8>, TextV4ExternalBuildMetrics) {
             let directory = tempfile::tempdir().unwrap();
             let config = TextV4ExternalBuildConfig {
@@ -2825,17 +2918,41 @@ mod tests {
             spool_directory: Some(directory.path().into()),
             ..TextV4ExternalBuildConfig::default()
         };
-        let mut builder = TextV4ExternalBuilder::with_config(&state(), context(), config).unwrap();
-        let huge = "x ".repeat(MIN_MEMORY_BUDGET_BYTES);
-        let error = builder
+        let mut builder =
+            TextV4ExternalBuilder::with_config(&state(), context(), config.clone()).unwrap();
+        // ~100 KiB of text: its 64x tokenization estimate is far above the
+        // 128 KiB per-record workspace of this budget. The write path accepted
+        // it, so refusing it would fail every later flush of the namespace;
+        // it must be indexed, reported, and leave the sort buffer bounded.
+        let huge = (0..8_000)
+            .map(|word| format!("termino{} ", word % 4_000))
+            .collect::<String>();
+        assert!(huge.len() * 64 > config.memory_budget_bytes / 2);
+        builder
             .push(TextV4Mutation {
                 node_id: node(1),
                 lsn: 1,
                 before: None,
-                after: Some(payload(huge, true)),
+                after: Some(payload(huge.clone(), true)),
             })
-            .unwrap_err();
-        assert!(error.to_string().contains("per-record workspace"));
+            .unwrap();
+        // A rewrite carries before + after images through the same path.
+        builder
+            .push(TextV4Mutation {
+                node_id: node(2),
+                lsn: 2,
+                before: Some(payload(huge.clone(), true)),
+                after: Some(payload(format!("{huge} final"), false)),
+            })
+            .unwrap();
+        let artifact = builder.finish().unwrap().unwrap();
+        assert_eq!(artifact.metrics.oversized_records, 2);
+        assert_eq!(artifact.output.segment.live_payload_count, 2);
+        assert!(
+            artifact.metrics.peak_logical_memory_bytes <= config.memory_budget_bytes,
+            "{:?}",
+            artifact.metrics
+        );
     }
 
     #[tokio::test]
@@ -3145,7 +3262,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_filter_cardinality_cap_fails_instead_of_degrading_completeness() {
+    fn explicit_filter_cardinality_cap_omits_the_property_instead_of_failing() {
         let directory = tempfile::tempdir().unwrap();
         let mut capped_context = context();
         capped_context.complete_filter_properties = vec!["codigo".into()];
@@ -3173,7 +3290,127 @@ mod tests {
                 })
                 .unwrap();
         }
-        let error = builder.finish().unwrap_err();
-        assert!(error.to_string().contains("explicit distinct-value cap"));
+        let artifact = builder.finish().unwrap().unwrap();
+        // The over-cap property is withdrawn whole: the segment no longer
+        // advertises it (so filtered searches take the exact fallback) and
+        // carries none of its postings — never a truncated, "complete"-looking
+        // subset.
+        assert!(artifact
+            .output
+            .segment
+            .complete_filter_properties
+            .is_empty());
+        assert_eq!(artifact.metrics.omitted_filter_properties, 1);
+        assert_eq!(artifact.metrics.filter_value_count, 0);
+        assert_eq!(artifact.output.segment.live_payload_count, 5);
+        let mut body = Vec::new();
+        let mut file = artifact.file;
+        file.read_to_end(&mut body).unwrap();
+        assert_eq!(body.len() as u64, artifact.len);
+    }
+
+    #[test]
+    fn filter_directory_over_budget_omits_the_property_instead_of_failing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wide_context = context();
+        wide_context.complete_filter_properties = vec!["codigo".into(), "vigente".into()];
+        let config = TextV4ExternalBuildConfig {
+            memory_budget_bytes: MIN_MEMORY_BUDGET_BYTES,
+            spool_directory: Some(directory.path().into()),
+            // The cap alone would admit every value: the 32 KiB resident
+            // directory budget is what runs out.
+            max_filter_distinct_per_property: 100_000,
+            ..TextV4ExternalBuildConfig::default()
+        };
+        let mut builder =
+            TextV4ExternalBuilder::with_config(&state(), wide_context, config).unwrap();
+        for value in 0..2_000u64 {
+            builder
+                .push(TextV4Mutation {
+                    node_id: node(value + 1),
+                    lsn: value + 1,
+                    before: None,
+                    after: Some(super::super::TextV4Payload {
+                        text: format!("norma {value}"),
+                        filters: BTreeMap::from([
+                            (
+                                "codigo".into(),
+                                SearchFilterValue::String(format!("codigo-{value:06}")),
+                            ),
+                            ("vigente".into(), SearchFilterValue::Bool(value % 2 == 0)),
+                        ]),
+                    }),
+                })
+                .unwrap();
+        }
+        let artifact = builder.finish().unwrap().unwrap();
+        assert_eq!(
+            artifact.output.segment.complete_filter_properties,
+            vec!["vigente".to_owned()]
+        );
+        assert_eq!(artifact.metrics.omitted_filter_properties, 1);
+        assert_eq!(artifact.metrics.filter_value_count, 2);
+    }
+
+    /// The production shape behind a stuck flush: an explicitly indexed,
+    /// non-unique identifier (thousands of distinct values per flush) next to
+    /// a low-cardinality status, both native filters of one text index.
+    #[tokio::test]
+    async fn high_cardinality_filter_is_omitted_while_low_cardinality_filter_stays_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut mixed_context = context();
+        mixed_context.complete_filter_properties = vec!["estado".into(), "id".into()];
+        let config = TextV4ExternalBuildConfig {
+            memory_budget_bytes: 2 * 1024 * 1024,
+            spool_directory: Some(directory.path().into()),
+            ..TextV4ExternalBuildConfig::default()
+        };
+        const DOCUMENTS: u64 = 5_000;
+        let mut builder =
+            TextV4ExternalBuilder::with_config(&state(), mixed_context, config.clone()).unwrap();
+        for value in 0..DOCUMENTS {
+            builder
+                .push(TextV4Mutation {
+                    node_id: node(value + 1),
+                    lsn: value + 1,
+                    before: None,
+                    after: Some(super::super::TextV4Payload {
+                        text: format!("articulo numero {value} de la norma"),
+                        filters: BTreeMap::from([
+                            (
+                                "estado".into(),
+                                SearchFilterValue::String(
+                                    if value % 3 == 0 {
+                                        "derogado"
+                                    } else {
+                                        "vigente"
+                                    }
+                                    .into(),
+                                ),
+                            ),
+                            (
+                                "id".into(),
+                                SearchFilterValue::String(format!("art-{value:06}")),
+                            ),
+                        ]),
+                    }),
+                })
+                .unwrap();
+        }
+        let artifact = builder.finish().unwrap().unwrap();
+        assert_eq!(
+            artifact.output.segment.complete_filter_properties,
+            vec!["estado".to_owned()]
+        );
+        assert_eq!(artifact.metrics.omitted_filter_properties, 1);
+        assert_eq!(artifact.metrics.filter_value_count, 2);
+        assert_eq!(artifact.output.segment.live_payload_count, DOCUMENTS);
+        assert!(artifact.metrics.peak_logical_memory_bytes <= config.memory_budget_bytes);
+
+        // The object opens against its own segment reference, and the kept
+        // filter remains exact.
+        let reader = open_artifact(artifact).await;
+        assert!(reader.supports_filter_property("estado"));
+        assert!(!reader.supports_filter_property("id"));
     }
 }

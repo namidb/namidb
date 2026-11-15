@@ -89,6 +89,9 @@ pub struct VectorV6ExternalBuildMetrics {
     pub max_page_bytes: usize,
     pub max_filter_value_bytes: usize,
     pub peak_logical_memory_bytes: usize,
+    /// Native-filter properties this segment does not advertise because
+    /// their distinct values exceeded the explicit cap.
+    pub omitted_filter_properties: u64,
 }
 
 /// File-backed immutable V6 object ready for bounded multipart upload.
@@ -619,7 +622,10 @@ impl VectorV6ExternalBuilder {
             live_payload_count: version_table.live_count,
             suppress_count: version_table.suppress_count,
             content_xxh3,
-            complete_filter_properties: self.context.complete_filter_properties,
+            complete_filter_properties: filters
+                .iter()
+                .map(|filter| filter.property.clone())
+                .collect(),
             stats: SearchSegmentStats::Vector {
                 live_count: SearchStatValue::Delta(self.live_count_delta),
             },
@@ -649,8 +655,11 @@ impl VectorV6ExternalBuilder {
         output.write_all(TRAILER_MAGIC)?;
         output.write_all(&(footer_bytes.len() as u64).to_le_bytes())?;
         output.write_all(&crc32fast::hash(&footer_bytes).to_le_bytes())?;
-        output.sync_data()?;
         let object_len = output.stream_position()?;
+        // An omitted filter property rewinds the writer; drop any bytes it
+        // left beyond the trailer.
+        output.set_len(object_len)?;
+        output.sync_data()?;
         output.rewind()?;
 
         self.metrics.live_payloads = self.live_count;
@@ -779,6 +788,10 @@ fn write_external_filters<W: Write + Seek>(
             values: Vec::new(),
         })
         .collect::<Vec<_>>();
+    let mut omitted = vec![false; result.len()];
+    // (property ordinal, writer offset where its first value block starts,
+    // filter_values metric before it) for the property being written.
+    let mut property_start: Option<(u32, u64, u64)> = None;
     let mut current: Option<(u32, Vec<u8>, AdaptiveOrdinals)> = None;
     while let Some(pair) = merge.next_pair()? {
         let ordinal = pair_ordinal(&pair)?;
@@ -787,20 +800,42 @@ fn write_external_filters<W: Write + Seek>(
                 "vector filter observation leaves live ordinals",
             ));
         }
+        let property_index = usize::try_from(pair.property)
+            .map_err(|_| Error::invariant("vector filter property exceeds usize"))?;
+        if *omitted
+            .get(property_index)
+            .ok_or_else(|| Error::invariant("vector filter property ordinal is out of bounds"))?
+        {
+            continue;
+        }
         let same = current
             .as_ref()
             .is_some_and(|(property, key, _)| *property == pair.property && *key == pair.key);
         if !same {
             if let Some((property, key, ordinals)) = current.take() {
-                finish_filter_value(
+                finish_or_omit_filter_value(
                     writer,
                     &mut result,
+                    &mut omitted,
+                    property_start,
                     property,
                     key,
                     ordinals,
                     config,
                     metrics,
                 )?;
+            }
+            if *omitted.get(property_index).ok_or_else(|| {
+                Error::invariant("vector filter property ordinal is out of bounds")
+            })? {
+                continue;
+            }
+            if property_start.is_none_or(|(property, _, _)| property != pair.property) {
+                property_start = Some((
+                    pair.property,
+                    writer.stream_position()?,
+                    metrics.filter_values,
+                ));
             }
             current = Some((
                 pair.property,
@@ -815,9 +850,11 @@ fn write_external_filters<W: Write + Seek>(
             .push(ordinal)?;
     }
     if let Some((property, key, ordinals)) = current {
-        finish_filter_value(
+        finish_or_omit_filter_value(
             writer,
             &mut result,
+            &mut omitted,
+            property_start,
             property,
             key,
             ordinals,
@@ -825,7 +862,59 @@ fn write_external_filters<W: Write + Seek>(
             metrics,
         )?;
     }
+    let mut omitted = omitted.into_iter();
+    result.retain(|_| !omitted.next().unwrap_or(false));
     Ok(result)
+}
+
+/// Finish one filter value, or withdraw its whole property from the segment
+/// when the value would exceed the explicit distinct-value cap.
+///
+/// A native filter is an optional accelerator: a segment that does not
+/// advertise a property makes filtered searches on it take the exact fallback
+/// path, whereas a failed build would leave the flush (and every later write)
+/// stuck. The property's already-written blocks are discarded by rewinding the
+/// writer to where they began; the caller truncates the file after the footer.
+#[allow(clippy::too_many_arguments)]
+fn finish_or_omit_filter_value<W: Write + Seek>(
+    writer: &mut W,
+    filters: &mut [FilterBlockRef],
+    omitted: &mut [bool],
+    property_start: Option<(u32, u64, u64)>,
+    property: u32,
+    key: Vec<u8>,
+    ordinals: AdaptiveOrdinals,
+    config: &VectorV6ExternalBuildConfig,
+    metrics: &mut VectorV6ExternalBuildMetrics,
+) -> Result<()> {
+    let index = usize::try_from(property)
+        .map_err(|_| Error::invariant("vector filter property exceeds usize"))?;
+    let filter = filters
+        .get_mut(index)
+        .ok_or_else(|| Error::invariant("vector filter property ordinal is out of bounds"))?;
+    if filter.values.len() < config.max_filter_distinct_per_property {
+        return finish_filter_value(writer, filters, property, key, ordinals, config, metrics);
+    }
+    let Some((start_property, start_offset, filter_values_before)) = property_start else {
+        return Err(Error::invariant("vector filter property start is absent"));
+    };
+    if start_property != property {
+        return Err(Error::invariant("vector filter property start disagrees"));
+    }
+    tracing::warn!(
+        property = %filter.property,
+        distinct_cap = config.max_filter_distinct_per_property,
+        "vector index segment omits a native filter whose values exceed its cap; \
+         filtered searches on it use the exact fallback path"
+    );
+    filter.values = Vec::new();
+    writer.seek(std::io::SeekFrom::Start(start_offset))?;
+    metrics.filter_values = filter_values_before;
+    metrics.omitted_filter_properties = metrics.omitted_filter_properties.saturating_add(1);
+    *omitted
+        .get_mut(index)
+        .ok_or_else(|| Error::invariant("vector filter property ordinal is out of bounds"))? = true;
+    Ok(())
 }
 
 /// Streaming counterpart of [`encode_filter_posting`]. It must produce the
@@ -1190,5 +1279,97 @@ mod tests {
                 Some(payload(0.5, false)),
             )
             .is_err());
+    }
+
+    #[derive(Debug)]
+    struct BodySource(bytes::Bytes);
+
+    #[async_trait::async_trait]
+    impl crate::sst::search_delta::SearchVersionRangeSource for BodySource {
+        async fn read_range(&self, range: std::ops::Range<u64>) -> Result<bytes::Bytes> {
+            let start = usize::try_from(range.start).unwrap();
+            let end = usize::try_from(range.end).unwrap();
+            self.0
+                .get(start..end)
+                .map(bytes::Bytes::copy_from_slice)
+                .ok_or_else(|| Error::invariant("test range leaves vector v6 body"))
+        }
+    }
+
+    /// An explicitly indexed identifier with more distinct values than the cap
+    /// must not fail the build (that left the flush, and every later write,
+    /// stuck): the property is withdrawn from the segment whole, and the
+    /// remaining filters stay exact. Run with the omitted property both before
+    /// and after the kept one, so the writer rewind is exercised mid-object
+    /// and at its tail.
+    #[tokio::test]
+    async fn over_cap_filter_property_is_omitted_and_object_stays_valid() {
+        for code_property in ["aaa_code", "zzz_code"] {
+            let mut properties = vec!["active".to_owned(), code_property.to_owned()];
+            properties.sort();
+            let context = VectorV6BuildContext {
+                sst_id: Uuid::from_u128(40),
+                event_ranges: vec![SearchEventRange::new(0, 1)],
+                complete_filter_properties: properties,
+            };
+            let config = VectorV6ExternalBuildConfig {
+                max_filter_distinct_per_property: 8,
+                ..VectorV6ExternalBuildConfig::default()
+            };
+            let mut builder =
+                VectorV6ExternalBuilder::with_config(&state(), &descriptor(), context, config)
+                    .unwrap();
+            for value in 0..20_u64 {
+                builder
+                    .push(VectorV6Mutation {
+                        node_id: u128::from(value + 1).to_be_bytes(),
+                        lsn: value + 1,
+                        before: None,
+                        after: Some(VectorV6Payload {
+                            vector: vec![value as f32 + 1.0, 1.0],
+                            filters: BTreeMap::from([
+                                ("active".into(), SearchFilterValue::Bool(value % 2 == 0)),
+                                (
+                                    code_property.into(),
+                                    SearchFilterValue::String(format!("code-{value:03}")),
+                                ),
+                            ]),
+                        }),
+                    })
+                    .unwrap();
+            }
+            let mut artifact = builder.finish().unwrap().unwrap();
+            assert_eq!(
+                artifact.output.segment.complete_filter_properties,
+                vec!["active".to_owned()],
+                "{code_property}"
+            );
+            assert_eq!(artifact.metrics.omitted_filter_properties, 1);
+            assert_eq!(artifact.metrics.filter_values, 2);
+            let mut body = Vec::new();
+            artifact.file.read_to_end(&mut body).unwrap();
+            assert_eq!(body.len() as u64, artifact.len);
+            let reader = VectorV6Reader::open(
+                std::sync::Arc::new(BodySource(bytes::Bytes::from(body))),
+                artifact.len,
+                &state(),
+                &artifact.output.segment,
+                &descriptor(),
+            )
+            .await
+            .unwrap();
+            assert!(reader.supports_filter_property("active"));
+            assert!(!reader.supports_filter_property(code_property));
+            let result = reader
+                .search_exact(
+                    &[1.0, 1.0],
+                    20,
+                    &[("active".into(), vec![SearchFilterValue::Bool(true)])],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.hits.len(), 10, "{code_property}");
+            reader.verify_all().await.unwrap();
+        }
     }
 }
