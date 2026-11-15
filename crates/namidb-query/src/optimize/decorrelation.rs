@@ -65,7 +65,7 @@ fn try_convert_at_root(plan: LogicalPlan, _catalog: &StatsCatalog) -> LogicalPla
 
     let mut outer_labels = BTreeMap::new();
     collect_outer_labels(&input, &mut outer_labels);
-    let Some(Some(label)) = outer_labels.get(&x).cloned() else {
+    let Some(Some(labels)) = outer_labels.get(&x).cloned() else {
         return LogicalPlan::SemiApply {
             input,
             subplan,
@@ -86,8 +86,11 @@ fn try_convert_at_root(plan: LogicalPlan, _catalog: &StatsCatalog) -> LogicalPla
         };
     }
 
-    // Replace the single Argument with a fresh NodeScan on `X`'s label.
-    let new_subplan = replace_argument(*subplan, &x, &label);
+    // Replace the single Argument with a fresh NodeScan on `X`'s label (a
+    // UNION ALL of scans when `X` comes from branches of different labels:
+    // a node in several of them repeats on the inner side, which the
+    // semi-join's key set absorbs).
+    let new_subplan = replace_argument(*subplan, &x, &labels);
 
     // Join key uses the internal NodeId, accessed via the `_id`
     // accessor since the unqualified `id` is now a user property
@@ -130,13 +133,18 @@ fn property_expression(alias: &str, key: &str) -> Expression {
     }
 }
 
-/// Walk the outer plan collecting `alias → label` for every operator
+/// `alias → labels` for every outer binding: scans of these labels together
+/// cover every node the alias can bind (one label, except under a union of
+/// branches with different labels). `None` when no label is known.
+type OuterLabels = BTreeMap<String, Option<Vec<String>>>;
+
+/// Walk the outer plan collecting `alias → labels` for every operator
 /// that introduces a labelled binding. Only the most-recent assignment
 /// wins (later operators shadow earlier ones).
-fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<String>>) {
+fn collect_outer_labels(plan: &LogicalPlan, out: &mut OuterLabels) {
     match plan {
         LogicalPlan::NodeScan { alias, label, .. } => {
-            out.insert(alias.clone(), label.clone());
+            out.insert(alias.clone(), label.clone().map(|l| vec![l]));
         }
         LogicalPlan::NodeById {
             alias,
@@ -145,7 +153,7 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
             ..
         } => {
             collect_outer_labels(input, out);
-            out.insert(alias.clone(), label.clone());
+            out.insert(alias.clone(), label.clone().map(|l| vec![l]));
         }
         LogicalPlan::NodeByPropertyValue {
             alias,
@@ -154,7 +162,7 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
             ..
         } => {
             collect_outer_labels(input, out);
-            out.insert(alias.clone(), Some(label.clone()));
+            out.insert(alias.clone(), Some(vec![label.clone()]));
         }
         LogicalPlan::Expand {
             input,
@@ -163,7 +171,10 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
             ..
         } => {
             collect_outer_labels(input, out);
-            out.insert(target_alias.clone(), target_labels.first().cloned());
+            out.insert(
+                target_alias.clone(),
+                target_labels.first().cloned().map(|l| vec![l]),
+            );
         }
         // Apply's `subplan` is a separate correlated scope: its internal
         // aliases are NOT outer bindings (only the subquery RETURN columns are,
@@ -172,22 +183,27 @@ fn collect_outer_labels(plan: &LogicalPlan, out: &mut BTreeMap<String, Option<St
         LogicalPlan::Apply { input, .. } => {
             collect_outer_labels(input, out);
         }
-        // Each branch binds the union's aliases with its own operators, so an
-        // alias's label holds for every row only when both branches agree on
-        // it. A label disjunction `WHERE n:A OR n:B` plans as a union of an
-        // `A` scan and a `B` scan: neither label covers all of `n`, and an
-        // inner side scanning just one of them would drop the other's rows.
+        // Each branch binds the union's aliases with its own operators, so a
+        // node an alias binds is covered by the labels of whichever branch
+        // produced it. A label disjunction `WHERE n:A OR n:B` plans as a union
+        // of an `A` scan and a `B` scan: an inner side scanning just one of
+        // them would drop the other's rows, so it must scan both.
         LogicalPlan::Union { left, right, .. } => {
-            let mut left_labels = BTreeMap::new();
-            let mut right_labels = BTreeMap::new();
+            let mut left_labels = OuterLabels::new();
+            let mut right_labels = OuterLabels::new();
             collect_outer_labels(left, &mut left_labels);
             collect_outer_labels(right, &mut right_labels);
-            for (alias, label) in left_labels {
-                let agreed = match right_labels.remove(&alias) {
-                    Some(other) if other == label => label,
+            for (alias, labels) in left_labels {
+                let merged = match (labels, right_labels.remove(&alias)) {
+                    (Some(mut labels), Some(Some(other))) => {
+                        labels.extend(other);
+                        labels.sort();
+                        labels.dedup();
+                        Some(labels)
+                    }
                     _ => None,
                 };
-                out.insert(alias, agreed);
+                out.insert(alias, merged);
             }
             for alias in right_labels.into_keys() {
                 out.insert(alias, None);
@@ -237,19 +253,36 @@ fn subplan_is_decorrelable(plan: &LogicalPlan) -> bool {
     }
 }
 
+/// An unlabelled scan: every node. Only reachable with an empty label list,
+/// which `collect_outer_labels` never produces.
+fn plan_for_empty_labels(x: &str) -> LogicalPlan {
+    LogicalPlan::NodeScan {
+        label: None,
+        alias: x.to_string(),
+        predicates: Vec::new(),
+        projection: None,
+    }
+}
+
 /// Replace the (unique) `Argument` leaf inside `plan` with a fresh
-/// `NodeScan { label, alias: x }`. Recurses down only the IR shape we
+/// `NodeScan { label, alias: x }` (a UNION ALL of one per label). Recurses down only the IR shape we
 /// already approved via `subplan_is_decorrelable`.
-fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
+fn replace_argument(plan: LogicalPlan, x: &str, labels: &[String]) -> LogicalPlan {
     match plan {
-        LogicalPlan::Argument { bindings } if bindings.iter().any(|b| b == x) => {
-            LogicalPlan::NodeScan {
-                label: Some(label.to_string()),
+        LogicalPlan::Argument { bindings } if bindings.iter().any(|b| b == x) => labels
+            .iter()
+            .map(|label| LogicalPlan::NodeScan {
+                label: Some(label.clone()),
                 alias: x.to_string(),
                 predicates: Vec::new(),
                 projection: None,
-            }
-        }
+            })
+            .reduce(|left, right| LogicalPlan::Union {
+                left: Box::new(left),
+                right: Box::new(right),
+                all: true,
+            })
+            .unwrap_or(plan_for_empty_labels(x)),
         LogicalPlan::Argument { .. } => plan,
         LogicalPlan::NodeScan { .. } | LogicalPlan::Empty => plan,
         LogicalPlan::NodeById {
@@ -258,7 +291,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             alias,
             id,
         } => LogicalPlan::NodeById {
-            input: Box::new(replace_argument(*input, x, label)),
+            input: Box::new(replace_argument(*input, x, labels)),
             label: l,
             alias,
             id,
@@ -271,7 +304,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             value,
             multi,
         } => LogicalPlan::NodeByPropertyValue {
-            input: Box::new(replace_argument(*input, x, label)),
+            input: Box::new(replace_argument(*input, x, labels)),
             label: l,
             alias,
             property,
@@ -285,7 +318,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             properties,
             values,
         } => LogicalPlan::NodeByPropertyTuple {
-            input: Box::new(replace_argument(*input, x, label)),
+            input: Box::new(replace_argument(*input, x, labels)),
             label: l,
             alias,
             properties,
@@ -306,7 +339,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             path_binding,
             unique_rels,
         } => LogicalPlan::Expand {
-            input: Box::new(replace_argument(*input, x, label)),
+            input: Box::new(replace_argument(*input, x, labels)),
             source,
             edge_type,
             direction,
@@ -321,7 +354,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             unique_rels,
         },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-            input: Box::new(replace_argument(*input, x, label)),
+            input: Box::new(replace_argument(*input, x, labels)),
             predicate,
         },
         LogicalPlan::Project {
@@ -330,7 +363,7 @@ fn replace_argument(plan: LogicalPlan, x: &str, label: &str) -> LogicalPlan {
             distinct,
             discard_input_bindings,
         } => LogicalPlan::Project {
-            input: Box::new(replace_argument(*input, x, label)),
+            input: Box::new(replace_argument(*input, x, labels)),
             items,
             distinct,
             discard_input_bindings,
@@ -807,14 +840,47 @@ mod tests {
     }
 
     #[test]
-    fn union_of_different_labels_keeps_the_semi_apply() {
+    fn union_of_different_labels_scans_every_label_on_the_inner_side() {
         // `WHERE (a:Person OR a:Robot) AND (a)-[:KNOWS]->()`: the outer binds
         // `a` from a Person scan in one branch and a Robot scan in the other.
-        // An inner side scanning either label alone would drop the other
-        // branch's rows from the join, so the correlated form stays.
+        // The inner side must scan both labels, or the join drops the other
+        // branch's rows.
         let outer = LogicalPlan::Union {
             left: Box::new(scan("Person", "a")),
             right: Box::new(scan("Robot", "a")),
+            all: true,
+        };
+        let plan = semi_apply(outer, expand(argument(&["a"]), "a", "KNOWS", "b"), false);
+        let out = convert_semi_apply_to_hash_semi_join(plan, &catalog());
+        let LogicalPlan::HashSemiJoin { inner, .. } = out else {
+            panic!("expected a HashSemiJoin, got {out:?}");
+        };
+        let LogicalPlan::Expand { input, .. } = *inner else {
+            panic!("expected the Expand on the inner side, got {inner:?}");
+        };
+        let LogicalPlan::Union { left, right, all } = *input else {
+            panic!("expected a union of label scans, got {input:?}");
+        };
+        assert!(all);
+        for (side, label) in [(left, "Person"), (right, "Robot")] {
+            assert!(
+                matches!(&*side, LogicalPlan::NodeScan { label: Some(l), alias, .. }
+                    if l == label && alias == "a"),
+                "{side:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn union_with_an_unlabelled_branch_keeps_the_semi_apply() {
+        let outer = LogicalPlan::Union {
+            left: Box::new(scan("Person", "a")),
+            right: Box::new(LogicalPlan::NodeScan {
+                label: None,
+                alias: "a".into(),
+                predicates: vec![],
+                projection: None,
+            }),
             all: true,
         };
         let plan = semi_apply(outer, expand(argument(&["a"]), "a", "KNOWS", "b"), false);

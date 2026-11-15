@@ -33,9 +33,9 @@ crates.io release will establish and document that API explicitly.
     scans whose branches are disjoint (branch *i* drops the nodes an earlier
     branch already returned), so nothing is returned twice and no
     de-duplication state is needed. A pattern predicate on such a variable
-    (`WHERE (n:A OR n:B) AND (n)-[:R]->()`) stays a correlated check per
-    row: decorrelating it would build its inner side from one branch's label
-    and drop the other branch's rows;
+    (`WHERE (n:A OR n:B) AND (n)-[:R]->()`) is still decorrelated into a
+    hash semi-join, whose inner side now scans every branch's label (built
+    from one branch's label alone, it dropped the other branch's rows);
   - `WHERE m:L` on the far end of a single hop becomes that hop's own label
     check, so it is proved before the neighbour is read.
 
