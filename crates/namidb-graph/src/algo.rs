@@ -1101,7 +1101,6 @@ pub fn fast_rp_cancellable(
         })
         .collect();
 
-    let iterations = opts.iteration_weights.len().saturating_sub(1);
     let mut emb: Vec<Vec<f32>> = vec![vec![0.0f32; d]; n];
     let w0 = opts.iteration_weights.first().copied().unwrap_or(0.0);
     if w0 != 0.0 {
@@ -1113,7 +1112,7 @@ pub fn fast_rp_cancellable(
     }
 
     let beta = opts.normalization_strength as f64;
-    for k in 1..=iterations {
+    for &wk in opts.iteration_weights.iter().skip(1) {
         if cancel() {
             return Err(Cancelled);
         }
@@ -1131,7 +1130,6 @@ pub fn fast_rp_cancellable(
             }
             l2_normalize(row);
         }
-        let wk = opts.iteration_weights[k];
         if wk != 0.0 {
             for i in 0..n {
                 for x in 0..d {
