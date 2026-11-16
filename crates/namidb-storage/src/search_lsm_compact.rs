@@ -58,7 +58,29 @@ const SEARCH_LSM_COMPACT_SEGMENTS_ENV: &str = "NAMIDB_SEARCH_LSM_COMPACT_SEGMENT
 const SEARCH_LSM_BASE_COMPACT_BYTES_ENV: &str = "NAMIDB_SEARCH_LSM_BASE_COMPACT_BYTES";
 const SEARCH_LSM_BASE_STALE_PERCENT_ENV: &str = "NAMIDB_SEARCH_LSM_BASE_STALE_PERCENT";
 const SEARCH_LSM_FORCE_BASE_COMPACTION_ENV: &str = "NAMIDB_SEARCH_LSM_FORCE_BASE_COMPACTION";
-const DEFAULT_SEARCH_LSM_MAX_SEGMENTS: usize = 8;
+const SEARCH_LSM_VECTOR_BASE_DELTA_ROWS_ENV: &str = "NAMIDB_SEARCH_LSM_VECTOR_BASE_DELTA_ROWS";
+const SEARCH_LSM_VECTOR_BASE_MAX_INPUT_BYTES_ENV: &str =
+    "NAMIDB_SEARCH_LSM_VECTOR_BASE_MAX_INPUT_BYTES";
+/// Flush ceiling. Compaction is due long before it (see
+/// [`default_delta_trigger`]); the room between the two absorbs the flushes
+/// that land while a compaction runs, so a flush is not refused merely because
+/// a merge is in progress.
+pub(crate) const DEFAULT_SEARCH_LSM_MAX_SEGMENTS: usize = 24;
+/// Similar-sized delta segments that make one routine DeltaRun.
+const DEFAULT_SEARCH_LSM_TIER_SEGMENTS: usize = 4;
+/// Exact (flat) vector rows a generation may hold in delta segments before
+/// they are folded into its clustered base. Every query scans the deltas in
+/// full, so this bounds the per-query cost of the unclustered tail.
+const DEFAULT_SEARCH_LSM_VECTOR_BASE_DELTA_ROWS: u64 = 32 * 1024;
+/// A generation whose newest delta is at least this old has stopped taking
+/// writes: its remaining flat tail is folded into the base even below
+/// [`DEFAULT_SEARCH_LSM_VECTOR_BASE_DELTA_ROWS`].
+const VECTOR_BASE_IDLE_SECS: i64 = 60;
+/// ... but only once the tail is worth a rebuild: at least this many rows and
+/// at least 1/[`VECTOR_BASE_IDLE_BASE_FRACTION`] of the base, so a trickle of
+/// writes cannot rebuild a large base for every few rows.
+const VECTOR_BASE_IDLE_MIN_ROWS: u64 = 1024;
+const VECTOR_BASE_IDLE_BASE_FRACTION: u64 = 64;
 const DEFAULT_SEARCH_LSM_BASE_COMPACT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_SEARCH_LSM_BASE_STALE_PERCENT: u64 = 800;
 const MIN_SEARCH_LSM_SEGMENTS: usize = 2;
@@ -89,6 +111,11 @@ pub(super) struct SearchCompactionPolicy {
     pub(super) base_compact_bytes: u64,
     pub(super) base_stale_percent: u64,
     pub(super) force_base: bool,
+    /// Flat vector delta rows that schedule a clustered base rebuild.
+    pub(super) vector_base_delta_rows: u64,
+    /// Largest Nodes corpus (descriptor bytes) the opportunistic vector base
+    /// rebuild may read; a rebuild holds a large share of it in memory.
+    pub(super) vector_base_max_input_bytes: u64,
 }
 
 impl SearchCompactionPolicy {
@@ -108,12 +135,23 @@ impl SearchCompactionPolicy {
             DEFAULT_SEARCH_LSM_BASE_STALE_PERCENT,
         )?;
         let force_base = parse_bool_env(SEARCH_LSM_FORCE_BASE_COMPACTION_ENV, false)?;
+        let vector_base_delta_rows = parse_positive_u64_env(
+            SEARCH_LSM_VECTOR_BASE_DELTA_ROWS_ENV,
+            DEFAULT_SEARCH_LSM_VECTOR_BASE_DELTA_ROWS,
+        )?;
+        let vector_base_max_input_bytes =
+            match std::env::var_os(SEARCH_LSM_VECTOR_BASE_MAX_INPUT_BYTES_ENV) {
+                Some(_) => parse_positive_u64_env(SEARCH_LSM_VECTOR_BASE_MAX_INPUT_BYTES_ENV, 1)?,
+                None => default_vector_base_max_input_bytes(),
+            };
         Ok(Self {
             delta_trigger_segments,
             hard_segment_cap,
             base_compact_bytes,
             base_stale_percent,
             force_base,
+            vector_base_delta_rows,
+            vector_base_max_input_bytes,
         })
     }
 
@@ -134,6 +172,8 @@ impl SearchCompactionPolicy {
                     base_compact_bytes: DEFAULT_SEARCH_LSM_BASE_COMPACT_BYTES,
                     base_stale_percent: DEFAULT_SEARCH_LSM_BASE_STALE_PERCENT,
                     force_base: false,
+                    vector_base_delta_rows: DEFAULT_SEARCH_LSM_VECTOR_BASE_DELTA_ROWS,
+                    vector_base_max_input_bytes: default_vector_base_max_input_bytes(),
                 }
             }
         }
@@ -143,8 +183,137 @@ impl SearchCompactionPolicy {
 fn default_delta_trigger(hard_segment_cap: usize) -> usize {
     hard_segment_cap
         .saturating_sub(2)
-        .max(MIN_SEARCH_LSM_SEGMENTS)
+        .clamp(MIN_SEARCH_LSM_SEGMENTS, DEFAULT_SEARCH_LSM_TIER_SEGMENTS)
         .min(hard_segment_cap)
+}
+
+/// Number of segments at which a generation is under segment pressure: the
+/// routine size-tiered choice is abandoned for the newest
+/// `delta_trigger_segments` deltas whatever their sizes, so the count always
+/// comes down well before the flush ceiling.
+fn pressure_segments(policy: SearchCompactionPolicy) -> usize {
+    policy
+        .delta_trigger_segments
+        .saturating_mul(2)
+        .min(policy.hard_segment_cap.saturating_sub(2))
+        .max(policy.delta_trigger_segments)
+}
+
+/// Deltas up to this size always join a tier.
+const TIER_SMALL_DELTA_BYTES: u64 = 1024 * 1024;
+
+/// Length of the newest run of similar-sized deltas (size-tiered selection).
+///
+/// Walking back from the newest delta, an older delta joins the run while it
+/// is at most twice everything newer already in the run (or small). Equal
+/// flushes therefore merge four at a time, their outputs merge with each other
+/// once there are enough of the same size, and a large consolidated delta is
+/// rewritten only when newer data has caught up with it: every row is
+/// rewritten O(log(rows)) times instead of once per merge (the newest-suffix
+/// rule rewrote every consolidated delta on every routine pass).
+fn tiered_delta_run_len(state: &SearchLsmState, descriptors: &[SstDescriptor]) -> usize {
+    let mut run = 0usize;
+    let mut newer_bytes = 0u64;
+    for (segment, descriptor) in state.segments.iter().zip(descriptors).rev() {
+        if segment.role != SearchSegmentRole::Delta
+            || segment.payload != SearchSegmentPayload::Complete
+        {
+            break;
+        }
+        let size = descriptor.size_bytes.max(1);
+        // Similar-sized: no more than twice the newer ones combined. Small
+        // deltas are cheap to rewrite and always tier together.
+        if run > 0 && size > TIER_SMALL_DELTA_BYTES && size > newer_bytes.saturating_mul(2) {
+            break;
+        }
+        newer_bytes = newer_bytes.saturating_add(size);
+        run += 1;
+    }
+    run
+}
+
+/// Newest complete deltas, contiguous from the physical tail.
+fn trailing_delta_len(state: &SearchLsmState) -> usize {
+    state
+        .segments
+        .iter()
+        .rev()
+        .take_while(|segment| {
+            segment.role == SearchSegmentRole::Delta
+                && segment.payload == SearchSegmentPayload::Complete
+        })
+        .count()
+}
+
+/// Half of the process's cgroup memory limit, or unbounded without one. A base
+/// rebuild streams the namespace's Nodes bodies through a k-way merge whose
+/// resident inputs were measured at ~45% of their total bytes; within half the
+/// limit that stays under a quarter of the process.
+fn default_vector_base_max_input_bytes() -> u64 {
+    cgroup_memory_limit_bytes().map_or(u64::MAX, |limit| limit / 2)
+}
+
+/// Finite cgroup v2 (then v1) memory limit of this process, if any.
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    let own = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|groups| {
+            groups
+                .lines()
+                .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+        });
+    let mut candidates = Vec::new();
+    if let Some(own) = own {
+        candidates.push(format!(
+            "/sys/fs/cgroup{}/memory.max",
+            own.trim_end_matches('/')
+        ));
+    }
+    candidates.push("/sys/fs/cgroup/memory.max".to_owned());
+    candidates.push("/sys/fs/cgroup/memory/memory.limit_in_bytes".to_owned());
+    candidates.into_iter().find_map(|path| {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let bytes = raw.trim().parse::<u64>().ok()?;
+        // cgroup v1 reports "unlimited" as a huge page-aligned value.
+        (bytes > 0 && bytes < (1u64 << 60)).then_some(bytes)
+    })
+}
+
+/// Flat vector rows held in deltas: every query scans them exactly.
+fn vector_base_rebuild_due(
+    state: &SearchLsmState,
+    descriptors: &[SstDescriptor],
+    policy: SearchCompactionPolicy,
+    now: chrono::DateTime<Utc>,
+    nodes_bytes: u64,
+) -> Result<bool> {
+    if state.kind != SearchLsmKind::Vector || nodes_bytes > policy.vector_base_max_input_bytes {
+        return Ok(false);
+    }
+    let mut delta_rows = 0u64;
+    let mut base_rows = 0u64;
+    let mut newest_delta = None;
+    for (segment, descriptor) in state.segments.iter().zip(descriptors) {
+        match segment.role {
+            SearchSegmentRole::Delta => {
+                delta_rows = delta_rows
+                    .checked_add(segment.mutation_count)
+                    .ok_or_else(|| Error::invariant("Search-LSM delta row count overflows"))?;
+                newest_delta = newest_delta.max(Some(descriptor.created_at));
+            }
+            SearchSegmentRole::Base => base_rows = segment.live_payload_count,
+        }
+    }
+    let Some(newest_delta) = newest_delta else {
+        return Ok(false);
+    };
+    if delta_rows >= policy.vector_base_delta_rows {
+        return Ok(true);
+    }
+    let idle = now.signed_duration_since(newest_delta).num_seconds() >= VECTOR_BASE_IDLE_SECS;
+    Ok(idle
+        && delta_rows >= VECTOR_BASE_IDLE_MIN_ROWS
+        && delta_rows >= base_rows / VECTOR_BASE_IDLE_BASE_FRACTION)
 }
 
 fn parse_positive_u64_env(name: &str, default: u64) -> Result<u64> {
@@ -407,6 +576,7 @@ pub(super) fn select_search_compactions(
         || policy.hard_segment_cap > MAX_ACTIVE_SEARCH_SEGMENTS
         || policy.base_compact_bytes == 0
         || policy.base_stale_percent == 0
+        || policy.vector_base_delta_rows == 0
     {
         return Err(Error::precondition(
             "Search-LSM compaction policy has invalid segment bounds",
@@ -418,6 +588,14 @@ pub(super) fn select_search_compactions(
         ))
     })?;
 
+    let now = Utc::now();
+    let nodes_bytes = manifest
+        .ssts
+        .iter()
+        .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+        .fold(0u64, |total, descriptor| {
+            total.saturating_add(descriptor.size_bytes)
+        });
     let mut selections = Vec::new();
     for state in manifest
         .search_lsm
@@ -453,32 +631,41 @@ pub(super) fn select_search_compactions(
             }
             descriptors.push((*descriptor).clone());
         }
-        let delta_count = state
-            .segments
-            .iter()
-            .filter(|segment| segment.role == SearchSegmentRole::Delta)
-            .count();
-        let delta_run_output_len = state
-            .segments
-            .len()
-            .checked_sub(policy.delta_trigger_segments)
-            .and_then(|retained| retained.checked_add(1));
+        let trailing_deltas = trailing_delta_len(state);
+        let tiered_run = tiered_delta_run_len(state, &descriptors);
+        let under_pressure = state.segments.len() >= pressure_segments(policy);
+        // Size-tiered: merge the newest `delta_trigger_segments` deltas once
+        // none of them is larger than the newer ones combined, so a merged
+        // output waits for peers of its size instead of being rewritten by
+        // every later run (which made each row's rewrites grow with the
+        // number of flushes). Under pressure, merge them whatever their sizes.
+        let delta_run_len = ((tiered_run >= policy.delta_trigger_segments)
+            || (under_pressure && trailing_deltas >= policy.delta_trigger_segments))
+            .then_some(policy.delta_trigger_segments);
+        let delta_run_output_len = delta_run_len.and_then(|len| {
+            state
+                .segments
+                .len()
+                .checked_sub(len)
+                .and_then(|retained| retained.checked_add(1))
+        });
         // Lowering the configured cap below an existing generation, or
         // reaching cap with Base + too short a delta tail, must still have a
         // route that frees a foreground flush slot.
         let cap_requires_base = state.segments.len() >= policy.hard_segment_cap
-            && (delta_count < policy.delta_trigger_segments
-                || delta_run_output_len
-                    .map(|len| len >= policy.hard_segment_cap)
-                    .unwrap_or(true));
-        let rebuild_base = base_rebuild_needed(state, &descriptors, policy)? || cap_requires_base;
+            && delta_run_output_len
+                .map(|len| len >= policy.hard_segment_cap)
+                .unwrap_or(true);
+        let rebuild_base = base_rebuild_needed(state, &descriptors, policy)?
+            || vector_base_rebuild_due(state, &descriptors, policy, now, nodes_bytes)?
+            || cap_requires_base;
         let (mode, selected_segment_start) = if rebuild_base {
             (SearchCompactionMode::BasePrefix, 0)
-        } else if delta_count >= policy.delta_trigger_segments {
+        } else if let Some(run_len) = delta_run_len {
             let start = state
                 .segments
                 .len()
-                .checked_sub(policy.delta_trigger_segments)
+                .checked_sub(run_len)
                 .ok_or_else(|| Error::invariant("Search-LSM delta suffix underflows"))?;
             if state.segments[start..].iter().any(|segment| {
                 segment.role != SearchSegmentRole::Delta
@@ -918,9 +1105,10 @@ pub(super) fn rebase_prepared_search_compaction(
             }
         }
     }
-    if rebased.segments.len() > prepared.selection.hard_segment_cap
-        || rebased.segments.len() > MAX_ACTIVE_SEARCH_SEGMENTS
-    {
+    // Off-lock flushes may take a generation past its configured ceiling (up
+    // to the protocol one) while this compaction ran; it still lowers the
+    // count, so only the protocol ceiling refuses it.
+    if rebased.segments.len() > MAX_ACTIVE_SEARCH_SEGMENTS {
         return Err(Error::precondition(format!(
             "abandoning physical Search-LSM compaction: rebased generation '{}' would retain {} \
              segments above hard cap {}",
@@ -3303,6 +3491,213 @@ mod tests {
         }
     }
 
+    /// Active vector generation of plain deltas: `(size_bytes, rows)` each,
+    /// oldest first, every delta created `age_secs` ago.
+    fn sized_delta_fixture(deltas: &[(u64, u64)], age_secs: i64) -> Manifest {
+        let mut manifest = fixture();
+        manifest
+            .ssts
+            .retain(|descriptor| descriptor.kind != SstKind::VectorGraph);
+        manifest
+            .ssts
+            .retain(|descriptor| descriptor.kind != SstKind::Nodes);
+        manifest.search_lsm.clear();
+        let created_at = Utc::now() - chrono::Duration::seconds(age_secs);
+        let mut segments = Vec::new();
+        let mut coverage = Vec::new();
+        for (event, (size_bytes, rows)) in deltas.iter().enumerate() {
+            let event = event as u64;
+            let node = Uuid::from_u128(0x1000 + u128::from(event));
+            manifest.ssts.push(descriptor(
+                node,
+                SstKind::Nodes,
+                "",
+                event + 1,
+                event + 1,
+                *rows,
+            ));
+            let segment_id = Uuid::from_u128(0x2000 + u128::from(event));
+            let mut segment_descriptor = descriptor(
+                segment_id,
+                SstKind::VectorGraph,
+                "doc_vec",
+                event + 1,
+                event + 1,
+                *rows,
+            );
+            // Sizes are given in MiB, above the small-delta floor.
+            segment_descriptor.size_bytes = *size_bytes * 1024 * 1024;
+            segment_descriptor.created_at = created_at;
+            manifest.ssts.push(segment_descriptor);
+            let mut segment = delta(segment_id, event, event + 1);
+            segment.mutation_count = *rows;
+            segment.live_payload_count = *rows;
+            segment.stats = SearchSegmentStats::Vector {
+                live_count: SearchStatValue::Delta(*rows as i64),
+            };
+            segments.push(segment);
+            coverage.push(SearchCoverage {
+                node_sst_id: node,
+                node_sst_max_lsn: event + 1,
+                event_ranges: vec![SearchEventRange::new(event, event + 1)],
+                disposition: CoverageDisposition::Segment,
+            });
+        }
+        let barrier = Uuid::from_u128(0x3000);
+        let state = SearchLsmState {
+            index_name: "doc_vec".into(),
+            kind: SearchLsmKind::Vector,
+            catalog_signature: crate::search_lsm::vector_catalog_signature(
+                &manifest,
+                &manifest.vector_indexes[0],
+            ),
+            generation_id: Uuid::from_u128(0x4000),
+            status: SearchLsmStatus::Active,
+            next_event_seq: deltas.len() as u64,
+            base_frontier: None,
+            segments,
+            proven_empty_event_ranges: Vec::new(),
+            coverage,
+            compat_barrier_sst_id: Some(barrier),
+            equal_lsn_conflict_count: 0,
+        };
+        let barrier_body = crate::search_lsm::encode_search_barrier(&state).unwrap();
+        manifest.ssts.push(search_barrier_descriptor(
+            &state,
+            barrier,
+            SstLevel::L0,
+            format!("sst/level0/{barrier}.slb"),
+            barrier_body.len() as u64,
+        ));
+        manifest.search_lsm.push(state);
+        validate_search_lsm(&manifest).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn delta_runs_are_size_tiered_and_leave_large_consolidated_deltas_alone() {
+        let policy = delta_policy(4, 24);
+        // Three fresh flushes behind a large consolidated delta: not due.
+        let manifest = sized_delta_fixture(&[(4_000, 40), (100, 1), (100, 1), (100, 1)], 0);
+        assert!(select_search_compactions(&manifest, policy)
+            .unwrap()
+            .is_empty());
+
+        // A fourth equal flush makes the run due; the large delta stays.
+        let manifest =
+            sized_delta_fixture(&[(4_000, 40), (100, 1), (100, 1), (100, 1), (100, 1)], 0);
+        let selection = select_search_compactions(&manifest, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(selection.mode, SearchCompactionMode::DeltaRun);
+        assert_eq!(selection.selected_segment_start, 1);
+        assert_eq!(selection.selected_descriptors.len(), 4);
+
+        // The merged output then waits for peers of its own size: the next
+        // run of small flushes does not rewrite it...
+        let manifest = sized_delta_fixture(
+            &[(400, 4), (100, 1), (100, 1), (100, 1), (100, 1), (100, 1)],
+            0,
+        );
+        let selection = select_search_compactions(&manifest, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(selection.selected_segment_start, 2);
+        assert_eq!(selection.selected_descriptors.len(), 4);
+        // ...and four outputs of one size merge into the next tier.
+        let manifest = sized_delta_fixture(&[(400, 4), (400, 4), (400, 4), (400, 4)], 0);
+        let selection = select_search_compactions(&manifest, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(selection.selected_segment_start, 0);
+        assert_eq!(selection.selected_descriptors.len(), 4);
+    }
+
+    #[test]
+    fn segment_pressure_merges_the_newest_deltas_whatever_their_sizes() {
+        // Strictly growing sizes never form a tier...
+        let sizes = [(9_000, 9), (5_000, 5), (3_000, 3), (1_000, 1)];
+        let policy = delta_policy(4, 24);
+        assert!(
+            select_search_compactions(&sized_delta_fixture(&sizes, 0), policy)
+                .unwrap()
+                .is_empty()
+        );
+        // ...but at the pressure mark (2 x trigger) the newest run is merged.
+        let many = [
+            (90_000, 90),
+            (50_000, 50),
+            (30_000, 30),
+            (17_000, 17),
+            (9_000, 9),
+            (5_000, 5),
+            (3_000, 3),
+            (1_000, 1),
+        ];
+        let selection = select_search_compactions(&sized_delta_fixture(&many, 0), policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(selection.mode, SearchCompactionMode::DeltaRun);
+        assert_eq!(selection.selected_segment_start, 4);
+    }
+
+    #[test]
+    fn flat_vector_rows_fold_into_a_clustered_base() {
+        let policy = SearchCompactionPolicy {
+            vector_base_delta_rows: 1_000,
+            vector_base_max_input_bytes: u64::MAX,
+            ..delta_policy(4, 24)
+        };
+        // Below the row bound, a busy generation keeps its flat deltas.
+        let manifest = sized_delta_fixture(&[(100, 300), (100, 300)], 0);
+        assert!(select_search_compactions(&manifest, policy)
+            .unwrap()
+            .is_empty());
+        // At the bound the deltas are rebuilt into the clustered base: every
+        // query scans flat deltas in full.
+        let manifest = sized_delta_fixture(&[(100, 600), (100, 600)], 0);
+        let selection = select_search_compactions(&manifest, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(selection.mode, SearchCompactionMode::BasePrefix);
+        // Not when the rebuild would read more Nodes bytes than memory allows.
+        let tight = SearchCompactionPolicy {
+            vector_base_max_input_bytes: 1,
+            ..policy
+        };
+        assert!(select_search_compactions(&manifest, tight)
+            .unwrap()
+            .is_empty());
+        // An idle generation folds a smaller tail too...
+        let manifest = sized_delta_fixture(&[(100, 300), (100, 300)], 0);
+        assert!(select_search_compactions(&manifest, policy)
+            .unwrap()
+            .is_empty());
+        let idle = sized_delta_fixture(
+            &[
+                (100, VECTOR_BASE_IDLE_MIN_ROWS / 2),
+                (100, VECTOR_BASE_IDLE_MIN_ROWS / 2),
+            ],
+            VECTOR_BASE_IDLE_SECS + 5,
+        );
+        let selection = select_search_compactions(
+            &idle,
+            SearchCompactionPolicy {
+                vector_base_delta_rows: u64::MAX,
+                vector_base_max_input_bytes: u64::MAX,
+                ..policy
+            },
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(selection.mode, SearchCompactionMode::BasePrefix);
+        // ...but not a few stray rows.
+        let trickle = sized_delta_fixture(&[(100, 3), (100, 3)], VECTOR_BASE_IDLE_SECS + 5);
+        assert!(select_search_compactions(&trickle, policy)
+            .unwrap()
+            .is_empty());
+    }
+
     fn delta_policy(trigger: usize, hard_cap: usize) -> SearchCompactionPolicy {
         SearchCompactionPolicy {
             delta_trigger_segments: trigger,
@@ -3310,6 +3705,8 @@ mod tests {
             base_compact_bytes: u64::MAX,
             base_stale_percent: u64::MAX,
             force_base: false,
+            vector_base_delta_rows: u64::MAX,
+            vector_base_max_input_bytes: u64::MAX,
         }
     }
 
@@ -3601,6 +3998,8 @@ mod tests {
             base_compact_bytes: 50,
             base_stale_percent: u64::MAX,
             force_base: false,
+            vector_base_delta_rows: u64::MAX,
+            vector_base_max_input_bytes: u64::MAX,
         };
         let selection = select_search_compactions(&manifest, policy)
             .unwrap()
@@ -3923,7 +4322,7 @@ mod tests {
     }
 
     #[test]
-    fn cas_rebase_rejects_concurrent_append_above_hard_cap() {
+    fn cas_rebase_accepts_concurrent_append_above_configured_cap() {
         let basis = fixture();
         let selection = select_search_compactions(&basis, base_policy(6, 8))
             .unwrap()
@@ -3963,21 +4362,20 @@ mod tests {
         current.search_lsm[0].next_event_seq = 15;
         validate_search_lsm(&current).unwrap();
 
-        let error = rebase_prepared_search_compaction(&current, &prepared, &current.search_lsm[0])
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("above hard cap"),
-            "unexpected error: {error}"
-        );
+        // Off-lock flushes may take a generation past its configured cap
+        // while the compaction ran; the compaction still lowers the count, so
+        // it installs. Only the protocol ceiling refuses it.
+        let rebased =
+            rebase_prepared_search_compaction(&current, &prepared, &current.search_lsm[0]).unwrap();
+        assert!(rebased.segments.len() > 8);
+        assert!(rebased.segments.len() < current.search_lsm[0].segments.len());
+        assert!(rebased.segments.len() <= MAX_ACTIVE_SEARCH_SEGMENTS);
     }
 
     #[test]
-    fn delta_rebase_rejects_concurrent_append_above_hard_cap() {
-        // A cap of 4 never reaches this path: planning escalates the fixture's
-        // six segments to BasePrefix because a DeltaRun would still retain four
-        // and free no foreground flush slot. Cap 5 keeps the DeltaRun route —
-        // it rebases to three retained plus one output — so two concurrent
-        // appends are what push the rebased generation to six.
+    fn delta_rebase_accepts_concurrent_append_above_configured_cap() {
+        // Cap 5 keeps the DeltaRun route; two concurrent appends push the
+        // rebased generation past it.
         let basis = fixture();
         let selection = select_search_compactions(&basis, delta_policy(3, 5))
             .unwrap()
@@ -4017,11 +4415,10 @@ mod tests {
         current.search_lsm[0].next_event_seq = 9;
         validate_search_lsm(&current).unwrap();
 
-        let error = rebase_prepared_search_compaction(&current, &prepared, &current.search_lsm[0])
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("above hard cap"),
-            "unexpected error: {error}"
-        );
+        // See `cas_rebase_accepts_concurrent_append_above_configured_cap`.
+        let rebased =
+            rebase_prepared_search_compaction(&current, &prepared, &current.search_lsm[0]).unwrap();
+        assert!(rebased.segments.len() > 5);
+        assert!(rebased.segments.len() < current.search_lsm[0].segments.len());
     }
 }

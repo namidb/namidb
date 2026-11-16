@@ -165,6 +165,8 @@ pub struct LoadConfig {
     pub seed: u64,
     pub counters_file: Option<PathBuf>,
     pub setup: bool,
+    /// Fulltext indexes `--setup` creates on `Doc` (0-4).
+    pub fulltext_indexes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -434,14 +436,29 @@ fn unit(rng: &mut ChaCha8Rng, dim: usize, center: Option<&[f32]>, spread: f32) -
     v
 }
 
-async fn setup_schema(client: &Client, dim: usize) -> Result<()> {
-    for ddl in [
+/// Fulltext indexes `--fulltext-indexes N` creates, in order. The first is the
+/// one the field report queries; the rest model an application that indexes
+/// several text properties of the same label.
+const FULLTEXT_INDEXES: [(&str, &str); 4] = [
+    ("doc_body", "[d.body]"),
+    ("doc_title", "[d.title]"),
+    ("doc_source", "[d.source]"),
+    ("doc_title_body", "[d.title, d.body]"),
+];
+
+async fn setup_schema(client: &Client, dim: usize, fulltext_indexes: usize) -> Result<()> {
+    let mut ddls = vec![
         "CREATE CONSTRAINT doc_id IF NOT EXISTS FOR (d:Doc) REQUIRE d.id IS UNIQUE".to_string(),
         format!(
             "CREATE VECTOR INDEX doc_emb IF NOT EXISTS ON :Doc(embedding) METRIC cosine DIMENSION {dim}"
         ),
-        "CREATE FULLTEXT INDEX doc_body IF NOT EXISTS FOR (d:Doc) ON EACH [d.body]".to_string(),
-    ] {
+    ];
+    for (name, properties) in FULLTEXT_INDEXES.iter().take(fulltext_indexes) {
+        ddls.push(format!(
+            "CREATE FULLTEXT INDEX {name} IF NOT EXISTS FOR (d:Doc) ON EACH {properties}"
+        ));
+    }
+    for ddl in ddls {
         let reply = client.run(&ddl, json!({})).await?;
         if reply.status != 200 {
             eprintln!("setup: `{ddl}` -> HTTP {}: {}", reply.status, reply.body);
@@ -471,7 +488,7 @@ fn vector_rows(gen: &VectorGen, range: std::ops::Range<usize>) -> Value {
 pub async fn http_load(config: LoadConfig) -> Result<LoadReport> {
     let client = Arc::new(Client::new(&config)?);
     if config.setup {
-        setup_schema(&client, config.dim).await?;
+        setup_schema(&client, config.dim, config.fulltext_indexes).await?;
     }
     let mut report = LoadReport {
         scenario: format!("{:?}", config.scenario),
@@ -480,12 +497,12 @@ pub async fn http_load(config: LoadConfig) -> Result<LoadReport> {
     match config.scenario {
         Scenario::FieldReport => field_report(&client, &config, &mut report).await?,
         Scenario::Bulk => {
-            let rate = sustained(&client, &config, false).await?;
-            report.metrics.insert("nodes_per_sec".into(), rate);
+            let sustained = sustained(&client, &config, false).await?;
+            insert_sustained(&mut report, "nodes_per_sec", &sustained);
         }
         Scenario::Vectors => {
-            let rate = sustained(&client, &config, true).await?;
-            report.metrics.insert("vectors_per_sec".into(), rate);
+            let sustained = sustained(&client, &config, true).await?;
+            insert_sustained(&mut report, "vectors_per_sec", &sustained);
         }
         Scenario::VectorSearch => vector_search(&client, &config, &mut report).await?,
     }
@@ -578,7 +595,20 @@ async fn field_report(client: &Client, config: &LoadConfig, report: &mut LoadRep
 
 /// Load `count` nodes (or vectors) in `batch`-row requests, `concurrency` in
 /// flight. Returns rows/s over the whole run and prints a per-10% rate.
-async fn sustained(client: &Arc<Client>, config: &LoadConfig, vectors: bool) -> Result<f64> {
+/// Throughput and per-request latency of one sustained load.
+pub struct SustainedReport {
+    pub rows_per_sec: f64,
+    /// Wall time of each committed request, retries included, in ms.
+    pub latencies_ms: Vec<f64>,
+    /// Requests answered 503 (busy / admission) and retried.
+    pub retried_requests: usize,
+}
+
+async fn sustained(
+    client: &Arc<Client>,
+    config: &LoadConfig,
+    vectors: bool,
+) -> Result<SustainedReport> {
     let gen = Arc::new(VectorGen::new(config.dim, config.clusters, config.seed));
     let batches: Vec<std::ops::Range<usize>> = (0..config.count)
         .step_by(config.batch.max(1))
@@ -588,6 +618,7 @@ async fn sustained(client: &Arc<Client>, config: &LoadConfig, vectors: bool) -> 
     let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let latencies = Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
     let before = client.settle_counters().await;
     let started = Instant::now();
     let mut workers = Vec::new();
@@ -597,6 +628,7 @@ async fn sustained(client: &Arc<Client>, config: &LoadConfig, vectors: bool) -> 
         let done = Arc::clone(&done);
         let failures = Arc::clone(&failures);
         let retries = Arc::clone(&retries);
+        let latencies = Arc::clone(&latencies);
         let gen = Arc::clone(&gen);
         let seed = config.seed;
         let node_bytes = config.node_bytes;
@@ -617,6 +649,7 @@ async fn sustained(client: &Arc<Client>, config: &LoadConfig, vectors: bool) -> 
                 // upload). Anything else is a failure. Only committed rows
                 // count towards the rate.
                 let mut attempts = 0;
+                let request_started = Instant::now();
                 let committed = loop {
                     attempts += 1;
                     let retry = match client.run(query, params.clone()).await {
@@ -642,6 +675,10 @@ async fn sustained(client: &Arc<Client>, config: &LoadConfig, vectors: bool) -> 
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 };
                 if committed {
+                    latencies
+                        .lock()
+                        .unwrap()
+                        .push(request_started.elapsed().as_secs_f64() * 1000.0);
                     done.fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -693,7 +730,39 @@ async fn sustained(client: &Arc<Client>, config: &LoadConfig, vectors: bool) -> 
     if failures.load(std::sync::atomic::Ordering::Relaxed) > 0 {
         bail!("some batches failed");
     }
-    Ok(rate)
+    let mut latencies_ms = std::mem::take(&mut *latencies.lock().unwrap());
+    latencies_ms.sort_by(|a, b| a.total_cmp(b));
+    eprintln!(
+        "  write latency p50={:.0}ms p95={:.0}ms p99={:.0}ms max={:.0}ms",
+        percentile(&latencies_ms, 50.0),
+        percentile(&latencies_ms, 95.0),
+        percentile(&latencies_ms, 99.0),
+        percentile(&latencies_ms, 100.0),
+    );
+    Ok(SustainedReport {
+        rows_per_sec: rate,
+        latencies_ms,
+        retried_requests: retries.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+fn insert_sustained(report: &mut LoadReport, rate_key: &str, sustained: &SustainedReport) {
+    report
+        .metrics
+        .insert(rate_key.into(), sustained.rows_per_sec);
+    for (key, p) in [
+        ("write_p50_ms", 50.0),
+        ("write_p95_ms", 95.0),
+        ("write_p99_ms", 99.0),
+        ("write_max_ms", 100.0),
+    ] {
+        report
+            .metrics
+            .insert(key.into(), percentile(&sustained.latencies_ms, p));
+    }
+    report
+        .metrics
+        .insert("retried_requests".into(), sustained.retried_requests as f64);
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -812,6 +881,12 @@ async fn vector_search(
             "store_bytes_read_per_query".into(),
             delta.bytes_read as f64 / queries.len().max(1) as f64,
         );
+        for (op, count) in &delta.by_op {
+            report.metrics.insert(
+                format!("store_{}_per_query", op.replace(' ', "_").to_lowercase()),
+                *count as f64 / queries.len().max(1) as f64,
+            );
+        }
     }
     eprintln!(
         "vector search: recall@{k}={recall:.4} p50={:.1}ms p95={:.1}ms (ef {}, {} queries)",

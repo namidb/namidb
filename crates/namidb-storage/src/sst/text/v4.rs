@@ -277,7 +277,7 @@ struct ContentDigestMaterial<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct PreparedPayload {
+pub(crate) struct PreparedPayload {
     tokens: Vec<String>,
     filters: BTreeMap<String, SearchFilterValue>,
 }
@@ -748,6 +748,33 @@ impl std::fmt::Debug for TextV4Reader {
 pub fn text_v4_payload_fingerprint(payload: &TextV4Payload) -> Result<u64> {
     let prepared = prepare_payload(payload)?;
     prepared_payload_fingerprint(&prepared)
+}
+
+/// A payload tokenized once, with its fingerprint, for callers that need the
+/// fingerprint and then hand the same mutation to a
+/// [`TextV4ExternalBuilder`] (see [`TextV4ExternalBuilder::push_prepared`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TextV4PreparedPayload {
+    pub(crate) prepared: PreparedPayload,
+    pub(crate) fingerprint: u64,
+    pub(crate) raw_text_len: usize,
+}
+
+impl TextV4PreparedPayload {
+    pub(crate) fn new(payload: &TextV4Payload) -> Result<Self> {
+        let prepared = prepare_payload(payload)?;
+        let fingerprint = prepared_payload_fingerprint(&prepared)?;
+        Ok(Self {
+            prepared,
+            fingerprint,
+            raw_text_len: payload.text.len(),
+        })
+    }
+
+    /// Token count, the document length BM25 uses.
+    pub(crate) fn token_count(&self) -> usize {
+        self.prepared.tokens.len()
+    }
 }
 
 /// In-memory convenience builder. Production flushes should use

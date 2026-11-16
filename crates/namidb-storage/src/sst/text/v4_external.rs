@@ -246,6 +246,13 @@ impl std::fmt::Debug for TextV4ExternalBuilder {
     }
 }
 
+/// Identity of the mutation `push_prepared_body` appends.
+#[derive(Clone, Copy)]
+struct MutationIds {
+    node_id: [u8; 16],
+    lsn: u64,
+}
+
 impl TextV4ExternalBuilder {
     /// Create a signed delta builder.
     pub fn new(state: &SearchLsmState, context: TextV4BuildContext) -> Result<Self> {
@@ -463,6 +470,89 @@ impl TextV4ExternalBuilder {
         self.preflight_text(&mutation)?;
         let before = mutation.before.as_ref().map(prepare_payload).transpose()?;
         let after = mutation.after.as_ref().map(prepare_payload).transpose()?;
+        self.push_prepared_body(mutation.node_id, mutation.lsn, before, after)
+    }
+
+    /// [`Self::push`] for payloads the caller already tokenized (each one
+    /// exactly once): identical semantics, without tokenizing again.
+    pub(crate) fn push_prepared(
+        &mut self,
+        node_id: [u8; 16],
+        lsn: u64,
+        before: Option<super::TextV4PreparedPayload>,
+        after: Option<super::TextV4PreparedPayload>,
+    ) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::precondition(
+                "text v4 external builder is poisoned by an earlier push failure",
+            ));
+        }
+        let result = self.push_prepared_inner(node_id, lsn, before, after);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn push_prepared_inner(
+        &mut self,
+        node_id: [u8; 16],
+        lsn: u64,
+        before: Option<super::TextV4PreparedPayload>,
+        after: Option<super::TextV4PreparedPayload>,
+    ) -> Result<()> {
+        if !matches!(self.mode, ExternalBuildMode::Derived) {
+            return Err(Error::precondition(
+                "text v4 reconciled DeltaRun requires push_reconciled",
+            ));
+        }
+        if lsn == 0 {
+            return Err(Error::precondition(
+                "text v4 external mutation uses reserved LSN zero",
+            ));
+        }
+        if self
+            .last_node_id
+            .is_some_and(|previous| node_id <= previous)
+        {
+            return Err(Error::precondition(
+                "text v4 external builder requires strictly ascending NodeIds",
+            ));
+        }
+        if self.role == SearchSegmentRole::Base && (before.is_some() || after.is_none()) {
+            return Err(Error::precondition(
+                "text v4 base requires before=None and one live after-image",
+            ));
+        }
+        self.last_node_id = Some(node_id);
+        let raw = before
+            .as_ref()
+            .map(|payload| payload.raw_text_len)
+            .unwrap_or(0)
+            .checked_add(
+                after
+                    .as_ref()
+                    .map(|payload| payload.raw_text_len)
+                    .unwrap_or(0),
+            )
+            .ok_or_else(|| Error::precondition("text v4 mutation text length overflows"))?;
+        self.observe_record_text(node_id, raw);
+        self.push_prepared_body(
+            node_id,
+            lsn,
+            before.map(|payload| payload.prepared),
+            after.map(|payload| payload.prepared),
+        )
+    }
+
+    fn push_prepared_body(
+        &mut self,
+        node_id: [u8; 16],
+        lsn: u64,
+        before: Option<super::PreparedPayload>,
+        after: Option<super::PreparedPayload>,
+    ) -> Result<()> {
+        let mutation = MutationIds { node_id, lsn };
         self.validate_filter_keys(before.as_ref())?;
         self.validate_filter_keys(after.as_ref())?;
         if before == after {

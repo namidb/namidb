@@ -62,8 +62,10 @@ with Docker `--memory` or another cgroup/OS limit for hard containment.
 Admission alone cannot stop a query that is already running, so the same
 ceiling also drives a per-query working-memory budget,
 `--query-memory-max-bytes` / `NAMIDB_QUERY_MEMORY_MAX_BYTES` (default `auto`:
-50% of `NAMIDB_MEMORY_MAX_BYTES`, off when that is `0`; an exact byte count
-also works without a ceiling; `0` disables it). The executor charges each
+50% of `NAMIDB_MEMORY_MAX_BYTES`, so 45% of a container's limit when the
+ceiling is `auto`, and 25% of the memory available to the process only when
+the ceiling is `0`; an exact byte count also works without a ceiling; `0`
+disables it). The executor charges each
 query's materialised rows and operator state (sort keys, grouping state,
 `collect()` lists, DISTINCT fingerprints, cross products, `range()` lists)
 with conservative estimates as they grow, on the flat and the factorised

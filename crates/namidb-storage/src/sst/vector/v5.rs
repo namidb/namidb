@@ -53,6 +53,8 @@ const MAX_COMPRESSED_BLOCK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RAW_BLOCK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DIM: u32 = 1_048_576;
 const MAX_NAV_BATCH_PAGES: usize = 16;
+/// Upper bound on exact f32 pages fetched concurrently for one rerank wave.
+const MAX_EXACT_BATCH_PAGES: usize = 8;
 /// Bincode's tree/string containers have allocator overhead in addition to
 /// the retained decompressed wire. Reserving six raw bytes per encoded byte is
 /// intentionally conservative and keeps the process-wide workspace cap above
@@ -516,6 +518,11 @@ impl VectorV5Reader {
     /// Every supported group is evaluated against local page bitmaps before
     /// approximate scoring and before top-k truncation. Unsupported groups are
     /// reported through `applied_filter_groups`, allowing a residual/fallback.
+    /// Byte length of the object this reader was opened over.
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
     pub async fn search_filter_groups(
         &self,
         query: &[f32],
@@ -623,6 +630,8 @@ impl VectorV5Reader {
                 .then_with(|| left.visit_order.cmp(&right.visit_order))
         });
         let mut exact_hits = BoundedExactHits::new(final_k);
+        // `(page, first candidate, end candidate)` per distinct rerank page.
+        let mut page_groups = Vec::new();
         let mut candidate_start = 0usize;
         while candidate_start < approximate.len() {
             let page = approximate[candidate_start].page;
@@ -630,51 +639,66 @@ impl VectorV5Reader {
             while candidate_end < approximate.len() && approximate[candidate_end].page == page {
                 candidate_end += 1;
             }
-            let range = self.footer.pages[page as usize].exact.range()?;
-            let wire = self.source.read_range(range.clone()).await?;
-            require_len(
-                &wire,
-                usize::try_from(range.end - range.start)
-                    .map_err(|_| Error::invariant("vector v5 range length overflows usize"))?,
-                "exact block",
-            )?;
-            let page_ref = &self.footer.pages[page as usize];
-            let raw = decode_block(&wire, &page_ref.exact, "exact page")?;
-            let expected = (page_ref.row_count as usize)
-                .checked_mul(self.footer.dim as usize)
-                .and_then(|v| v.checked_mul(4))
-                .ok_or_else(|| Error::invariant("vector v5 exact page size overflows"))?;
-            if raw.len() != expected {
-                return Err(Error::invariant(format!(
-                    "vector v5 exact page length {} != expected {expected}",
-                    raw.len()
-                )));
-            }
-            let row_bytes = (self.footer.dim as usize)
-                .checked_mul(4)
-                .ok_or_else(|| Error::invariant("vector v5 row byte size overflows"))?;
-            for candidate in &approximate[candidate_start..candidate_end] {
-                let start = (candidate.row as usize)
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| Error::invariant("vector v5 exact row offset overflows"))?;
-                let end = start
-                    .checked_add(row_bytes)
-                    .ok_or_else(|| Error::invariant("vector v5 exact row end overflows"))?;
-                let row = raw
-                    .get(start..end)
-                    .ok_or_else(|| Error::invariant("vector v5 exact row out of range"))?;
-                let mut vector = Vec::with_capacity(self.footer.dim as usize);
-                for bytes in row.chunks_exact(4) {
-                    vector.push(f32::from_le_bytes(
-                        bytes
-                            .try_into()
-                            .map_err(|_| Error::invariant("vector v5 invalid f32 bytes"))?,
-                    ));
-                }
-                let score = metric_score(self.metric, &vector, query).0 as f32;
-                exact_hits.insert(self.metric, candidate.id, score);
-            }
+            page_groups.push((page, candidate_start, candidate_end));
             candidate_start = candidate_end;
+        }
+        for wave in page_groups.chunks(workspace_plan.exact_batch_pages.max(1)) {
+            let ranges = wave
+                .iter()
+                .map(|(page, _, _)| self.footer.pages[*page as usize].exact.range())
+                .collect::<Result<Vec<_>, _>>()?;
+            let wires = self.source.read_ranges(&ranges).await?;
+            if wires.len() != ranges.len() {
+                return Err(Error::invariant(
+                    "vector v5 range source returned wrong exact block count",
+                ));
+            }
+            for ((&(page, candidate_start, candidate_end), wire), range) in
+                wave.iter().zip(wires).zip(ranges)
+            {
+                require_len(
+                    &wire,
+                    usize::try_from(range.end - range.start)
+                        .map_err(|_| Error::invariant("vector v5 range length overflows usize"))?,
+                    "exact block",
+                )?;
+                let page_ref = &self.footer.pages[page as usize];
+                let raw = decode_block(&wire, &page_ref.exact, "exact page")?;
+                let expected = (page_ref.row_count as usize)
+                    .checked_mul(self.footer.dim as usize)
+                    .and_then(|v| v.checked_mul(4))
+                    .ok_or_else(|| Error::invariant("vector v5 exact page size overflows"))?;
+                if raw.len() != expected {
+                    return Err(Error::invariant(format!(
+                        "vector v5 exact page length {} != expected {expected}",
+                        raw.len()
+                    )));
+                }
+                let row_bytes = (self.footer.dim as usize)
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::invariant("vector v5 row byte size overflows"))?;
+                for candidate in &approximate[candidate_start..candidate_end] {
+                    let start = (candidate.row as usize)
+                        .checked_mul(row_bytes)
+                        .ok_or_else(|| Error::invariant("vector v5 exact row offset overflows"))?;
+                    let end = start
+                        .checked_add(row_bytes)
+                        .ok_or_else(|| Error::invariant("vector v5 exact row end overflows"))?;
+                    let row = raw
+                        .get(start..end)
+                        .ok_or_else(|| Error::invariant("vector v5 exact row out of range"))?;
+                    let mut vector = Vec::with_capacity(self.footer.dim as usize);
+                    for bytes in row.chunks_exact(4) {
+                        vector.push(f32::from_le_bytes(
+                            bytes
+                                .try_into()
+                                .map_err(|_| Error::invariant("vector v5 invalid f32 bytes"))?,
+                        ));
+                    }
+                    let score = metric_score(self.metric, &vector, query).0 as f32;
+                    exact_hits.insert(self.metric, candidate.id, score);
+                }
+            }
         }
         let hits = exact_hits.into_sorted_hits(self.metric);
         Ok(VectorV5SearchResult {
@@ -1040,6 +1064,8 @@ impl BoundedExactHits {
 #[derive(Debug, Clone, Copy)]
 struct VectorWorkspacePlan {
     nav_batch_pages: usize,
+    /// Exact f32 pages fetched (concurrently) and scored per rerank wave.
+    exact_batch_pages: usize,
     required_bytes: usize,
 }
 
@@ -1211,14 +1237,45 @@ fn vector_workspace_plan(
         let required = checked_add(base, transient_peak, "vector v5 total query workspace")?;
         fallback_required = fallback_required.min(required);
         if required <= capacity {
+            // Rerank pages are independent range reads: fetch as many at once
+            // as the workspace holds (one round trip per wave instead of one
+            // per page), never fewer than the single page already admitted.
+            let mut exact_batch_pages = 1;
+            for wave in (2..=MAX_EXACT_BATCH_PAGES).rev() {
+                let exact_peak = checked_mul(
+                    exact_page_peak,
+                    wave,
+                    "vector v5 exact rerank wave workspace",
+                )?;
+                let wave_required = checked_add(
+                    base,
+                    nav_peak.max(exact_peak),
+                    "vector v5 total query workspace",
+                )?;
+                if wave_required <= capacity {
+                    exact_batch_pages = wave;
+                    break;
+                }
+            }
+            let required = checked_add(
+                base,
+                nav_peak.max(checked_mul(
+                    exact_page_peak,
+                    exact_batch_pages,
+                    "vector v5 exact rerank wave workspace",
+                )?),
+                "vector v5 total query workspace",
+            )?;
             return Ok(VectorWorkspacePlan {
                 nav_batch_pages: batch_pages,
+                exact_batch_pages,
                 required_bytes: required,
             });
         }
     }
     Ok(VectorWorkspacePlan {
         nav_batch_pages: 1,
+        exact_batch_pages: 1,
         required_bytes: fallback_required,
     })
 }
@@ -2641,6 +2698,116 @@ mod tests {
             source.range_count()
         );
         assert!(source.range_count() <= 6);
+    }
+
+    /// Recall/IO sweep over a bench-like corpus (clusters of ~6k rows around
+    /// random centroids, Gaussian noise of norm `spread`). Run by hand:
+    /// `NAMIDB_V5_SWEEP_ROWS=96000 cargo test --release ... v5_recall_sweep -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn v5_recall_sweep() {
+        let rows: u32 = std::env::var("NAMIDB_V5_SWEEP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48_000);
+        let dim: usize = std::env::var("NAMIDB_V5_SWEEP_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let clusters = (rows / 5_900).max(1);
+        let spread = 0.35f32;
+        let gauss = |rng: &mut ChaCha8Rng| -> f32 {
+            let u1: f32 = rng.gen_range(f32::MIN_POSITIVE..1.0);
+            let u2: f32 = rng.gen_range(0.0..1.0);
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| {
+                let mut c: Vec<f32> = (0..dim).map(|_| gauss(&mut rng)).collect();
+                normalize(&mut c);
+                c
+            })
+            .collect();
+        let noise = spread / (dim as f32).sqrt();
+        let around = |rng: &mut ChaCha8Rng, c: &[f32]| {
+            let mut v: Vec<f32> = c.iter().map(|x| x + gauss(rng) * noise).collect();
+            normalize(&mut v);
+            v
+        };
+        let members: Vec<_> = (0..rows)
+            .map(|i| (id(i), around(&mut rng, &centers[(i % clusters) as usize])))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..40)
+            .map(|q| {
+                let c = &centers[q % clusters as usize];
+                around(&mut rng, c)
+            })
+            .collect();
+        let truth: Vec<BTreeSet<[u8; 16]>> = queries
+            .iter()
+            .map(|query| {
+                let mut exact: Vec<_> = members
+                    .iter()
+                    .map(|(node_id, vector)| {
+                        (
+                            *node_id,
+                            metric_score(VectorMetric::Cosine, vector, query).0 as f32,
+                        )
+                    })
+                    .collect();
+                sort_hits(VectorMetric::Cosine, &mut exact);
+                exact.truncate(10);
+                exact.into_iter().map(|hit| hit.0).collect()
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let (body, _) = build_body_v5(
+            &descriptor(VectorMetric::Cosine, dim as u32),
+            members,
+            VectorV5BuildOptions::default(),
+        )
+        .expect("build")
+        .expect("body");
+        eprintln!("built {} bytes in {:?}", body.len(), started.elapsed());
+        for (nprobe, rerank) in [
+            (4, 8),
+            (8, 8),
+            (16, 8),
+            (16, 16),
+            (24, 16),
+            (32, 16),
+            (48, 16),
+            (64, 16),
+        ] {
+            let source = Arc::new(TrackingSource::new(body.clone()));
+            let reader = VectorV5Reader::open(source.clone(), body.len() as u64)
+                .await
+                .expect("open");
+            let pages = reader.page_count();
+            let opened = source.range_count();
+            let mut recall = 0usize;
+            for (query, truth) in queries.iter().zip(&truth) {
+                let hits = reader
+                    .search(
+                        query,
+                        10,
+                        VectorV5SearchOptions {
+                            nprobe: nprobe.min(pages),
+                            max_nprobe: nprobe.min(pages),
+                            rerank_factor: rerank,
+                        },
+                    )
+                    .await
+                    .expect("search");
+                recall += hits.iter().filter(|hit| truth.contains(&hit.0)).count();
+            }
+            eprintln!(
+                "pages={pages} nprobe={nprobe} rerank={rerank} recall@10={:.3} ranges/query={:.1}",
+                recall as f64 / (10.0 * queries.len() as f64),
+                (source.range_count() - opened) as f64 / queries.len() as f64
+            );
+        }
     }
 
     #[tokio::test]

@@ -62,7 +62,11 @@ const FOYER_INDEX_SHARD_OVERHEAD_BYTES: usize = PAGE_BYTES;
 
 /// Default RAM request when a complete NVMe configuration is supplied without
 /// an explicit `NAMIDB_RAM_PAGE_CACHE_MAX_BYTES`.
-pub const DEFAULT_RAM_PAGE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Requested RAM page tier. It is a share of `NAMIDB_CACHE_MAX_BYTES`, fitted
+/// proportionally beside the other tiers (about 15% of it by default), so a
+/// vector query's quantized navigation pages and a full-text query's posting
+/// ranges stay resident across queries instead of costing a round trip each.
+pub const DEFAULT_RAM_PAGE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 /// Largest range admitted by default.
 pub const DEFAULT_RANGE_CACHE_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 /// Canonical fetch/cache page. Normalizing arbitrary reads to this boundary

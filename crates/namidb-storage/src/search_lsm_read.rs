@@ -411,6 +411,108 @@ fn metadata_fits_workspace(bytes: usize) -> bool {
     bytes <= crate::search_workspace::shared_search_workspace().capacity_bytes()
 }
 
+/// Open one segment of an active vector generation. `Ok(None)` is an exact
+/// fallback (missing/corrupt optional object), never an error.
+#[cfg(feature = "vector-index")]
+async fn open_vector_segment(
+    snapshot: &Snapshot<'_>,
+    state: &SearchLsmState,
+    segment: &crate::search_lsm::SearchSegmentRef,
+    catalog: &crate::manifest::VectorIndexDescriptor,
+) -> Result<Option<OpenedVectorSegment>> {
+    let Some(descriptor) = unique_descriptor(snapshot, segment.sst_id, state) else {
+        return Ok(None);
+    };
+    // A clustered base is immutable at a create-only path and its reader
+    // retains only the centroid footer: reuse it across queries instead of
+    // paying a HEAD plus the footer read (~1 MiB at 400k x 1024d) each time.
+    let cache_key = format!(
+        "{}/{}",
+        snapshot.paths.namespace_prefix().as_ref(),
+        descriptor.path
+    );
+    if segment.format == SearchSegmentFormat::VectorV5Base {
+        if let Some(reader) = snapshot
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.get_vector_v5_reader(&cache_key))
+        {
+            let wrapped = super::VectorSearchIndex::Ranged(reader.clone());
+            if reader.file_len() == descriptor.size_bytes
+                && super::active_vector_base_matches(&wrapped, descriptor, segment)
+            {
+                return Ok(Some(OpenedVectorSegment::V5Base {
+                    segment: segment.clone(),
+                    reader,
+                }));
+            }
+        }
+    }
+    let Some(source) = pin_descriptor(snapshot, descriptor).await? else {
+        return Ok(None);
+    };
+    let opened = match segment.format {
+        SearchSegmentFormat::VectorV5Base => {
+            let source: Arc<dyn crate::sst::vector::v5::VectorV5RangeSource> = source;
+            let reader =
+                match crate::sst::vector::v5::VectorV5Reader::open(source, descriptor.size_bytes)
+                    .await
+                {
+                    Ok(reader) => Arc::new(reader),
+                    Err(error) if optional_accelerator_fallback(&error) => {
+                        tracing::warn!(
+                            path = %descriptor.path,
+                            error = %error,
+                            "Search-LSM V5 base validation failed"
+                        );
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+            let wrapped = super::VectorSearchIndex::Ranged(reader.clone());
+            if !super::active_vector_base_matches(&wrapped, descriptor, segment) {
+                return Ok(None);
+            }
+            if let Some(cache) = snapshot.cache.as_ref() {
+                cache.insert_vector_v5_reader(cache_key, reader.clone());
+            }
+            OpenedVectorSegment::V5Base {
+                segment: segment.clone(),
+                reader,
+            }
+        }
+        SearchSegmentFormat::VectorV6 => {
+            let source: Arc<dyn SearchVersionRangeSource> = source;
+            let reader = match crate::sst::vector::v6::VectorV6Reader::open(
+                source,
+                descriptor.size_bytes,
+                state,
+                segment,
+                catalog,
+            )
+            .await
+            {
+                Ok(reader) => Arc::new(reader),
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    tracing::warn!(
+                        path = %descriptor.path,
+                        error = %error,
+                        "Search-LSM VG6 footer/lineage validation failed"
+                    );
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            OpenedVectorSegment::V6 {
+                segment: segment.clone(),
+                reader,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(opened))
+}
+
 #[cfg(feature = "vector-index")]
 async fn open_vector_generation(
     snapshot: &Snapshot<'_>,
@@ -445,70 +547,23 @@ async fn open_vector_generation(
     let mut resident_bytes = segments
         .capacity()
         .saturating_mul(std::mem::size_of::<OpenedVectorSegment>());
-    for segment in &state.segments {
-        let Some(descriptor) = unique_descriptor(snapshot, segment.sst_id, &state) else {
+    // Segment footers are independent reads: open them concurrently so a
+    // generation costs one round trip of footers, not one per segment.
+    let opens = state
+        .segments
+        .iter()
+        .map(|segment| open_vector_segment(snapshot, &state, segment, &catalog))
+        .collect::<Vec<_>>();
+    let opened_segments: Vec<Result<Option<OpenedVectorSegment>>> = {
+        use futures::StreamExt as _;
+        futures::stream::iter(opens)
+            .buffered(SEARCH_SEGMENT_FANOUT)
+            .collect()
+            .await
+    };
+    for opened in opened_segments {
+        let Some(opened) = opened? else {
             return Ok(ActiveSearch::Unavailable);
-        };
-        let Some(source) = pin_descriptor(snapshot, descriptor).await? else {
-            return Ok(ActiveSearch::Unavailable);
-        };
-        let opened = match segment.format {
-            SearchSegmentFormat::VectorV5Base => {
-                let source: Arc<dyn crate::sst::vector::v5::VectorV5RangeSource> = source;
-                let reader = match crate::sst::vector::v5::VectorV5Reader::open(
-                    source,
-                    descriptor.size_bytes,
-                )
-                .await
-                {
-                    Ok(reader) => Arc::new(reader),
-                    Err(error) if optional_accelerator_fallback(&error) => {
-                        tracing::warn!(
-                            path = %descriptor.path,
-                            error = %error,
-                            "Search-LSM V5 base validation failed"
-                        );
-                        return Ok(ActiveSearch::Unavailable);
-                    }
-                    Err(error) => return Err(error),
-                };
-                let wrapped = super::VectorSearchIndex::Ranged(reader.clone());
-                if !super::active_vector_base_matches(&wrapped, descriptor, segment) {
-                    return Ok(ActiveSearch::Unavailable);
-                }
-                OpenedVectorSegment::V5Base {
-                    segment: segment.clone(),
-                    reader,
-                }
-            }
-            SearchSegmentFormat::VectorV6 => {
-                let source: Arc<dyn SearchVersionRangeSource> = source;
-                let reader = match crate::sst::vector::v6::VectorV6Reader::open(
-                    source,
-                    descriptor.size_bytes,
-                    &state,
-                    segment,
-                    &catalog,
-                )
-                .await
-                {
-                    Ok(reader) => Arc::new(reader),
-                    Err(error) if optional_accelerator_fallback(&error) => {
-                        tracing::warn!(
-                            path = %descriptor.path,
-                            error = %error,
-                            "Search-LSM VG6 footer/lineage validation failed"
-                        );
-                        return Ok(ActiveSearch::Unavailable);
-                    }
-                    Err(error) => return Err(error),
-                };
-                OpenedVectorSegment::V6 {
-                    segment: segment.clone(),
-                    reader,
-                }
-            }
-            _ => return Ok(ActiveSearch::Unavailable),
         };
         resident_bytes = match resident_bytes.checked_add(opened.resident_metadata_bytes()) {
             Some(value) => value,

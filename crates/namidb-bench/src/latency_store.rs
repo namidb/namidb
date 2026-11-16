@@ -128,6 +128,32 @@ pub fn key_class(location: &Path) -> &'static str {
     }
 }
 
+/// `object_store`'s `OBJECT_STORE_COALESCE_DEFAULT`: ranges closer than this
+/// are fetched by one request.
+const S3_COALESCE_GAP: u64 = 1024 * 1024;
+/// `object_store`'s `OBJECT_STORE_COALESCE_PARALLEL`.
+const S3_COALESCE_PARALLEL: usize = 10;
+
+/// Requests the S3 client issues for one `get_ranges` call.
+fn coalesced_request_count(ranges: &[Range<u64>]) -> usize {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|range| range.start);
+    let mut requests = 0usize;
+    let mut end: Option<u64> = None;
+    for range in sorted {
+        match end {
+            Some(current) if range.start <= current.saturating_add(S3_COALESCE_GAP) => {
+                end = Some(current.max(range.end));
+            }
+            _ => {
+                requests += 1;
+                end = Some(range.end);
+            }
+        }
+    }
+    requests.max(1)
+}
+
 /// The simulating layer. See the module docs.
 pub struct LatencyStore {
     inner: Arc<dyn ObjectStore>,
@@ -277,8 +303,16 @@ impl ObjectStore for LatencyStore {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        // One coalesced request, as the S3 client issues it for nearby ranges.
-        self.before("GETR", location, 0).await;
+        // The S3 client merges ranges closer than 1 MiB into one request and
+        // issues the merged requests 10 at a time: charge exactly that.
+        let requests = coalesced_request_count(ranges);
+        for wave in 0..requests.div_ceil(S3_COALESCE_PARALLEL) {
+            let in_wave = (requests - wave * S3_COALESCE_PARALLEL).min(S3_COALESCE_PARALLEL);
+            for _ in 1..in_wave {
+                self.counters.record("GETR", location);
+            }
+            self.before("GETR", location, 0).await;
+        }
         let out = self.inner.get_ranges(location, ranges).await?;
         let bytes: u64 = out.iter().map(|b| b.len() as u64).sum();
         self.after_download(bytes).await;
