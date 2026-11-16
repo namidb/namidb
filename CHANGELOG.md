@@ -21,7 +21,7 @@ crates.io release will establish and document that API explicitly.
   scans the whole label, and hydrates the nodes it matches in batches.** A
   loader statement such as
   `UNWIND $rows AS r MERGE (a:Article {id: r.id}) SET a += r WITH a, r
-  MATCH (n:Act {id: r.act_id}) MERGE (n)-[:CONTAINS]->(a)` paid two
+  MATCH (n:Act {id: r.act_id}) MERGE (n)-[:HAS_ARTICLE]->(a)` paid two
   costs that grew with the stored corpus:
   - The first lookup of a non-unique indexed key inside a write filled the
     writer's transactional postings by reading every node of the label with
@@ -39,7 +39,10 @@ crates.io release will establish and document that API explicitly.
   transactional postings, and hydrate the matches in one row-group-aware
   batch. The answers stay exact for keys repeated in the batch, for changes
   staged earlier in the transaction, and after a rollback. A `UNIQUE`
-  constraint was already on the fast path and is unchanged.
+  constraint was already on the fast path and is unchanged. A statement with
+  only a few keys (one-row auto-commits) still builds the complete map once,
+  which then answers every later statement, but it reads only the indexed
+  column instead of every property.
 
 ## [3.3.2] - 2026-11-15
 
