@@ -2397,6 +2397,7 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "libc",
  "namidb-core",
  "namidb-graph",
  "namidb-storage",

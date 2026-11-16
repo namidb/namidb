@@ -2179,3 +2179,75 @@ async fn bolt_fields_are_return_order_and_values_line_up_positionally() {
     goodbye(&mut stream).await;
     task.abort();
 }
+
+/// A RESET (or GOODBYE) sent while a RUN is executing interrupts the
+/// statement, as in Neo4j. Before, the session only looked at the queued
+/// RESET once the statement had run to completion: a runaway read held the
+/// connection (and its CPU) until it finished or timed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bolt_reset_interrupts_a_running_read() {
+    // No query timeout and no row cap: only the RESET can stop the read.
+    let (bolt_addr, task) = boot_bolt_config(
+        "bolt-reset-interrupts",
+        Duration::ZERO,
+        Duration::ZERO,
+        DEFAULT_POST_AUTH_MESSAGE_BYTES,
+        0,
+    )
+    .await;
+    let mut stream = TcpStream::connect(bolt_addr).await.expect("connect bolt");
+    handshake(&mut stream).await;
+    hello_and_logon(&mut stream, "test-token").await;
+
+    // CPU-bound for minutes with little memory.
+    let run = Value::Struct {
+        tag: struct_tag::RUN,
+        fields: vec![
+            Value::String(
+                "UNWIND range(1, 1000000) AS i \
+                 RETURN sum(reduce(s = 0, x IN range(1, 5000) | s + x)) AS t"
+                    .into(),
+            ),
+            Value::Map(BTreeMap::new()),
+            Value::Map(BTreeMap::new()),
+        ],
+    };
+    send_msg(&mut stream, &pack(&run)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let reset = Value::Struct {
+        tag: struct_tag::RESET,
+        fields: vec![],
+    };
+    let sent = std::time::Instant::now();
+    send_msg(&mut stream, &pack(&reset)).await;
+
+    // The interrupted RUN fails, then the RESET succeeds.
+    let answered = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut responses = Vec::new();
+        loop {
+            let response = recv_msg(&mut stream).await;
+            let done = matches!(response, Response::Success(_));
+            responses.push(response);
+            if done {
+                return responses;
+            }
+        }
+    })
+    .await
+    .expect("RESET must interrupt the running statement");
+    let latency = sent.elapsed();
+    assert!(
+        matches!(answered.first(), Some(Response::Failure(_))),
+        "the interrupted RUN must fail: {answered:?}"
+    );
+    assert!(
+        latency < Duration::from_secs(2),
+        "RESET took {latency:?} to interrupt the statement"
+    );
+
+    // The session is READY again.
+    let (_, rows) = run_pull(&mut stream, "RETURN 1 AS one").await;
+    assert_eq!(rows.len(), 1);
+    goodbye(&mut stream).await;
+    task.abort();
+}

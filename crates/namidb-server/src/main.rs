@@ -337,7 +337,9 @@ struct Cli {
     /// stops with a 413 `query_memory_limit` (Bolt
     /// `Neo.ClientError.Statement.ResourceLimitExceeded`) instead of growing
     /// until the kernel kills the process. `auto` (the default) is 50% of
-    /// `--memory-max-bytes`, and off when that is `0`. With a memory ceiling,
+    /// `--memory-max-bytes`, or 25% of the memory available to the process
+    /// (physical memory, or a smaller cgroup limit) when that is `0`. With a
+    /// memory ceiling,
     /// all running queries together also share a pool of 75% of it, and a
     /// running query is stopped with a retryable 503 `memory_pressure` when
     /// the pool is full or the process reaches the ceiling. `0` disables the
@@ -524,6 +526,12 @@ fn main() -> anyhow::Result<()> {
     .map_err(anyhow::Error::msg)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // Statements are parsed on the runtime workers and reads execute on
+        // its blocking threads. Planning, evaluating and dropping a long
+        // left-deep expression (`1 + 1 + ...`, a generated `OR` list)
+        // recurses once per operand, and tokio's 2 MiB default stack
+        // overflowed — aborting the whole server — at about a thousand.
+        .thread_stack_size(16 * 1024 * 1024)
         .build()?;
     rt.block_on(namidb_server::run_with_memory_limits(
         config,

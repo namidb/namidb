@@ -11,6 +11,7 @@
 #![allow(clippy::useless_conversion)]
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -27,8 +28,9 @@ use namidb_core::{NodeId, Value};
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
     execute_with_limits, execute_write_with_deadline, parse as cypher_parse, plan as build_plan,
-    show_constraints_rows, show_indexes_rows, show_schema_columns, ExecError, LowerError, Params,
-    ParseError, Query, Row, RuntimeValue, StatsCatalog,
+    show_constraints_rows, show_indexes_rows, show_schema_columns, with_query_memory, ExecError,
+    LowerError, Params, ParseError, Query, QueryMemoryBudget, QueryMemoryExceeded, QueryMemoryPool,
+    QueryMemoryScope, Row, RuntimeValue, StatsCatalog,
 };
 mod format;
 
@@ -56,8 +58,174 @@ mod query_errors {
         PyRuntimeError,
         "A Cypher read produced more rows than its `max_rows`."
     );
+    pyo3::create_exception!(
+        namidb,
+        QueryCancelledError,
+        PyRuntimeError,
+        "A Cypher query was cancelled through its `CancelToken`."
+    );
+    pyo3::create_exception!(
+        namidb,
+        QueryMemoryError,
+        pyo3::exceptions::PyMemoryError,
+        "A Cypher query needed more memory than its limit allows."
+    );
 }
-use query_errors::{QueryRowCapError, QueryTimeoutError};
+use query_errors::{QueryCancelledError, QueryMemoryError, QueryRowCapError, QueryTimeoutError};
+
+// ── Query resource limits ─────────────────────────────────────────────
+
+/// Share of the memory available to the process (the smaller of physical
+/// memory and a container limit) one query may use when
+/// `query_memory_max_bytes` is left at its default.
+const AUTO_QUERY_MEMORY_PERCENT: usize = 25;
+/// Share of the available memory at which a running query is stopped
+/// because the whole process reached it (`memory_max_bytes` default).
+const AUTO_PROCESS_MEMORY_PERCENT: usize = 80;
+/// Share of the process ceiling that all concurrent queries of one client
+/// may hold together.
+const QUERY_POOL_PERCENT: usize = 75;
+/// Stack size of the runtime threads Cypher statements run on: twice the
+/// usual 8 MiB main-thread stack the calling thread used to give them.
+const QUERY_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+/// How often a thread waiting for a query checks for Ctrl-C.
+const SIGNAL_POLL: Duration = Duration::from_millis(50);
+
+/// Resolve a byte limit from an explicit argument, then the environment
+/// variable `env`, then `auto` (`percent` of the available memory). `0`
+/// disables the limit.
+fn resolve_memory_limit(explicit: Option<usize>, env: &str, percent: usize) -> PyResult<usize> {
+    if let Some(bytes) = explicit {
+        return Ok(bytes);
+    }
+    let raw = match std::env::var(env) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => "auto".into(),
+        Err(error) => return Err(PyValueError::new_err(format!("{env}: {error}"))),
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return Ok(namidb_query::system_memory_bytes()
+            .map(|total| total / 100 * percent)
+            .unwrap_or(0));
+    }
+    raw.parse::<usize>().map_err(|error| {
+        PyValueError::new_err(format!(
+            "{env} must be a byte count, 0 (no limit) or auto: {error}"
+        ))
+    })
+}
+
+/// The per-client memory limits every Cypher statement runs under.
+struct QueryLimits {
+    /// Default per-query budget in bytes (`0` = none).
+    query_bytes: usize,
+    /// Process resident-memory ceiling in bytes (`0` = none).
+    process_bytes: usize,
+    /// Pool shared by this client's concurrent queries, when a process
+    /// ceiling is set.
+    pool: Option<Arc<QueryMemoryPool>>,
+}
+
+impl QueryLimits {
+    fn new(query_bytes: usize, process_bytes: usize) -> Self {
+        let pool = (process_bytes > 0).then(|| {
+            Arc::new(QueryMemoryPool::new(
+                process_bytes / 100 * QUERY_POOL_PERCENT,
+            ))
+        });
+        Self {
+            query_bytes,
+            process_bytes,
+            pool,
+        }
+    }
+
+    /// The budget for one statement. `override_bytes` replaces the client
+    /// default for this call (`0` = no per-query budget).
+    fn budget(&self, override_bytes: Option<usize>) -> Option<Arc<QueryMemoryBudget>> {
+        let query_bytes = override_bytes.unwrap_or(self.query_bytes);
+        if query_bytes == 0 && self.process_bytes == 0 {
+            return None;
+        }
+        let limit = if query_bytes == 0 {
+            usize::MAX
+        } else {
+            query_bytes
+        };
+        let mut budget = QueryMemoryBudget::new(limit);
+        if let Some(pool) = &self.pool {
+            budget = budget.with_pool(pool.clone());
+        }
+        if let Some(probe) = namidb_query::resident_memory_probe(self.process_bytes) {
+            budget = budget.with_probe(probe);
+        }
+        Some(Arc::new(budget))
+    }
+}
+
+/// A cancellation handle for Cypher queries. Pass it as
+/// `client.cypher(..., cancel=token)` (or `acypher`) and call
+/// [`CancelToken::cancel`] from any thread: every query running with it
+/// stops at its next cooperative check (within milliseconds) and raises
+/// `QueryCancelledError`. A token stays cancelled; use a new one per
+/// query you may want to stop on its own.
+#[pyclass(module = "namidb")]
+#[derive(Clone, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+#[pymethods]
+impl CancelToken {
+    #[new]
+    fn py_new() -> Self {
+        Self::default()
+    }
+
+    /// Ask every query running with this token to stop. Thread-safe and
+    /// idempotent; never blocks.
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`CancelToken::cancel`] was called.
+    #[getter]
+    fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("CancelToken(cancelled={})", self.cancelled())
+    }
+}
+
+/// Sets the query's cancel flag when dropped while armed: an `acypher`
+/// coroutine cancelled by asyncio drops its future, and the query running
+/// on its worker thread must stop too.
+struct CancelOnDrop(Option<Arc<AtomicBool>>);
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(flag) = &self.0 {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Wait until `flag` is set. Polls: the flag is a plain atomic so a
+/// cancel from Python never needs the runtime.
+async fn cancelled(flag: &AtomicBool) {
+    while !flag.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 /// What a [`Client`] holds: the namespace's writer, or a reader that never
 /// claims the writer epoch (`read_only=True`).
@@ -254,6 +422,8 @@ pub struct Client {
     /// `flush()` compacts inline once a bucket holds this many L0 SSTs
     /// (`0` disables).
     compaction_l0_trigger: usize,
+    /// Memory limits every Cypher statement runs under.
+    limits: Arc<QueryLimits>,
 }
 
 #[pymethods]
@@ -291,6 +461,19 @@ impl Client {
     /// disables). A `read_only` client never compacts or sweeps, so these
     /// options do nothing there and no spool dir is created.
     ///
+    /// Every Cypher statement runs under two memory limits.
+    /// `query_memory_max_bytes` bounds one statement's working memory (the
+    /// rows its steps hold, sort / grouping / `collect()` / DISTINCT state,
+    /// the rows a scan decodes); a statement that needs more raises
+    /// `QueryMemoryError` instead of growing. `memory_max_bytes` stops a
+    /// running statement once the whole process's resident memory reaches
+    /// it, and all concurrent statements of this client share 75% of it.
+    /// Each defaults to its environment variable
+    /// (`NAMIDB_QUERY_MEMORY_MAX_BYTES`, `NAMIDB_MEMORY_MAX_BYTES`), then to
+    /// `auto`: 25% and 80% of the memory available to the process (the
+    /// smaller of physical memory and a container limit). `0` disables a
+    /// limit.
+    ///
     /// Opening never rewrites existing data. A namespace written by NamiDB
     /// 2.x, which that release can still read, raises `StorageFormatError`
     /// unless `upgrade=True`: anything this client writes uses the current
@@ -298,7 +481,7 @@ impl Client {
     /// SSTs. A namespace written by a newer NamiDB than this one raises
     /// `StorageFormatError` whatever the flags.
     #[new]
-    #[pyo3(signature = (uri, cache_bytes=None, *, read_only=false, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8, upgrade=false))]
+    #[pyo3(signature = (uri, cache_bytes=None, *, read_only=false, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8, query_memory_max_bytes=None, memory_max_bytes=None, upgrade=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -308,14 +491,35 @@ impl Client {
         spool_dir: Option<String>,
         auto_sweep_min_age_secs: Option<u64>,
         compaction_l0_trigger: usize,
+        query_memory_max_bytes: Option<usize>,
+        memory_max_bytes: Option<usize>,
         upgrade: bool,
     ) -> PyResult<Self> {
+        let limits = Arc::new(QueryLimits::new(
+            resolve_memory_limit(
+                query_memory_max_bytes,
+                "NAMIDB_QUERY_MEMORY_MAX_BYTES",
+                AUTO_QUERY_MEMORY_PERCENT,
+            )?,
+            resolve_memory_limit(
+                memory_max_bytes,
+                "NAMIDB_MEMORY_MAX_BYTES",
+                AUTO_PROCESS_MEMORY_PERCENT,
+            )?,
+        ));
         let (store, paths) = parse_uri(uri)?;
         if !read_only {
             configure_spool_dir(uri, spool_dir)?;
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            // Cypher statements run on this runtime's blocking threads (so a
+            // long query never holds the caller's thread). Parsing, planning,
+            // evaluating and dropping a long left-deep expression (`a OR b OR
+            // ...`, `1 + 1 + ...`) recurses once per operand; tokio's 2 MiB
+            // default overflowed — and aborted the whole Python process —
+            // on statements the caller's own 8 MiB thread used to run.
+            .thread_stack_size(QUERY_THREAD_STACK_BYTES)
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
         let cache = SstCache::new(cache_bytes.unwrap_or(64 * 1024 * 1024));
@@ -357,6 +561,7 @@ impl Client {
                 .filter(|_| !read_only)
                 .map(Duration::from_secs),
             compaction_l0_trigger: if read_only { 0 } else { compaction_l0_trigger },
+            limits,
         })
     }
 
@@ -1149,7 +1354,19 @@ impl Client {
     /// included. A write that times out is discarded, not committed.
     /// `max_rows` aborts a read with `QueryRowCapError` as soon as any step
     /// produces more rows than that; writes ignore it.
-    #[pyo3(signature = (query, params=None, *, timeout_ms=None, max_rows=None))]
+    ///
+    /// `max_memory_bytes` replaces the client's `query_memory_max_bytes`
+    /// for this call (`0` = no per-query budget); a query that needs more
+    /// raises `QueryMemoryError`. `cancel` takes a [`CancelToken`]: calling
+    /// its `cancel()` from another thread stops the query with
+    /// `QueryCancelledError`. Ctrl-C (`KeyboardInterrupt`) while this call
+    /// waits stops the query too, then raises as usual.
+    ///
+    /// The query runs on a worker thread of its own, so a long query never
+    /// holds up other queries, the client's background work, or the
+    /// calling thread's signal handling.
+    #[pyo3(signature = (query, params=None, *, timeout_ms=None, max_rows=None, max_memory_bytes=None, cancel=None))]
+    #[allow(clippy::too_many_arguments)]
     fn cypher(
         &self,
         py: Python<'_>,
@@ -1157,28 +1374,65 @@ impl Client {
         params: Option<&Bound<'_, PyDict>>,
         timeout_ms: Option<u64>,
         max_rows: Option<usize>,
+        max_memory_bytes: Option<usize>,
+        cancel: Option<CancelToken>,
     ) -> PyResult<Py<QueryResult>> {
-        let params = match params {
-            Some(d) => py_dict_to_params(d)?,
-            None => Params::new(),
+        let job = self.query_job(py, query, params, timeout_ms, max_rows, max_memory_bytes)?;
+        let flag = cancel.map(|token| token.flag).unwrap_or_default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = self.runtime.handle().clone();
+        let worker_flag = flag.clone();
+        self.runtime.spawn_blocking(move || {
+            let _ = tx.send(handle.block_on(job.run(worker_flag)));
+        });
+        // `Receiver` is `Send` but not `Sync`: move it into each wait and
+        // back out, so the GIL is released while waiting.
+        let wait = |py: Python<'_>, rx: std::sync::mpsc::Receiver<PyResult<QueryResult>>| {
+            py.allow_threads(move || {
+                let got = rx.recv_timeout(SIGNAL_POLL);
+                (got, rx)
+            })
         };
-        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-        let result: QueryResult = py.allow_threads(|| {
-            self.runtime.block_on(run_cypher(
-                &self.session,
-                query,
-                &params,
-                self.cache.clone(),
-                deadline,
-                max_rows,
-            ))
-        })?;
-        Py::new(py, result)
+        let mut rx = rx;
+        loop {
+            let (got, back) = wait(py, rx);
+            rx = back;
+            match got {
+                Ok(result) => return Py::new(py, result?),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Err(interrupt) = py.check_signals() {
+                        // Ctrl-C (or any signal handler that raised): stop
+                        // the query, wait for it to let go, then raise. A
+                        // second interrupt stops waiting.
+                        flag.store(true, Ordering::Relaxed);
+                        loop {
+                            let (got, back) = wait(py, rx);
+                            rx = back;
+                            match got {
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    if py.check_signals().is_err() {
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                        return Err(interrupt);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(PyRuntimeError::new_err("the query worker thread panicked"));
+                }
+            }
+        }
     }
 
     /// Async sibling of [`Client::cypher`]. Returns a Python coroutine
-    /// that resolves to a [`QueryResult`].
-    #[pyo3(signature = (query, params=None, *, timeout_ms=None, max_rows=None))]
+    /// that resolves to a [`QueryResult`]. Cancelling the awaiting task
+    /// (`task.cancel()`, `asyncio.wait_for` timing out, Ctrl-C under
+    /// `asyncio.run`) stops the query; `cancel` works as in `cypher`.
+    #[pyo3(signature = (query, params=None, *, timeout_ms=None, max_rows=None, max_memory_bytes=None, cancel=None))]
+    #[allow(clippy::too_many_arguments)]
     fn acypher<'py>(
         &self,
         py: Python<'py>,
@@ -1186,19 +1440,38 @@ impl Client {
         params: Option<&Bound<'_, PyDict>>,
         timeout_ms: Option<u64>,
         max_rows: Option<usize>,
+        max_memory_bytes: Option<usize>,
+        cancel: Option<CancelToken>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let params = match params {
-            Some(d) => py_dict_to_params(d)?,
-            None => Params::new(),
-        };
-        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-        let query = query.to_string();
-        let session = self.session.clone();
-        let cache = self.cache.clone();
+        let job = self.query_job(py, query, params, timeout_ms, max_rows, max_memory_bytes)?;
+        let flag = cancel.map(|token| token.flag).unwrap_or_default();
+        let handle = self.runtime.handle().clone();
+        let worker_flag = flag.clone();
+        let worker = self
+            .runtime
+            .spawn_blocking(move || handle.block_on(job.run(worker_flag)));
+        // Dropped un-disarmed when asyncio cancels the coroutine, even
+        // before its future is first polled.
+        let mut guard = CancelOnDrop(Some(flag));
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let result = run_cypher(&session, &query, &params, cache, deadline, max_rows).await?;
+            let result = worker.await;
+            guard.disarm();
+            let result = result
+                .map_err(|e| PyRuntimeError::new_err(format!("query worker failed: {e}")))??;
             Python::with_gil(|py| Py::new(py, result))
         })
+    }
+
+    /// The default per-query memory budget in bytes (`0` = none).
+    #[getter]
+    fn query_memory_max_bytes(&self) -> usize {
+        self.limits.query_bytes
+    }
+
+    /// The process resident-memory ceiling in bytes (`0` = none).
+    #[getter]
+    fn memory_max_bytes(&self) -> usize {
+        self.limits.process_bytes
     }
 
     /// Return `(hits, misses, inserts, usage_bytes)` for the cache.
@@ -1753,16 +2026,24 @@ async fn run_cypher(
     cache: SstCache,
     deadline: Option<Instant>,
     row_cap: Option<usize>,
+    cancel: &AtomicBool,
 ) -> PyResult<QueryResult> {
     let parsed = cypher_parse(query).map_err(parse_errs_to_pyerr)?;
     if !is_schema_ddl(&parsed) {
-        let owned = session.snapshot(deadline).await?;
+        let owned = tokio::select! {
+            owned = session.snapshot(deadline) => owned?,
+            _ = cancelled(cancel) => return Err(exec_err_to_pyerr(ExecError::Cancelled)),
+        };
         let snap = owned.borrow().with_cache(cache);
         if let Some(result) = run_read(&parsed, &snap, params, deadline, row_cap).await? {
             return Ok(result);
         }
     }
-    let mut guard = session.writer()?.lock_until(deadline).await?;
+    let writer = session.writer()?;
+    let mut guard = tokio::select! {
+        guard = writer.lock_until(deadline) => guard?,
+        _ = cancelled(cancel) => return Err(exec_err_to_pyerr(ExecError::Cancelled)),
+    };
     run_write(&mut guard, &parsed, params, deadline).await
 }
 
@@ -1916,6 +2197,69 @@ async fn run_write(
         .rows;
     let columns = namidb_query::result_columns(&plan, &rows);
     Ok(QueryResult { columns, rows })
+}
+
+/// One Cypher statement with everything it needs, owned, so it can run on a
+/// worker thread.
+struct QueryJob {
+    session: Session,
+    query: String,
+    params: Params,
+    cache: SstCache,
+    deadline: Option<Instant>,
+    row_cap: Option<usize>,
+    budget: Option<Arc<QueryMemoryBudget>>,
+}
+
+impl QueryJob {
+    /// Run under the cancel flag and the memory budget, mapping a memory
+    /// stop to `QueryMemoryError` with this client's knobs.
+    async fn run(self, flag: Arc<AtomicBool>) -> PyResult<QueryResult> {
+        let QueryJob {
+            session,
+            query,
+            params,
+            cache,
+            deadline,
+            row_cap,
+            budget,
+        } = self;
+        namidb_storage::cancel::with_cancel_flag(
+            flag.clone(),
+            with_query_memory(
+                budget,
+                run_cypher(&session, &query, &params, cache, deadline, row_cap, &flag),
+            ),
+        )
+        .await
+    }
+}
+
+impl Client {
+    /// Validate a statement's arguments and package it as a [`QueryJob`].
+    fn query_job(
+        &self,
+        _py: Python<'_>,
+        query: &str,
+        params: Option<&Bound<'_, PyDict>>,
+        timeout_ms: Option<u64>,
+        max_rows: Option<usize>,
+        max_memory_bytes: Option<usize>,
+    ) -> PyResult<QueryJob> {
+        let params = match params {
+            Some(d) => py_dict_to_params(d)?,
+            None => Params::new(),
+        };
+        Ok(QueryJob {
+            session: self.session.clone(),
+            query: query.to_string(),
+            params,
+            cache: self.cache.clone(),
+            deadline: timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+            row_cap: max_rows,
+            budget: self.limits.budget(max_memory_bytes),
+        })
+    }
 }
 
 // ── QueryResult ───────────────────────────────────────────────────────
@@ -2398,20 +2742,69 @@ fn lower_err_to_pyerr(e: LowerError) -> PyErr {
 fn exec_err_to_pyerr(e: ExecError) -> PyErr {
     match e {
         _ if is_deadline(&e) => QueryTimeoutError::new_err(e.to_string()),
+        _ if is_cancel(&e) => QueryCancelledError::new_err("query cancelled"),
         ExecError::RowCap(_) => QueryRowCapError::new_err(e.to_string()),
+        ExecError::MemoryLimit(exceeded) => memory_err_to_pyerr(exceeded),
         _ => PyRuntimeError::new_err(format!("Cypher execution error: {e}")),
     }
 }
 
-/// Whether `e` is the query's own `timeout_ms` firing. Python has no admin
-/// cancel path, so a cancel can only come from the same deadline machinery.
-/// A deadline that fires in a write's commit tail arrives as a storage error.
+/// `QueryMemoryError` naming the embedded client's own knobs, with the
+/// figures as attributes (`scope`, `required_bytes`, `limit_bytes`).
+fn memory_err_to_pyerr(exceeded: QueryMemoryExceeded) -> PyErr {
+    let (scope, message) = match exceeded.scope {
+        QueryMemoryScope::Query => (
+            "query",
+            format!(
+                "query exceeded its memory limit: it needs at least {} bytes, the per-query \
+                 limit is {} bytes (Client(query_memory_max_bytes=...), \
+                 cypher(max_memory_bytes=...) or NAMIDB_QUERY_MEMORY_MAX_BYTES); return fewer \
+                 or narrower rows (LIMIT, aggregation, projecting properties instead of whole \
+                 nodes)",
+                exceeded.required_bytes, exceeded.limit_bytes
+            ),
+        ),
+        QueryMemoryScope::Shared => (
+            "shared",
+            format!(
+                "query stopped: it needs {} bytes but this client's concurrent queries hold \
+                 the shared pool of {} bytes (75% of memory_max_bytes); retry after they finish",
+                exceeded.required_bytes, exceeded.limit_bytes
+            ),
+        ),
+        QueryMemoryScope::Process => (
+            "process",
+            format!(
+                "query stopped: the process's resident memory ({} bytes) reached its ceiling \
+                 of {} bytes (Client(memory_max_bytes=...) or NAMIDB_MEMORY_MAX_BYTES)",
+                exceeded.required_bytes, exceeded.limit_bytes
+            ),
+        ),
+    };
+    Python::with_gil(|py| {
+        let err = QueryMemoryError::new_err(message);
+        let value = err.value_bound(py);
+        let _ = value.setattr("scope", scope);
+        let _ = value.setattr("required_bytes", exceeded.required_bytes);
+        let _ = value.setattr("limit_bytes", exceeded.limit_bytes);
+        err
+    })
+}
+
+/// Whether `e` is the query's own `timeout_ms` firing. A deadline that
+/// fires in a write's commit tail arrives as a storage error.
 fn is_deadline(e: &ExecError) -> bool {
     matches!(
         e,
-        ExecError::Timeout
-            | ExecError::Cancelled
-            | ExecError::Storage(namidb_storage::Error::Timeout | namidb_storage::Error::Cancelled)
+        ExecError::Timeout | ExecError::Storage(namidb_storage::Error::Timeout)
+    )
+}
+
+/// Whether `e` is a [`CancelToken`] (or Ctrl-C, or asyncio) cancel.
+fn is_cancel(e: &ExecError) -> bool {
+    matches!(
+        e,
+        ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled)
     )
 }
 
@@ -2535,6 +2928,12 @@ fn _lib(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("QueryRowCapError", py.get_type_bound::<QueryRowCapError>())?;
     m.add(
+        "QueryCancelledError",
+        py.get_type_bound::<QueryCancelledError>(),
+    )?;
+    m.add("QueryMemoryError", py.get_type_bound::<QueryMemoryError>())?;
+    m.add_class::<CancelToken>()?;
+    m.add(
         "StorageFormatError",
         py.get_type_bound::<format::StorageFormatError>(),
     )?;
@@ -2558,9 +2957,39 @@ mod tests {
         assert!(is_deadline(&ExecError::Storage(
             namidb_storage::Error::Timeout
         )));
-        assert!(is_deadline(&ExecError::Storage(
+        assert!(!is_deadline(&ExecError::RowCap(1)));
+    }
+
+    // A cancel in the commit tail is a cancel, not a timeout.
+    #[test]
+    fn a_cancel_in_the_commit_is_a_cancel() {
+        assert!(is_cancel(&ExecError::Cancelled));
+        assert!(is_cancel(&ExecError::Storage(
             namidb_storage::Error::Cancelled
         )));
-        assert!(!is_deadline(&ExecError::RowCap(1)));
+        assert!(!is_deadline(&ExecError::Storage(
+            namidb_storage::Error::Cancelled
+        )));
+    }
+
+    #[test]
+    fn explicit_memory_limits_win_over_the_environment() {
+        assert_eq!(
+            resolve_memory_limit(Some(123), "NAMIDB_TEST_UNSET_MEMORY_KNOB", 25).unwrap(),
+            123
+        );
+        assert_eq!(
+            resolve_memory_limit(Some(0), "NAMIDB_TEST_UNSET_MEMORY_KNOB", 25).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_client_without_limits_runs_unbudgeted() {
+        assert!(QueryLimits::new(0, 0).budget(None).is_none());
+        let limits = QueryLimits::new(1 << 20, 0);
+        assert_eq!(limits.budget(None).unwrap().limit_bytes(), 1 << 20);
+        assert!(limits.budget(Some(0)).is_none());
+        assert_eq!(limits.budget(Some(7)).unwrap().limit_bytes(), 7);
     }
 }

@@ -58,6 +58,14 @@ pub enum Error {
     #[error("query cancelled by administrator")]
     Cancelled,
 
+    /// The query's memory account (a [`crate::cancel::MemoryHook`] scoped by
+    /// the query layer) refused more memory while this crate was
+    /// materialising rows for it, or the process reached its memory
+    /// ceiling. The query layer maps it to its own memory-limit error with
+    /// the exact figures. Only raised when a hook is in scope.
+    #[error("query exceeded its memory limit while reading")]
+    MemoryLimit,
+
     /// A valid monolithic search accelerator cannot fit inside the configured
     /// decoded-index cache pool. This is intentionally not treated as
     /// "index absent": silently selecting the exact O(corpus) fallback would

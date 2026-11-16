@@ -44,6 +44,10 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 xxhash-rust = { workspace = true }
 
+# `malloc_trim` for the resident-memory probe (glibc only).
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tokio-test = { workspace = true }
 proptest = { workspace = true }

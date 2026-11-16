@@ -53,8 +53,9 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::factor::{FactorArena, FactorIdx, FactorNode, FactorRowSet, Slot};
 use super::row::Row;
@@ -73,6 +74,12 @@ const POOL_CHUNK_BYTES: usize = 1024 * 1024;
 /// How much a query's charged total must grow between two resident-memory
 /// probes. A probe reads procfs, which is cheap but not free.
 const PROBE_INTERVAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// Minimum time between two resident-memory probes taken from the
+/// cooperative cancellation checks (see [`QueryMemoryBudget::with_probe`]).
+/// Those checks run every few thousand rows whatever the query charges, so
+/// they also catch growth the estimates do not see.
+const PROBE_INTERVAL_NANOS: u64 = 10_000_000;
 
 /// Which limit a query ran into. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +229,20 @@ pub struct QueryMemoryBudget {
     pool_held: AtomicUsize,
     probe: Option<MemoryProbe>,
     next_probe_at: AtomicUsize,
+    /// Rows a storage read has kept for the operator that is running,
+    /// reported through the storage [`namidb_storage::cancel::MemoryHook`].
+    /// Transient like a growth meter: the operator boundary charges the
+    /// finished output and clears it.
+    storage_bytes: AtomicUsize,
+    /// The limit a refusal ran into, for the error the query surfaces when
+    /// the refusal came through storage or a cooperative probe.
+    exceeded: Mutex<Option<QueryMemoryExceeded>>,
+    /// Set once the budget has refused anything: every later probe stops the
+    /// query.
+    tripped: AtomicBool,
+    created: Instant,
+    /// Nanoseconds since `created` of the last time-based probe.
+    last_timed_probe: AtomicU64,
 }
 
 impl fmt::Debug for QueryMemoryBudget {
@@ -248,6 +269,11 @@ impl QueryMemoryBudget {
             pool_held: AtomicUsize::new(0),
             probe: None,
             next_probe_at: AtomicUsize::new(PROBE_INTERVAL_BYTES),
+            storage_bytes: AtomicUsize::new(0),
+            exceeded: Mutex::new(None),
+            tripped: AtomicBool::new(false),
+            created: Instant::now(),
+            last_timed_probe: AtomicU64::new(0),
         }
     }
 
@@ -279,6 +305,72 @@ impl QueryMemoryBudget {
         self.peak.load(Ordering::Acquire)
     }
 
+    /// The limit this budget last refused, if it refused anything.
+    pub fn exceeded(&self) -> Option<QueryMemoryExceeded> {
+        *self.exceeded.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Remember a refusal so a probe or a storage error can report it.
+    fn record(&self, exceeded: QueryMemoryExceeded) -> QueryMemoryExceeded {
+        let mut slot = self.exceeded.lock().unwrap_or_else(|e| e.into_inner());
+        slot.get_or_insert(exceeded);
+        self.tripped.store(true, Ordering::Release);
+        exceeded
+    }
+
+    /// The refusal to report for a stop that came through storage or a
+    /// cooperative probe. Always `Some` after a refusal; the fallback only
+    /// covers a hook that was dropped mid-query.
+    pub(crate) fn exceeded_or_limit(&self) -> QueryMemoryExceeded {
+        self.exceeded().unwrap_or(QueryMemoryExceeded {
+            scope: QueryMemoryScope::Query,
+            required_bytes: self.used_bytes().saturating_add(1),
+            limit_bytes: self.limit,
+        })
+    }
+
+    /// Storage kept `bytes` more rows for the running operator.
+    fn retain_storage(&self, bytes: usize) -> bool {
+        let storage = self
+            .storage_bytes
+            .fetch_add(bytes, Ordering::AcqRel)
+            .saturating_add(bytes);
+        self.ensure(self.used_bytes().saturating_add(storage))
+            .is_ok()
+    }
+
+    /// Time-based process probe plus the sticky refusal, for the
+    /// cooperative cancellation checks.
+    fn probe_now(&self) -> bool {
+        if self.tripped.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(probe) = &self.probe else {
+            return true;
+        };
+        let now = u64::try_from(self.created.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let last = self.last_timed_probe.load(Ordering::Acquire);
+        if now.saturating_sub(last) < PROBE_INTERVAL_NANOS
+            || self
+                .last_timed_probe
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return true;
+        }
+        match probe() {
+            Some((resident, max)) => {
+                self.record(QueryMemoryExceeded {
+                    scope: QueryMemoryScope::Process,
+                    required_bytes: resident,
+                    limit_bytes: max,
+                });
+                false
+            }
+            None => true,
+        }
+    }
+
     /// Charge `bytes` more on top of what is already charged and keep it
     /// charged (until the budget is dropped).
     pub fn charge(&self, bytes: usize) -> Result<(), QueryMemoryExceeded> {
@@ -292,6 +384,10 @@ impl QueryMemoryBudget {
     /// growing its pool reservation to cover it. Does not change the charged
     /// total.
     fn ensure(&self, projected: usize) -> Result<(), QueryMemoryExceeded> {
+        self.ensure_inner(projected).map_err(|e| self.record(e))
+    }
+
+    fn ensure_inner(&self, projected: usize) -> Result<(), QueryMemoryExceeded> {
         if projected > self.limit {
             return Err(QueryMemoryExceeded {
                 scope: QueryMemoryScope::Query,
@@ -375,16 +471,60 @@ tokio::task_local! {
     static BUDGET: Arc<QueryMemoryBudget>;
 }
 
+/// The budget as storage sees it: rows a storage read keeps for the query
+/// are charged as they are decoded, and every cooperative probe consults
+/// the budget (sticky refusals, time-based process probe).
+struct StorageHook(Arc<QueryMemoryBudget>);
+
+impl namidb_storage::cancel::MemoryHook for StorageHook {
+    fn retain(&self, bytes: usize) -> bool {
+        self.0.retain_storage(bytes)
+    }
+
+    fn probe(&self) -> bool {
+        self.0.probe_now()
+    }
+}
+
 /// Run `fut` with `budget` charged by the executor. `None` runs it
-/// unbudgeted at no extra cost.
+/// unbudgeted at no extra cost. The budget is also scoped as the storage
+/// crate's memory hook, so storage reads charge the rows they materialise
+/// for the query while they run.
 pub async fn with_query_memory<F: Future>(
     budget: Option<Arc<QueryMemoryBudget>>,
     fut: F,
 ) -> F::Output {
     match budget {
-        Some(budget) => BUDGET.scope(budget, fut).await,
+        Some(budget) => {
+            let hook: Arc<dyn namidb_storage::cancel::MemoryHook> =
+                Arc::new(StorageHook(budget.clone()));
+            BUDGET
+                .scope(
+                    budget,
+                    namidb_storage::cancel::with_memory_hook(Some(hook), fut),
+                )
+                .await
+        }
         None => fut.await,
     }
+}
+
+/// The budget scoped on this task, if any — for re-scoping onto a spawned
+/// task (task-locals do not cross `tokio::spawn`).
+pub fn current_query_memory() -> Option<Arc<QueryMemoryBudget>> {
+    BUDGET.try_with(Arc::clone).ok()
+}
+
+/// The [`ExecError::MemoryLimit`] for a stop reported by storage or a
+/// cooperative probe (which carry no figures of their own).
+pub(crate) fn scoped_memory_error() -> ExecError {
+    let exceeded =
+        with_budget(QueryMemoryBudget::exceeded_or_limit).unwrap_or(QueryMemoryExceeded {
+            scope: QueryMemoryScope::Process,
+            required_bytes: 0,
+            limit_bytes: 0,
+        });
+    ExecError::MemoryLimit(exceeded)
 }
 
 fn with_budget<R>(f: impl FnOnce(&QueryMemoryBudget) -> R) -> Option<R> {
@@ -464,6 +604,9 @@ fn settle_with(
                 (current.max(keep), keep)
             }
         };
+        // Storage rows the operator kept are now part of its output (or
+        // were dropped with its inputs): the estimate above replaces them.
+        budget.storage_bytes.store(0, Ordering::Release);
         budget.ensure(peak)?;
         budget.set_used(keep);
         Ok(())
@@ -586,6 +729,164 @@ impl GrowthMeter {
     #[inline]
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+// ─────────────────────────── host memory ────────────────────────────
+
+/// Resident set of this process in bytes, where the platform exposes it
+/// cheaply (Linux `/proc/self/statm`). `None` elsewhere.
+pub fn process_resident_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident_pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(resident_pages.saturating_mul(page_size()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn page_size() -> usize {
+    // Most Linux kernels use 4 KiB pages, but some arm64 builds use 16 or
+    // 64 KiB: read AT_PAGESZ from the auxiliary vector instead of assuming.
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        std::fs::read("/proc/self/auxv")
+            .ok()
+            .and_then(|auxv| {
+                // AT_PAGESZ = 6; entries are (u64 key, u64 value) pairs.
+                auxv.chunks_exact(16).find_map(|entry| {
+                    let key = u64::from_ne_bytes(entry[..8].try_into().ok()?);
+                    let value = u64::from_ne_bytes(entry[8..].try_into().ok()?);
+                    (key == 6).then_some(value as usize)
+                })
+            })
+            .filter(|size| size.is_power_of_two())
+            .unwrap_or(4096)
+    })
+}
+
+/// Memory this process may use in bytes: the smaller of physical memory
+/// and a finite cgroup (container) limit. `None` when neither can be read
+/// (non-Linux platforms).
+pub fn system_memory_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let physical = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|info| {
+                info.lines().find_map(|line| {
+                    let rest = line.strip_prefix("MemTotal:")?;
+                    let kib: usize = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+                    Some(kib.saturating_mul(1024))
+                })
+            });
+        match (physical, cgroup_memory_limit_bytes()) {
+            (Some(physical), Some(cgroup)) => Some(physical.min(cgroup)),
+            (physical, cgroup) => physical.or(cgroup),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The finite memory limit of this process's cgroup (v2, then v1).
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_bytes() -> Option<usize> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut candidates = Vec::new();
+    for line in membership.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (_, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+        let path = path.trim_start_matches('/');
+        if controllers.is_empty() {
+            candidates.push(format!("/sys/fs/cgroup/{path}/memory.max"));
+        } else if controllers.split(',').any(|c| c == "memory") {
+            candidates.push(format!(
+                "/sys/fs/cgroup/memory/{path}/memory.limit_in_bytes"
+            ));
+        }
+    }
+    candidates.push("/sys/fs/cgroup/memory.max".into());
+    candidates.push("/sys/fs/cgroup/memory/memory.limit_in_bytes".into());
+    candidates.into_iter().find_map(|path| {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let bytes: u128 = raw.trim().parse().ok()?;
+        // cgroup v1 reports "unlimited" as a value near i64::MAX.
+        (bytes > 0 && bytes < (1u128 << 60)).then(|| usize::try_from(bytes).ok())?
+    })
+}
+
+/// A [`MemoryProbe`] that reports the process at its ceiling once its
+/// resident set reaches `max_bytes`. `None` when the platform cannot read
+/// the resident set or `max_bytes` is zero.
+///
+/// The allocator keeps memory a finished (or stopped) query freed, and it
+/// still counts as resident: without giving it back, one query that reached
+/// the ceiling left the process above it, and every later query stopped at
+/// its first probe. So at the ceiling the probe first asks the allocator to
+/// return its free pages (at most once per [`TRIM_INTERVAL_NANOS`] across
+/// the process) and stops the query only if the process is still there.
+pub fn resident_memory_probe(max_bytes: usize) -> Option<MemoryProbe> {
+    if max_bytes == 0 || process_resident_bytes().is_none() {
+        return None;
+    }
+    Some(Arc::new(move || {
+        let resident = process_resident_bytes()?;
+        if resident < max_bytes {
+            return None;
+        }
+        if trim_allocator_rate_limited() {
+            let resident = process_resident_bytes()?;
+            return (resident >= max_bytes).then_some((resident, max_bytes));
+        }
+        Some((resident, max_bytes))
+    }))
+}
+
+/// Minimum time between two allocator trims requested by
+/// [`resident_memory_probe`]. A trim walks the allocator's free lists, so a
+/// process that really is at its ceiling must not trim on every probe.
+const TRIM_INTERVAL_NANOS: u64 = 1_000_000_000;
+
+/// Return free allocator pages to the operating system unless another probe
+/// did so less than [`TRIM_INTERVAL_NANOS`] ago. `true` when it trimmed.
+fn trim_allocator_rate_limited() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        // Nanoseconds since `EPOCH` of the last trim, plus one (0 = never).
+        static LAST_TRIM: AtomicU64 = AtomicU64::new(0);
+        let epoch = *EPOCH.get_or_init(Instant::now);
+        let now = u64::try_from(epoch.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let last = LAST_TRIM.load(Ordering::Acquire);
+        if last != 0 && now.saturating_sub(last) < TRIM_INTERVAL_NANOS {
+            return false;
+        }
+        if LAST_TRIM
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        // SAFETY: `malloc_trim(0)` has no pointer preconditions; it only asks
+        // the process-global glibc allocator to release wholly free pages.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+        true
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
     }
 }
 
@@ -836,6 +1137,34 @@ pub fn estimate_rows_text_bytes(rows: &[Row]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resident_probe_reports_only_a_process_still_at_its_ceiling() {
+        // A ceiling far above this process: never reported.
+        let roomy = resident_memory_probe(usize::MAX).expect("Linux reads its resident set");
+        assert_eq!(roomy(), None);
+        // A ceiling below anything the process can trim down to: reported
+        // with the figures, trim or no trim, on every probe.
+        let tight = resident_memory_probe(1).expect("Linux reads its resident set");
+        for _ in 0..3 {
+            let (resident, max) = tight().expect("a process is always above one byte");
+            assert!(resident >= 1);
+            assert_eq!(max, 1);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn allocator_trims_are_rate_limited_across_the_process() {
+        // Whatever earlier probes did, two trims in a row never both run.
+        let first = trim_allocator_rate_limited();
+        let second = trim_allocator_rate_limited();
+        assert!(
+            !(first && second),
+            "two trims within {TRIM_INTERVAL_NANOS} ns"
+        );
+    }
 
     fn int_row(i: i64) -> Row {
         Row::new()

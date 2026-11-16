@@ -10,6 +10,9 @@ pub mod auth;
 pub mod authz;
 pub mod bolt;
 mod introspect;
+mod isolate;
+#[doc(hidden)]
+pub use isolate::running_isolated_reads;
 mod maintenance;
 pub mod memory;
 pub mod metrics;
@@ -4459,24 +4462,38 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // Read path: no writer lock. Borrow a short-lived `Snapshot`
         // from the owned one; the `OwnedSnapshot` Arc keeps the
         // underlying memtable alive for the duration of the query.
-        let _admission = match acquire_read_admission(&plan, state.query_gate.as_ref()).await {
-            Ok(admission) => admission,
-            Err(gate) => return admission_exhausted_observation(started, gate),
-        };
-        let snap = owned.borrow();
+        // Shared with the isolated thread: a client that goes away releases
+        // its share at once, but the permits stay held until the query has
+        // actually stopped, so disconnect churn cannot run more reads than
+        // the admission gates allow.
+        let admission = Arc::new(
+            match acquire_read_admission(&plan, state.query_gate.as_ref()).await {
+                Ok(admission) => admission,
+                Err(gate) => return admission_exhausted_observation(started, gate),
+            },
+        );
         // Working-memory budget (#203): held until the response body is
         // built below, which charges its own copies of the result.
         let budget = state.memory.query_budget();
-        let result = namidb_query::with_query_memory(
-            budget.clone(),
-            execute_with_limits(
-                &plan,
-                &snap,
-                &params,
-                state.query_deadline(),
-                state.query_row_cap(),
-            ),
-        )
+        // On a thread of its own: a client that disconnects (or the request
+        // timeout) drops this future, which cancels the query.
+        let plan = Arc::new(plan);
+        let result = isolate::run_read_isolated({
+            let plan = Arc::clone(&plan);
+            let budget = budget.clone();
+            let deadline = state.query_deadline();
+            let row_cap = state.query_row_cap();
+            let admission = Arc::clone(&admission);
+            async move {
+                let _admission = admission;
+                let snap = owned.borrow();
+                namidb_query::with_query_memory(
+                    budget,
+                    execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                )
+                .await
+            }
+        })
         .await
         .and_then(|rows| charge_json_response(budget.as_deref(), rows));
         let elapsed = started.elapsed();
@@ -6294,24 +6311,38 @@ async fn run_cypher_multi(
         }
     } else {
         // Read path.
-        let _admission = match acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await {
-            Ok(admission) => admission,
-            Err(gate) => return admission_exhausted_observation(started, gate),
-        };
-        let snap = owned.borrow();
+        // Shared with the isolated thread: a client that goes away releases
+        // its share at once, but the permits stay held until the query has
+        // actually stopped, so disconnect churn cannot run more reads than
+        // the admission gates allow.
+        let admission = Arc::new(
+            match acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await {
+                Ok(admission) => admission,
+                Err(gate) => return admission_exhausted_observation(started, gate),
+            },
+        );
         // Working-memory budget (#203): held until the response body is
         // built below, which charges its own copies of the result.
         let budget = shared.memory.query_budget();
-        let result = namidb_query::with_query_memory(
-            budget.clone(),
-            execute_with_limits(
-                &plan,
-                &snap,
-                &params,
-                shared.query_deadline(),
-                shared.query_row_cap(),
-            ),
-        )
+        // On a thread of its own: a client that disconnects (or the request
+        // timeout) drops this future, which cancels the query.
+        let plan = Arc::new(plan);
+        let result = isolate::run_read_isolated({
+            let plan = Arc::clone(&plan);
+            let budget = budget.clone();
+            let deadline = shared.query_deadline();
+            let row_cap = shared.query_row_cap();
+            let admission = Arc::clone(&admission);
+            async move {
+                let _admission = admission;
+                let snap = owned.borrow();
+                namidb_query::with_query_memory(
+                    budget,
+                    execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                )
+                .await
+            }
+        })
         .await
         .and_then(|rows| charge_json_response(budget.as_deref(), rows));
         let elapsed = started.elapsed();
@@ -7781,7 +7812,19 @@ mod tests {
     #[test]
     fn query_memory_setting_resolves_against_the_ceiling() {
         use memory::resolve_query_memory_max_bytes as resolve;
-        assert_eq!(resolve("auto", 0), Ok(0), "no ceiling: auto is off");
+        use memory::resolve_query_memory_max_bytes_with as resolve_with;
+        assert_eq!(
+            resolve_with("auto", 0, Some(1000)),
+            Ok(250),
+            "no ceiling: a quarter of the available memory"
+        );
+        assert_eq!(
+            resolve_with("auto", 0, None),
+            Ok(0),
+            "no ceiling and unknown memory: off"
+        );
+        assert_eq!(resolve_with("0", 0, Some(1000)), Ok(0));
+        assert_eq!(resolve_with("auto", 1000, Some(1 << 40)), Ok(500));
         assert_eq!(resolve("auto", 1000), Ok(500));
         assert_eq!(resolve(" AUTO ", 1000), Ok(500));
         assert_eq!(resolve("", 1000), Ok(500));

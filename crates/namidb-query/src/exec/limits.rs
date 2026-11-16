@@ -72,6 +72,7 @@ pub(crate) fn check_deadline() -> Result<(), ExecError> {
         None => Ok(()),
         Some(Interrupt::Timeout) => Err(ExecError::Timeout),
         Some(Interrupt::Cancelled) => Err(ExecError::Cancelled),
+        Some(Interrupt::MemoryLimit) => Err(super::memory::scoped_memory_error()),
     }
 }
 
