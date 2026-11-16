@@ -190,6 +190,13 @@ struct ConstraintMap {
     /// loader from retaining a third copy of every unique value.
     complete: bool,
     known_misses: HashSet<UniqueKey>,
+    /// Set once this partial map has been seeded with NON-unique posting
+    /// lists ([`UniqueConstraintIndex::seed_postings`]). A staged upsert then
+    /// files a node only under a key whose holder set is already known: a
+    /// non-unique key may also have committed holders that were never
+    /// seeded, so a one-node holder set would be a wrong, incomplete answer.
+    /// Leaving the key unknown keeps the authoritative fallback for it.
+    point_postings: bool,
 }
 
 impl ConstraintMap {
@@ -516,6 +523,81 @@ impl UniqueConstraintIndex {
         }
     }
 
+    /// Seed exact NON-unique posting lists for a batch of keys without
+    /// claiming that the whole `(label, names)` domain is populated.
+    ///
+    /// `entries` must hold every current holder of each key in the view the
+    /// writer exposes (committed, plus staged when `staged`), with an empty
+    /// list for a miss. That is what a sidecar-backed point lookup over the
+    /// overlay snapshot returns, and it costs one posting probe per SST
+    /// instead of the label scan that [`Self::populate`] needs. Keys already
+    /// known are left alone: staged maintenance has kept them current.
+    ///
+    /// Journalling follows [`Self::seed_committed_keys`] (no staged
+    /// mutations) and [`Self::seed_staged_keys`] (staged mutations), so a
+    /// rolled-back batch or request cannot leave a transaction-dependent
+    /// answer behind.
+    pub(crate) fn seed_postings(
+        &self,
+        label: &str,
+        names: &[String],
+        entries: impl IntoIterator<Item = (UniqueKey, Vec<NodeId>)>,
+        staged: bool,
+    ) {
+        let identity = (label.to_string(), names.to_vec());
+        let mut state = self.state.lock().expect("unique index lock");
+        if state.maps.get(&identity).is_some_and(|map| map.complete) {
+            return;
+        }
+        let created_in_batch = staged && !state.maps.contains_key(&identity);
+        let (maps, undo) = state.maps_and_journal();
+        let map = maps.entry(identity.clone()).or_default();
+        map.point_postings = true;
+        let mut rollback = if staged {
+            let rollback = undo.entry(identity).or_default();
+            if created_in_batch {
+                rollback.created_in_batch = true;
+            }
+            Some(rollback)
+        } else {
+            None
+        };
+
+        for (key, holders) in entries {
+            if map.holders.contains_key(&key) || map.known_misses.contains(&key) {
+                continue;
+            }
+            if let Some(rollback) = rollback.as_mut().filter(|r| !r.created_in_batch) {
+                rollback
+                    .known_misses
+                    .entry(key.clone())
+                    .or_insert_with(|| map.known_misses.contains(&key));
+                for id in &holders {
+                    rollback
+                        .by_node
+                        .entry(*id)
+                        .or_insert_with(|| map.by_node.get(id).cloned());
+                    if let Some(old_key) = map.by_node.get(id) {
+                        rollback
+                            .known_misses
+                            .entry(old_key.clone())
+                            .or_insert_with(|| map.known_misses.contains(old_key));
+                    }
+                }
+            }
+            if holders.is_empty() {
+                map.known_misses.insert(key);
+                continue;
+            }
+            for id in holders {
+                // A node holds one current value per property set, so a
+                // confirmed holder of `key` cannot still be filed elsewhere.
+                map.detach(id);
+                map.file(id, key.clone());
+            }
+        }
+    }
+
     /// Maintain every populated map for a staged full-record node upsert:
     /// the node's previous tuple (if any) is freed, and it is re-filed under
     /// each constraint whose label it carries and whose properties are all
@@ -560,7 +642,13 @@ impl UniqueConstraintIndex {
             // `MATCH (n {prop: ...})`. Every node, including an unlabelled one,
             // belongs to that global postings map.
             if let Some(key) = new_key {
-                map.file(id, key);
+                let unknown_posting = !map.complete
+                    && map.point_postings
+                    && !map.holders.contains_key(&key)
+                    && !map.known_misses.contains(&key);
+                if !unknown_posting {
+                    map.file(id, key);
+                }
             }
         }
     }
@@ -1089,5 +1177,85 @@ mod tests {
         let key = encode_probe_key(&[&Value::I64(1)]).unwrap();
         assert_eq!(idx.probe("L", &names, &key, None), None);
         assert_eq!(idx.probes(), 0);
+    }
+
+    #[test]
+    fn seeded_postings_answer_known_keys_only_and_roll_back() {
+        let idx = UniqueConstraintIndex::new();
+        let names = vec!["id".to_string()];
+        let key = |v: &str| encode_probe_key(&[&Value::Str(v.into())]).unwrap();
+        let sorted = |ids: Option<Vec<NodeId>>| {
+            ids.map(|mut ids| {
+                ids.sort();
+                ids
+            })
+        };
+        // Committed seed: a duplicated key, a single holder and a miss.
+        idx.seed_postings(
+            "Doc",
+            &names,
+            vec![
+                (key("dup"), vec![nid(1), nid(2)]),
+                (key("one"), vec![nid(3)]),
+                (key("miss"), Vec::new()),
+            ],
+            false,
+        );
+        assert_eq!(
+            sorted(idx.probe_all("Doc", &names, &key("dup"))),
+            Some(vec![nid(1), nid(2)])
+        );
+        assert_eq!(idx.probe_all("Doc", &names, &key("miss")), Some(Vec::new()));
+        assert_eq!(idx.probe_all("Doc", &names, &key("other")), None);
+
+        // A staged upsert to a key whose holder set is unknown must not make
+        // that key look known with only the staged node in it: committed
+        // holders of "other" may exist.
+        let other = props(&[("id", Value::Str("other".into()))]);
+        idx.apply_upsert(nid(3), &["Doc"], &other);
+        assert_eq!(idx.probe_all("Doc", &names, &key("other")), None);
+        assert_eq!(
+            idx.probe_all("Doc", &names, &key("one")),
+            Some(Vec::new()),
+            "the node left a known key"
+        );
+        // Staged moves between known keys are maintained.
+        let miss = props(&[("id", Value::Str("miss".into()))]);
+        idx.apply_upsert(nid(4), &["Doc"], &miss);
+        assert_eq!(
+            idx.probe_all("Doc", &names, &key("miss")),
+            Some(vec![nid(4)])
+        );
+
+        // A staged seed (after mutations) of a new key, then rollback.
+        idx.seed_postings("Doc", &names, vec![(key("late"), vec![nid(5)])], true);
+        assert_eq!(
+            idx.probe_all("Doc", &names, &key("late")),
+            Some(vec![nid(5)])
+        );
+        idx.rollback_staged();
+        assert_eq!(
+            idx.probe_all("Doc", &names, &key("late")),
+            None,
+            "an answer seeded from staged state is forgotten on rollback"
+        );
+        assert_eq!(
+            idx.probe_all("Doc", &names, &key("one")),
+            Some(vec![nid(3)])
+        );
+        assert_eq!(idx.probe_all("Doc", &names, &key("miss")), Some(Vec::new()));
+        assert_eq!(
+            sorted(idx.probe_all("Doc", &names, &key("dup"))),
+            Some(vec![nid(1), nid(2)])
+        );
+
+        // A map first created by a staged seed disappears on rollback.
+        idx.seed_postings("Fresh", &names, vec![(key("x"), vec![nid(9)])], true);
+        assert_eq!(
+            idx.probe_all("Fresh", &names, &key("x")),
+            Some(vec![nid(9)])
+        );
+        idx.rollback_staged();
+        assert_eq!(idx.probe_all("Fresh", &names, &key("x")), None);
     }
 }

@@ -15,6 +15,32 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`MERGE` on a key with a RANGE index but no `UNIQUE` constraint no longer
+  scans the whole label, and hydrates the nodes it matches in batches.** A
+  loader statement such as
+  `UNWIND $rows AS r MERGE (a:Article {id: r.id}) SET a += r WITH a, r
+  MATCH (n:Act {id: r.act_id}) MERGE (n)-[:CONTAINS]->(a)` paid two
+  costs that grew with the stored corpus:
+  - The first lookup of a non-unique indexed key inside a write filled the
+    writer's transactional postings by reading every node of the label with
+    every column (all of a large text corpus), before it could answer the
+    first row. The same happened to the `MATCH` after `WITH` once the
+    statement had staged writes. When the statement hit the write timeout
+    the half-built map was dropped, so every retry started again.
+  - Every row whose key already existed was hydrated with its own targeted
+    SST read, which decodes a whole row group.
+
+  On a remote object store a 300-row batch of existing ids took longer than
+  the 30 s write timeout, and smaller batches did too. Both lookups now
+  resolve all the batch's keys at once through the equality sidecars (one
+  posting probe per SST, plus the memtable), seed exactly those keys into the
+  transactional postings, and hydrate the matches in one row-group-aware
+  batch. The answers stay exact for keys repeated in the batch, for changes
+  staged earlier in the transaction, and after a rollback. A `UNIQUE`
+  constraint was already on the fast path and is unchanged.
+
 ## [3.3.2] - 2026-11-15
 
 ### Fixed
