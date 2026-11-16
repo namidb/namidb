@@ -134,7 +134,7 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
-          - { target: aarch64-apple-darwin, runner: macos-14 }
+          - { target: aarch64-apple-darwin, runner: macos-15 }
           - { target: x86_64-pc-windows-msvc, runner: windows-2022 }
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -254,7 +254,7 @@ jobs:
           # Match the x86_64 glibc baseline. Building natively on 24.04 linked
           # the nominally generic GNU archive against GLIBC_2.39.
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
-          - { target: aarch64-apple-darwin, runner: macos-14 }
+          - { target: aarch64-apple-darwin, runner: macos-15 }
           - { target: x86_64-pc-windows-msvc, runner: windows-2022 }
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

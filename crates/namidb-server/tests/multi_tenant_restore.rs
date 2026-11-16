@@ -82,6 +82,7 @@ fn config(
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
         fence_policy: Default::default(),
+        http_max_body_bytes: namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         http_request_timeout: None,
     }
 }

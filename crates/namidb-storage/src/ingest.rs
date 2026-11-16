@@ -361,6 +361,11 @@ pub struct WriterSession {
     /// further object-store writes and mints no new orphan segments.
     /// Only a fresh [`Self::open`] clears it.
     poisoned: bool,
+    /// Identity of the memtable/manifest lineage an off-lock flush ticket was
+    /// cut from (see [`Self::begin_background_flush`]). Process-unique per
+    /// session and replaced by every synchronous flush, so a ticket cut
+    /// before a reopen or a synchronous flush can never be installed.
+    flush_lineage: u64,
     /// Node rows decoded while the generic staged-aware unique String lookup
     /// reconciles an immutable point batch with the complete staged memtable.
     ///
@@ -596,6 +601,7 @@ impl WriterSession {
             auto_snapshot_every: auto_snapshot_every(),
             commits_since_snapshot: 0,
             poisoned: false,
+            flush_lineage: next_flush_lineage(),
             staged_unique_overlay_rows_scanned: AtomicU64::new(0),
             pending_types: PendingTypes::default(),
         };
@@ -1206,6 +1212,14 @@ impl WriterSession {
     /// Current manifest version visible to this writer.
     pub fn manifest_version(&self) -> u64 {
         self.current.manifest.version
+    }
+
+    /// True when a search index of the current manifest has enough delta
+    /// segments to compact. Servers request a compaction after a flush when
+    /// this holds — also after a flush that failed because a search index
+    /// reached its segment cap, which only a compaction can clear.
+    pub fn search_compaction_due(&self) -> bool {
+        crate::compact::search_compaction_due(&self.current.manifest)
     }
 
     /// The largest number of L0 SSTs in any single `(kind, scope)` bucket
@@ -1906,11 +1920,30 @@ impl WriterSession {
             Ok(_) => {
                 let pointer = body_result?;
                 let probe = PointerCasProbe::for_manifest(&next);
-                let new_current = match self
-                    .manifest_store
-                    .cas_pointer(&self.fence, &self.current, next, pointer)
-                    .await
-                {
+                // Two round trips, not three: the advisory for this version
+                // is published with the next commit or flush. The previous
+                // commit's advisory, if still owed, rides with this pointer
+                // create. It is sent only now that this commit's Create-only
+                // body landed, which proves no writer has committed past the
+                // owed version: a fenced writer never rolls `current.json`
+                // back (see `ManifestStore::publish_pending_advisory`).
+                let owed_advisory = self.manifest_store.publish_pending_advisory_unchecked();
+                let (cas_result, advisory_result) = tokio::join!(
+                    self.manifest_store.cas_pointer_deferring_advisory(
+                        &self.fence,
+                        &self.current,
+                        next,
+                        pointer
+                    ),
+                    owed_advisory,
+                );
+                if let Err(error) = advisory_result {
+                    tracing::warn!(
+                        error = %error,
+                        "advisory current.json PUT failed; it stays owed to the next commit"
+                    );
+                }
+                let new_current = match cas_result {
                     Ok(current) => current,
                     // Determinate outcomes (a competitor took the version /
                     // we are fenced) keep today's semantics.
@@ -2341,7 +2374,15 @@ impl WriterSession {
  manifest_version = self.current.manifest.version,
  ))]
     pub async fn flush(&mut self, schema: Schema) -> Result<FlushOutcome> {
+        // Any off-lock flush cut before this one covers rows this flush is
+        // about to write; it must not install afterwards.
+        self.flush_lineage = next_flush_lineage();
         let _ = self.commit_batch().await?;
+        // An idle writer still owes the advisory of its last commit; every
+        // periodic flush tick settles it even when the memtable is empty.
+        if let Err(error) = self.manifest_store.publish_pending_advisory().await {
+            tracing::warn!(error = %error, "advisory current.json PUT failed; still owed");
+        }
         let schema = self.resolve_pending_types(schema).await?;
         let frozen = self.memtable.freeze();
         let mut restore = FrozenMemtableRestoreGuard::new(
@@ -2403,6 +2444,123 @@ impl WriterSession {
         // rows touched between flushes, not by the lifetime of the writer.
         self.unique_index.drop_partial_maps();
         Ok(outcome)
+    }
+
+    /// Start a flush whose expensive part runs WITHOUT the writer.
+    ///
+    /// [`Self::flush`] holds `&mut self` while it encodes the memtable into
+    /// SSTs and uploads them, which on a remote store with a large memtable
+    /// is seconds to tens of seconds during which no write can run. This is
+    /// the same flush split in three:
+    ///
+    /// 1. `begin_background_flush` (with the writer): commit the pending
+    ///    batch, settle pending property types, and checkpoint the memtable
+    ///    in O(1) without draining it. Returns `None` when there is nothing
+    ///    to flush.
+    /// 2. [`BackgroundFlush::build`] (without the writer): build and upload
+    ///    the SSTs and search deltas of the checkpoint. Writes keep
+    ///    committing to the WAL and memtable meanwhile, and reads keep
+    ///    seeing the checkpointed rows in the memtable.
+    /// 3. [`Self::install_background_flush`] (with the writer): commit a
+    ///    manifest that adds the uploaded objects and retires exactly the WAL
+    ///    segments the checkpoint covered, then release the flushed versions
+    ///    from the memtable.
+    ///
+    /// Crash safety is the synchronous flush's: until step 3 commits, the
+    /// uploaded objects are unreferenced and every checkpointed row is still
+    /// in a WAL segment the manifest lists; after it, those rows are in SSTs
+    /// and every later row is in a WAL segment the new manifest keeps. A
+    /// failed build changes nothing at all. Step 3 refuses (returning
+    /// [`BackgroundFlushInstall::Superseded`]) when anything but WAL commits
+    /// changed the manifest since step 1 (a compaction, DDL, a synchronous
+    /// flush, a reopen): the rows simply stay in the memtable for the next
+    /// flush, and the orphaned objects are swept by the janitor.
+    pub async fn begin_background_flush(&mut self) -> Result<Option<BackgroundFlush>> {
+        let _ = self.commit_batch().await?;
+        if let Err(error) = self.manifest_store.publish_pending_advisory().await {
+            tracing::warn!(error = %error, "advisory current.json PUT failed; still owed");
+        }
+        let schema = self.current.manifest.schema.clone();
+        let schema = self.resolve_pending_types(schema).await?;
+        if self.memtable.is_empty() {
+            return Ok(None);
+        }
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        Ok(Some(BackgroundFlush {
+            manifest_store: self.manifest_store.clone(),
+            base: self.current.clone(),
+            frozen: self.memtable.checkpoint(),
+            schema,
+            lineage: self.flush_lineage,
+            retired_wal_seq: self
+                .current
+                .manifest
+                .wal_segments
+                .iter()
+                .map(|segment| segment.seq)
+                .max(),
+        }))
+    }
+
+    /// Commit an off-lock flush built by [`BackgroundFlush::build`]. See
+    /// [`Self::begin_background_flush`].
+    pub async fn install_background_flush(
+        &mut self,
+        built: BuiltBackgroundFlush,
+    ) -> Result<BackgroundFlushInstall> {
+        let BuiltBackgroundFlush {
+            base,
+            frozen,
+            lineage,
+            retired_wal_seq,
+            uploaded,
+        } = built;
+        if lineage != self.flush_lineage
+            || !flush_basis_unchanged(&base.manifest, &self.current.manifest)?
+        {
+            return Ok(BackgroundFlushInstall::Superseded);
+        }
+        if self.poisoned {
+            return Err(Error::precondition(
+                "writer session poisoned by a prior terminal commit failure; drop and reopen",
+            ));
+        }
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        // Commit whatever is staged first, exactly like a synchronous flush:
+        // the manifest below is derived from the then-current one.
+        let _ = self.commit_batch().await?;
+        let ssts_written = uploaded.ssts_written;
+        let bloom_sidecars_written = uploaded.bloom_sidecars_written;
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.label_dict = self.label_dict.clone();
+        uploaded.apply(&mut next);
+        // Retire exactly the segments the checkpoint covered; the ones
+        // committed while the flush was built hold rows it does not.
+        if let Some(retired) = retired_wal_seq {
+            next.wal_segments.retain(|segment| segment.seq > retired);
+        }
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        self.current = committed.clone();
+        let released = self.memtable.release_flushed(&frozen);
+        self.prune_sst_cache();
+        self.refresh_published();
+        // Same physical-tier resets as a synchronous flush (see `flush`).
+        self.property_index_cache.reset_memtable_claimants();
+        self.unique_index.drop_partial_maps();
+        tracing::debug!(
+            released,
+            remaining = self.memtable.len(),
+            version = committed.manifest.version,
+            "installed background flush"
+        );
+        Ok(BackgroundFlushInstall::Installed(Box::new(FlushOutcome {
+            committed,
+            ssts_written,
+            bloom_sidecars_written,
+        })))
     }
 
     /// Attach offline-built SSTs into a FRESH namespace as ONE new manifest
@@ -3408,6 +3566,93 @@ pub struct StageMark {
     node_mutations: bool,
 }
 
+fn next_flush_lineage() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Whether `current` differs from `base` only in what a WAL commit changes
+/// (version, writer, timestamp, WAL segment list, label dictionary). Any
+/// other difference (SSTs, schema, search state, index catalogs, epoch, and
+/// fields added in the future) means an off-lock flush built against `base`
+/// may no longer apply to `current`.
+fn flush_basis_unchanged(base: &Manifest, current: &Manifest) -> Result<bool> {
+    fn stable(manifest: &Manifest) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(manifest)?;
+        if let Some(object) = value.as_object_mut() {
+            for volatile in [
+                "version",
+                "writer_id",
+                "created_at",
+                "wal_segments",
+                "label_dict",
+            ] {
+                object.remove(volatile);
+            }
+        }
+        Ok(value)
+    }
+    Ok(stable(base)? == stable(current)?)
+}
+
+/// An off-lock flush cut by [`WriterSession::begin_background_flush`].
+#[derive(Debug)]
+pub struct BackgroundFlush {
+    manifest_store: ManifestStore,
+    base: LoadedManifest,
+    frozen: crate::memtable::FrozenMemtable,
+    schema: Schema,
+    lineage: u64,
+    retired_wal_seq: Option<u64>,
+}
+
+impl BackgroundFlush {
+    /// Rows the flush covers.
+    pub fn rows(&self) -> usize {
+        self.frozen.len()
+    }
+
+    /// Build and upload the flush's objects. Needs no writer: run it with
+    /// the writer lock released.
+    pub async fn build(self) -> Result<BuiltBackgroundFlush> {
+        let uploaded = crate::flush::build_and_upload(
+            &self.manifest_store,
+            &self.base,
+            &self.frozen,
+            self.schema,
+        )
+        .await?;
+        Ok(BuiltBackgroundFlush {
+            base: self.base,
+            frozen: self.frozen,
+            lineage: self.lineage,
+            retired_wal_seq: self.retired_wal_seq,
+            uploaded,
+        })
+    }
+}
+
+/// A built and uploaded off-lock flush, ready for
+/// [`WriterSession::install_background_flush`].
+#[derive(Debug)]
+pub struct BuiltBackgroundFlush {
+    base: LoadedManifest,
+    frozen: crate::memtable::FrozenMemtable,
+    lineage: u64,
+    retired_wal_seq: Option<u64>,
+    uploaded: crate::flush::UploadedFlush,
+}
+
+/// Outcome of [`WriterSession::install_background_flush`].
+#[derive(Debug)]
+pub enum BackgroundFlushInstall {
+    /// The flush is committed and its rows released from the memtable.
+    Installed(Box<FlushOutcome>),
+    /// The manifest changed beyond WAL commits since the flush was cut; it
+    /// was not installed and its rows stay in the memtable.
+    Superseded,
+}
+
 /// Convenience: the WAL payload bytes a `WalEntry` produces. Useful
 /// for diagnostics or external WAL consumers; the writer itself
 /// emits these inside `commit_batch`.
@@ -3446,6 +3691,7 @@ fn value_datatype(v: &Value) -> Option<DataType> {
 pub fn prune_shared_caches(paths: &NamespacePaths) {
     let prefix = paths.namespace_prefix();
     let prefix = prefix.as_ref();
+    crate::range_cache::forget_create_only_heads_with_prefix(prefix);
     if let Some(cache) = shared_sst_cache() {
         cache.prune_namespace(prefix);
     }

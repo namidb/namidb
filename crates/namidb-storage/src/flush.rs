@@ -74,8 +74,8 @@ use namidb_core::{
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::manifest::{
-    KindSpecificStats, LoadedManifest, ManifestStore, PerLabelPropertyStat, SstDescriptor, SstKind,
-    SstLevel,
+    KindSpecificStats, LoadedManifest, Manifest, ManifestStore, PerLabelPropertyStat,
+    SstDescriptor, SstKind, SstLevel,
 };
 use crate::memtable::{FrozenMemtable, MemKey, MemOp};
 use crate::paths::NamespacePaths;
@@ -391,6 +391,62 @@ pub async fn flush(
         });
     }
 
+    let flush_started = std::time::Instant::now();
+    let uploaded = build_and_upload(manifest_store, base, frozen, schema).await?;
+    let ssts_written = uploaded.ssts_written;
+    let bloom_count = uploaded.bloom_sidecars_written;
+    let mut next = base.manifest.next_version(fence.writer_id);
+    uploaded.apply(&mut next);
+    next.wal_segments.clear();
+
+    let committed = manifest_store.commit(fence, base, next).await?;
+    debug!(
+        rows = frozen.len(),
+        total_ms = flush_started.elapsed().as_millis() as u64,
+        "flush committed"
+    );
+
+    Ok(FlushOutcome {
+        committed,
+        ssts_written,
+        bloom_sidecars_written: bloom_count,
+    })
+}
+
+/// SST and search objects a flush has built and uploaded, not yet committed
+/// to any manifest. [`Self::apply`] adds them to the manifest that will
+/// expose them; until then they are unreferenced (janitor-swept) objects.
+#[derive(Debug)]
+pub(crate) struct UploadedFlush {
+    schema: Schema,
+    new_ssts: Vec<SstDescriptor>,
+    search: crate::search_lsm_flush::SearchFlushManifestUpdate,
+    pub(crate) ssts_written: usize,
+    pub(crate) bloom_sidecars_written: usize,
+}
+
+impl UploadedFlush {
+    /// Record the flushed SSTs, search segments and the flush's schema in
+    /// `next`. The caller decides which WAL segments the flush retires.
+    pub(crate) fn apply(self, next: &mut Manifest) {
+        next.schema = self.schema;
+        next.ssts.extend(self.new_ssts);
+        self.search.apply(next);
+    }
+}
+
+/// Build the SSTs (and search deltas) of a non-empty `frozen` memtable
+/// against `base`, and upload every object. Commits nothing: this is the
+/// part of a flush that needs no writer lock, since it reads only immutable
+/// state (`base`'s SSTs and the frozen rows) and writes only fresh,
+/// unreferenced UUID objects.
+pub(crate) async fn build_and_upload(
+    manifest_store: &ManifestStore,
+    base: &LoadedManifest,
+    frozen: &FrozenMemtable,
+    schema: Schema,
+) -> Result<UploadedFlush> {
+    let flush_started = std::time::Instant::now();
     let (node_rows, edge_buckets) = bucket_nodes_and_edges(frozen);
 
     let store = manifest_store.store().clone();
@@ -412,6 +468,7 @@ pub async fn flush(
         Ok((pendings, node_rows))
     })
     .await?;
+    let build_elapsed = flush_started.elapsed();
 
     // Classify and build search deltas before the first object PUT. A segment
     // cap/build failure therefore cannot expose a Nodes SST without exact
@@ -434,6 +491,7 @@ pub async fn flush(
     };
     let (search_uploads, search_manifest_update) = search_plan.into_parts();
     let search_descriptor_count = search_manifest_update.descriptor_count();
+    let search_elapsed = flush_started.elapsed() - build_elapsed;
 
     // 2. I/O phase — issue body + bloom PUTs with bounded object-level
     // concurrency. The PUTs are independent (each targets a fresh UUIDv7
@@ -486,19 +544,21 @@ pub async fn flush(
         }));
     }
     await_all_object_uploads(put_futures).await?;
+    let upload_elapsed = flush_started.elapsed() - build_elapsed - search_elapsed;
 
     let ssts_written = new_ssts.len().saturating_add(search_descriptor_count);
+    debug!(
+        rows = frozen.len(),
+        build_ms = build_elapsed.as_millis() as u64,
+        search_ms = search_elapsed.as_millis() as u64,
+        upload_ms = upload_elapsed.as_millis() as u64,
+        "flush build and upload phases"
+    );
 
-    let mut next = base.manifest.next_version(fence.writer_id);
-    next.schema = schema;
-    next.ssts.extend(new_ssts);
-    search_manifest_update.apply(&mut next);
-    next.wal_segments.clear();
-
-    let committed = manifest_store.commit(fence, base, next).await?;
-
-    Ok(FlushOutcome {
-        committed,
+    Ok(UploadedFlush {
+        schema,
+        new_ssts,
+        search: search_manifest_update,
         ssts_written,
         bloom_sidecars_written: bloom_count,
     })

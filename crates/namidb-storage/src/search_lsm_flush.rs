@@ -448,11 +448,16 @@ fn chunk_end(rows: &[NodeRow], start: usize, byte_budget: usize) -> Result<usize
         if end > start && bytes.saturating_add(row_bytes) > byte_budget {
             break;
         }
+        // A single mutation always forms a chunk of its own, however large:
+        // it is already resident in the memtable, and refusing it would fail
+        // every later flush of the namespace with the same row.
         if end == start && row_bytes > byte_budget {
-            return Err(Error::precondition(format!(
-                "one node mutation requires {row_bytes} bytes, above the {byte_budget}-byte \
-                 search before-image chunk budget"
-            )));
+            tracing::warn!(
+                row_bytes,
+                chunk_budget_bytes = byte_budget,
+                "one node mutation exceeds the search before-image chunk budget; \
+                 reading it in a chunk of its own"
+            );
         }
         bytes = bytes
             .checked_add(row_bytes)
@@ -772,7 +777,7 @@ impl TextWork {
             if let Some(payload) = &after_payload {
                 self.live_total_len = self
                     .live_total_len
-                    .checked_add(crate::text::tokenize(&payload.text).len() as u64)
+                    .checked_add(crate::text::visit_tokens(&payload.text, |_| {}) as u64)
                     .ok_or_else(|| Error::invariant("FT4 live token count overflows"))?;
             }
         }
@@ -1211,7 +1216,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(chunk_end(&rows, 0, usize::MAX).unwrap(), 512);
         assert_eq!(chunk_end(&rows, 512, usize::MAX).unwrap(), 600);
-        assert!(chunk_end(&rows, 0, 1).is_err());
+        // One row larger than the budget still forms a chunk of its own.
+        assert_eq!(chunk_end(&rows, 0, 1).unwrap(), 1);
+        assert_eq!(chunk_end(&rows, 1, 1).unwrap(), 2);
     }
 
     #[test]

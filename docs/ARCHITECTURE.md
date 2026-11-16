@@ -132,10 +132,38 @@ Types:
       b. manifest_store.put_body(fence, base, next)  (PutMode::Create)
    The WAL path is fully determined by seq, so both can fly at once —
    turning WAL + body + pointer (3 RTs) into max(WAL,body) + pointer (2).
-3. On WAL Ok: pointer = body_result?; cas_pointer(...) publishes p<v+1>.
+3. On WAL Ok: pointer = body_result?; cas_pointer_deferring_advisory(...)
+   publishes p<v+1> and leaves this version's current.json PUT owed. The
+   advisory the PREVIOUS commit still owes (if any) is PUT alongside it: the
+   Create-only body of v+1 just landed, so v is still the newest version.
 4. Only AFTER the pointer CAS lands: drain pending_payloads into the live
    memtable, advance current/seq, refresh_published() (new Arc snapshot).
 ```
+
+A commit therefore waits two sequential round trips, not three. The advisory
+`current.json` is not part of the commit: the version is durable and
+discoverable once its pointer exists, and the forward probe advances from any
+older advisory. The owed PUT rides with the next commit's pointer create, and
+every flush (the periodic one included, so an idle writer settles it within one
+flush interval) publishes it; the janitor keeps every pointer at or above the
+version `current.json` names, so a lagging advisory always resolves. An owed
+advisory is never sent once the namespace has moved past it (the flush path
+first checks that `p<v+1>` does not exist): a writer fenced while it owed one
+must not roll `current.json` back below a pointer the janitor already reclaimed
+under the successor's newer advisory, since an EC-LIST reader would then find
+an advisory naming a missing pointer.
+
+The periodic flush (`begin_background_flush` → `BackgroundFlush::build` →
+`install_background_flush`) holds the writer only to commit the pending batch
+and checkpoint the memtable (an O(1) clone of the persistent map), and again to
+commit the manifest that adds the uploaded SSTs and retires exactly the WAL
+segments the checkpoint covered. Encoding the SSTs and search deltas and
+uploading them run without the writer, so writes keep committing meanwhile;
+the checkpointed rows stay readable in the memtable until the install releases
+the entries whose LSN it flushed. An install whose base changed beyond WAL
+commits (compaction, DDL, a reopen) is refused and the next flush runs under
+the lock. Immutable SST objects are HEADed once per process
+(`range_cache::head_create_only`), not once per published snapshot.
 
 The ordering — **WAL durable and manifest committed before the memtable is touched and before the client is acked** — is the core invariant: a failed commit never ACKs a record it did not make durable and reference, and the memtable is untouched until the pointer CAS succeeds, so recovery never resurrects an unacked write nor drops an acked one.
 
@@ -147,7 +175,7 @@ Failure handling is precise. A WAL `Precondition` (seq collision with an orphan)
 
 The linearization point is the **Create-only pointer family** `manifest/pointer/p<N>.json`, where `N` equals the manifest version and the *current pointer is the highest `N` present*. `cas_pointer` creates `p<v+1>.json` with `PutMode::Create`: whoever creates it first owns version `v+1`. Both commit phases now use the same primitive (PUT-if-absent), removing the engine's former dependency on `If-Match` overwrite. This matches the Delta Lake / SlateDB model (monotonic commit files + LIST for current + writer epoch).
 
-`load_current` → `load_pointer`: `max_pointer_version` LISTs `pointer/`, takes the max `N`, then `probe_pointer_forward` galloping HEADs `p<N+1>, p<N+2>, …` (bounded `MAX_PROBE = 8192`) to close the window where a just-created pointer has not yet appeared in an eventually-consistent LIST. If LIST is empty, it falls back to a HEAD of `p0` (fresh namespace) and then to reading the advisory `current.json` (aged namespace whose low pointers the janitor reclaimed) — trusting the advisory only if the pointer at its version still HEADs. If the probe exhausts its window it returns the *retryable* `PointerResolveStale`. The advisory `current.json` is a plain unconditional PUT written on every commit/bootstrap; it is explicitly **not** part of the CAS contract, only a non-LIST discovery hint that prevents `WriterSession::open` from re-bootstrapping (and thereby erasing) a live namespace on an EC-LIST store.
+`load_current` → `load_pointer`: `max_pointer_version` LISTs `pointer/`, takes the max `N`, then `probe_pointer_forward` galloping HEADs `p<N+1>, p<N+2>, …` (bounded `MAX_PROBE = 8192`) to close the window where a just-created pointer has not yet appeared in an eventually-consistent LIST. If LIST is empty, it falls back to a HEAD of `p0` (fresh namespace) and then to reading the advisory `current.json` (aged namespace whose low pointers the janitor reclaimed) — trusting the advisory only if the pointer at its version still HEADs. If the probe exhausts its window it returns the *retryable* `PointerResolveStale`. The advisory `current.json` is a plain unconditional PUT written at bootstrap and, deferred by one commit, after every commit (see `commit_batch` above); it is explicitly **not** part of the CAS contract, only a non-LIST discovery hint that prevents `WriterSession::open` from re-bootstrapping (and thereby erasing) a live namespace on an EC-LIST store.
 
 Monotonicity invariants enforced in `put_body`: `new.version == base.version + 1`, `new.epoch >= base.epoch`, and `fence.assert_alive(base.epoch)` before any write.
 
@@ -347,6 +375,8 @@ The parser (RFC-004) is a two-pass, hand-written front end. `parser::lexer::lex`
 
 `optimize::optimize(plan, catalog)` (`crates/namidb-query/src/optimize/mod.rs`) first runs the structural `apply_edge_count_pushdown` once, then iterates a rewrite battery to a fixpoint capped at `MAX_FIXPOINT_ROUNDS = 8` (each well-formed rewrite is idempotent within two rounds; the cap is defensive). Per round, in order: (1) `unique_lookup` collapses `Filter(prop = literal) → NodeByPropertyValue` when the property is schema-`unique` (point lookup) or non-unique-`indexed` (`multi:true` posting-list lookup), and `WHERE elementId(n)=…` → `NodeById`; (2) `anchor_inversion` re-anchors a single-hop, non-optional pattern at its selective endpoint: when the `Expand` reads from a bare `NodeScan` but the expand *target* carries an index-answerable equality, it swaps sides — `NodeByPropertyValue` on the target, direction flipped, residual predicates kept above (unique targets always; non-unique indexed targets only when stats say the target label is no larger than the source; var-length/OPTIONAL/back-reference/shortestPath/walker-materialized-trail shapes are refused); (3) `vector_search` (feature `vector-index`) rewrites a KNN shape to `VectorSearch`; (4) `predicate_pushdown` splits each `Filter` on `AND` and sinks each conjunct toward the leaves, folding pushable single-column conjuncts into `NodeScan.predicates` (RFC-013 Parquet row-group pruning) with `Distinct`/`TopN`/write operators acting as barriers; (5) `normalize_filters` merges adjacent filters and drops `Filter(true)` and redundant `__label_eq`; (6) `convert_cross_to_hash` (RFC-012); (7) `convert_semi_apply_to_hash_semi_join` (RFC-014 decorrelation); (8) `reorder_joins` (RFC-016); (9) `detect_multiway_join` (RFC-024); (10) `apply_projection_pushdown` (RFC-015) runs last so it sees the final `NodeScan` shape. Reaching the KNN→`VectorSearch` rewrite *below* `WITH`/`Project`/`Filter` chains matters because `vector_search::recurse` rebuilds those wrappers structurally and re-attempts the match at each parent. A source `WHERE` below `TopN` becomes the operator's pre-k residual filter; a `Filter` above `TopN` remains a separate post-k operator and may shorten the bounded page without refilling it.
 
+Two further rewrites decide where a pattern starts. **Label predicates** (`optimize/label_scan.rs`): a label written in `WHERE` instead of the pattern (`MATCH (n) WHERE n:Device`, `n:A:B`, `n:A AND n.x = 1`) lowers to an unlabelled `NodeScan` under a `__label_eq` filter; once pushdown has left that filter on the scan, the scan is scoped to the label (the one with the fewest nodes when there are several, the others staying as filters, as does `NOT n:L`), and a `WHERE m:L` on the target of a plain single-hop `Expand` becomes that `Expand`'s own label check. A label *disjunction* (`n:A OR n:B`, `(n:A AND …) OR n:B`, a `(n:A|B)` pattern) becomes a `UNION ALL` of label scans after the first fixpoint, so anchor inversion sees the disjunction first; branch *i* adds `NOT coalesce(Dj, false)` for every earlier disjunct `Dj`, so the branches are disjoint and need no de-duplication. Only a predicate that can hold without any label (`NOT n:L` alone, `n:A OR n.x = 1`) still scans every node. **Hub anchors** (`optimize/anchor_choice.rs`): an id seek (`WHERE elementId(d) IN $ids`) is a point lookup, but walking away from it costs the anchor's degree. `id_anchor_wins` compares the C_out of the walk from the ids (a parameter list counts as one id) with the walk back from the hop target's smallest label scan, from the per-edge-type, per-direction average degrees; the scan replaces the anchor only when it is at least `SCAN_MARGIN = 4`× cheaper and every number is known. `apply_hub_deanchor` rewrites `Expand(id seek on d → c:Call)` into `Filter(elementId(d) IN $ids)` over the inverted `Expand` from a `NodeScan(c:Call)`; anchor inversion asks the same question before it re-anchors at an id-pinned target, so the two passes never undo each other. Averages are per edge type, not per node: a hub among many ordinary nodes of its label is averaged away. **Bound endpoints** (`apply_bound_endpoint_start`, also after the first fixpoint so id seeks and index lookups win first): a single hop from a fresh scan to a node an earlier clause bound (`MATCH (c:Call) MATCH (d)<-[:R]-(c)`), which lowers to a cross product of every scanned node with every input row plus an edge probe per pair, becomes an `Expand` from the bound node, with the scanned alias's label as the target label and its `Filter` above; a labelled scan is kept unless the edge type's average degree from the bound side is no larger than the label's node count, and a scan carrying storage-level predicates is kept.
+
 ### Statistics and the cost model
 
 The optimizer's cost inputs are a `StatsCatalog` (RFC-010/025, `crates/namidb-query/src/cost/stats.rs`) built in `O(|ssts|)` from a committed `Manifest`, holding per-label `node_count`; per-property `PropStats { null_count, non_null_count, min, max, ndv, unique, indexed }`; and per-edge-type `EdgeTypeStats { edge_count, avg/max out/in degree }`. Number-of-distinct-values (`ndv`) comes from HyperLogLog (HLL) sketches merged across SSTs (`absorb_hll_sketch`); if *any* contributing SST lacks a sketch the merge degrades to `Incomplete` and `ndv` stays `None`, at which point equality selectivity falls back to a constant. Per-label property statistics (RFC-025) are read from an `per_label_property_stats` sidecar on id-primary node SSTs (which span many labels in one `__overflow_json` column), resolving each `label_id` through the namespace `LabelDictionary`. The memtable is deliberately not consulted; single-writer flush cadence bounds the under-estimate.
@@ -367,7 +397,7 @@ Factorization (RFC-017, `crates/namidb-query/src/exec/factor.rs`) replaces `Vec<
 
 ### Variable-length and shortest paths
 
-`execute_expand` (RFC-023, `crates/namidb-query/src/exec/walker.rs:1032`) implements both single- and variable-length traversal as a per-seed BFS over a `Vec<Step>` frontier, where `Step { tail, row, trail, rels }`. Hop bounds come from `RelationshipLength`; an unbounded `*` is clamped to `UNBOUNDED_VAR_LENGTH_CAP = 64` hops (`clamp_hop_max`). Cypher relationship-uniqueness (trail semantics) is enforced by `Step.rels`, the list of stored edge identities `(edge_type, src, dst)` already traversed on this path; an edge whose key is in `rels` is skipped, so `-[:R*2..2]-` cannot walk one edge out and back. This is only populated for multi-hop expansions (`max > 1`); the single-hop hot path leaves it empty. `back_reference` reads the pre-bound target once and keeps only paths whose tail equals it. For `shortestPath` (`ShortestMode::First`) and `allShortestPaths` (`ShortestMode::All`), a visited-set BFS prune is engaged **only for `min ≤ 1`**: a `HashSet<NodeId>` seeded with the source drops any neighbour reached at an earlier level, because every prefix of an unweighted shortest path is itself shortest, so discarding re-visits preserves *all* shortest paths while bounding the frontier at `O(V)` per level instead of the `deg^hop` walk enumeration; the set is sealed at level end so `All` admits every same-level arrival (each a distinct shortest path), and `First` additionally keeps one walk per node per level and stops the whole BFS at the first hit. When `path_binding` is set (`MATCH p = shortestPath(...)`), the alternating Node/Rel `trail` is materialized into a `RuntimeValue::Path` on the hit row so `length(p)`/`nodes(p)` work.
+`execute_expand` (RFC-023, `crates/namidb-query/src/exec/walker.rs:1032`) implements both single- and variable-length traversal as a per-seed BFS over a `Vec<Step>` frontier, where `Step { tail, row, trail, rels }`. Hop bounds come from `RelationshipLength`; an unbounded `*` is clamped to `UNBOUNDED_VAR_LENGTH_CAP = 64` hops (`clamp_hop_max`). Cypher relationship-uniqueness (trail semantics) is enforced by `Step.rels`, the list of stored edge identities `(edge_type, src, dst)` already traversed on this path; an edge whose key is in `rels` is skipped, so `-[:R*2..2]-` cannot walk one edge out and back. This is only populated for multi-hop expansions (`max > 1`); the single-hop hot path leaves it empty. `back_reference` reads the pre-bound target once and keeps only paths whose tail equals it. Before the per-seed loop, an uncapped Expand over several seeds reads every seed's first hop with `SEED_PREFETCH_CONCURRENCY = 16` reads in flight (`prefetch_seed_neighbours`, into the operator's neighbour memo and within its 1M-edge budget), but only when the edge SSTs' degree histograms bound every partner list by `SEED_PREFETCH_MAX_DEGREE = 1024`, so a run of hubs is still read one at a time; a single-hop Expand-Into runs its `(source, target)` probes the same way (`prefetch_exact_edges`). Each read is a few dependent range reads of the edge SST, so one seed at a time they cost a millisecond-scale wait each. For `shortestPath` (`ShortestMode::First`) and `allShortestPaths` (`ShortestMode::All`), a visited-set BFS prune is engaged **only for `min ≤ 1`**: a `HashSet<NodeId>` seeded with the source drops any neighbour reached at an earlier level, because every prefix of an unweighted shortest path is itself shortest, so discarding re-visits preserves *all* shortest paths while bounding the frontier at `O(V)` per level instead of the `deg^hop` walk enumeration; the set is sealed at level end so `All` admits every same-level arrival (each a distinct shortest path), and `First` additionally keeps one walk per node per level and stops the whole BFS at the first hit. When `path_binding` is set (`MATCH p = shortestPath(...)`), the alternating Node/Rel `trail` is materialized into a `RuntimeValue::Path` on the hit row so `length(p)`/`nodes(p)` work.
 
 ### The write path
 
@@ -692,7 +722,27 @@ The methodology's governing principle, stated in RFC-031, is that **recall on a 
 
 A separate track (`vector_recall.rs`) isolates the error introduced by int8 quantization *alone* — the arithmetic of encoding, dequantizing, and the asymmetric quantized distance — from the graph-navigation error, so the two sources of approximation can be attributed independently. This matters because the engine rescan-corrects quantized scores with the exact f32 metric on the candidate pool (§6): reported scores and ordering inside the reached pool are exact, while quantization and graph navigation affect which neighbours are reached, i.e. recall.
 
-### 10.4 What the measurements are for
+### 10.4 Write throughput and served search over a slow store
+
+The in-process harnesses above call the engine directly against a local
+store. `namidb-bench serve` / `namidb-bench http-load` (feature `http-load`)
+instead measure what a client sees: the real HTTP server, with every object
+store request delayed by a uniform 20-40 ms (`--latency-min-ms`,
+`--latency-max-ms`) and counted per operation (`GET`, ranged `GETR`, `HEAD`,
+`PUT`, `LIST`, multipart parts), so a result reports round trips as well as
+seconds. The server is meant to run in a memory-limited cgroup
+(`systemd-run --user --scope -p MemoryMax=1G ... --memory-max-bytes auto`)
+with the allocator settings of the container image. The scenarios are a
+mixed field workload (`field-report`), sustained document and vector loads
+with a configurable batch size and client concurrency (`bulk`, `vectors`;
+the clients retry 503 and transport errors and count only committed rows),
+and `vector-search`: recall@k against brute-force ground truth on the same
+seeded, clustered synthetic corpus, with p50/p95 latency per `ef`. Its
+results depend on `(count, dim, clusters, seed, ef, k)`, the memory limit,
+the latency model and whether the vector index has a compacted base or only
+deltas, and are reported with all of them.
+
+### 10.5 What the measurements are for
 
 The harness is an engineering instrument, not a marketing one: it exists to catch regressions (a recall floor that a code change drops below), to guide parameter defaults (the Vamana degree `R`, build beam `L`, and diversification `α`; the compaction level budgets), and to make the cost of a design decision visible before it ships. A researcher reproducing a NamiDB number should report the parameter vector alongside it and should distinguish an internal synthetic measurement from an external-dataset one, exactly as RFC-031 requires of the project itself.
 

@@ -195,6 +195,7 @@ async fn boot_bolt_grouped(ns: &str) -> (std::net::SocketAddr, tokio::task::Join
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
         fence_policy: Default::default(),
+        http_max_body_bytes: namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
@@ -311,6 +312,7 @@ async fn boot_bolt_multi(
         namespace_idle_timeout: Duration::from_secs(3600),
         fence_policy: Default::default(),
         auth_tokens_reload_interval: std::time::Duration::ZERO,
+        http_max_body_bytes: namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
@@ -757,6 +759,7 @@ async fn boot_bolt_memory(
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
         fence_policy: Default::default(),
+        http_max_body_bytes: namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
@@ -829,6 +832,7 @@ async fn boot_bolt_tokens(
         namespace_idle_timeout: Duration::from_secs(3600),
         fence_policy: Default::default(),
         auth_tokens_reload_interval: std::time::Duration::ZERO,
+        http_max_body_bytes: namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         http_request_timeout: None,
     };
     let task = tokio::spawn(async move {
@@ -1088,6 +1092,7 @@ async fn bolt_create_then_match_roundtrip() {
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
         fence_policy: Default::default(),
+        http_max_body_bytes: namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         http_request_timeout: None,
     };
 
@@ -1185,6 +1190,7 @@ async fn bolt_bad_token_yields_failure() {
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
         fence_policy: Default::default(),
+        http_max_body_bytes: namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         http_request_timeout: None,
     };
 
@@ -1360,6 +1366,7 @@ async fn bolt_memgraph_introspection_populates_schema() {
         max_namespaces: 100,
         namespace_idle_timeout: Duration::from_secs(3600),
         fence_policy: Default::default(),
+        http_max_body_bytes: namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         http_request_timeout: None,
     };
     let server_task = tokio::spawn(async move {

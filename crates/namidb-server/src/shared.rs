@@ -62,6 +62,8 @@ pub struct SharedAppState {
     /// a time regardless of namespace, keeping the global HTTP slot
     /// economy honest (the admin routes sit outside the request timeout).
     pub backup_permit: Arc<tokio::sync::Semaphore>,
+    /// Largest `/v0/cypher` JSON body accepted, in bytes.
+    pub http_body_limit: usize,
 }
 
 impl SharedAppState {
@@ -135,7 +137,14 @@ impl SharedAppState {
             authz: Arc::new(NoOpAuthz),
             backup_target_prefix: None,
             backup_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            http_body_limit: crate::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES,
         }
+    }
+
+    /// Set the largest `/v0/cypher` JSON body accepted (builder style).
+    pub fn with_http_body_limit(mut self, bytes: usize) -> Self {
+        self.http_body_limit = bytes.max(1);
+        self
     }
 
     /// Attach a pre-execution authorization hook (builder style). Defaults to

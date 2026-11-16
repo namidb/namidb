@@ -1672,6 +1672,17 @@ impl PinnedObjectRangeSource {
 
     /// Read one exact half-open range from the frozen object generation.
     pub async fn read_range(&self, range: Range<u64>) -> crate::error::Result<Bytes> {
+        let result = self.read_range_inner(range).await;
+        if result.is_err() {
+            // The metadata this source pins may have come from the
+            // process-wide HEAD cache. Whatever failed, never let a cached
+            // HEAD outlive a failed read: the next open asks the store again.
+            forget_create_only_head(&self.store, &self.meta.location);
+        }
+        result
+    }
+
+    async fn read_range_inner(&self, range: Range<u64>) -> crate::error::Result<Bytes> {
         self.validate_range(&range)?;
         self.counters
             .logical_requests
@@ -1849,6 +1860,128 @@ fn store_instance_token(store: &Arc<dyn ObjectStore>) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     map.insert(pointer, (id, Arc::downgrade(store)));
     id
+}
+
+/// Default ceiling on [`head_create_only`]'s process-wide entries. One entry
+/// is an `ObjectMeta` (path, size, ETag, version), about 200-300 bytes, so the
+/// default retains at most a few MiB.
+const DEFAULT_CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES: usize = 16_384;
+const CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES_ENV: &str = "NAMIDB_CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES";
+
+type HeadKey = (u64, String);
+
+#[derive(Default)]
+struct CreateOnlyHeads {
+    entries: std::collections::HashMap<HeadKey, ObjectMeta>,
+    /// Insertion order for FIFO eviction; may hold keys already removed.
+    order: std::collections::VecDeque<HeadKey>,
+}
+
+static CREATE_ONLY_HEADS: std::sync::OnceLock<std::sync::Mutex<CreateOnlyHeads>> =
+    std::sync::OnceLock::new();
+
+fn create_only_heads() -> std::sync::MutexGuard<'static, CreateOnlyHeads> {
+    CREATE_ONLY_HEADS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn create_only_head_cache_max_entries() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var(CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES)
+    })
+}
+
+/// HEAD a NamiDB create-only object (an SST body or sidecar under a fresh
+/// UUID name), reusing an earlier answer for the same store instance and
+/// path.
+///
+/// Such an object never changes while it exists, so its size and generation
+/// token are fixed. Before this cache every published snapshot (one per
+/// commit) re-issued a HEAD for each sidecar it probed, which on a remote
+/// store put a round trip per SST on every write and every read (#212).
+/// Entries are keyed by the store instance, bounded by
+/// `NAMIDB_CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES` (default 16384; `0` disables
+/// the cache) with FIFO eviction, dropped for a namespace by
+/// [`forget_create_only_heads_with_prefix`], and dropped for one object by
+/// any failed read through a source opened from it. Mutable objects
+/// (manifest pointers, `current.json`, pin leases) must never use this.
+pub(crate) async fn head_create_only(
+    store: &Arc<dyn ObjectStore>,
+    location: &ObjectPath,
+) -> object_store::Result<ObjectMeta> {
+    let max_entries = create_only_head_cache_max_entries();
+    if max_entries == 0 {
+        return store.head(location).await;
+    }
+    let key: HeadKey = (store_instance_token(store), location.as_ref().to_string());
+    if let Some(meta) = create_only_heads().entries.get(&key) {
+        return Ok(meta.clone());
+    }
+    let meta = store.head(location).await?;
+    if meta.location == *location {
+        let mut heads = create_only_heads();
+        if heads.entries.insert(key.clone(), meta.clone()).is_none() {
+            heads.order.push_back(key);
+        }
+        while heads.entries.len() > max_entries {
+            let Some(oldest) = heads.order.pop_front() else {
+                break;
+            };
+            heads.entries.remove(&oldest);
+        }
+        // Keys removed by `forget_*` linger in `order`; compact it before it
+        // can grow past twice the live set.
+        if heads.order.len() > max_entries.saturating_mul(2) {
+            let CreateOnlyHeads { entries, order } = &mut *heads;
+            order.retain(|key| entries.contains_key(key));
+        }
+    }
+    Ok(meta)
+}
+
+/// Drop the cached HEAD of one object (see [`head_create_only`]).
+pub(crate) fn forget_create_only_head(store: &Arc<dyn ObjectStore>, location: &ObjectPath) {
+    let Some(heads) = CREATE_ONLY_HEADS.get() else {
+        return;
+    };
+    let key: HeadKey = (store_instance_token(store), location.as_ref().to_string());
+    heads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries
+        .remove(&key);
+}
+
+/// Drop every cached HEAD whose path starts with `prefix` (a namespace
+/// prefix), in every store instance.
+pub(crate) fn forget_create_only_heads_with_prefix(prefix: &str) {
+    let Some(heads) = CREATE_ONLY_HEADS.get() else {
+        return;
+    };
+    let mut heads = heads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let CreateOnlyHeads { entries, order } = &mut *heads;
+    entries.retain(|(_, path), _| !path.starts_with(prefix));
+    order.retain(|key| entries.contains_key(key));
+}
+
+/// Number of HEAD answers [`head_create_only`] currently retains.
+#[doc(hidden)]
+pub fn create_only_head_cache_len() -> usize {
+    CREATE_ONLY_HEADS.get().map_or(0, |heads| {
+        heads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .len()
+    })
 }
 
 /// Store instances (by [`store_instance_token`]) whose object paths are all

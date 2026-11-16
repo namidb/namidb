@@ -79,8 +79,8 @@ pub use format::{
     LEGACY_STORAGE_FORMAT_VERSION, STORAGE_FORMAT_VERSION,
 };
 pub use ingest::{
-    clear_shared_caches, prune_shared_caches, CommitOutcome, SessionCaches, StageMark, StagedValue,
-    WriterSession,
+    clear_shared_caches, prune_shared_caches, BackgroundFlush, BackgroundFlushInstall,
+    BuiltBackgroundFlush, CommitOutcome, SessionCaches, StageMark, StagedValue, WriterSession,
 };
 pub use janitor::{sweep_orphans, JanitorReport};
 pub use local::LocalFileObjectStore;
