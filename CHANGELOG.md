@@ -54,8 +54,9 @@ crates.io release will establish and document that API explicitly.
   its rows along one coordinate at a time and probed 4 leaf pages per query
   at the default `ef`. In high dimensions a single coordinate separates
   natural clusters poorly, so a query's true neighbours were spread over many
-  512-row leaves (recall@10 ~0.35 at 1024 dimensions). Bases are now split
-  along the principal direction of a bounded 256-row sample, and a query
+  512-row leaves (recall@10 ~0.35 at 1024 dimensions). Cosine and Euclidean
+  bases are now split along the principal direction of a bounded 256-row
+  sample (dot-product bases keep the per-coordinate split), and a query
   probes `max(ef / 4, 24)` pages, fetched concurrently: recall@10 ~0.99 on
   the same corpus. Bases written by earlier versions stay readable and pick
   up the better layout at their next rebuild.

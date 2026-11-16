@@ -1360,7 +1360,12 @@ fn partition_rows(
         .iter()
         .map(|index| rows[*index].vector.as_slice())
         .collect::<Vec<_>>();
-    let keyed = match principal_direction(&sample_rows, axis) {
+    // Dot-product scores also grow with a row's norm, which the centred
+    // principal direction ignores: dot-metric bases keep the axis split.
+    let direction = (metric != VectorMetric::Dot)
+        .then(|| principal_direction(&sample_rows, axis))
+        .flatten();
+    let keyed = match direction {
         Some(direction) => indices
             .into_iter()
             .map(|index| (dot_f32(&rows[index].vector, &direction), index))

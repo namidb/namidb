@@ -1089,7 +1089,13 @@ fn partition_multiway(
     // natural clusters poorly in high dimensions, spreading neighbours over
     // many leaves. The sample costs at most `DIRECTION_SAMPLE_ROWS * dim`
     // floats.
-    let direction = split_direction(partition, stats.split_axis, depth, dim, context)?;
+    // Dot-product scores also grow with a row's norm, which the centred
+    // principal direction ignores: dot-metric bases keep the axis split.
+    let direction = if context.desc.metric == VectorMetric::Dot {
+        None
+    } else {
+        split_direction(partition, stats.split_axis, depth, dim, context)?
+    };
     let split_value = |vector: &[f32]| match &direction {
         Some(direction) => super::dot_f32(vector, direction),
         None => vector[stats.split_axis],
