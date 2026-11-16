@@ -10615,6 +10615,7 @@ impl<'mt> Snapshot<'mt> {
     /// Probe the property pages for `rows` (in physical order) in one call
     /// and append their views to `out`. `false` when the pages disagree with
     /// the Parquet rows, so the caller falls back to Parquet.
+    #[allow(clippy::too_many_arguments)]
     async fn project_pending_rows(
         &self,
         reader: &NodePropertyPageReader,
