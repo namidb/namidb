@@ -543,6 +543,9 @@ namidb explain --verbose "MATCH (a:Person)-[:KNOWS]->(b) RETURN b LIMIT 20"
 # Consistent backup / restore of a namespace (copy between URIs).
 namidb backup  --from "s3://bucket?ns=prod"      --to "file:///snapshots/prod"
 namidb restore --from "file:///snapshots/prod"   --to "s3://bucket?ns=restored"
+
+# Storage format of a namespace; rewrite NamiDB 2.x SSTs into the current one.
+namidb migrate --store "file:///var/lib/namidb?ns=prod" --dry-run
 ```
 
 See [`crates/namidb-cli/README.md`](./crates/namidb-cli/README.md) for every subcommand.

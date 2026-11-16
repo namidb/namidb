@@ -62,6 +62,17 @@ namidb backup --from "s3://my-bucket/data?ns=prod&region=us-east-1" \
   --as-of 2026-11-03T09:30:00Z --verify
 ```
 
+Namespaces written by NamiDB 2.x keep their old node SST layout, with
+embeddings stored as JSON text, until something rewrites them. `migrate`
+reports the storage format and rewrites those SSTs, one verified SST per
+commit; rerun it to resume after an interruption
+([details](../../docs/architecture/storage-format.md)):
+
+```bash
+namidb migrate --store "file:///var/lib/namidb?ns=prod" --dry-run
+namidb migrate --store "file:///var/lib/namidb?ns=prod"
+```
+
 The full URI grammar (endpoint overrides for R2, MinIO and LocalStack,
 GCS service-account paths, Azure emulator mode) lives in the
 [project README](../../README.md#pick-your-storage-backend) and in

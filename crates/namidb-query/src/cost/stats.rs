@@ -789,6 +789,7 @@ mod tests {
             text_indexes: Vec::new(),
             search_index_builds: Vec::new(),
             search_lsm: Vec::new(),
+            storage_format: None,
         };
         let cat = StatsCatalog::from_manifest(&m);
         let p = cat.label("Person").expect("Person seeded");
@@ -835,6 +836,7 @@ mod tests {
             text_indexes: Vec::new(),
             search_index_builds: Vec::new(),
             search_lsm: Vec::new(),
+            storage_format: None,
         };
         let cat = StatsCatalog::from_manifest(&m);
         let p = cat.label("Person").unwrap();
@@ -892,6 +894,7 @@ mod tests {
             text_indexes: Vec::new(),
             search_index_builds: Vec::new(),
             search_lsm: Vec::new(),
+            storage_format: None,
         };
         let cat = StatsCatalog::from_manifest(&m);
         let k = cat.edge_type("KNOWS").unwrap();
@@ -927,6 +930,7 @@ mod tests {
             text_indexes: Vec::new(),
             search_index_builds: Vec::new(),
             search_lsm: Vec::new(),
+            storage_format: None,
         };
         let cat = StatsCatalog::from_manifest(&m);
         let u = cat.label("Unknown").unwrap();
@@ -957,6 +961,7 @@ mod tests {
             text_indexes: Vec::new(),
             search_index_builds: Vec::new(),
             search_lsm: Vec::new(),
+            storage_format: None,
         };
         let cat = StatsCatalog::from_manifest(&m);
         let names: Vec<_> = cat.label_names().collect();

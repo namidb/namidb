@@ -477,7 +477,29 @@ impl WriterSession {
         paths: NamespacePaths,
         caches: SessionCaches,
     ) -> Result<Self> {
-        Self::open_claiming(store, paths, caches, None).await
+        Self::open_claiming(
+            store,
+            paths,
+            caches,
+            None,
+            crate::format::FormatUpgrade::Allow,
+        )
+        .await
+    }
+
+    /// [`Self::open_with_caches`] that applies `upgrade` to a namespace in an
+    /// older storage format before claiming it (see [`crate::format`]). With
+    /// [`crate::format::FormatUpgrade::Refuse`], a namespace a NamiDB 2.x
+    /// reader can still read fails with
+    /// [`Error::StorageFormatUpgradeRequired`] and is left untouched: no
+    /// claim, no manifest commit.
+    pub async fn open_with_options(
+        store: Arc<dyn ObjectStore>,
+        paths: NamespacePaths,
+        caches: SessionCaches,
+        upgrade: crate::format::FormatUpgrade,
+    ) -> Result<Self> {
+        Self::open_claiming(store, paths, caches, None, upgrade).await
     }
 
     /// The open behind [`Self::open_with_caches`]; `yield_above` goes to
@@ -488,12 +510,14 @@ impl WriterSession {
         paths: NamespacePaths,
         caches: SessionCaches,
         yield_above: Option<crate::fence::Epoch>,
+        upgrade: crate::format::FormatUpgrade,
     ) -> Result<Self> {
         let manifest_store = ManifestStore::new(store.clone(), paths.clone());
-        let wal_store = WalStore::new(store.clone(), paths);
+        let wal_store = WalStore::new(store.clone(), paths.clone());
 
         let (current, fence) = match manifest_store.load_current().await {
-            Ok(_) => {
+            Ok(loaded) => {
+                crate::format::check_upgrade(&store, &paths, &loaded.manifest, upgrade).await?;
                 manifest_store
                     .claim_writer_unless_newer(yield_above)
                     .await?
@@ -1402,7 +1426,14 @@ impl WriterSession {
             adjacency_cache: self.adjacency_cache.clone(),
         };
         let dropped_batches = self.dropped_batches.saturating_add(1);
-        *self = Self::open_claiming(store, paths, caches, yield_above).await?;
+        *self = Self::open_claiming(
+            store,
+            paths,
+            caches,
+            yield_above,
+            crate::format::FormatUpgrade::Allow,
+        )
+        .await?;
         self.dropped_batches = dropped_batches;
         Ok(())
     }

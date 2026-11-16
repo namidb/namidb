@@ -49,6 +49,63 @@ class _SweepReport(TypedDict):
     aborted_by_pin: bool
 
 
+class _StorageFormatStamp(TypedDict):
+    version: int
+    min_reader_version: int
+    min_writer_version: int
+    written_by: str
+
+
+class _StorageFormatReport(TypedDict):
+    manifest_version: int
+    # The newest format this build reads; also the one it writes.
+    supported_version: int
+    # None when NamiDB 3.3.1 or older committed the current manifest.
+    stamp: Optional[_StorageFormatStamp]
+    # Oldest format that can read the data (0 for an empty namespace).
+    effective_version: int
+    node_ssts: int
+    legacy_node_ssts: int
+    legacy_node_rows: int
+    legacy_node_bytes: int
+    legacy_wal_segments: int
+    needs_migration: bool
+
+
+class _MigrationStep(TypedDict):
+    done: int
+    total: int
+    rows: int
+    source_bytes: int
+    output_bytes: int
+    level: int
+    elapsed_secs: float
+
+
+class _MigrationReport(TypedDict):
+    legacy_node_ssts: int
+    legacy_node_rows: int
+    legacy_node_bytes: int
+    dry_run: bool
+    migrated: int
+    # Listed SSTs a compaction merged away meanwhile (already current).
+    skipped: int
+    # SSTs still in the 2.x layout afterwards; call migrate() again.
+    remaining: int
+    steps: list[_MigrationStep]
+    manifest_version: int
+    seconds: float
+
+
+STORAGE_FORMAT_VERSION: int
+
+
+class StorageFormatError(RuntimeError):
+    """The namespace's storage format does not allow this access: it was
+    written by a newer NamiDB, or opening it for writing would upgrade
+    data NamiDB 2.x still reads (pass `upgrade=True` to allow that)."""
+
+
 class QueryTimeoutError(TimeoutError):
     """A Cypher query ran past its `timeout_ms`."""
 
@@ -139,6 +196,7 @@ class Client:
         spool_dir: Optional[str] = None,
         auto_sweep_min_age_secs: Optional[int] = 60,
         compaction_l0_trigger: int = 8,
+        upgrade: bool = False,
     ) -> None:
         """`spool_dir` holds compaction scratch files; it defaults to
         `NAMIDB_SPOOL_DIR`, then `<root>/.namidb-spool` for `file://`
@@ -151,7 +209,13 @@ class Client:
         once a bucket holds `compaction_l0_trigger` L0 SSTs (`0`
         disables). A `read_only` client never compacts or sweeps, so
         these three options do nothing there and no spool dir is
-        created."""
+        created.
+
+        Opening never rewrites existing data. A namespace written by a
+        newer NamiDB raises `StorageFormatError`. One written by NamiDB
+        2.x raises it too when opened for writing, unless `upgrade=True`:
+        what this client writes uses the current format, which 2.x
+        cannot read."""
 
     def refresh(self) -> bool:
         """Move a `read_only` client to the newest committed version.
@@ -230,6 +294,26 @@ class Client:
         `dry_run=True` nothing is deleted. The auto sweep after a
         compaction skips that pass's own young leftovers, so call this
         once more at the end of a bulk load."""
+
+    def storage_format(self) -> _StorageFormatReport:
+        """The namespace's storage format: the current manifest's stamp,
+        the format its data needs, and how many node SSTs are still in
+        the NamiDB 2.x layout (embeddings stored as JSON text)."""
+
+    def migrate(
+        self,
+        *,
+        progress: Optional[Any] = None,
+        dry_run: bool = False,
+    ) -> _MigrationReport:
+        """Rewrite every node SST still in the NamiDB 2.x layout into the
+        current one. Each SST keeps exactly its rows, is read back and
+        compared row by row, and is swapped in by its own commit, so an
+        interrupted run keeps what it finished and the next call resumes.
+        `progress(step)` is called after each SST. Queries, writes and
+        compactions keep running meanwhile; a compaction waits for at most
+        the one SST being rewritten. Raises `PermissionError` on a
+        `read_only` client."""
 
     # ── Bulk APIs (batched under one runtime + lock hop) ────────────
 

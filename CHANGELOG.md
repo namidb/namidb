@@ -15,6 +15,88 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Manifests record their storage format.** Every manifest version now
+  carries `storage_format`: the format its writer used (`version`), the
+  oldest format a reader needs (`min_reader_version`), the oldest format a
+  writer needs (`min_writer_version`), and the release that wrote it
+  (`written_by`). Format 1 is the NamiDB 2.x layout, format 2 the 3.x one.
+  A manifest that needs a newer reader is refused on load with "namespace
+  was written in storage format N by namidb X ...; upgrade NamiDB to open
+  it", by every reader, writer, backup and sweep, before anything is
+  claimed or deleted; one that needs a newer writer opens read-only only,
+  and stalled-commit repair neither publishes nor deletes a newer
+  release's interrupted commit.
+  Until now nothing marked the format, so a release could open, rewrite
+  and sweep data from a newer one. Manifests written by 3.3.1 and older
+  carry no stamp; for those the format is inferred from the node SST
+  footers and WAL headers. Releases up to 3.3.1 ignore the field, so they
+  still open what this release writes. See
+  `docs/architecture/storage-format.md`.
+- **`namidb migrate` and Python `Client.migrate()` rewrite NamiDB 2.x node
+  SSTs into the current layout.** A namespace compacted by 2.x keeps its
+  embeddings as JSON text inside the node SSTs until something rewrites
+  them, and a lone, fully compacted SST was never rewritten. The migration
+  rewrites each such SST with exactly the same rows at the same level, reads
+  the new SST back and compares it with the old one row by row, and swaps
+  it in with its own manifest commit. A crash, an error or Ctrl-C keeps
+  every SST it finished; running it again resumes with the rest. Reads,
+  writes and compactions keep running meanwhile: in Python a compaction,
+  including the one a `flush()` triggers, waits for at most the SST being
+  rewritten. `namidb migrate --dry-run` and
+  `Client.storage_format()` report the stamp and how many node SSTs, rows
+  and bytes are still in the 2.x layout; `migrate(progress=...)` reports
+  each SST. On a store of 20,000 `:Doc` nodes with 384-float embeddings
+  written and compacted by 2.6.19, the migration took 7.3 s, shrank the
+  node SST from 37.1 MB to 28.6 MB, and cut the CPU time of
+  `MATCH (d:Doc) WHERE d.kind = 'call' RETURN d` (2,858 whole nodes) from
+  1.81 s to 1.15 s (median of 7); projections that leave the embedding
+  out did not change.
+- **Server: a namespace in a newer storage format answers 409.** In
+  multi-tenant mode, `/{ns}/v0/cypher`, `/health` and the admin routes
+  answer `409` with `code: "unsupported_storage_format"` and the release
+  that wrote it, instead of a retryable `503`, and leave the namespace
+  untouched; the other namespaces keep serving. 3.3.1 opened such a
+  namespace, claimed it and dropped the newer release's fields from the
+  manifest. `GET /v0/version` now reports `storage_format`, the newest
+  format the server reads.
+- `CompactionBasis::legacy_node_ssts`,
+  `CompactionBasis::prepare_node_layout_migration`,
+  `WriterSession::open_with_options` with `FormatUpgrade`, and
+  `inspect_storage_format` in `namidb-storage`.
+
+- **`namidb-bench serve` and `namidb-bench http-load`** (feature `http-load`):
+  the real HTTP server on a store with simulated object-store latency (default
+  20-40 ms per request, with request counters per operation), and a client
+  that replays a field workload (`field-report`), measures sustained document
+  and vector loads (`bulk`, `vectors`), and measures vector search recall@k
+  and p50/p95 latency against brute-force ground truth on synthetic clustered
+  vectors (`vector-search`). Run `serve` in a memory-limited cgroup to measure
+  a container size.
+
+- `namidb-bench graph-shape-generate` writes a deterministic hub-shaped graph
+  (2.4M nodes by default: four `:Device` hubs, the largest holding 1.7M
+  `ON_DEVICE` edges, 2,958 `:Call` nodes, 64-float embeddings) straight into a
+  namespace, or as NDJSON that `bench/load_ndjson.py` loads through any
+  released Python package, to compare layouts written by older releases.
+  `namidb-bench graph-shape-query` times a read query against it and reports
+  the plan, rows, run times and peak RSS. See `bench/README.md`.
+
+### Changed
+
+- **Python: opening a NamiDB 2.x namespace for writing needs
+  `upgrade=True`.** `Client(uri)` claimed the namespace and wrote whatever
+  came next in the 3.x format, after which 2.x could no longer read any of
+  it ("node SST schema does not match the declared node schema"), with no
+  warning. It now raises the new `namidb.StorageFormatError` before
+  touching anything when the namespace's data can still be read by 2.x.
+  Open it with `read_only=True` to read it as it is, or take a backup and
+  pass `upgrade=True` once; the stamp that open writes records the upgrade,
+  so later opens need no flag. Namespaces already written by 3.x open as
+  before. The server, the CLI and the Rust `WriterSession::open` keep
+  opening such namespaces, as before.
+
 ### Changed — write throughput on remote object stores
 
 - **A write no longer re-reads the size of every SST sidecar it touches
@@ -167,25 +249,6 @@ crates.io release will establish and document that API explicitly.
   edge type's average degree from the bound side is no larger than the
   label's node count; an id seek or index lookup on the far end, and a
   literal property filter folded into its scan, keep the plan as before.
-
-### Added
-
-- **`namidb-bench serve` and `namidb-bench http-load`** (feature `http-load`):
-  the real HTTP server on a store with simulated object-store latency (default
-  20-40 ms per request, with request counters per operation), and a client
-  that replays a field workload (`field-report`), measures sustained document
-  and vector loads (`bulk`, `vectors`), and measures vector search recall@k
-  and p50/p95 latency against brute-force ground truth on synthetic clustered
-  vectors (`vector-search`). Run `serve` in a memory-limited cgroup to measure
-  a container size.
-
-- `namidb-bench graph-shape-generate` writes a deterministic hub-shaped graph
-  (2.4M nodes by default: four `:Device` hubs, the largest holding 1.7M
-  `ON_DEVICE` edges, 2,958 `:Call` nodes, 64-float embeddings) straight into a
-  namespace, or as NDJSON that `bench/load_ndjson.py` loads through any
-  released Python package, to compare layouts written by older releases.
-  `namidb-bench graph-shape-query` times a read query against it and reports
-  the plan, rows, run times and peak RSS. See `bench/README.md`.
 
 ## [3.3.2] - 2026-11-15
 

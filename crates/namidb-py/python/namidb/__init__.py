@@ -15,6 +15,8 @@ from ._lib import (
     QueryResult,
     QueryRowCapError,
     QueryTimeoutError,
+    STORAGE_FORMAT_VERSION,
+    StorageFormatError,
     __version__,
 )
 
@@ -25,5 +27,7 @@ __all__ = [
     "QueryResult",
     "QueryRowCapError",
     "QueryTimeoutError",
+    "STORAGE_FORMAT_VERSION",
+    "StorageFormatError",
     "__version__",
 ]

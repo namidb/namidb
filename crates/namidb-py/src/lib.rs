@@ -30,6 +30,8 @@ use namidb_query::{
     show_constraints_rows, show_indexes_rows, show_schema_columns, ExecError, LowerError, Params,
     ParseError, Query, Row, RuntimeValue, StatsCatalog,
 };
+mod format;
+
 use namidb_storage::{
     sweep_orphans, CommitOutcome, EdgeListView, EdgeScanCursor, EdgeView, EdgeWriteRecord,
     JanitorReport, ManifestStore, NodeScanCursor, NodeView, NodeWriteRecord, OwnedSnapshot,
@@ -288,8 +290,16 @@ impl Client {
     /// compacts once a bucket reaches `compaction_l0_trigger` L0 SSTs (`0`
     /// disables). A `read_only` client never compacts or sweeps, so these
     /// options do nothing there and no spool dir is created.
+    ///
+    /// Opening never rewrites existing data. A namespace written by NamiDB
+    /// 2.x, which that release can still read, raises `StorageFormatError`
+    /// unless `upgrade=True`: anything this client writes uses the current
+    /// storage format, which 2.x cannot read. `migrate()` rewrites the old
+    /// SSTs. A namespace written by a newer NamiDB than this one raises
+    /// `StorageFormatError` whatever the flags.
     #[new]
-    #[pyo3(signature = (uri, cache_bytes=None, *, read_only=false, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8))]
+    #[pyo3(signature = (uri, cache_bytes=None, *, read_only=false, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8, upgrade=false))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         uri: &str,
@@ -298,6 +308,7 @@ impl Client {
         spool_dir: Option<String>,
         auto_sweep_min_age_secs: Option<u64>,
         compaction_l0_trigger: usize,
+        upgrade: bool,
     ) -> PyResult<Self> {
         let (store, paths) = parse_uri(uri)?;
         if !read_only {
@@ -319,7 +330,17 @@ impl Client {
                         tokio::spawn(renew_reader_pins(Arc::downgrade(&reader)));
                         Session::Reader(reader)
                     } else {
-                        let writer = WriterSession::open(store.clone(), paths.clone()).await?;
+                        let writer = WriterSession::open_with_options(
+                            store.clone(),
+                            paths.clone(),
+                            namidb_storage::SessionCaches::shared(),
+                            if upgrade {
+                                namidb_storage::FormatUpgrade::Allow
+                            } else {
+                                namidb_storage::FormatUpgrade::Refuse
+                            },
+                        )
+                        .await?;
                         Session::Writer(Arc::new(Writer::new(writer)))
                     })
                 })
@@ -664,6 +685,74 @@ impl Client {
         // A pin lease that landed mid-sweep deletes nothing; run it again.
         d.set_item("aborted_by_pin", report.aborted_by_pin)?;
         Ok(d.into())
+    }
+
+    /// The namespace's storage format: the stamp of the current manifest
+    /// (`None` when NamiDB 3.3.1 or older committed it), the format the data
+    /// needs (`effective_version`), and how many node SSTs are still in the
+    /// NamiDB 2.x layout. Reads each node SST's footer.
+    fn storage_format(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let inspection = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let snapshot = self.session.snapshot(None).await?;
+                format::inspect(
+                    self.store.clone(),
+                    self.paths.clone(),
+                    snapshot.manifest().manifest.clone(),
+                )
+                .await
+                .map_err(map_storage_err)
+            })
+        })?;
+        format::inspection_to_py(py, &inspection)
+    }
+
+    /// Rewrite every node SST still in the NamiDB 2.x layout (embeddings
+    /// inside the overflow JSON) into the current layout. Each SST is
+    /// rewritten with exactly the same rows, read back and compared row by
+    /// row, then swapped in by its own manifest commit, so an interrupted
+    /// run (an exception, Ctrl-C, a crash) keeps what it finished and the
+    /// next call resumes with what is left. Reads, writes and compactions
+    /// keep running meanwhile; a compaction waits for at most the one SST
+    /// being rewritten. `progress` is called with a dict after each SST. With
+    /// `dry_run=True` it only reports what it would rewrite. The replaced
+    /// SSTs are left for the sweep (the automatic one when
+    /// `auto_sweep_min_age_secs` is set, else `sweep()`).
+    #[pyo3(signature = (*, progress=None, dry_run=false))]
+    fn migrate(
+        &self,
+        py: Python<'_>,
+        progress: Option<Bound<'_, PyAny>>,
+        dry_run: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let writer = self.session.writer()?;
+        let report = format::migrate(
+            py,
+            &self.runtime,
+            writer,
+            &self.compaction_lock,
+            progress.as_ref(),
+            dry_run,
+        )?;
+        if let Some((manifest_store, min_age)) = self.auto_sweep() {
+            let migrated: usize = report
+                .bind(py)
+                .get_item("migrated")?
+                .map_or(Ok(0), |v| v.extract())?;
+            if migrated > 0 {
+                let _compaction_guard =
+                    py.allow_threads(|| self.runtime.block_on(self.compaction_lock.lock()));
+                py.allow_threads(|| {
+                    self.runtime.block_on(async {
+                        let guard = writer.lock().await;
+                        // The migration is installed; a failed sweep only
+                        // leaves the old SSTs for the next one.
+                        let _ = sweep_locked(&guard, &manifest_store, min_age, true).await;
+                    })
+                });
+            }
+        }
+        Ok(report)
     }
 
     /// Look up a single node by `(label, id)`.
@@ -2286,6 +2375,9 @@ fn row_to_py_dict<'py>(
 // ── Error mapping ─────────────────────────────────────────────────────
 
 fn map_storage_err(e: namidb_storage::Error) -> PyErr {
+    if let Some(err) = format::map_format_err(&e) {
+        return err;
+    }
     PyRuntimeError::new_err(format!("namidb storage error: {e}"))
 }
 
@@ -2442,6 +2534,14 @@ fn _lib(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         py.get_type_bound::<QueryTimeoutError>(),
     )?;
     m.add("QueryRowCapError", py.get_type_bound::<QueryRowCapError>())?;
+    m.add(
+        "StorageFormatError",
+        py.get_type_bound::<format::StorageFormatError>(),
+    )?;
+    m.add(
+        "STORAGE_FORMAT_VERSION",
+        namidb_storage::STORAGE_FORMAT_VERSION,
+    )?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
