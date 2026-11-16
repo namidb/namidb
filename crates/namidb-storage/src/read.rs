@@ -10488,7 +10488,16 @@ impl<'mt> Snapshot<'mt> {
 
         let dict = &self.manifest.manifest.label_dict;
         let label_id = label.and_then(|label| dict.id(label));
-        let probe_rows = PROJECTED_PROBE_ROWS.min(reader.max_query_rows()).max(1);
+        let mut retained = crate::cancel::RetainMeter::new();
+        // A probe's rows are decoded before they can be charged, so under a
+        // query memory budget one probe holds at most a storage batch's worth.
+        let probe_rows = if retained.active() {
+            PROJECTED_PROBE_ROWS_METERED
+        } else {
+            PROJECTED_PROBE_ROWS
+        }
+        .min(reader.max_query_rows())
+        .max(1);
         let mut candidates = Vec::with_capacity(
             usize::try_from(desc.row_count)
                 .unwrap_or(usize::MAX)
@@ -10496,7 +10505,6 @@ impl<'mt> Snapshot<'mt> {
         );
         let mut pending: Vec<PendingProjectedRow> = Vec::new();
         let mut next_ordinal = 0_u64;
-        let mut retained = crate::cancel::RetainMeter::new();
         while let Some(batches) = stream.next_row_group().await? {
             for batch in batches {
                 let batch = batch.map_err(|error| {
@@ -10795,6 +10803,11 @@ type ProjectedNodeCandidate = (NodeId, u64, Option<NodeView>);
 /// time. Large enough that a small label spread over a large SST probes each
 /// page once, small enough to bound the buffered rows.
 const PROJECTED_PROBE_ROWS: usize = 65_536;
+
+/// [`PROJECTED_PROBE_ROWS`] while a query memory budget is in scope: the
+/// probed rows are decoded before they can be charged, so a wide projection
+/// over a large label must not decode 65,536 rows past the budget.
+const PROJECTED_PROBE_ROWS_METERED: usize = 8_192;
 
 /// A live row of a projected structural scan whose properties are still to
 /// be read from the property pages.

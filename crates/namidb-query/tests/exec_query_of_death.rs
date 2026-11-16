@@ -181,7 +181,7 @@ async fn queries_of_death_stop_at_the_budget_with_bounded_heap() {
         // SST in full; the label one goes through the label postings).
         "MATCH (n) RETURN n",
         "MATCH (n:Item) RETURN n",
-        "MATCH (n) WHERE n:Item RETURN count(n)",
+        "MATCH (n) WHERE n:Item RETURN n",
         // Cartesian product.
         "MATCH (a:Item), (b:Item) RETURN a.k, b.k",
         // Unbounded variable-length paths over a dense chain.
@@ -230,4 +230,13 @@ async fn queries_of_death_stop_at_the_budget_with_bounded_heap() {
     assert_eq!(fits.result.unwrap(), 100);
     let count = run(&writer, "MATCH (n:Item) RETURN count(n) AS c").await;
     assert_eq!(count.result.unwrap(), 1);
+    // A label in WHERE plans the same label scan as the pattern form, so its
+    // count no longer materialises every node either.
+    let count = run(&writer, "MATCH (n) WHERE n:Item RETURN count(n) AS c").await;
+    assert_eq!(count.result.unwrap(), 1);
+    assert!(
+        count.heap_growth <= BUDGET + HEAP_SLACK,
+        "{:?}",
+        count.heap_growth
+    );
 }
