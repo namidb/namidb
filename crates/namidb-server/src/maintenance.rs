@@ -18,7 +18,7 @@ use std::time::Instant;
 use namidb_storage::{CompactionOutcome, SnapshotCell, WriterSession};
 use tokio::sync::{watch, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::metrics::{
     CompactionPhase, CompactionStatus, CompactionTrigger, Metrics, WriterLockKind,
@@ -533,6 +533,77 @@ async fn run_compaction_pass(
     metrics: &Metrics,
     cancel: Option<&watch::Receiver<bool>>,
 ) -> namidb_storage::Result<CompactionPass> {
+    // Search segments first, in passes of their own: every flush that touches
+    // an indexed label adds one, and neither a Nodes merge (which reads and
+    // rewrites the corpus) nor a vector base rebuild may hold back the cheap
+    // delta consolidations that keep each index below its segment ceiling.
+    // Each pass installs on its own, so a slow later pass never delays an
+    // earlier one's result.
+    let mut applied = None;
+    for scope in [PassScope::SearchDeltas, PassScope::SearchOnly] {
+        match run_scoped_pass(
+            scope,
+            trigger,
+            writer,
+            snapshot,
+            writer_health,
+            namespace,
+            metrics,
+            cancel,
+        )
+        .await
+        {
+            Ok(CompactionPass::Cancelled) => return Ok(CompactionPass::Cancelled),
+            Ok(pass @ CompactionPass::Applied { .. }) => applied = Some(pass),
+            Ok(CompactionPass::Noop) => {}
+            Err(error) => {
+                // The next pass plans the remaining search work again; a
+                // persistent failure is reported by the periodic passes.
+                warn!(namespace, ?trigger, ?scope, %error, "search compaction pass failed");
+            }
+        }
+    }
+    let full = run_scoped_pass(
+        PassScope::WithoutSearch,
+        trigger,
+        writer,
+        snapshot,
+        writer_health,
+        namespace,
+        metrics,
+        cancel,
+    )
+    .await?;
+    match (applied, full) {
+        (Some(applied), CompactionPass::Noop) => Ok(applied),
+        (_, full) => Ok(full),
+    }
+}
+
+/// Which part of the namespace one pass consolidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassScope {
+    /// Search-LSM delta runs only (`CompactionBasis::prepare_search_deltas`).
+    SearchDeltas,
+    /// Every due Search-LSM consolidation, base rebuilds included
+    /// (`CompactionBasis::prepare_search_only`).
+    SearchOnly,
+    /// Nodes and edges (`CompactionBasis::prepare_without_search`); the
+    /// search passes above already ran.
+    WithoutSearch,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_scoped_pass(
+    scope: PassScope,
+    trigger: CompactionTrigger,
+    writer: &Mutex<WriterSession>,
+    snapshot: &SnapshotCell,
+    writer_health: &WriterHealth,
+    namespace: &str,
+    metrics: &Metrics,
+    cancel: Option<&watch::Receiver<bool>>,
+) -> namidb_storage::Result<CompactionPass> {
     let basis = {
         let wait_started = Instant::now();
         let writer = writer.lock().await;
@@ -549,7 +620,15 @@ async fn run_compaction_pass(
     };
 
     let l0_before = basis.max_l0_bucket_len();
-    if !basis.needs_compaction() {
+    let due = match scope {
+        PassScope::SearchDeltas | PassScope::SearchOnly => basis.search_compaction_due(),
+        PassScope::WithoutSearch => basis.needs_compaction(),
+    };
+    if !due {
+        if scope != PassScope::WithoutSearch {
+            // Not a pass of its own for the metrics: the full pass follows.
+            return Ok(CompactionPass::Noop);
+        }
         metrics.observe_compaction_result(
             trigger,
             CompactionStatus::Noop,
@@ -566,7 +645,12 @@ async fn run_compaction_pass(
     // I/O without monopolising a reactor thread.
     let schema = basis.schema().clone();
     let prepare_started = Instant::now();
-    let prepared = match basis.prepare(&schema).await {
+    let prepared = match scope {
+        PassScope::SearchDeltas => basis.prepare_search_deltas(&schema).await,
+        PassScope::SearchOnly => basis.prepare_search_only(&schema).await,
+        PassScope::WithoutSearch => basis.prepare_without_search(&schema).await,
+    };
+    let prepared = match prepared {
         Ok(prepared) => {
             metrics.observe_compaction_phase(
                 trigger,

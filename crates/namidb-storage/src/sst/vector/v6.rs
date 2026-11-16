@@ -771,6 +771,19 @@ impl VectorV6Reader {
         }
         let workspace_bytes =
             estimate_vector_search_workspace(&self.footer.pages, &self.footer.filters, groups, k)?;
+        // Pages are independent range reads. Fetch a wave of them at once
+        // (one round trip per wave instead of one per page) while a quarter of
+        // the shared workspace still holds the extra in-flight pages.
+        let page_peak = vector_page_peak_bytes(&self.footer.pages);
+        let wave_budget = shared_search_workspace().capacity_bytes() / 4;
+        let scan_wave = (1..=MAX_EXACT_SCAN_WAVE_PAGES)
+            .rev()
+            .find(|wave| {
+                workspace_bytes.saturating_add(page_peak.saturating_mul(wave - 1)) <= wave_budget
+            })
+            .unwrap_or(1);
+        let workspace_bytes =
+            workspace_bytes.saturating_add(page_peak.saturating_mul(scan_wave - 1));
         let _workspace = shared_search_workspace()
             .reserve("vector v6 exact search", workspace_bytes)
             .await?;
@@ -787,38 +800,51 @@ impl VectorV6Reader {
                 .saturating_mul(std::mem::size_of::<RankedHit>()),
         );
 
-        for page in &self.footer.pages {
-            let compressed = self.source.read_range(page.wire.range()?).await?;
-            let raw = decode_block(&compressed, &page.wire, "vector page")?;
-            let rows = decode_vector_page(&raw, page, self.footer.dim)?;
-            peak_live_bytes = peak_live_bytes.max(
-                mask_bytes
-                    .saturating_add(vector_rows_resident_bytes(&rows))
-                    .saturating_add(
-                        heap.capacity()
-                            .saturating_mul(std::mem::size_of::<RankedHit>()),
-                    ),
-            );
-            for row in rows {
-                if allowed
-                    .as_ref()
-                    .is_some_and(|mask| !mask.contains(row.ordinal))
-                {
-                    continue;
-                }
-                eligible_rows_seen = eligible_rows_seen.saturating_add(1);
-                let score = metric_score(self.footer.metric, &row.vector, query);
-                heap.push(RankedHit {
-                    hit: VectorV6Hit {
-                        node_id: row.node_id,
-                        lsn: row.lsn,
-                        payload_fingerprint: row.payload_fingerprint,
-                        score,
-                    },
-                    higher_is_better,
-                });
-                if heap.len() > k {
-                    heap.pop();
+        for wave in self.footer.pages.chunks(scan_wave) {
+            crate::cancel::check()?;
+            let ranges = wave
+                .iter()
+                .map(|page| page.wire.range())
+                .collect::<Result<Vec<_>>>()?;
+            let wires = self.source.read_ranges(&ranges).await?;
+            if wires.len() != wave.len() {
+                return Err(Error::invariant(
+                    "vector v6 range source returned the wrong page count",
+                ));
+            }
+            for (page, compressed) in wave.iter().zip(wires) {
+                let raw = decode_block(&compressed, &page.wire, "vector page")?;
+                drop(compressed);
+                let rows = decode_vector_page(&raw, page, self.footer.dim)?;
+                peak_live_bytes = peak_live_bytes.max(
+                    mask_bytes
+                        .saturating_add(vector_rows_resident_bytes(&rows))
+                        .saturating_add(
+                            heap.capacity()
+                                .saturating_mul(std::mem::size_of::<RankedHit>()),
+                        ),
+                );
+                for row in rows {
+                    if allowed
+                        .as_ref()
+                        .is_some_and(|mask| !mask.contains(row.ordinal))
+                    {
+                        continue;
+                    }
+                    eligible_rows_seen = eligible_rows_seen.saturating_add(1);
+                    let score = metric_score(self.footer.metric, &row.vector, query);
+                    heap.push(RankedHit {
+                        hit: VectorV6Hit {
+                            node_id: row.node_id,
+                            lsn: row.lsn,
+                            payload_fingerprint: row.payload_fingerprint,
+                            score,
+                        },
+                        higher_is_better,
+                    });
+                    if heap.len() > k {
+                        heap.pop();
+                    }
                 }
             }
         }
@@ -1800,6 +1826,20 @@ fn vector_rows_resident_bytes(rows: &[VectorPageRow]) -> usize {
                 })
                 .sum::<usize>(),
         )
+}
+
+/// Pages one exact scan fetches concurrently at most.
+const MAX_EXACT_SCAN_WAVE_PAGES: usize = 8;
+
+/// Workspace of one in-flight page beyond the first: its compressed wire and
+/// decoded body (the decoded rows of one page at a time are already in the
+/// base estimate).
+fn vector_page_peak_bytes(pages: &[VectorPageRef]) -> usize {
+    pages
+        .iter()
+        .map(|page| (page.wire.len as usize).saturating_add(page.wire.raw_len as usize))
+        .max()
+        .unwrap_or(0)
 }
 
 fn estimate_vector_search_workspace(

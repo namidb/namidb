@@ -52,8 +52,7 @@ use crate::manifest::TextIndexDescriptor;
 use crate::manifest::VectorIndexDescriptor;
 #[cfg(feature = "text-index")]
 use crate::sst::text::v4::{
-    text_v4_payload_fingerprint, TextV4BuildContext, TextV4ExternalBuildConfig,
-    TextV4ExternalBuilder, TextV4Mutation, TextV4Payload,
+    TextV4BuildContext, TextV4ExternalBuildConfig, TextV4ExternalBuilder, TextV4Payload,
 };
 #[cfg(feature = "vector-index")]
 use crate::sst::vector::v6::{
@@ -63,7 +62,7 @@ use crate::sst::vector::v6::{
 
 const SEARCH_LSM_MAX_SEGMENTS_ENV: &str = "NAMIDB_SEARCH_LSM_MAX_SEGMENTS";
 const INDEX_BUILD_MEMORY_ENV: &str = "NAMIDB_INDEX_BUILD_MEMORY_BYTES";
-const DEFAULT_SEARCH_LSM_MAX_SEGMENTS: usize = 8;
+const DEFAULT_SEARCH_LSM_MAX_SEGMENTS: usize = crate::compact::DEFAULT_SEARCH_LSM_MAX_SEGMENTS;
 const MIN_SEARCH_LSM_SEGMENTS: usize = 2;
 const DEFAULT_INDEX_BUILD_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 const CLASSIFIER_VERSION: u16 = 1;
@@ -102,6 +101,151 @@ impl SearchFlushManifestUpdate {
     pub(crate) fn descriptor_count(&self) -> usize {
         self.descriptors.len()
     }
+
+    /// Re-target this flush's search work from `base` (the manifest it was
+    /// built against) onto `current`, when everything that committed in
+    /// between only consolidated segments of the same generations.
+    ///
+    /// The flush appended, per generation, one event range (`base`'s
+    /// `next_event_seq`), at most one segment or proven-empty range, one
+    /// coverage entry for its Nodes SST, and a fresh compatibility barrier. A
+    /// compaction replaces a prefix or tail of the segments and rewrites
+    /// coverage, but never allocates events, so the same appendix is valid on
+    /// top of the compacted state: only the barrier, which binds the whole
+    /// state, is rebuilt. Returns the rebased update and the barrier objects
+    /// that must be uploaded before the manifest that names them; `None` when
+    /// the generations moved in any other way (another flush, a rebuild, DDL),
+    /// in which case the flush must be redone.
+    pub(crate) fn rebase(
+        &self,
+        base: &Manifest,
+        current: &Manifest,
+        paths: &crate::paths::NamespacePaths,
+    ) -> Result<Option<(Self, Vec<SearchFlushUpload>)>> {
+        let mut rebased = SearchFlushManifestUpdate::default();
+        let mut uploads = Vec::new();
+        // Every flushed state retired its base barrier, and nothing else.
+        let mut expected_retired = HashSet::new();
+        let mut flushed_barriers = HashSet::new();
+        for flushed in &self.states {
+            let find = |manifest: &Manifest| {
+                let mut matches = manifest.search_lsm.iter().filter(|state| {
+                    state.kind == flushed.kind && state.index_name == flushed.index_name
+                });
+                match (matches.next(), matches.next()) {
+                    (Some(state), None) => Some(state.clone()),
+                    _ => None,
+                }
+            };
+            let (Some(before), Some(now)) = (find(base), find(current)) else {
+                return Ok(None);
+            };
+            let same_generation = |state: &SearchLsmState| {
+                state.generation_id == flushed.generation_id
+                    && state.catalog_signature == flushed.catalog_signature
+                    && state.status == flushed.status
+                    && state.next_event_seq == before.next_event_seq
+            };
+            if !same_generation(&before) || !same_generation(&now) {
+                return Ok(None);
+            }
+            let appended = |old: usize, new: usize, max: usize| new >= old && new - old <= max;
+            if flushed.next_event_seq != before.next_event_seq.saturating_add(1)
+                || flushed.base_frontier != before.base_frontier
+                || !appended(before.segments.len(), flushed.segments.len(), 1)
+                || flushed.segments[..before.segments.len()] != before.segments[..]
+                || !appended(before.coverage.len(), flushed.coverage.len(), 1)
+                || flushed.coverage[..before.coverage.len()] != before.coverage[..]
+                || !appended(
+                    before.proven_empty_event_ranges.len(),
+                    flushed.proven_empty_event_ranges.len(),
+                    1,
+                )
+                || flushed.proven_empty_event_ranges[..before.proven_empty_event_ranges.len()]
+                    != before.proven_empty_event_ranges[..]
+            {
+                return Ok(None);
+            }
+            if let Some(barrier) = before.compat_barrier_sst_id {
+                expected_retired.insert(barrier);
+            }
+            if let Some(barrier) = flushed.compat_barrier_sst_id {
+                flushed_barriers.insert(barrier);
+            }
+
+            let mut state = now.clone();
+            state.next_event_seq = flushed.next_event_seq;
+            state
+                .segments
+                .extend(flushed.segments[before.segments.len()..].iter().cloned());
+            state
+                .coverage
+                .extend(flushed.coverage[before.coverage.len()..].iter().cloned());
+            state.proven_empty_event_ranges.extend(
+                flushed.proven_empty_event_ranges[before.proven_empty_event_ranges.len()..]
+                    .iter()
+                    .copied(),
+            );
+            if let Some(old_barrier) = state.compat_barrier_sst_id {
+                rebased.retired_descriptor_ids.insert(old_barrier);
+            }
+            let barrier_id = Uuid::now_v7();
+            state.compat_barrier_sst_id = Some(barrier_id);
+            let body = encode_search_barrier(&state).map_err(|error| {
+                Error::invariant(format!("search barrier encode failed: {error}"))
+            })?;
+            let file_name = format!(
+                "{}-{}-{}.slb",
+                barrier_id.simple(),
+                state.kind.sst_kind().path_tag(),
+                state.index_name
+            );
+            uploads.push(SearchFlushUpload {
+                path: paths.sst_object(SstLevel::L0.as_u32(), &file_name),
+                body: SidecarPayload::InMemory(body.clone().into()),
+            });
+            rebased.descriptors.push(search_barrier_descriptor(
+                &state,
+                barrier_id,
+                SstLevel::L0,
+                relative_sst_path(SstLevel::L0.as_u32(), &file_name),
+                body.len() as u64,
+            ));
+            rebased.states.push(state);
+        }
+        if self.retired_descriptor_ids != expected_retired {
+            // The flush also retired a stale generation: not an append.
+            return Ok(None);
+        }
+        // Keep the flush's data segments; its barriers bound the old states.
+        for descriptor in &self.descriptors {
+            if flushed_barriers.contains(&descriptor.id) {
+                continue;
+            }
+            rebased.descriptors.push(descriptor.clone());
+        }
+        Ok(Some((rebased, uploads)))
+    }
+}
+
+/// Upload rebased barrier objects (small, in memory) before the manifest CAS
+/// that references them.
+pub(crate) async fn upload_rebased_barriers(
+    store: &Arc<dyn ObjectStore>,
+    uploads: Vec<SearchFlushUpload>,
+) -> Result<()> {
+    let puts = uploads.into_iter().map(|upload| {
+        let store = store.clone();
+        async move {
+            let SidecarPayload::InMemory(body) = upload.body else {
+                return Err(Error::invariant("rebased search barrier is not in memory"));
+            };
+            store.put(&upload.path, body).await?;
+            Ok(())
+        }
+    });
+    futures::future::try_join_all(puts).await?;
+    Ok(())
 }
 
 /// Complete local work product. Consuming it cannot perform external I/O.
@@ -175,12 +319,27 @@ fn parse_segment_cap(value: &str) -> Result<usize> {
 
 /// Prepare search deltas and their exact manifest coverage for one new Nodes
 /// SST. No object is uploaded by this function.
+/// How many active segments a flush may leave behind in one generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchSegmentLimit {
+    /// `NAMIDB_SEARCH_LSM_MAX_SEGMENTS`. A caller that can compact inline
+    /// ([`crate::WriterSession::flush`]) uses this and never exceeds it.
+    Configured,
+    /// Past the configured ceiling, up to [`MAX_ACTIVE_SEARCH_SEGMENTS`] (the
+    /// most any reader, 3.3.x included, accepts). For flushes that run off the
+    /// writer lock and cannot compact first: the flush still succeeds while a
+    /// prioritised compaction catches up, and only the protocol ceiling can
+    /// delay it.
+    ProtocolCeiling,
+}
+
 pub(crate) async fn prepare_search_flush(
     manifest_store: &ManifestStore,
     base: &LoadedManifest,
     final_schema: &Schema,
     node_sst: &SstDescriptor,
     node_rows: &[NodeRow],
+    limit: SearchSegmentLimit,
 ) -> Result<SearchFlushPlan> {
     if node_sst.kind != SstKind::Nodes || node_rows.is_empty() {
         return Err(Error::invariant(
@@ -215,7 +374,11 @@ pub(crate) async fn prepare_search_flush(
     if index_count == 0 {
         return Ok(SearchFlushPlan::default());
     }
-    let config = SearchFlushConfig::from_env()?;
+    let mut config = SearchFlushConfig::from_env()?;
+    let configured_segments = config.max_segments;
+    if limit == SearchSegmentLimit::ProtocolCeiling {
+        config.max_segments = MAX_ACTIVE_SEARCH_SEGMENTS.max(config.max_segments);
+    }
     let build_pool = config.build_memory_bytes / 2;
     let per_index_memory = build_pool / index_count;
     if per_index_memory < MIN_PER_INDEX_BUILD_MEMORY_BYTES {
@@ -299,6 +462,7 @@ pub(crate) async fn prepare_search_flush(
             filters,
             builder,
             digest: classifier_hasher(SearchLsmKind::Vector),
+            changed: false,
         }));
     }
 
@@ -338,8 +502,37 @@ pub(crate) async fn prepare_search_flush(
             builder,
             digest: classifier_hasher(SearchLsmKind::Text),
             live_total_len: 0,
+            changed: false,
         }));
     }
+
+    // An index already at the flush ceiling refuses any flush that changes
+    // it. Decide that from the frozen rows alone, before a single before-image
+    // lookup or posting is built: the caller compacts and retries, and work
+    // done here would be thrown away. Tombstones may remove an indexed row
+    // whose label only the before-image shows, so they count as touching.
+    let capped = works
+        .iter()
+        .map(IndexWork::segment_room)
+        .filter(|(state, _)| state.segments.len() >= config.max_segments)
+        .collect::<Vec<_>>();
+    if !capped.is_empty() {
+        for row in node_rows {
+            let touched = match &row.op {
+                MemOp::Tombstone => capped.first(),
+                MemOp::Upsert(payload) => {
+                    let record = NodeWriteRecord::decode(payload)?;
+                    capped.iter().find(|(_, label)| {
+                        label.is_some_and(|label| record.labels.contains(&label))
+                    })
+                }
+            };
+            if let Some((state, _)) = touched {
+                ensure_segment_room(state, config.max_segments)?;
+            }
+        }
+    }
+    drop(capped);
 
     // One pinned persisted before-image source is shared by every index.
     // Chunks bound decoded NodeViews and after-image records independently of
@@ -367,15 +560,26 @@ pub(crate) async fn prepare_search_flush(
             .collect::<Vec<_>>();
         works = crate::flush::run_flush_build(move || {
             let mut works = works;
-            for (node_id, lsn, op, before) in chunk {
-                let after = match op {
-                    MemOp::Tombstone => None,
-                    MemOp::Upsert(payload) => Some(NodeWriteRecord::decode(&payload)?),
-                };
-                for work in &mut works {
-                    work.observe(node_id, lsn, before.as_ref(), after.as_ref())?;
+            let rows = chunk
+                .into_iter()
+                .map(|(node_id, lsn, op, before)| {
+                    let after = match op {
+                        MemOp::Tombstone => None,
+                        MemOp::Upsert(payload) => Some(NodeWriteRecord::decode(&payload)?),
+                    };
+                    Ok((node_id, lsn, after, before))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Each index has its own builder and memory budget: feed them on
+            // their own threads. A text-heavy flush with several full-text
+            // indexes is CPU-bound in tokenizing and sorting postings, and
+            // writes stall once the memtable fills behind it.
+            for_each_work_parallel(&mut works, |work| {
+                for (node_id, lsn, after, before) in &rows {
+                    work.observe(*node_id, *lsn, before.as_ref(), after.as_ref())?;
                 }
-            }
+                Ok(())
+            })?;
             Ok(works)
         })
         .await?;
@@ -392,17 +596,47 @@ pub(crate) async fn prepare_search_flush(
             },
             ..Default::default()
         };
-        for work in works {
+        // Assemble every index's postings/pages in parallel, then merge the
+        // per-index plans in index order so the result is deterministic.
+        let mut slots = works
+            .into_iter()
+            .map(|work| (Some(work), SearchFlushPlan::default()))
+            .collect::<Vec<_>>();
+        for_each_work_parallel(&mut slots, |(work, partial)| {
+            let work = work
+                .take()
+                .ok_or_else(|| Error::invariant("search flush work finished twice"))?;
             work.finish(
                 config.max_segments,
                 &finish_node_sst,
                 &finish_paths,
-                &mut plan,
-            )?;
+                partial,
+            )
+        })?;
+        for (_, partial) in slots {
+            plan.uploads.extend(partial.uploads);
+            plan.manifest
+                .descriptors
+                .extend(partial.manifest.descriptors);
+            plan.manifest.states.extend(partial.manifest.states);
+            plan.manifest
+                .retired_descriptor_ids
+                .extend(partial.manifest.retired_descriptor_ids);
         }
         Ok(plan)
     })
     .await?;
+    for state in &plan.manifest.states {
+        if state.segments.len() > configured_segments {
+            tracing::warn!(
+                index = %state.index_name,
+                segments = state.segments.len(),
+                configured = configured_segments,
+                ceiling = config.max_segments,
+                "search index is above its segment ceiling until compaction catches up"
+            );
+        }
+    }
 
     // Validate the exact manifest shape before a single PUT begins. Active
     // generations must cover every visible Nodes SST; Building generations
@@ -585,6 +819,18 @@ enum IndexWork {
 }
 
 impl IndexWork {
+    /// `(segments, label id)` of the generation this work appends to.
+    fn segment_room(&self) -> (&SearchLsmState, Option<u32>) {
+        match self {
+            #[cfg(feature = "vector-index")]
+            Self::Vector(work) => (&work.state, work.label_id),
+            #[cfg(feature = "text-index")]
+            Self::Text(work) => (&work.state, work.label_id),
+            #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+            _ => unreachable!("IndexWork has no constructible variants without search features"),
+        }
+    }
+
     fn observe(
         &mut self,
         node_id: [u8; 16],
@@ -627,6 +873,8 @@ struct VectorWork {
     filters: Vec<String>,
     builder: VectorV6ExternalBuilder,
     digest: Xxh3,
+    /// Some observed row changed this index: the flush needs a segment.
+    changed: bool,
 }
 
 #[cfg(feature = "vector-index")]
@@ -663,6 +911,7 @@ impl VectorWork {
             .as_ref()
             .map(vector_v6_payload_fingerprint)
             .transpose()?;
+        self.changed |= before_fingerprint != after_fingerprint;
         update_classifier_digest(
             &mut self.digest,
             node_id,
@@ -691,8 +940,13 @@ impl VectorWork {
             descriptor,
             builder,
             digest,
+            changed,
             ..
         } = self;
+        if changed {
+            // Refuse before the (expensive) segment assembly, not after it.
+            ensure_segment_room(&state, max_segments)?;
+        }
         let artifact = builder.finish()?;
         let disposition = if let Some(artifact) = artifact {
             ensure_segment_room(&state, max_segments)?;
@@ -737,6 +991,8 @@ struct TextWork {
     builder: TextV4ExternalBuilder,
     digest: Xxh3,
     live_total_len: u64,
+    /// Some observed row changed this index: the flush needs a segment.
+    changed: bool,
 }
 
 #[cfg(feature = "text-index")]
@@ -765,19 +1021,24 @@ impl TextWork {
                 &record.properties,
             )
         });
-        let before_fingerprint = before_payload
+        // Tokenize each side exactly once: the fingerprint, the BM25 length
+        // and the builder's postings all come from the same token list.
+        let before_prepared = before_payload
             .as_ref()
-            .map(text_v4_payload_fingerprint)
+            .map(crate::sst::text::v4::TextV4PreparedPayload::new)
             .transpose()?;
-        let after_fingerprint = after_payload
+        let after_prepared = after_payload
             .as_ref()
-            .map(text_v4_payload_fingerprint)
+            .map(crate::sst::text::v4::TextV4PreparedPayload::new)
             .transpose()?;
+        let before_fingerprint = before_prepared.as_ref().map(|payload| payload.fingerprint);
+        let after_fingerprint = after_prepared.as_ref().map(|payload| payload.fingerprint);
+        self.changed |= before_fingerprint != after_fingerprint;
         if before_fingerprint != after_fingerprint {
-            if let Some(payload) = &after_payload {
+            if let Some(payload) = &after_prepared {
                 self.live_total_len = self
                     .live_total_len
-                    .checked_add(crate::text::visit_tokens(&payload.text, |_| {}) as u64)
+                    .checked_add(payload.token_count() as u64)
                     .ok_or_else(|| Error::invariant("FT4 live token count overflows"))?;
             }
         }
@@ -788,12 +1049,12 @@ impl TextWork {
             before_fingerprint,
             after_fingerprint,
         );
-        self.builder.push(TextV4Mutation {
-            node_id,
-            lsn,
-            before: before_payload,
-            after: after_payload,
-        })
+        if before_prepared == after_prepared {
+            // Exactly the same tokens and filters: the builder would drop it.
+            return Ok(());
+        }
+        self.builder
+            .push_prepared(node_id, lsn, before_prepared, after_prepared)
     }
 
     fn finish(
@@ -810,8 +1071,13 @@ impl TextWork {
             builder,
             digest,
             live_total_len,
+            changed,
             ..
         } = self;
+        if changed {
+            // Refuse before the (expensive) posting assembly, not after it.
+            ensure_segment_room(&state, max_segments)?;
+        }
         let artifact = builder.finish()?;
         let disposition = if let Some(artifact) = artifact {
             ensure_segment_room(&state, max_segments)?;
@@ -847,13 +1113,52 @@ impl TextWork {
     }
 }
 
+/// Run `f` on every item, the items in parallel on scoped threads (at most
+/// `available_parallelism` at a time). The first error wins; a panic is an
+/// invariant error.
+fn for_each_work_parallel<T, F>(items: &mut [T], f: F) -> Result<()>
+where
+    T: Send,
+    F: Fn(&mut T) -> Result<()> + Sync,
+{
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .max(1);
+    if items.len() <= 1 || threads == 1 {
+        return items.iter_mut().try_for_each(f);
+    }
+    for group in items.chunks_mut(threads) {
+        std::thread::scope(|scope| {
+            let handles = group
+                .iter_mut()
+                .map(|item| {
+                    let f = &f;
+                    scope.spawn(move || f(item))
+                })
+                .collect::<Vec<_>>();
+            let mut first_error = None;
+            for handle in handles {
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::invariant("search flush index build panicked")));
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })?;
+    }
+    Ok(())
+}
+
 fn ensure_segment_room(state: &SearchLsmState, max_segments: usize) -> Result<()> {
     if state.segments.len() >= max_segments {
         return Err(Error::precondition(format!(
             "search index '{}' has {} active segments and \
-             {SEARCH_LSM_MAX_SEGMENTS_ENV}={max_segments}; compact it before flushing another delta",
+             {SEARCH_LSM_MAX_SEGMENTS_ENV}={max_segments}; {}",
             state.index_name,
-            state.segments.len()
+            state.segments.len(),
+            crate::error::SEARCH_SEGMENT_CAP_MARKER,
         )));
     }
     Ok(())
@@ -1193,7 +1498,7 @@ mod tests {
 
     #[test]
     fn segment_cap_defaults_clamps_and_rejects_values_without_progress() {
-        assert_eq!(DEFAULT_SEARCH_LSM_MAX_SEGMENTS, 8);
+        assert_eq!(DEFAULT_SEARCH_LSM_MAX_SEGMENTS, 24);
         assert_eq!(parse_segment_cap("2").unwrap(), 2);
         assert_eq!(parse_segment_cap(" 8 ").unwrap(), 8);
         assert_eq!(

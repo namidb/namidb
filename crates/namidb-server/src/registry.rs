@@ -25,7 +25,7 @@ use namidb_storage::{
 use object_store::ObjectStore;
 use tokio::sync::{watch, Mutex, OnceCell, RwLock};
 use tokio::task::JoinHandle;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::maintenance::{request_compaction, CompactionScheduler};
 use crate::metrics::{CompactionTrigger, Metrics, WriterLockKind};
@@ -508,6 +508,7 @@ impl NamespaceRegistry {
                     // trigger when the L0 high-water mark trips. The
                     // scheduler captures a fresh basis inside its sole
                     // worker, including for its one pending follow-up.
+                    let mut segment_cap = false;
                     let should_compact = 'flush: {
                         let lock_started = Instant::now();
                         let mut w = s.writer.lock().await;
@@ -547,7 +548,7 @@ impl NamespaceRegistry {
                         // see the single-tenant loop.
                         let flushed = if std::mem::take(&mut flush_superseded) {
                             let schema = w.snapshot().manifest().manifest.schema.clone();
-                            w.flush(schema).await.map(|_| None)
+                            w.try_flush(schema).await.map(|_| None)
                         } else {
                             match w.begin_background_flush().await {
                                 Ok(None) => Ok(None),
@@ -596,7 +597,13 @@ impl NamespaceRegistry {
                                             w.install_background_flush(built).await.map(Some)
                                         }
                                         Err(e) => {
-                                            error!(namespace = %ns, error = %e, "periodic flush build failed");
+                                            if e.is_search_segment_cap() {
+                                                // Expected under sustained writes: retried shortly, once a
+                                                // delta consolidation frees a slot.
+                                                warn!(namespace = %ns, error = %e, "flush waits for a search segment compaction");
+                                            } else {
+                                                error!(namespace = %ns, error = %e, "periodic flush build failed");
+                                            }
                                             if e.is_local_persistence() {
                                                 s.writer_health.mark_persistence_degraded(
                                                     crate::persistence_degraded_reason(&e),
@@ -607,6 +614,7 @@ impl NamespaceRegistry {
                                                 );
                                             }
                                             // See the single-tenant loop.
+                                            segment_cap |= e.is_search_segment_cap();
                                             break 'flush !s.is_retired();
                                         }
                                     }
@@ -631,7 +639,13 @@ impl NamespaceRegistry {
                                     || w.search_compaction_due()
                             }
                             Err(e) => {
-                                error!(namespace = %ns, error = %e, "periodic flush failed");
+                                if e.is_search_segment_cap() {
+                                    // Expected under sustained writes: retried shortly, once a
+                                    // delta consolidation frees a slot.
+                                    warn!(namespace = %ns, error = %e, "flush waits for a search segment compaction");
+                                } else {
+                                    error!(namespace = %ns, error = %e, "periodic flush failed");
+                                }
                                 if e.is_local_persistence() {
                                     s.writer_health.mark_persistence_degraded(
                                         crate::persistence_degraded_reason(&e),
@@ -656,7 +670,8 @@ impl NamespaceRegistry {
                                 // every flush until a compaction merges its
                                 // deltas: request it now, not at the next
                                 // periodic tick.
-                                !s.is_retired() && w.search_compaction_due()
+                                segment_cap |= e.is_search_segment_cap();
+                                !s.is_retired() && (w.search_compaction_due() || segment_cap)
                             }
                         }
                     };
@@ -681,6 +696,15 @@ impl NamespaceRegistry {
                             handle.abort();
                             let _ = handle.await;
                         }
+                    }
+                    if segment_cap && !s.is_retired() {
+                        // See the single-tenant loop.
+                        let _ = tokio::time::timeout(
+                            crate::SEGMENT_CAP_RETRY_WAIT,
+                            s.compaction_scheduler.wait_idle(),
+                        )
+                        .await;
+                        s.flush_notify.notify_one();
                     }
                 }
             });

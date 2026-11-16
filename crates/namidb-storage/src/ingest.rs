@@ -67,8 +67,7 @@ use crate::compact::{
 use crate::error::{Error, Result};
 use crate::fence::WriterFence;
 use crate::flush::{
-    await_all_object_uploads, flush, EdgeWriteRecord, FlushOutcome, NodeWriteRecord,
-    ObjectUploadFuture,
+    await_all_object_uploads, EdgeWriteRecord, FlushOutcome, NodeWriteRecord, ObjectUploadFuture,
 };
 use crate::manifest::{
     LoadedManifest, Manifest, ManifestStore, SstKind, SstLevel, TextIndexDescriptor,
@@ -82,6 +81,7 @@ use crate::recovery::{
     recover_memtable_with_snapshot, write_memtable_snapshot_for_manifest, MemtableSnapshotFile,
     WalEntry, WalOp,
 };
+use crate::search_lsm_flush::SearchSegmentLimit;
 use crate::wal::{WalRecord, WalSegment, WalStore};
 
 /// Default number of commits between automatic memtable snapshots.
@@ -2374,6 +2374,71 @@ impl WriterSession {
  manifest_version = self.current.manifest.version,
  ))]
     pub async fn flush(&mut self, schema: Schema) -> Result<FlushOutcome> {
+        match self
+            .flush_once(schema.clone(), SearchSegmentLimit::Configured)
+            .await
+        {
+            Err(error) if error.is_search_segment_cap() => {
+                // A search index is at its segment ceiling. The failed flush
+                // changed nothing; consolidate that index's segments now (a
+                // bounded, search-only pass) and flush again, rather than
+                // refusing the flush until some later compaction runs.
+                tracing::info!(%error, "flush at the search segment ceiling; compacting first");
+                // Delta runs first: short and proportional to the deltas. A
+                // run cannot always free a slot (one huge delta behind the
+                // base), so fall back to a full search pass, which rebuilds
+                // the base when it must.
+                self.compact_search_deltas().await?;
+                match self
+                    .flush_once(schema.clone(), SearchSegmentLimit::Configured)
+                    .await
+                {
+                    Err(error) if error.is_search_segment_cap() => {
+                        self.compact_search_segments().await?;
+                        self.flush_once(schema, SearchSegmentLimit::Configured)
+                            .await
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Run one delta-run-only search compaction pass
+    /// ([`CompactionBasis::prepare_search_deltas`]) and install it.
+    pub async fn compact_search_deltas(&mut self) -> Result<CompactionOutcome> {
+        let basis = self.compaction_basis();
+        let schema = basis.schema().clone();
+        let prepared = basis.prepare_search_deltas(&schema).await?;
+        self.install_prepared_compaction(prepared).await
+    }
+
+    /// Run one search-only compaction pass ([`CompactionBasis::prepare_search_only`])
+    /// against the current manifest and install it.
+    pub async fn compact_search_segments(&mut self) -> Result<CompactionOutcome> {
+        let basis = self.compaction_basis();
+        let schema = basis.schema().clone();
+        let prepared = basis.prepare_search_only(&schema).await?;
+        self.install_prepared_compaction(prepared).await
+    }
+
+    /// [`Self::flush`] without its inline search compaction, for callers that
+    /// hold a shared writer lock and must not compact under it: a search
+    /// index at `NAMIDB_SEARCH_LSM_MAX_SEGMENTS` takes the delta anyway, up
+    /// to the protocol ceiling ([`crate::search_lsm::MAX_ACTIVE_SEARCH_SEGMENTS`]),
+    /// and only there fails with [`Error::is_search_segment_cap`], changing
+    /// nothing. The caller schedules the compaction.
+    pub async fn try_flush(&mut self, schema: Schema) -> Result<FlushOutcome> {
+        self.flush_once(schema, SearchSegmentLimit::ProtocolCeiling)
+            .await
+    }
+
+    async fn flush_once(
+        &mut self,
+        schema: Schema,
+        limit: SearchSegmentLimit,
+    ) -> Result<FlushOutcome> {
         // Any off-lock flush cut before this one covers rows this flush is
         // about to write; it must not install afterwards.
         self.flush_lineage = next_flush_lineage();
@@ -2390,12 +2455,13 @@ impl WriterSession {
             &mut self.published_memtable,
             frozen,
         );
-        let outcome = match flush(
+        let outcome = match crate::flush::flush_limited(
             &self.manifest_store,
             &self.fence,
             &self.current,
             restore.frozen(),
             schema,
+            limit,
         )
         .await
         {
@@ -2515,11 +2581,28 @@ impl WriterSession {
             retired_wal_seq,
             uploaded,
         } = built;
-        if lineage != self.flush_lineage
-            || !flush_basis_unchanged(&base.manifest, &self.current.manifest)?
-        {
+        if lineage != self.flush_lineage {
             return Ok(BackgroundFlushInstall::Superseded);
         }
+        // A compaction that committed while the flush was built changed only
+        // which objects hold the same logical rows. Rebase onto it instead of
+        // throwing the flush away: a superseded flush is redone under the
+        // writer lock, which is exactly when writes queue behind it.
+        let (uploaded, rebased_barriers) =
+            if flush_basis_unchanged(&base.manifest, &self.current.manifest)? {
+                (uploaded, Vec::new())
+            } else if only_compaction_changed(&base.manifest, &self.current.manifest)? {
+                match uploaded.rebase(
+                    &base.manifest,
+                    &self.current.manifest,
+                    self.manifest_store.paths(),
+                )? {
+                    Some(rebased) => rebased,
+                    None => return Ok(BackgroundFlushInstall::Superseded),
+                }
+            } else {
+                return Ok(BackgroundFlushInstall::Superseded);
+            };
         if self.poisoned {
             return Err(Error::precondition(
                 "writer session poisoned by a prior terminal commit failure; drop and reopen",
@@ -2538,6 +2621,21 @@ impl WriterSession {
         // committed while the flush was built hold rows it does not.
         if let Some(retired) = retired_wal_seq {
             next.wal_segments.retain(|segment| segment.seq > retired);
+        }
+        if !rebased_barriers.is_empty() {
+            if crate::search_lsm::validate_search_lsm(&next).is_err() {
+                tracing::debug!("rebased background flush fails Search-LSM validation; redoing it");
+                return Ok(BackgroundFlushInstall::Superseded);
+            }
+            crate::search_lsm_flush::upload_rebased_barriers(
+                self.manifest_store.store(),
+                rebased_barriers,
+            )
+            .await?;
+            tracing::debug!(
+                version = self.current.manifest.version,
+                "rebased background flush onto a concurrent compaction"
+            );
         }
         let committed = self
             .manifest_store
@@ -3595,6 +3693,38 @@ fn flush_basis_unchanged(base: &Manifest, current: &Manifest) -> Result<bool> {
     Ok(stable(base)? == stable(current)?)
 }
 
+/// `true` when `current` differs from `base` only in what a compaction
+/// rewrites: the SST set, Search-LSM segment states and search build markers
+/// (plus the volatile fields [`flush_basis_unchanged`] ignores). Schema,
+/// catalogs, epoch and format must be identical.
+fn only_compaction_changed(base: &Manifest, current: &Manifest) -> Result<bool> {
+    fn stable(manifest: &Manifest) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(manifest)?;
+        if let Some(object) = value.as_object_mut() {
+            for volatile in [
+                "version",
+                "writer_id",
+                "created_at",
+                "wal_segments",
+                "label_dict",
+                "ssts",
+                "search_lsm",
+                "search_index_builds",
+            ] {
+                object.remove(volatile);
+            }
+        }
+        Ok(value)
+    }
+    // A compaction only rewrites rows that were already durable: it never
+    // introduces a newer LSN than the base already held.
+    let max_lsn = |manifest: &Manifest| manifest.ssts.iter().map(|sst| sst.max_lsn).max();
+    if max_lsn(current) > max_lsn(base) {
+        return Ok(false);
+    }
+    Ok(stable(base)? == stable(current)?)
+}
+
 /// An off-lock flush cut by [`WriterSession::begin_background_flush`].
 #[derive(Debug)]
 pub struct BackgroundFlush {
@@ -3615,11 +3745,15 @@ impl BackgroundFlush {
     /// Build and upload the flush's objects. Needs no writer: run it with
     /// the writer lock released.
     pub async fn build(self) -> Result<BuiltBackgroundFlush> {
+        // Off the writer lock nothing can compact first: a generation at its
+        // configured ceiling takes the delta anyway (up to the protocol
+        // ceiling) while the server prioritises its compaction.
         let uploaded = crate::flush::build_and_upload(
             &self.manifest_store,
             &self.base,
             &self.frozen,
             self.schema,
+            crate::search_lsm_flush::SearchSegmentLimit::ProtocolCeiling,
         )
         .await?;
         Ok(BuiltBackgroundFlush {

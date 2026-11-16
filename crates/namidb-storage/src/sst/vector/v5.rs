@@ -53,6 +53,8 @@ const MAX_COMPRESSED_BLOCK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RAW_BLOCK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DIM: u32 = 1_048_576;
 const MAX_NAV_BATCH_PAGES: usize = 16;
+/// Upper bound on exact f32 pages fetched concurrently for one rerank wave.
+const MAX_EXACT_BATCH_PAGES: usize = 8;
 /// Bincode's tree/string containers have allocator overhead in addition to
 /// the retained decompressed wire. Reserving six raw bytes per encoded byte is
 /// intentionally conservative and keeps the process-wide workspace cap above
@@ -516,6 +518,11 @@ impl VectorV5Reader {
     /// Every supported group is evaluated against local page bitmaps before
     /// approximate scoring and before top-k truncation. Unsupported groups are
     /// reported through `applied_filter_groups`, allowing a residual/fallback.
+    /// Byte length of the object this reader was opened over.
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
     pub async fn search_filter_groups(
         &self,
         query: &[f32],
@@ -623,6 +630,8 @@ impl VectorV5Reader {
                 .then_with(|| left.visit_order.cmp(&right.visit_order))
         });
         let mut exact_hits = BoundedExactHits::new(final_k);
+        // `(page, first candidate, end candidate)` per distinct rerank page.
+        let mut page_groups = Vec::new();
         let mut candidate_start = 0usize;
         while candidate_start < approximate.len() {
             let page = approximate[candidate_start].page;
@@ -630,51 +639,66 @@ impl VectorV5Reader {
             while candidate_end < approximate.len() && approximate[candidate_end].page == page {
                 candidate_end += 1;
             }
-            let range = self.footer.pages[page as usize].exact.range()?;
-            let wire = self.source.read_range(range.clone()).await?;
-            require_len(
-                &wire,
-                usize::try_from(range.end - range.start)
-                    .map_err(|_| Error::invariant("vector v5 range length overflows usize"))?,
-                "exact block",
-            )?;
-            let page_ref = &self.footer.pages[page as usize];
-            let raw = decode_block(&wire, &page_ref.exact, "exact page")?;
-            let expected = (page_ref.row_count as usize)
-                .checked_mul(self.footer.dim as usize)
-                .and_then(|v| v.checked_mul(4))
-                .ok_or_else(|| Error::invariant("vector v5 exact page size overflows"))?;
-            if raw.len() != expected {
-                return Err(Error::invariant(format!(
-                    "vector v5 exact page length {} != expected {expected}",
-                    raw.len()
-                )));
-            }
-            let row_bytes = (self.footer.dim as usize)
-                .checked_mul(4)
-                .ok_or_else(|| Error::invariant("vector v5 row byte size overflows"))?;
-            for candidate in &approximate[candidate_start..candidate_end] {
-                let start = (candidate.row as usize)
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| Error::invariant("vector v5 exact row offset overflows"))?;
-                let end = start
-                    .checked_add(row_bytes)
-                    .ok_or_else(|| Error::invariant("vector v5 exact row end overflows"))?;
-                let row = raw
-                    .get(start..end)
-                    .ok_or_else(|| Error::invariant("vector v5 exact row out of range"))?;
-                let mut vector = Vec::with_capacity(self.footer.dim as usize);
-                for bytes in row.chunks_exact(4) {
-                    vector.push(f32::from_le_bytes(
-                        bytes
-                            .try_into()
-                            .map_err(|_| Error::invariant("vector v5 invalid f32 bytes"))?,
-                    ));
-                }
-                let score = metric_score(self.metric, &vector, query).0 as f32;
-                exact_hits.insert(self.metric, candidate.id, score);
-            }
+            page_groups.push((page, candidate_start, candidate_end));
             candidate_start = candidate_end;
+        }
+        for wave in page_groups.chunks(workspace_plan.exact_batch_pages.max(1)) {
+            let ranges = wave
+                .iter()
+                .map(|(page, _, _)| self.footer.pages[*page as usize].exact.range())
+                .collect::<Result<Vec<_>, _>>()?;
+            let wires = self.source.read_ranges(&ranges).await?;
+            if wires.len() != ranges.len() {
+                return Err(Error::invariant(
+                    "vector v5 range source returned wrong exact block count",
+                ));
+            }
+            for ((&(page, candidate_start, candidate_end), wire), range) in
+                wave.iter().zip(wires).zip(ranges)
+            {
+                require_len(
+                    &wire,
+                    usize::try_from(range.end - range.start)
+                        .map_err(|_| Error::invariant("vector v5 range length overflows usize"))?,
+                    "exact block",
+                )?;
+                let page_ref = &self.footer.pages[page as usize];
+                let raw = decode_block(&wire, &page_ref.exact, "exact page")?;
+                let expected = (page_ref.row_count as usize)
+                    .checked_mul(self.footer.dim as usize)
+                    .and_then(|v| v.checked_mul(4))
+                    .ok_or_else(|| Error::invariant("vector v5 exact page size overflows"))?;
+                if raw.len() != expected {
+                    return Err(Error::invariant(format!(
+                        "vector v5 exact page length {} != expected {expected}",
+                        raw.len()
+                    )));
+                }
+                let row_bytes = (self.footer.dim as usize)
+                    .checked_mul(4)
+                    .ok_or_else(|| Error::invariant("vector v5 row byte size overflows"))?;
+                for candidate in &approximate[candidate_start..candidate_end] {
+                    let start = (candidate.row as usize)
+                        .checked_mul(row_bytes)
+                        .ok_or_else(|| Error::invariant("vector v5 exact row offset overflows"))?;
+                    let end = start
+                        .checked_add(row_bytes)
+                        .ok_or_else(|| Error::invariant("vector v5 exact row end overflows"))?;
+                    let row = raw
+                        .get(start..end)
+                        .ok_or_else(|| Error::invariant("vector v5 exact row out of range"))?;
+                    let mut vector = Vec::with_capacity(self.footer.dim as usize);
+                    for bytes in row.chunks_exact(4) {
+                        vector.push(f32::from_le_bytes(
+                            bytes
+                                .try_into()
+                                .map_err(|_| Error::invariant("vector v5 invalid f32 bytes"))?,
+                        ));
+                    }
+                    let score = metric_score(self.metric, &vector, query).0 as f32;
+                    exact_hits.insert(self.metric, candidate.id, score);
+                }
+            }
         }
         let hits = exact_hits.into_sorted_hits(self.metric);
         Ok(VectorV5SearchResult {
@@ -1040,6 +1064,8 @@ impl BoundedExactHits {
 #[derive(Debug, Clone, Copy)]
 struct VectorWorkspacePlan {
     nav_batch_pages: usize,
+    /// Exact f32 pages fetched (concurrently) and scored per rerank wave.
+    exact_batch_pages: usize,
     required_bytes: usize,
 }
 
@@ -1211,14 +1237,45 @@ fn vector_workspace_plan(
         let required = checked_add(base, transient_peak, "vector v5 total query workspace")?;
         fallback_required = fallback_required.min(required);
         if required <= capacity {
+            // Rerank pages are independent range reads: fetch as many at once
+            // as the workspace holds (one round trip per wave instead of one
+            // per page), never fewer than the single page already admitted.
+            let mut exact_batch_pages = 1;
+            for wave in (2..=MAX_EXACT_BATCH_PAGES).rev() {
+                let exact_peak = checked_mul(
+                    exact_page_peak,
+                    wave,
+                    "vector v5 exact rerank wave workspace",
+                )?;
+                let wave_required = checked_add(
+                    base,
+                    nav_peak.max(exact_peak),
+                    "vector v5 total query workspace",
+                )?;
+                if wave_required <= capacity {
+                    exact_batch_pages = wave;
+                    break;
+                }
+            }
+            let required = checked_add(
+                base,
+                nav_peak.max(checked_mul(
+                    exact_page_peak,
+                    exact_batch_pages,
+                    "vector v5 exact rerank wave workspace",
+                )?),
+                "vector v5 total query workspace",
+            )?;
             return Ok(VectorWorkspacePlan {
                 nav_batch_pages: batch_pages,
+                exact_batch_pages,
                 required_bytes: required,
             });
         }
     }
     Ok(VectorWorkspacePlan {
         nav_batch_pages: 1,
+        exact_batch_pages: 1,
         required_bytes: fallback_required,
     })
 }
@@ -1294,39 +1351,116 @@ fn partition_rows(
     let axis = highest_variance_axis(rows, &indices)?;
     let group_count = branch.min(indices.len().div_ceil(target)).max(2);
     let mut children = Vec::with_capacity(group_count);
+    // Split along the principal direction of a bounded sample (falling back
+    // to the highest-variance axis). In high dimensions a single coordinate
+    // separates natural clusters poorly, so neighbours ended up spread over
+    // many leaves and recall needed far more probes.
+    let sample = principal_sample_indices(&indices);
+    let sample_rows = sample
+        .iter()
+        .map(|index| rows[*index].vector.as_slice())
+        .collect::<Vec<_>>();
+    // Dot-product scores also grow with a row's norm, which the centred
+    // principal direction ignores: dot-metric bases keep the axis split.
+    let direction = (metric != VectorMetric::Dot)
+        .then(|| principal_direction(&sample_rows, axis))
+        .flatten();
+    let keyed = match direction {
+        Some(direction) => indices
+            .into_iter()
+            .map(|index| (dot_f32(&rows[index].vector, &direction), index))
+            .collect::<Vec<_>>(),
+        None => indices
+            .into_iter()
+            .map(|index| (rows[index].vector[axis], index))
+            .collect::<Vec<_>>(),
+    };
     // Balanced recursive multi-selection is O(N log B) for fan-out B, unlike
     // assigning every row to every centroid (O(N*B)) or sorting the whole set
     // at each tree level (O(N log N log C)). Across the tree this gives the
     // intended O(N log C * dim) construction bound.
-    for chunk in balanced_axis_groups(rows, indices, axis, group_count) {
+    for chunk in balanced_key_groups(rows, keyed, group_count) {
         children.push(partition_rows(rows, chunk, target, branch, metric, tree)?);
     }
     tree.nodes[node_index as usize].children = children;
     Ok(node_index)
 }
 
-fn balanced_axis_groups(
+fn balanced_key_groups(
     rows: &[BuildRow],
-    mut indices: Vec<usize>,
-    axis: usize,
+    mut keyed: Vec<(f32, usize)>,
     groups: usize,
 ) -> Vec<Vec<usize>> {
-    if groups <= 1 || indices.len() <= 1 {
-        return vec![indices];
+    if groups <= 1 || keyed.len() <= 1 {
+        return vec![keyed.into_iter().map(|(_, index)| index).collect()];
     }
     let left_groups = groups / 2;
     let right_groups = groups - left_groups;
     // Proportional split keeps every eventual bucket within one row of N/B.
-    let split = indices.len() * left_groups / groups;
-    indices.select_nth_unstable_by(split, |left, right| {
-        rows[*left].vector[axis]
-            .total_cmp(&rows[*right].vector[axis])
-            .then_with(|| rows[*left].id.cmp(&rows[*right].id))
+    let split = keyed.len() * left_groups / groups;
+    keyed.select_nth_unstable_by(split, |left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| rows[left.1].id.cmp(&rows[right.1].id))
     });
-    let right = indices.split_off(split);
-    let mut out = balanced_axis_groups(rows, indices, axis, left_groups);
-    out.extend(balanced_axis_groups(rows, right, axis, right_groups));
+    let right = keyed.split_off(split);
+    let mut out = balanced_key_groups(rows, keyed, left_groups);
+    out.extend(balanced_key_groups(rows, right, right_groups));
     out
+}
+
+/// Rows sampled to estimate a split direction: an even stride over the set.
+const PRINCIPAL_SAMPLE_ROWS: usize = 256;
+const PRINCIPAL_ITERATIONS: usize = 8;
+
+fn principal_sample_indices(indices: &[usize]) -> Vec<usize> {
+    let step = indices.len().div_ceil(PRINCIPAL_SAMPLE_ROWS).max(1);
+    indices.iter().step_by(step).copied().collect()
+}
+
+pub(super) fn dot_f32(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(l, r)| l * r).sum()
+}
+
+/// Top principal direction of `sample` by power iteration, started from
+/// `axis` so it is deterministic and never worse-conditioned than the axis.
+/// `None` when the sample has no spread. Memory is `O(dim)` beyond the
+/// sample; cost is `O(sample * dim * iterations)`.
+pub(super) fn principal_direction(sample: &[&[f32]], axis: usize) -> Option<Vec<f32>> {
+    let dim = sample.first()?.len();
+    if sample.len() < 2 || axis >= dim {
+        return None;
+    }
+    let mut mean = vec![0.0f64; dim];
+    for row in sample {
+        for (sum, value) in mean.iter_mut().zip(row.iter()) {
+            *sum += f64::from(*value);
+        }
+    }
+    let n = sample.len() as f64;
+    let mean = mean.into_iter().map(|sum| sum / n).collect::<Vec<_>>();
+    let mut direction = vec![0.0f64; dim];
+    direction[axis] = 1.0;
+    for _ in 0..PRINCIPAL_ITERATIONS {
+        let mut next = vec![0.0f64; dim];
+        for row in sample {
+            let projection = row
+                .iter()
+                .zip(&mean)
+                .zip(&direction)
+                .map(|((value, mean), dir)| (f64::from(*value) - mean) * dir)
+                .sum::<f64>();
+            for ((acc, value), mean) in next.iter_mut().zip(row.iter()).zip(&mean) {
+                *acc += (f64::from(*value) - mean) * projection;
+            }
+        }
+        let norm = next.iter().map(|value| value * value).sum::<f64>().sqrt();
+        if !norm.is_finite() || norm <= f64::EPSILON {
+            return None;
+        }
+        direction = next.into_iter().map(|value| value / norm).collect();
+    }
+    Some(direction.into_iter().map(|value| value as f32).collect())
 }
 
 fn centroid(rows: &[BuildRow], indices: &[usize], metric: VectorMetric) -> Result<Vec<f32>, Error> {
@@ -2641,6 +2775,182 @@ mod tests {
             source.range_count()
         );
         assert!(source.range_count() <= 6);
+    }
+
+    /// Recall@10 over a bench-like corpus (clusters of ~6k rows around random
+    /// centroids, Gaussian noise of norm `spread`) for each `(nprobe,
+    /// rerank)`, built with the in-memory or the spooling (compaction) builder.
+    async fn clustered_recall(
+        rows: u32,
+        cluster_rows: u32,
+        dim: usize,
+        external: bool,
+        combos: &[(usize, usize)],
+    ) -> Vec<f64> {
+        let clusters = (rows / cluster_rows).max(1);
+        let spread = 0.35f32;
+        let gauss = |rng: &mut ChaCha8Rng| -> f32 {
+            let u1: f32 = rng.gen_range(f32::MIN_POSITIVE..1.0);
+            let u2: f32 = rng.gen_range(0.0..1.0);
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| {
+                let mut c: Vec<f32> = (0..dim).map(|_| gauss(&mut rng)).collect();
+                normalize(&mut c);
+                c
+            })
+            .collect();
+        let noise = spread / (dim as f32).sqrt();
+        let around = |rng: &mut ChaCha8Rng, c: &[f32]| {
+            let mut v: Vec<f32> = c.iter().map(|x| x + gauss(rng) * noise).collect();
+            normalize(&mut v);
+            v
+        };
+        let members: Vec<_> = (0..rows)
+            .map(|i| (id(i), around(&mut rng, &centers[(i % clusters) as usize])))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..40)
+            .map(|q| {
+                let c = &centers[q % clusters as usize];
+                around(&mut rng, c)
+            })
+            .collect();
+        let truth: Vec<BTreeSet<[u8; 16]>> = queries
+            .iter()
+            .map(|query| {
+                let mut exact: Vec<_> = members
+                    .iter()
+                    .map(|(node_id, vector)| {
+                        (
+                            *node_id,
+                            metric_score(VectorMetric::Cosine, vector, query).0 as f32,
+                        )
+                    })
+                    .collect();
+                sort_hits(VectorMetric::Cosine, &mut exact);
+                exact.truncate(10);
+                exact.into_iter().map(|hit| hit.0).collect()
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let body = if external {
+            let mut members = members;
+            members.sort_by_key(|(node_id, _)| *node_id);
+            let mut collector = external::VectorV5ExternalCollector::new_base(
+                external::VectorV5ExternalBuildConfig::default(),
+            )
+            .expect("collector");
+            for (node_id, vector) in &members {
+                collector
+                    .push(*node_id, vector, &BTreeMap::new())
+                    .expect("push");
+            }
+            let mut artifact = collector
+                .finish(
+                    &descriptor(VectorMetric::Cosine, dim as u32),
+                    VectorV5BuildOptions::default(),
+                )
+                .expect("build")
+                .expect("artifact");
+            artifact.rewind().expect("rewind");
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut artifact.file, &mut body).expect("read");
+            Bytes::from(body)
+        } else {
+            build_body_v5(
+                &descriptor(VectorMetric::Cosine, dim as u32),
+                members,
+                VectorV5BuildOptions::default(),
+            )
+            .expect("build")
+            .expect("body")
+            .0
+        };
+        eprintln!("built {} bytes in {:?}", body.len(), started.elapsed());
+        let mut recalls = Vec::with_capacity(combos.len());
+        for &(nprobe, rerank) in combos {
+            let source = Arc::new(TrackingSource::new(body.clone()));
+            let reader = VectorV5Reader::open(source.clone(), body.len() as u64)
+                .await
+                .expect("open");
+            let pages = reader.page_count();
+            let opened = source.range_count();
+            let mut recall = 0usize;
+            for (query, truth) in queries.iter().zip(&truth) {
+                let hits = reader
+                    .search(
+                        query,
+                        10,
+                        VectorV5SearchOptions {
+                            nprobe: nprobe.min(pages),
+                            max_nprobe: nprobe.min(pages),
+                            rerank_factor: rerank,
+                        },
+                    )
+                    .await
+                    .expect("search");
+                recall += hits.iter().filter(|hit| truth.contains(&hit.0)).count();
+            }
+            let recall = recall as f64 / (10.0 * queries.len() as f64);
+            eprintln!(
+                "pages={pages} nprobe={nprobe} rerank={rerank} recall@10={recall:.3} ranges/query={:.1}",
+                (source.range_count() - opened) as f64 / queries.len() as f64
+            );
+            recalls.push(recall);
+        }
+        recalls
+    }
+
+    /// Recall/IO sweep. Run by hand:
+    /// `NAMIDB_V5_SWEEP_ROWS=377000 cargo test ... v5_recall_sweep -- --ignored --nocapture`
+    /// (`NAMIDB_V5_SWEEP_EXTERNAL=1` for the spooling builder).
+    #[tokio::test]
+    #[ignore]
+    async fn v5_recall_sweep() {
+        let rows: u32 = std::env::var("NAMIDB_V5_SWEEP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48_000);
+        let dim: usize = std::env::var("NAMIDB_V5_SWEEP_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let external = std::env::var_os("NAMIDB_V5_SWEEP_EXTERNAL").is_some_and(|v| v == "1");
+        clustered_recall(
+            rows,
+            5_900,
+            dim,
+            external,
+            &[
+                (4, 8),
+                (8, 8),
+                (16, 8),
+                (24, 16),
+                (32, 16),
+                (48, 16),
+                (64, 16),
+                (128, 16),
+            ],
+        )
+        .await;
+    }
+
+    /// Leaves split along a principal direction keep a natural cluster's
+    /// neighbours in few leaves. Axis-aligned splits (3.4.0) scattered them:
+    /// recall@10 0.78 here, against 0.98.
+    #[tokio::test]
+    async fn clustered_neighbours_stay_in_few_leaves() {
+        for external in [false, true] {
+            // 64 clusters of 1000 rows in 128 leaves; 4 probes.
+            let recall = clustered_recall(64_000, 1_000, 512, external, &[(4, 8)]).await;
+            assert!(
+                recall[0] >= 0.9,
+                "external={external} recall@10={} at nprobe 4",
+                recall[0]
+            );
+        }
     }
 
     #[tokio::test]

@@ -377,6 +377,9 @@ enum Cmd {
         /// Create the constraint and the vector/fulltext indexes first.
         #[arg(long)]
         setup: bool,
+        /// How many fulltext indexes `--setup` creates on `Doc` (0-4).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=4))]
+        fulltext_indexes: u8,
     },
 }
 
@@ -822,6 +825,7 @@ async fn main() -> Result<()> {
             seed,
             counters_file,
             setup,
+            fulltext_indexes,
         } => {
             let report = http_load::http_load(http_load::LoadConfig {
                 url,
@@ -839,6 +843,7 @@ async fn main() -> Result<()> {
                 seed,
                 counters_file,
                 setup,
+                fulltext_indexes: usize::from(fulltext_indexes),
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);

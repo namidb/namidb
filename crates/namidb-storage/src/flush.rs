@@ -380,6 +380,26 @@ pub async fn flush(
     frozen: &FrozenMemtable,
     schema: Schema,
 ) -> Result<FlushOutcome> {
+    flush_limited(
+        manifest_store,
+        fence,
+        base,
+        frozen,
+        schema,
+        crate::search_lsm_flush::SearchSegmentLimit::Configured,
+    )
+    .await
+}
+
+/// [`flush`] with an explicit search segment limit.
+pub(crate) async fn flush_limited(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    base: &LoadedManifest,
+    frozen: &FrozenMemtable,
+    schema: Schema,
+    limit: crate::search_lsm_flush::SearchSegmentLimit,
+) -> Result<FlushOutcome> {
     fence.assert_alive(base.manifest.epoch)?;
 
     if frozen.is_empty() {
@@ -392,7 +412,7 @@ pub async fn flush(
     }
 
     let flush_started = std::time::Instant::now();
-    let uploaded = build_and_upload(manifest_store, base, frozen, schema).await?;
+    let uploaded = build_and_upload(manifest_store, base, frozen, schema, limit).await?;
     let ssts_written = uploaded.ssts_written;
     let bloom_count = uploaded.bloom_sidecars_written;
     let mut next = base.manifest.next_version(fence.writer_id);
@@ -433,6 +453,28 @@ impl UploadedFlush {
         next.ssts.extend(self.new_ssts);
         self.search.apply(next);
     }
+
+    /// See [`crate::search_lsm_flush::SearchFlushManifestUpdate::rebase`].
+    /// Nodes and edge SSTs are newer than anything a compaction merged, so
+    /// they carry over unchanged.
+    pub(crate) fn rebase(
+        self,
+        base: &Manifest,
+        current: &Manifest,
+        paths: &NamespacePaths,
+    ) -> Result<Option<(Self, Vec<crate::search_lsm_flush::SearchFlushUpload>)>> {
+        let Some((search, uploads)) = self.search.rebase(base, current, paths)? else {
+            return Ok(None);
+        };
+        Ok(Some((
+            Self {
+                search,
+                ssts_written: self.ssts_written + uploads.len(),
+                ..self
+            },
+            uploads,
+        )))
+    }
 }
 
 /// Build the SSTs (and search deltas) of a non-empty `frozen` memtable
@@ -445,6 +487,7 @@ pub(crate) async fn build_and_upload(
     base: &LoadedManifest,
     frozen: &FrozenMemtable,
     schema: Schema,
+    limit: crate::search_lsm_flush::SearchSegmentLimit,
 ) -> Result<UploadedFlush> {
     let flush_started = std::time::Instant::now();
     let (node_rows, edge_buckets) = bucket_nodes_and_edges(frozen);
@@ -484,6 +527,7 @@ pub(crate) async fn build_and_upload(
                 &schema,
                 &nodes.descriptor,
                 &node_rows,
+                limit,
             )
             .await?
         }

@@ -1,8 +1,10 @@
 //! A sustained load into a vector-indexed label must not wedge its flushes.
 //!
 //! Every periodic flush that touches an indexed label adds one search delta
-//! segment, and at `NAMIDB_SEARCH_LSM_MAX_SEGMENTS` (default 8) every further
-//! flush fails until a compaction consolidates the deltas. A loader flushes
+//! segment. Up to 3.4.0, at `NAMIDB_SEARCH_LSM_MAX_SEGMENTS` (then 8) every
+//! further flush failed until a compaction consolidated the deltas; an
+//! off-lock flush now goes past it up to the protocol ceiling, so only the
+//! compaction keeps the count bounded. A loader flushes
 //! every few seconds while the periodic compaction runs every few minutes,
 //! so the server must request a compaction when the deltas are due, not only
 //! when L0 is deep. This test turns the L0 trigger and the periodic

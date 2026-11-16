@@ -15,6 +15,60 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Server: a flush is never refused by a search index's segment cap.** Under
+  sustained writes a full-text or vector index could reach
+  `NAMIDB_SEARCH_LSM_MAX_SEGMENTS` (8) faster than compaction freed it; each
+  flush then failed with "search index '…' has N active segments", the
+  memtable filled, writes stalled with 503 "writer is busy" and vector
+  loading slowed sharply. Now:
+  - the server's off-lock flush goes past the configured ceiling (default
+    now 24) up to 32, the most any reader (3.3.x included) accepts, instead
+    of failing; only at 32 does it wait, a few seconds, and it never waits
+    for a whole compaction pass;
+  - an embedded `WriterSession::flush` at the ceiling consolidates that
+    index's deltas first (bounded and search-only) and then succeeds;
+  - the server compacts in three passes, each installed on its own: search
+    delta runs first (short, proportional to the deltas), then search base
+    rebuilds, then node tables; none holds the writer, and a slow pass no
+    longer delays the delta consolidation behind it;
+  - delta compaction is size-tiered, so each row is rewritten O(log n) times
+    instead of on every pass;
+  - an off-lock flush whose base gained only a compaction meanwhile is
+    rebased onto it instead of being redone under the writer lock;
+  - a flush tokenizes each full-text document once instead of three times
+    per index, and skips documents whose indexed text did not change;
+  - the ceiling is checked before any search segment is built.
+- **Vector search over large flat deltas.** Vectors loaded through flushes
+  stayed in flat exact deltas that every query scanned in full (seconds per
+  query at a few hundred thousand 1024-dimension rows). A vector index now
+  rebuilds its clustered base once its deltas hold
+  `NAMIDB_SEARCH_LSM_VECTOR_BASE_DELTA_ROWS` (32768) rows, or when it goes
+  idle, as long as the rebuild's input fits
+  `NAMIDB_SEARCH_LSM_VECTOR_BASE_MAX_INPUT_BYTES` (half the memory limit).
+  Clustered-base readers are reused across queries, and the pages a query
+  reranks or scans are fetched concurrently in waves instead of one round
+  trip each.
+- **Vector search recall on large clustered bases.** A clustered base split
+  its rows along one coordinate at a time and probed 4 leaf pages per query
+  at the default `ef`. In high dimensions a single coordinate separates
+  natural clusters poorly, so a query's true neighbours were spread over many
+  512-row leaves (recall@10 ~0.35 at 1024 dimensions). Cosine and Euclidean
+  bases are now split along the principal direction of a bounded 256-row
+  sample (dot-product bases keep the per-coordinate split), and a query
+  probes `max(ef / 4, 24)` pages, fetched concurrently: recall@10 ~0.99 on
+  the same corpus. Bases written by earlier versions stay readable and pick
+  up the better layout at their next rebuild.
+- **Range page cache share.** The RAM tier for immutable object ranges
+  (quantized vector pages, postings, paged indexes) requests 512 MiB instead
+  of 64 MiB, so it gets about 15% of `NAMIDB_CACHE_MAX_BYTES` rather than 2%.
+  The total cache bound is unchanged.
+- **Docs: the per-query memory default.** `NAMIDB_QUERY_MEMORY_MAX_BYTES=auto`
+  is 50% of the process ceiling (`NAMIDB_MEMORY_MAX_BYTES`) and 25% of the
+  available memory only when there is no ceiling; the server README now says
+  so everywhere, and the startup log prints the ceiling next to the budget.
+
 ## [3.4.0] - 2026-11-16
 
 Includes every fix in 3.3.3.

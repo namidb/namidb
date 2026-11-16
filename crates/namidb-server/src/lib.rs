@@ -1329,9 +1329,12 @@ pub async fn run_with_memory_limits(
             .with_query_memory_max_bytes(query_memory_max_bytes),
     );
     if memory.query_memory_max_bytes() > 0 {
+        // `auto` is 50% of the process ceiling (25% of the available memory
+        // without one); log the ceiling too so the ratio is visible.
         info!(
             query_memory_max_bytes = memory.query_memory_max_bytes(),
             query_memory_pool_bytes = memory.query_memory_pool().map_or(0, |p| p.capacity_bytes()),
+            memory_max_bytes,
             "per-query working-memory budget enabled"
         );
         if query_memory_max_bytes > memory.query_memory_max_bytes() {
@@ -1592,6 +1595,7 @@ pub async fn run_with_memory_limits(
                 // when the L0 high-water mark trips. The scheduler captures
                 // a fresh basis inside its sole worker, so a queued follow-up
                 // neither retains a stale manifest nor allocates another task.
+                let mut segment_cap = false;
                 let should_compact = 'flush: {
                     let lock_started = std::time::Instant::now();
                     let mut w = state_for_flush.writer.lock().await;
@@ -1626,7 +1630,7 @@ pub async fn run_with_memory_limits(
                     // the lock, so a busy compactor can never starve flushes.
                     let flushed = if std::mem::take(&mut flush_superseded) {
                         let schema = w.snapshot().manifest().manifest.schema.clone();
-                        w.flush(schema).await.map(|_| None)
+                        w.try_flush(schema).await.map(|_| None)
                     } else {
                         match w.begin_background_flush().await {
                             Ok(None) => Ok(None),
@@ -1676,7 +1680,13 @@ pub async fn run_with_memory_limits(
                                     Err(e) => {
                                         // Nothing changed: the rows are still in
                                         // the memtable and its WAL segments.
-                                        error!(error = %e, "periodic flush build failed");
+                                        if e.is_search_segment_cap() {
+                                            // Expected under sustained writes: retried shortly, once a
+                                            // delta consolidation frees a slot.
+                                            warn!(error = %e, "flush waits for a search segment compaction");
+                                        } else {
+                                            error!(error = %e, "periodic flush build failed");
+                                        }
                                         if e.is_local_persistence() {
                                             state_for_flush
                                                 .writer_health
@@ -1692,6 +1702,7 @@ pub async fn run_with_memory_limits(
                                         // cap fails every flush until a
                                         // compaction consolidates it: ask for
                                         // one now (a no-op when none is due).
+                                        segment_cap |= e.is_search_segment_cap();
                                         break 'flush true;
                                     }
                                 }
@@ -1724,7 +1735,13 @@ pub async fn run_with_memory_limits(
                                 || w.search_compaction_due()
                         }
                         Err(e) => {
-                            error!(error = %e, "periodic flush failed");
+                            if e.is_search_segment_cap() {
+                                // Expected under sustained writes: retried shortly, once a
+                                // delta consolidation frees a slot.
+                                warn!(error = %e, "flush waits for a search segment compaction");
+                            } else {
+                                error!(error = %e, "periodic flush failed");
+                            }
                             if e.is_local_persistence() {
                                 state_for_flush
                                     .writer_health
@@ -1745,7 +1762,8 @@ pub async fn run_with_memory_limits(
                             // A search index at its segment cap refuses every
                             // flush until a compaction merges its deltas:
                             // request it now, not at the next periodic tick.
-                            w.search_compaction_due()
+                            segment_cap |= e.is_search_segment_cap();
+                            w.search_compaction_due() || segment_cap
                         }
                     }
                 };
@@ -1765,6 +1783,17 @@ pub async fn run_with_memory_limits(
                     &state_for_flush.metrics,
                     None,
                 );
+                if segment_cap {
+                    // The refused flush changed nothing and succeeds as soon
+                    // as the delta pass installs: retry soon (at once if the
+                    // scheduler goes idle first), not a flush interval later.
+                    let _ = tokio::time::timeout(
+                        SEGMENT_CAP_RETRY_WAIT,
+                        state_for_flush.compaction_scheduler.wait_idle(),
+                    )
+                    .await;
+                    state_for_flush.flush_notify.notify_one();
+                }
             }
         });
     }
@@ -2943,6 +2972,14 @@ pub(crate) async fn group_committer_loop(
 /// mutex; this window keeps the mutex available and gives the operator a
 /// stable degraded state instead of a grinding loop.
 pub(crate) const FLUSH_FAILURE_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long a flush refused at the search segment ceiling waits before it is
+/// retried. The refusal is decided before any segment is built, so a retry is
+/// cheap; the flush loop must not wait for a long compaction pass to finish,
+/// because nothing is flushed meanwhile and writes stall once the memtable
+/// fills. The scheduler runs the delta consolidation that frees the slot at
+/// the start of its next pass.
+pub(crate) const SEGMENT_CAP_RETRY_WAIT: Duration = Duration::from_secs(5);
 
 /// The reason recorded in `WriterHealth` when a flush fails on local
 /// persistence. Written for the operator who reads `/v0/health`.

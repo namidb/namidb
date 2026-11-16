@@ -225,4 +225,16 @@ impl Error {
     pub fn is_local_persistence(&self) -> bool {
         matches!(self, Error::Io(_))
     }
+
+    /// A flush found a vector/full-text index at its delta-segment ceiling
+    /// (`NAMIDB_SEARCH_LSM_MAX_SEGMENTS`). Nothing changed; a search-only
+    /// compaction ([`crate::CompactionBasis::prepare_search_only`]) frees the
+    /// segments, after which the same flush succeeds.
+    pub fn is_search_segment_cap(&self) -> bool {
+        matches!(self, Error::Precondition(message) if message.contains(SEARCH_SEGMENT_CAP_MARKER))
+    }
 }
+
+/// Stable fragment of the segment-ceiling flush error that
+/// [`Error::is_search_segment_cap`] recognises.
+pub(crate) const SEARCH_SEGMENT_CAP_MARKER: &str = "compact it before flushing another delta";

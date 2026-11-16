@@ -144,6 +144,7 @@ use crate::sst::nodes::{
 #[path = "search_lsm_compact.rs"]
 mod search_lsm_compact;
 use search_lsm_compact::PreparedSearchCompaction;
+pub(crate) use search_lsm_compact::DEFAULT_SEARCH_LSM_MAX_SEGMENTS;
 
 /// Outcome of [`compact_l0_to_l1`].
 #[derive(Debug, Clone)]
@@ -300,6 +301,73 @@ impl CompactionBasis {
     pub async fn prepare(&self, schema: &Schema) -> Result<PreparedCompaction> {
         prepare_compaction(&self.manifest_store, &self.fence, &self.base, schema).await
     }
+
+    /// `true` when a vector/full-text index of this basis has search segments
+    /// due for consolidation (metadata only).
+    pub fn search_compaction_due(&self) -> bool {
+        search_compaction_due(&self.base.manifest)
+    }
+
+    /// Prepare only the due Search-LSM consolidations of this basis: no Nodes
+    /// or edge bucket is merged. A Nodes merge reads and rewrites the whole
+    /// corpus and can take minutes on a large namespace, and every flush that
+    /// touches an indexed label adds one search segment meanwhile; running
+    /// the search work in its own short pass keeps the segment count well
+    /// below the flush ceiling during sustained writes. Install it with
+    /// [`crate::WriterSession::install_prepared_compaction`] like any other
+    /// prepared compaction.
+    pub async fn prepare_search_only(&self, schema: &Schema) -> Result<PreparedCompaction> {
+        self.prepare_scoped(schema, CompactionScope::SearchOnly)
+            .await
+    }
+
+    /// [`Self::prepare_search_only`] restricted to delta-run consolidations:
+    /// no base is rebuilt, so the pass stays short (it reads only the
+    /// selected deltas and their winners) whatever the corpus size.
+    pub async fn prepare_search_deltas(&self, schema: &Schema) -> Result<PreparedCompaction> {
+        self.prepare_scoped(schema, CompactionScope::SearchDeltas)
+            .await
+    }
+
+    /// [`Self::prepare`] without physical Search-LSM consolidation, for a
+    /// caller that runs the search-scoped passes separately.
+    pub async fn prepare_without_search(&self, schema: &Schema) -> Result<PreparedCompaction> {
+        self.prepare_scoped(schema, CompactionScope::WithoutPhysicalSearch)
+            .await
+    }
+
+    async fn prepare_scoped(
+        &self,
+        schema: &Schema,
+        scope: CompactionScope,
+    ) -> Result<PreparedCompaction> {
+        prepare_leveled_scoped(
+            &self.manifest_store,
+            &self.fence,
+            &self.base,
+            schema,
+            compaction_base_bytes(),
+            compaction_level_ratio(),
+            scope,
+        )
+        .await
+    }
+}
+
+/// What one prepare pass may rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionScope {
+    /// Nodes, edges and search indexes.
+    Full,
+    /// Search-LSM consolidations only.
+    SearchOnly,
+    /// Search-LSM delta-run consolidations only: no base rebuild, so the pass
+    /// is short and proportional to the changed rows.
+    SearchDeltas,
+    /// Nodes and edges, plus any logical search rebuild a Nodes merge needs,
+    /// but no physical Search-LSM consolidation (a search-scoped pass does
+    /// that work).
+    WithoutPhysicalSearch,
 }
 
 /// One node SST rewritten from the 2.x layout into the current one by
@@ -1482,6 +1550,27 @@ async fn prepare_leveled(
     base_bytes: u64,
     ratio: u64,
 ) -> Result<PreparedCompaction> {
+    prepare_leveled_scoped(
+        manifest_store,
+        fence,
+        base,
+        schema,
+        base_bytes,
+        ratio,
+        CompactionScope::Full,
+    )
+    .await
+}
+
+async fn prepare_leveled_scoped(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    base: &LoadedManifest,
+    schema: &Schema,
+    base_bytes: u64,
+    ratio: u64,
+    scope: CompactionScope,
+) -> Result<PreparedCompaction> {
     fence.assert_alive(base.manifest.epoch)?;
 
     // Group every SST by (kind, scope), every level together, so
@@ -1527,6 +1616,17 @@ async fn prepare_leveled(
         }
     }
 
+    if matches!(
+        scope,
+        CompactionScope::SearchOnly | CompactionScope::SearchDeltas
+    ) {
+        // No Nodes/edge merge and therefore no logical search rebuild: only
+        // the physical Search-LSM selections below run.
+        node_buckets.clear();
+        fwd_buckets.clear();
+        inv_buckets.clear();
+    }
+
     let store = manifest_store.store().clone();
     let paths = manifest_store.paths();
     let mut new_descs: Vec<SstDescriptor> = Vec::new();
@@ -1537,6 +1637,13 @@ async fn prepare_leveled(
     let search_policy = search_lsm_compact::SearchCompactionPolicy::from_env()?;
     let mut search_selections =
         search_lsm_compact::select_search_compactions(&base.manifest, search_policy)?;
+    match scope {
+        CompactionScope::Full | CompactionScope::SearchOnly => {}
+        CompactionScope::SearchDeltas => search_selections.retain(|selection| {
+            selection.mode == search_lsm_compact::SearchCompactionMode::DeltaRun
+        }),
+        CompactionScope::WithoutPhysicalSearch => search_selections.clear(),
+    }
 
     // Node tombstone GC needs the merge authoritative for every node key it
     // touches. Nodes are id-primary, so a key can live in any node SST
