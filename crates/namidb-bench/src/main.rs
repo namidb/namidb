@@ -24,6 +24,8 @@ mod graph_shape;
 mod http_load;
 #[cfg(feature = "http-load")]
 mod latency_store;
+#[cfg(feature = "http-load")]
+mod live_load;
 mod loader;
 #[cfg(feature = "object-native")]
 mod object_native;
@@ -380,6 +382,43 @@ enum Cmd {
         /// How many fulltext indexes `--setup` creates on `Doc` (0-4).
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=4))]
         fulltext_indexes: u8,
+    },
+    /// Document-graph ingestion with full-text indexes, then an embedding
+    /// backfill onto the same nodes, then search (see `live_load.rs`).
+    #[cfg(feature = "http-load")]
+    LiveLoad {
+        #[arg(long, default_value = "http://127.0.0.1:18480")]
+        url: String,
+        #[arg(long, value_enum)]
+        phase: live_load::LivePhase,
+        /// Directory for `requests.csv` and the per-phase JSON reports.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 45.0)]
+        text_minutes: f64,
+        #[arg(long, default_value_t = 300)]
+        batch: usize,
+        /// Client think time between text batches.
+        #[arg(long, default_value_t = 1000)]
+        pause_ms: u64,
+        #[arg(long, default_value_t = 377_000)]
+        vectors: usize,
+        #[arg(long, default_value_t = 300)]
+        vector_batch: usize,
+        #[arg(long, default_value_t = 150.0)]
+        vector_minutes: f64,
+        #[arg(long, default_value_t = 1024)]
+        dim: usize,
+        #[arg(long, default_value_t = 256)]
+        clusters: usize,
+        #[arg(long, default_value_t = 100)]
+        queries: usize,
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = 64)]
+        ef: usize,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
     },
 }
 
@@ -847,6 +886,43 @@ async fn main() -> Result<()> {
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "http-load")]
+        Cmd::LiveLoad {
+            url,
+            phase,
+            out,
+            text_minutes,
+            batch,
+            pause_ms,
+            vectors,
+            vector_batch,
+            vector_minutes,
+            dim,
+            clusters,
+            queries,
+            k,
+            ef,
+            seed,
+        } => {
+            live_load::live_load(live_load::LiveConfig {
+                url,
+                phase,
+                out,
+                text_minutes,
+                batch,
+                pause_ms,
+                vectors,
+                vector_batch,
+                vector_minutes,
+                dim,
+                clusters,
+                queries,
+                k,
+                ef,
+                seed,
+            })
+            .await?;
         }
     }
     Ok(())
