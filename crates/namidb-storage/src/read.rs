@@ -492,7 +492,7 @@ impl VectorSearchIndex {
 
 #[cfg(feature = "vector-index")]
 /// Leaf pages every clustered-base vector query probes at least.
-const MIN_VECTOR_V5_NPROBE: usize = 16;
+const MIN_VECTOR_V5_NPROBE: usize = 24;
 
 #[cfg(feature = "vector-index")]
 fn vector_v5_search_options(
@@ -502,11 +502,12 @@ fn vector_v5_search_options(
     let page_count = index.page_count().max(1);
     // `ef` remains the public accuracy knob. A natural cluster of embeddings
     // spans many 512-row leaves once the corpus is large, and the true nearest
-    // neighbours are spread across them: at 1024 dimensions four leaves gave
-    // recall@10 ~0.35, sixteen ~0.98. Probe `ef / 4` leaves, at least
-    // sixteen; the pages are fetched concurrently, so this costs bandwidth,
-    // not round trips. Widening eventually reaches every page when `ef`
-    // approaches the corpus, preserving the exact-fallback/exhaustion logic.
+    // neighbours are spread across them. On 377k 1024-dimension rows in 1024
+    // leaves (principal-direction splits) 16 leaves gave recall@10 0.94-0.97
+    // and 24 gave 0.995. Probe `ef / 4` leaves, at least 24; the pages are
+    // fetched concurrently, so this costs bandwidth, not round trips.
+    // Widening eventually reaches every page when `ef` approaches the corpus,
+    // preserving the exact-fallback/exhaustion logic.
     let nprobe = ef.div_ceil(4).max(MIN_VECTOR_V5_NPROBE).min(page_count);
     crate::sst::vector::v5::VectorV5SearchOptions {
         nprobe,

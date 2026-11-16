@@ -50,11 +50,15 @@ crates.io release will establish and document that API explicitly.
   Clustered-base readers are reused across queries, and the pages a query
   reranks or scans are fetched concurrently in waves instead of one round
   trip each.
-- **Vector search recall on large clustered bases.** A clustered base probed
-  4 leaf pages per query at the default `ef`; once a natural cluster of
-  embeddings spans many 512-row pages that missed most true neighbours
-  (recall@10 ~0.35 at 1024 dimensions). It now probes `max(ef / 4, 16)`
-  pages (recall@10 ~0.98 on the same corpus), fetched concurrently.
+- **Vector search recall on large clustered bases.** A clustered base split
+  its rows along one coordinate at a time and probed 4 leaf pages per query
+  at the default `ef`. In high dimensions a single coordinate separates
+  natural clusters poorly, so a query's true neighbours were spread over many
+  512-row leaves (recall@10 ~0.35 at 1024 dimensions). Bases are now split
+  along the principal direction of a bounded 256-row sample, and a query
+  probes `max(ef / 4, 24)` pages, fetched concurrently: recall@10 ~0.99 on
+  the same corpus. Bases written by earlier versions stay readable and pick
+  up the better layout at their next rebuild.
 - **Range page cache share.** The RAM tier for immutable object ranges
   (quantized vector pages, postings, paged indexes) requests 512 MiB instead
   of 64 MiB, so it gets about 15% of `NAMIDB_CACHE_MAX_BYTES` rather than 2%.

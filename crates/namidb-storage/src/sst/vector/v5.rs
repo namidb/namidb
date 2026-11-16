@@ -1351,39 +1351,111 @@ fn partition_rows(
     let axis = highest_variance_axis(rows, &indices)?;
     let group_count = branch.min(indices.len().div_ceil(target)).max(2);
     let mut children = Vec::with_capacity(group_count);
+    // Split along the principal direction of a bounded sample (falling back
+    // to the highest-variance axis). In high dimensions a single coordinate
+    // separates natural clusters poorly, so neighbours ended up spread over
+    // many leaves and recall needed far more probes.
+    let sample = principal_sample_indices(&indices);
+    let sample_rows = sample
+        .iter()
+        .map(|index| rows[*index].vector.as_slice())
+        .collect::<Vec<_>>();
+    let keyed = match principal_direction(&sample_rows, axis) {
+        Some(direction) => indices
+            .into_iter()
+            .map(|index| (dot_f32(&rows[index].vector, &direction), index))
+            .collect::<Vec<_>>(),
+        None => indices
+            .into_iter()
+            .map(|index| (rows[index].vector[axis], index))
+            .collect::<Vec<_>>(),
+    };
     // Balanced recursive multi-selection is O(N log B) for fan-out B, unlike
     // assigning every row to every centroid (O(N*B)) or sorting the whole set
     // at each tree level (O(N log N log C)). Across the tree this gives the
     // intended O(N log C * dim) construction bound.
-    for chunk in balanced_axis_groups(rows, indices, axis, group_count) {
+    for chunk in balanced_key_groups(rows, keyed, group_count) {
         children.push(partition_rows(rows, chunk, target, branch, metric, tree)?);
     }
     tree.nodes[node_index as usize].children = children;
     Ok(node_index)
 }
 
-fn balanced_axis_groups(
+fn balanced_key_groups(
     rows: &[BuildRow],
-    mut indices: Vec<usize>,
-    axis: usize,
+    mut keyed: Vec<(f32, usize)>,
     groups: usize,
 ) -> Vec<Vec<usize>> {
-    if groups <= 1 || indices.len() <= 1 {
-        return vec![indices];
+    if groups <= 1 || keyed.len() <= 1 {
+        return vec![keyed.into_iter().map(|(_, index)| index).collect()];
     }
     let left_groups = groups / 2;
     let right_groups = groups - left_groups;
     // Proportional split keeps every eventual bucket within one row of N/B.
-    let split = indices.len() * left_groups / groups;
-    indices.select_nth_unstable_by(split, |left, right| {
-        rows[*left].vector[axis]
-            .total_cmp(&rows[*right].vector[axis])
-            .then_with(|| rows[*left].id.cmp(&rows[*right].id))
+    let split = keyed.len() * left_groups / groups;
+    keyed.select_nth_unstable_by(split, |left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| rows[left.1].id.cmp(&rows[right.1].id))
     });
-    let right = indices.split_off(split);
-    let mut out = balanced_axis_groups(rows, indices, axis, left_groups);
-    out.extend(balanced_axis_groups(rows, right, axis, right_groups));
+    let right = keyed.split_off(split);
+    let mut out = balanced_key_groups(rows, keyed, left_groups);
+    out.extend(balanced_key_groups(rows, right, right_groups));
     out
+}
+
+/// Rows sampled to estimate a split direction: an even stride over the set.
+const PRINCIPAL_SAMPLE_ROWS: usize = 256;
+const PRINCIPAL_ITERATIONS: usize = 8;
+
+fn principal_sample_indices(indices: &[usize]) -> Vec<usize> {
+    let step = indices.len().div_ceil(PRINCIPAL_SAMPLE_ROWS).max(1);
+    indices.iter().step_by(step).copied().collect()
+}
+
+pub(super) fn dot_f32(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(l, r)| l * r).sum()
+}
+
+/// Top principal direction of `sample` by power iteration, started from
+/// `axis` so it is deterministic and never worse-conditioned than the axis.
+/// `None` when the sample has no spread. Memory is `O(dim)` beyond the
+/// sample; cost is `O(sample * dim * iterations)`.
+pub(super) fn principal_direction(sample: &[&[f32]], axis: usize) -> Option<Vec<f32>> {
+    let dim = sample.first()?.len();
+    if sample.len() < 2 || axis >= dim {
+        return None;
+    }
+    let mut mean = vec![0.0f64; dim];
+    for row in sample {
+        for (sum, value) in mean.iter_mut().zip(row.iter()) {
+            *sum += f64::from(*value);
+        }
+    }
+    let n = sample.len() as f64;
+    let mean = mean.into_iter().map(|sum| sum / n).collect::<Vec<_>>();
+    let mut direction = vec![0.0f64; dim];
+    direction[axis] = 1.0;
+    for _ in 0..PRINCIPAL_ITERATIONS {
+        let mut next = vec![0.0f64; dim];
+        for row in sample {
+            let projection = row
+                .iter()
+                .zip(&mean)
+                .zip(&direction)
+                .map(|((value, mean), dir)| (f64::from(*value) - mean) * dir)
+                .sum::<f64>();
+            for ((acc, value), mean) in next.iter_mut().zip(row.iter()).zip(&mean) {
+                *acc += (f64::from(*value) - mean) * projection;
+            }
+        }
+        let norm = next.iter().map(|value| value * value).sum::<f64>().sqrt();
+        if !norm.is_finite() || norm <= f64::EPSILON {
+            return None;
+        }
+        direction = next.into_iter().map(|value| value / norm).collect();
+    }
+    Some(direction.into_iter().map(|value| value as f32).collect())
 }
 
 fn centroid(rows: &[BuildRow], indices: &[usize], metric: VectorMetric) -> Result<Vec<f32>, Error> {
@@ -2700,21 +2772,17 @@ mod tests {
         assert!(source.range_count() <= 6);
     }
 
-    /// Recall/IO sweep over a bench-like corpus (clusters of ~6k rows around
-    /// random centroids, Gaussian noise of norm `spread`). Run by hand:
-    /// `NAMIDB_V5_SWEEP_ROWS=96000 cargo test --release ... v5_recall_sweep -- --ignored --nocapture`.
-    #[tokio::test]
-    #[ignore]
-    async fn v5_recall_sweep() {
-        let rows: u32 = std::env::var("NAMIDB_V5_SWEEP_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(48_000);
-        let dim: usize = std::env::var("NAMIDB_V5_SWEEP_DIM")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024);
-        let clusters = (rows / 5_900).max(1);
+    /// Recall@10 over a bench-like corpus (clusters of ~6k rows around random
+    /// centroids, Gaussian noise of norm `spread`) for each `(nprobe,
+    /// rerank)`, built with the in-memory or the spooling (compaction) builder.
+    async fn clustered_recall(
+        rows: u32,
+        cluster_rows: u32,
+        dim: usize,
+        external: bool,
+        combos: &[(usize, usize)],
+    ) -> Vec<f64> {
+        let clusters = (rows / cluster_rows).max(1);
         let spread = 0.35f32;
         let gauss = |rng: &mut ChaCha8Rng| -> f32 {
             let u1: f32 = rng.gen_range(f32::MIN_POSITIVE..1.0);
@@ -2762,24 +2830,42 @@ mod tests {
             })
             .collect();
         let started = std::time::Instant::now();
-        let (body, _) = build_body_v5(
-            &descriptor(VectorMetric::Cosine, dim as u32),
-            members,
-            VectorV5BuildOptions::default(),
-        )
-        .expect("build")
-        .expect("body");
+        let body = if external {
+            let mut members = members;
+            members.sort_by_key(|(node_id, _)| *node_id);
+            let mut collector = external::VectorV5ExternalCollector::new_base(
+                external::VectorV5ExternalBuildConfig::default(),
+            )
+            .expect("collector");
+            for (node_id, vector) in &members {
+                collector
+                    .push(*node_id, vector, &BTreeMap::new())
+                    .expect("push");
+            }
+            let mut artifact = collector
+                .finish(
+                    &descriptor(VectorMetric::Cosine, dim as u32),
+                    VectorV5BuildOptions::default(),
+                )
+                .expect("build")
+                .expect("artifact");
+            artifact.rewind().expect("rewind");
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut artifact.file, &mut body).expect("read");
+            Bytes::from(body)
+        } else {
+            build_body_v5(
+                &descriptor(VectorMetric::Cosine, dim as u32),
+                members,
+                VectorV5BuildOptions::default(),
+            )
+            .expect("build")
+            .expect("body")
+            .0
+        };
         eprintln!("built {} bytes in {:?}", body.len(), started.elapsed());
-        for (nprobe, rerank) in [
-            (4, 8),
-            (8, 8),
-            (16, 8),
-            (16, 16),
-            (24, 16),
-            (32, 16),
-            (48, 16),
-            (64, 16),
-        ] {
+        let mut recalls = Vec::with_capacity(combos.len());
+        for &(nprobe, rerank) in combos {
             let source = Arc::new(TrackingSource::new(body.clone()));
             let reader = VectorV5Reader::open(source.clone(), body.len() as u64)
                 .await
@@ -2802,10 +2888,62 @@ mod tests {
                     .expect("search");
                 recall += hits.iter().filter(|hit| truth.contains(&hit.0)).count();
             }
+            let recall = recall as f64 / (10.0 * queries.len() as f64);
             eprintln!(
-                "pages={pages} nprobe={nprobe} rerank={rerank} recall@10={:.3} ranges/query={:.1}",
-                recall as f64 / (10.0 * queries.len() as f64),
+                "pages={pages} nprobe={nprobe} rerank={rerank} recall@10={recall:.3} ranges/query={:.1}",
                 (source.range_count() - opened) as f64 / queries.len() as f64
+            );
+            recalls.push(recall);
+        }
+        recalls
+    }
+
+    /// Recall/IO sweep. Run by hand:
+    /// `NAMIDB_V5_SWEEP_ROWS=377000 cargo test ... v5_recall_sweep -- --ignored --nocapture`
+    /// (`NAMIDB_V5_SWEEP_EXTERNAL=1` for the spooling builder).
+    #[tokio::test]
+    #[ignore]
+    async fn v5_recall_sweep() {
+        let rows: u32 = std::env::var("NAMIDB_V5_SWEEP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48_000);
+        let dim: usize = std::env::var("NAMIDB_V5_SWEEP_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let external = std::env::var_os("NAMIDB_V5_SWEEP_EXTERNAL").is_some_and(|v| v == "1");
+        clustered_recall(
+            rows,
+            5_900,
+            dim,
+            external,
+            &[
+                (4, 8),
+                (8, 8),
+                (16, 8),
+                (24, 16),
+                (32, 16),
+                (48, 16),
+                (64, 16),
+                (128, 16),
+            ],
+        )
+        .await;
+    }
+
+    /// Leaves split along a principal direction keep a natural cluster's
+    /// neighbours in few leaves. Axis-aligned splits (3.4.0) scattered them:
+    /// recall@10 0.78 here, against 0.98.
+    #[tokio::test]
+    async fn clustered_neighbours_stay_in_few_leaves() {
+        for external in [false, true] {
+            // 64 clusters of 1000 rows in 128 leaves; 4 probes.
+            let recall = clustered_recall(64_000, 1_000, 512, external, &[(4, 8)]).await;
+            assert!(
+                recall[0] >= 0.9,
+                "external={external} recall@10={} at nprobe 4",
+                recall[0]
             );
         }
     }

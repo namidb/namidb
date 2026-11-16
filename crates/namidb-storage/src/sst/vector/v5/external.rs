@@ -1084,6 +1084,16 @@ fn partition_multiway(
         .min(sample_capacity_by_budget)
         .min(partition.rows as usize)
         .max(2);
+    // Split along the principal direction of a bounded hash sample (falling
+    // back to the highest-variance axis): a single coordinate separates
+    // natural clusters poorly in high dimensions, spreading neighbours over
+    // many leaves. The sample costs at most `DIRECTION_SAMPLE_ROWS * dim`
+    // floats.
+    let direction = split_direction(partition, stats.split_axis, depth, dim, context)?;
+    let split_value = |vector: &[f32]| match &direction {
+        Some(direction) => super::dot_f32(vector, direction),
+        None => vector[stats.split_axis],
+    };
     let mut heap = BinaryHeap::with_capacity(sample_limit);
     partition.rewind(dim)?;
     while let Some(record) = read_record(
@@ -1093,7 +1103,7 @@ fn partition_multiway(
     )? {
         let point = SamplePoint {
             sample_hash: stable_hash(&record.id, stats.split_axis, depth, 0x51),
-            value: record.vector[stats.split_axis],
+            value: split_value(&record.vector),
             tie_hash: stable_hash(&record.id, stats.split_axis, depth, 0xA7),
             id: record.id,
         };
@@ -1132,7 +1142,7 @@ fn partition_multiway(
     )? {
         let key = SamplePoint {
             sample_hash: 0,
-            value: record.vector[stats.split_axis],
+            value: split_value(&record.vector),
             tie_hash: stable_hash(&record.id, stats.split_axis, depth, 0xA7),
             id: record.id,
         };
@@ -1153,6 +1163,79 @@ fn partition_multiway(
         return partition_by_rank(partition, requested_groups, dim, context);
     }
     Ok(children)
+}
+
+/// Rows hashed into the split-direction sample.
+const DIRECTION_SAMPLE_ROWS: usize = 256;
+
+struct DirectionSample {
+    key: (u64, [u8; 16]),
+    vector: Vec<f32>,
+}
+
+impl PartialEq for DirectionSample {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for DirectionSample {}
+
+impl PartialOrd for DirectionSample {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DirectionSample {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+fn split_direction(
+    partition: &mut Partition,
+    axis: usize,
+    depth: usize,
+    dim: usize,
+    context: &mut ExternalBuildContext<'_>,
+) -> Result<Option<Vec<f32>>, Error> {
+    let limit = DIRECTION_SAMPLE_ROWS.min(partition.rows as usize);
+    if limit < 2 {
+        return Ok(None);
+    }
+    // Max-heap on the hash keeps the `limit` smallest hashes: a deterministic
+    // sample independent of spool order.
+    let mut heap: BinaryHeap<DirectionSample> = BinaryHeap::with_capacity(limit + 1);
+    partition.rewind(dim)?;
+    while let Some(record) = read_record(
+        partition.spool.as_file_mut(),
+        dim,
+        context.config.memory_budget_bytes,
+    )? {
+        let hash = stable_hash(&record.id, axis, depth, 0x3C);
+        let sample = DirectionSample {
+            key: (hash, record.id),
+            vector: record.vector,
+        };
+        if heap.len() < limit {
+            heap.push(sample);
+        } else if heap.peek().is_some_and(|largest| sample.key < largest.key) {
+            heap.pop();
+            heap.push(sample);
+        }
+    }
+    context.metrics.observe_working(
+        limit
+            .saturating_mul(dim)
+            .saturating_mul(std::mem::size_of::<f32>()),
+    );
+    let sample = heap.into_sorted_vec();
+    let rows = sample
+        .iter()
+        .map(|sample| sample.vector.as_slice())
+        .collect::<Vec<_>>();
+    Ok(super::principal_direction(&rows, axis))
 }
 
 fn split_key_order(left: &SamplePoint, right: &SamplePoint) -> Ordering {
