@@ -39,6 +39,16 @@ fn quantifier_kind(name: &str) -> Option<QuantifierKind> {
 /// to at most this depth).
 const MAX_EXPRESSION_DEPTH: usize = 128;
 
+/// Cap on the depth of one expression's tree. A chain of binary operators
+/// (`a OR b OR ...`, `1 + 1 + ...`) parses in a loop, not by recursion, so
+/// [`MAX_EXPRESSION_DEPTH`] does not see it, but it builds a left-deep tree
+/// one level per operator, and lowering, planning, evaluating and dropping
+/// that tree recurse once per level: a generated 10,000-term `OR` overflowed
+/// a 16 MiB stack and aborted the whole process. The depth is counted as
+/// the operators of each chain plus the deepest operand nested in it, so a
+/// long list of small expressions (`[-1.5, -2.5, ...]`) is not affected.
+const MAX_EXPRESSION_TREE_DEPTH: usize = 2_048;
+
 /// Optional Vamana build overrides from `CREATE VECTOR INDEX … WITH {…}`:
 /// `(r, l_build, alpha)`, each `None` when the key was omitted.
 type VectorBuildOverrides = (
@@ -54,13 +64,19 @@ struct Parser<'src> {
     pos: usize,
     /// Current expression-nesting depth, bounded by [`MAX_EXPRESSION_DEPTH`].
     depth: usize,
+    /// One entry per active [`Self::parse_expr_bp`] frame: the deepest tree
+    /// among the sub-expressions that frame has finished so far. Bounds the
+    /// tree depth by [`MAX_EXPRESSION_TREE_DEPTH`].
+    frame_depths: Vec<usize>,
     /// Outcome and end position of every node-like `(` parsed so far, keyed
     /// by `(token position, depth)`; see [`Self::parse_node_like_paren`].
     node_paren_memo: NodeParenMemo,
 }
 
+/// Outcome, end position and tree depth (see [`Parser::frame_depths`]) of a
+/// node-like paren parse.
 type NodeParenMemo =
-    std::collections::HashMap<(usize, usize), (Result<Expression, ParseError>, usize)>;
+    std::collections::HashMap<(usize, usize), (Result<Expression, ParseError>, usize, usize)>;
 
 type ReturnTail = (Vec<OrderItem>, Option<Expression>, Option<Expression>);
 
@@ -71,6 +87,7 @@ impl<'src> Parser<'src> {
             tokens,
             pos: 0,
             depth: 0,
+            frame_depths: Vec::new(),
             node_paren_memo: NodeParenMemo::new(),
         }
     }
@@ -1771,13 +1788,26 @@ impl<'src> Parser<'src> {
     /// re-parsing was exponential in it.
     fn parse_node_like_paren(&mut self) -> Result<Expression, ParseError> {
         let key = (self.pos, self.depth);
-        if let Some((result, end)) = self.node_paren_memo.get(&key) {
-            let result = result.clone();
-            self.pos = *end;
+        if let Some((result, end, tree_depth)) = self.node_paren_memo.get(&key) {
+            let (result, end, tree_depth) = (result.clone(), *end, *tree_depth);
+            self.pos = end;
+            self.note_tree_depth(tree_depth);
             return result;
         }
+        // Measure the depth this paren adds to the enclosing frame on its
+        // own, so a replay can add the same.
+        let outer = self.frame_depths.last_mut().map(std::mem::take);
         let result = self.parse_node_like_paren_uncached();
-        self.node_paren_memo.insert(key, (result.clone(), self.pos));
+        let tree_depth = match (self.frame_depths.last_mut(), outer) {
+            (Some(top), Some(outer)) => {
+                let inner = *top;
+                *top = inner.max(outer);
+                inner
+            }
+            _ => 0,
+        };
+        self.node_paren_memo
+            .insert(key, (result.clone(), self.pos, tree_depth));
         result
     }
 
@@ -2120,13 +2150,43 @@ impl<'src> Parser<'src> {
                 self.peek_span(),
             ));
         }
+        self.frame_depths.push(0);
         let result = self.parse_expr_bp_inner(min_bp);
+        let nested = self.frame_depths.pop().unwrap_or(0);
         self.depth -= 1;
-        result
+        let (expr, operators) = result?;
+        let tree_depth = nested.saturating_add(operators).saturating_add(1);
+        if tree_depth > MAX_EXPRESSION_TREE_DEPTH {
+            return Err(self.tree_depth_error(expr.span));
+        }
+        self.note_tree_depth(tree_depth);
+        Ok(expr)
     }
 
-    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expression, ParseError> {
+    /// Record a finished sub-expression's tree depth in the enclosing frame.
+    fn note_tree_depth(&mut self, depth: usize) {
+        if let Some(top) = self.frame_depths.last_mut() {
+            *top = (*top).max(depth);
+        }
+    }
+
+    fn tree_depth_error(&self, span: SourceSpan) -> ParseError {
+        ParseError::new(
+            ErrorCode::RecursionLimit,
+            format!(
+                "expression is too deep: more than {MAX_EXPRESSION_TREE_DEPTH} levels of \
+                 operators; pass a long list of alternatives as a list parameter \
+                 (`x IN $values`) instead of chaining them"
+            ),
+            span,
+        )
+    }
+
+    /// Parse one Pratt level; also returns how many binary operators this
+    /// level chained, each of which deepens the tree by one.
+    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<(Expression, usize), ParseError> {
         let mut lhs = self.parse_unary()?;
+        let mut operators = 0usize;
 
         loop {
             let op_info = match self.peek() {
@@ -2160,6 +2220,12 @@ impl<'src> Parser<'src> {
             };
             if lbp < min_bp {
                 break;
+            }
+            operators += 1;
+            let nested = self.frame_depths.last().copied().unwrap_or(0);
+            if nested.saturating_add(operators) >= MAX_EXPRESSION_TREE_DEPTH {
+                // Stop before building the rest of an over-long chain.
+                return Err(self.tree_depth_error(self.peek_span()));
             }
 
             // Consume the operator token (special cases handle their own tokens).
@@ -2221,7 +2287,7 @@ impl<'src> Parser<'src> {
                 }
             }
         }
-        Ok(lhs)
+        Ok((lhs, operators))
     }
 
     fn parse_unary(&mut self) -> Result<Expression, ParseError> {
@@ -3986,6 +4052,51 @@ mod tests {
             help.contains("relationship pattern"),
             "help should name the production, was: {help}"
         );
+    }
+
+    #[test]
+    fn long_operator_chains_are_bounded_by_tree_depth() {
+        let chain = |op: &str, n: usize| {
+            format!(
+                "MATCH (n) WHERE {} RETURN n",
+                (0..n)
+                    .map(|i| format!("n.k = {i}"))
+                    .collect::<Vec<_>>()
+                    .join(op)
+            )
+        };
+        // Up to the cap a chain parses as before.
+        assert!(parse(&chain(" OR ", 1_500)).is_ok());
+        // Past it: a typed error, not a tree deep enough to overflow later.
+        assert_eq!(err_code(&chain(" OR ", 20_000)), ErrorCode::RecursionLimit);
+        let plus = format!("RETURN {} AS x", vec!["1"; 50_000].join(" + "));
+        assert_eq!(err_code(&plus), ErrorCode::RecursionLimit);
+        // Chains nested in parentheses add up: 100 levels of 100 terms.
+        let mut nested = "1".to_string();
+        for _ in 0..100 {
+            nested = format!("({nested}{})", " + 1".repeat(100));
+        }
+        assert_eq!(
+            err_code(&format!("RETURN {nested} AS x")),
+            ErrorCode::RecursionLimit
+        );
+        // Many small expressions side by side are not deep.
+        let list = format!(
+            "RETURN [{}] AS v",
+            (0..20_000)
+                .map(|i| format!("-{i}.5 + 1"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(parse(&list).is_ok());
+        let wide = format!(
+            "RETURN {} AS x",
+            (0..2_000)
+                .map(|i| format!("(a{i} OR b{i})"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        );
+        assert!(parse(&wide).is_ok());
     }
 
     #[test]
