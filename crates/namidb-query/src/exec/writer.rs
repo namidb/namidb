@@ -3388,7 +3388,10 @@ async fn prepare_single_node_merge_batch(
     else {
         return Ok(None);
     };
-    if rows.is_empty() || !merge_labels_have_unique_key(writer, labels) {
+    if rows.is_empty()
+        || !(merge_labels_have_unique_key(writer, labels)
+            || merge_labels_have_equality_index(writer, labels))
+    {
         return Ok(None);
     }
 
@@ -3431,6 +3434,38 @@ async fn prepare_single_node_merge_batch(
             for view in views.into_iter().flatten() {
                 prefetched.insert(view.id, NodeValue::from(view));
             }
+        }
+    }
+
+    // Rows without a covered unique key use a declared non-unique equality
+    // index (a RANGE index without a UNIQUE constraint). Resolve all their
+    // values in one batch: the sidecar lookup seeds the writer's
+    // transactional postings (so the per-row probe below is O(1) and no
+    // label scan populates the whole map) and returns the confirmed views,
+    // which become the hydration hints for the matched rows.
+    let mut equality_groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for expected in &prepared {
+        if expected.explicit_id.is_some()
+            || !covered_merge_unique_keys(writer, labels, expected).is_empty()
+        {
+            continue;
+        }
+        if let Some((label, property, value)) = covered_merge_equality_key(writer, labels, expected)
+        {
+            equality_groups
+                .entry((label, property))
+                .or_default()
+                .push(value);
+        }
+    }
+    for ((label, property), values) in equality_groups {
+        let groups = writer
+            .transactional_overlay_snapshot()
+            .batch_lookup_nodes_by_property_multi(&label, &property, &values)
+            .await
+            .map_err(ExecError::Storage)?;
+        for view in groups.into_iter().flatten() {
+            prefetched.insert(view.id, NodeValue::from(view));
         }
     }
 
@@ -3507,6 +3542,19 @@ fn merge_labels_have_unique_key(writer: &WriterSession, labels: &[String]) -> bo
             .schema()
             .label(label)
             .is_some_and(|definition| definition.properties.iter().any(|property| property.unique))
+    })
+}
+
+/// Schema-only guard for the non-unique arm of the bulk preparation: some
+/// label of the pattern declares an indexed, non-unique property.
+fn merge_labels_have_equality_index(writer: &WriterSession, labels: &[String]) -> bool {
+    labels.iter().any(|label| {
+        writer.schema().label(label).is_some_and(|definition| {
+            definition
+                .properties
+                .iter()
+                .any(|property| property.indexed && !property.unique)
+        })
     })
 }
 
@@ -4340,6 +4388,49 @@ async fn merge_node_candidates_materialized(
         // the first staged mutation so one-row statements stay O(1) after one
         // population.
         let snap = writer.transactional_overlay_snapshot();
+        if let Some(prefetched) = prefetched_nodes {
+            // Bulk-prepared batch: the value was seeded into the
+            // transactional postings, so this probe is O(1) and current for
+            // earlier rows of the batch. Hydrate from the prepared views
+            // (refreshed after each mutating row) and read only the rest, in
+            // one batch.
+            if let Some((mut ids, mut resolved)) = snap
+                .transactional_string_postings(&label, &property, std::slice::from_ref(&value))
+                .await
+                .map_err(ExecError::Storage)?
+            {
+                let ids = ids.pop().unwrap_or_default();
+                let mut found = Vec::with_capacity(ids.len());
+                let mut unresolved = Vec::new();
+                for id in ids {
+                    let node = match prefetched.get(&id) {
+                        Some(node) => Some(node.clone()),
+                        None => resolved.remove(&id).map(NodeValue::from),
+                    };
+                    match node {
+                        Some(node) => {
+                            if materialized_node_matches(&node, pattern.labels, expected) {
+                                found.push(node);
+                            }
+                        }
+                        None => unresolved.push(id),
+                    }
+                }
+                if !unresolved.is_empty() {
+                    let views = snap
+                        .batch_lookup_nodes(&label, &unresolved)
+                        .await
+                        .map_err(ExecError::Storage)?;
+                    for node in views.into_iter().flatten().map(NodeValue::from) {
+                        if materialized_node_matches(&node, pattern.labels, expected) {
+                            found.push(node);
+                        }
+                    }
+                }
+                found.sort_by_key(|node| node.id);
+                return Ok(found);
+            }
+        }
         let lookup_value = RuntimeValue::String(value);
         let candidates = crate::exec::walker::lookup_nodes_by_property_via_scan(
             &snap,
