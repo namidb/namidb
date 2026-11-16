@@ -1182,12 +1182,15 @@ impl<'mt> Snapshot<'mt> {
 
         // Populate from exactly the view this snapshot exposes. An empty label
         // denotes the id-primary any-label scope; physical nodes are reconciled
-        // once even when they carry multiple labels.
+        // once even when they carry multiple labels. Only the indexed column is
+        // read: the map needs nothing else, and a full scan would decode every
+        // property of the label (all of a large text corpus).
         let views = if label.is_empty() {
-            self.scan_all_nodes_with_predicates_and_projection(&[], None)
+            self.scan_all_nodes_with_predicates_and_projection(&[], Some(&names))
                 .await?
         } else {
-            self.scan_label(label).await?
+            self.scan_label_with_predicates_and_projection(label, &[], Some(&names))
+                .await?
         };
         let entries = views.iter().map(|view| (view.id, &view.properties));
         if self.transactional_property_index_staged {
@@ -1768,10 +1771,11 @@ impl<'mt> Snapshot<'mt> {
             return Ok(Some(ids));
         }
         let views = if label.is_empty() {
-            self.scan_all_nodes_with_predicates_and_projection(&[], None)
+            self.scan_all_nodes_with_predicates_and_projection(&[], Some(&names))
                 .await?
         } else {
-            self.scan_label(label).await?
+            self.scan_label_with_predicates_and_projection(label, &[], Some(&names))
+                .await?
         };
         let entries = views.iter().map(|view| (view.id, &view.properties));
         if self.transactional_property_index_staged {
@@ -3003,21 +3007,19 @@ impl<'mt> Snapshot<'mt> {
     }
 
     /// Resolve String equality postings through the writer-private
-    /// transactional map, seeding every value it does not know yet.
+    /// transactional map, resolving every value it does not know yet.
     ///
     /// Returns `None` when no transactional map is attached. Otherwise the
     /// ids align with `values` and are authoritative for this snapshot. The
     /// map holds the views already confirmed while seeding (a caller that
     /// needs them hydrated does not have to read them again).
     ///
-    /// Unknown values take one batched point lookup: one posting probe per
-    /// SST, the memtable claimants of this overlay, and one batched confirm.
-    /// That view is exact for committed plus staged state, so its answers are
-    /// seeded as known keys. Only when an in-scope SST has no usable sidecar
-    /// does this fall back to the one-time label scan that populates the
-    /// complete map, as before. Seeding each key costs a sidecar probe; the
-    /// label scan it replaces read every column of every node of the label
-    /// (all of a large text corpus) before the first row could be answered.
+    /// The unknown values of a batch (at least `TRANSACTIONAL_SEED_MIN_VALUES`
+    /// distinct values) take one batched point lookup: one posting probe per SST, the
+    /// memtable claimants of this overlay, and one batched confirm. That view
+    /// is exact for committed plus staged state, so its answers are seeded as
+    /// known keys. Fewer values, or an in-scope SST without a usable sidecar,
+    /// populate the complete map once from a scan of the indexed column.
     pub async fn transactional_string_postings(
         &self,
         label: &str,
@@ -3034,18 +3036,25 @@ impl<'mt> Snapshot<'mt> {
         };
         let mut resolved: HashMap<NodeId, NodeView> = HashMap::new();
         let mut unknown: Vec<String> = Vec::new();
-        {
-            let mut seen: HashSet<&str> = HashSet::new();
-            for value in values {
-                if seen.insert(value.as_str())
-                    && index.probe_all(label, &names, &key_of(value)).is_none()
-                {
-                    unknown.push(value.clone());
-                }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for value in values {
+            if seen.insert(value.as_str())
+                && index.probe_all(label, &names, &key_of(value)).is_none()
+            {
+                unknown.push(value.clone());
             }
         }
+        let distinct = seen.len();
         if !unknown.is_empty() {
-            if label.is_empty() || !self.string_property_sidecars_cover(label, property) {
+            // A few values (one-row auto-commit statements) populate the
+            // complete map once, from a scan of the indexed column only: it
+            // then answers every later statement in O(1) and survives
+            // commits and flushes. A batch seeds just its own keys, so a
+            // large label is never scanned for a loader.
+            if label.is_empty()
+                || distinct < TRANSACTIONAL_SEED_MIN_VALUES
+                || !self.string_property_sidecars_cover(label, property)
+            {
                 for value in &unknown {
                     self.transactional_property_candidates(
                         label,
@@ -11709,6 +11718,12 @@ fn key_ranges_may_overlap(a: &SstDescriptor, b: &SstDescriptor) -> bool {
 
 /// One authoritative String-property claimant source for a node SST.
 ///
+/// Below this many distinct values, a transactional String postings lookup
+/// populates the complete map (once, from the indexed column) instead of
+/// seeding point answers. One-row auto-commit statements then stay O(1) after
+/// the first; batches never scan the label.
+const TRANSACTIONAL_SEED_MIN_VALUES: usize = 16;
+
 /// Legacy label-scoped SSTs encode schema-unique properties as a single-value
 /// map, while current id-primary SSTs encode the same logical key as a global
 /// equality posting map. A rolling-upgrade manifest can contain both at once,

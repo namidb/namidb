@@ -41,7 +41,7 @@ const LOADER: &str = "UNWIND $rows AS r \
      MERGE (a:Article {id: r.id}) SET a += r \
      WITH a, r \
      MATCH (n:Act {id: r.act_id}) \
-     MERGE (n)-[c:CONTAINS]->(a) SET c.position = r.position";
+     MERGE (n)-[c:HAS_ARTICLE]->(a) SET c.position = r.position";
 
 const ARTICLES: usize = 4_000;
 const ACTS: usize = 200;
@@ -148,7 +148,7 @@ fn schema() -> namidb_core::Schema {
         })
         .unwrap()
         .edge_type(EdgeTypeDef {
-            name: "CONTAINS".into(),
+            name: "HAS_ARTICLE".into(),
             src_label: "Act".into(),
             dst_label: "Article".into(),
             properties: vec![PropertyDef::new("position", DataType::Int64, true).unwrap()],
@@ -188,7 +188,7 @@ fn act_of(i: usize) -> usize {
     i % ACTS
 }
 
-/// Store an legal-corpus-shaped corpus (articles with their CONTAINS edge) in two
+/// Store an legal-corpus-shaped corpus (articles with their HAS_ARTICLE edge) in two
 /// flushed SSTs, then return a cold writer over it.
 async fn seeded(name: &str) -> (WriterSession, Arc<MeteredStore>, SstCache) {
     let store = Arc::new(MeteredStore {
@@ -238,7 +238,7 @@ async fn seeded(name: &str) -> (WriterSession, Arc<MeteredStore>, SstCache) {
             .unwrap();
         writer
             .upsert_edge(
-                "CONTAINS",
+                "HAS_ARTICLE",
                 act_ids[act_of(i)],
                 id,
                 &EdgeWriteRecord {
@@ -373,7 +373,7 @@ async fn loader_merge_on_non_unique_key_seeds_postings_and_reads_a_fraction_of_t
     );
     assert_eq!(
         outcome.edges_created, 148,
-        "existing articles keep their CONTAINS edge"
+        "existing articles keep their HAS_ARTICLE edge"
     );
     assert_eq!(
         writer.unique_index().populate_scans(),
@@ -408,7 +408,7 @@ async fn loader_merge_on_non_unique_key_seeds_postings_and_reads_a_fraction_of_t
     assert_eq!(updated, 1);
     let dup = count(
         &writer,
-        "MATCH (:Act)-[:CONTAINS]->(a:Article {id: $id}) RETURN count(a) AS c",
+        "MATCH (:Act)-[:HAS_ARTICLE]->(a:Article {id: $id}) RETURN count(a) AS c",
         &Params::from([("id".into(), RuntimeValue::String(article_id(ARTICLES)))]),
     )
     .await;
@@ -425,16 +425,26 @@ async fn loader_merge_on_non_unique_key_seeds_postings_and_reads_a_fraction_of_t
 #[tokio::test]
 async fn seeded_postings_follow_staged_changes_and_rollback() {
     let (mut writer, _store, _cache) = seeded("merge-nonunique-staged").await;
+    // Every MERGE carries 20 existing ids besides the one under test, so the
+    // batch seeds point postings (a lone value would populate the whole map).
+    let fillers: Vec<String> = existing_indices(21)
+        .into_iter()
+        .filter(|i| *i != 7)
+        .take(20)
+        .map(article_id)
+        .collect();
     let merge = |id: &str| {
+        let mut ids: Vec<RuntimeValue> = fillers
+            .iter()
+            .map(|f| RuntimeValue::String(f.clone()))
+            .collect();
+        ids.push(RuntimeValue::String(id.into()));
         (
             lower(
                 &parse("UNWIND $ids AS id MERGE (a:Article {id: id}) RETURN a.id AS id").unwrap(),
             )
             .unwrap(),
-            Params::from([(
-                "ids".into(),
-                RuntimeValue::List(vec![RuntimeValue::String(id.into())]),
-            )]),
+            Params::from([("ids".into(), RuntimeValue::List(ids))]),
         )
     };
 
@@ -451,6 +461,9 @@ async fn seeded_postings_follow_staged_changes_and_rollback() {
     )
     .await
     .unwrap();
+    // The one-key MATCH above may populate the map once; the batches below
+    // must not scan again.
+    let scans = writer.unique_index().populate_scans();
     let (plan, params) = merge("renamed");
     let out = execute_write_staged(&plan, &mut writer, &params)
         .await
@@ -472,6 +485,11 @@ async fn seeded_postings_follow_staged_changes_and_rollback() {
     assert_eq!(
         out.nodes_created, 0,
         "a staged create is visible to the next MERGE"
+    );
+    assert_eq!(
+        writer.unique_index().populate_scans(),
+        scans,
+        "batched MERGEs inside the transaction seed point postings"
     );
 
     // Roll everything back: none of the staged answers may survive.
