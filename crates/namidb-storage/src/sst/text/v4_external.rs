@@ -226,6 +226,9 @@ pub struct TextV4ExternalBuilder {
     last_term_delta: Option<String>,
     metrics: TextV4ExternalBuildMetrics,
     poisoned: bool,
+    /// Postings arrive already merged and sorted (a k-way merge of existing
+    /// FT4 segments): no tokenization and no external sort runs.
+    presorted: bool,
 }
 
 impl std::fmt::Debug for TextV4ExternalBuilder {
@@ -379,7 +382,162 @@ impl TextV4ExternalBuilder {
             final_total_len: 0,
             last_term_delta: None,
             poisoned: false,
+            presorted: false,
         })
+    }
+
+    /// Builder for a segment whose documents and postings are streamed already
+    /// merged and sorted from existing FT4 segments (see `v4_merge.rs`).
+    ///
+    /// A delta (`stats` given) carries the authenticated signed sums of its
+    /// sources and takes explicit per-term statistics; a base (`stats` none)
+    /// derives its absolute statistics from the merged live documents and
+    /// postings.
+    pub(super) fn with_config_presorted(
+        state: &SearchLsmState,
+        context: TextV4BuildContext,
+        config: TextV4ExternalBuildConfig,
+        stats: Option<ReconciledTextDeltaStats>,
+    ) -> Result<Self> {
+        let (role, mode) = match stats {
+            Some(stats) => (
+                SearchSegmentRole::Delta,
+                ExternalBuildMode::Reconciled(stats),
+            ),
+            None => (SearchSegmentRole::Base, ExternalBuildMode::Derived),
+        };
+        let mut builder = Self::with_config_for_role(state, context, config, role, mode)?;
+        builder.presorted = true;
+        Ok(builder)
+    }
+
+    /// Append one merged winner to a presorted build. A live winner carries its
+    /// document length and receives the next output ordinal, which is
+    /// returned; a suppression (deltas only) carries none.
+    pub(super) fn push_merged_winner(
+        &mut self,
+        source: SearchVersionRecord,
+        doc_len: Option<u32>,
+    ) -> Result<Option<u64>> {
+        if self.poisoned {
+            return Err(Error::precondition(
+                "text v4 external builder is poisoned by an earlier push failure",
+            ));
+        }
+        let result = self.push_merged_winner_inner(source, doc_len);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn push_merged_winner_inner(
+        &mut self,
+        source: SearchVersionRecord,
+        doc_len: Option<u32>,
+    ) -> Result<Option<u64>> {
+        if !self.presorted {
+            return Err(Error::precondition(
+                "push_merged_winner requires a presorted text v4 builder",
+            ));
+        }
+        if source.lsn == 0 {
+            return Err(Error::precondition(
+                "text v4 merged version uses reserved LSN zero",
+            ));
+        }
+        if self
+            .last_node_id
+            .is_some_and(|previous| source.node_id <= previous)
+        {
+            return Err(Error::precondition(
+                "text v4 merged builder requires strictly ascending NodeIds",
+            ));
+        }
+        let (output_record, ordinal) = match (source.operation, doc_len) {
+            (SearchVersionOperation::Live { payload_ordinal }, Some(_))
+                if payload_ordinal != u64::MAX =>
+            {
+                let ordinal = self.live_count;
+                (
+                    SearchVersionRecord::live(
+                        source.node_id,
+                        source.lsn,
+                        source.payload_fingerprint,
+                        ordinal,
+                    ),
+                    Some(ordinal),
+                )
+            }
+            (SearchVersionOperation::Suppress, None)
+                if self.role == SearchSegmentRole::Delta
+                    && source.payload_fingerprint == search_suppress_fingerprint() =>
+            {
+                (
+                    SearchVersionRecord::suppress(
+                        source.node_id,
+                        source.lsn,
+                        source.payload_fingerprint,
+                    ),
+                    None,
+                )
+            }
+            _ => {
+                return Err(Error::precondition(
+                    "text v4 merged winner has an inconsistent operation, document length or role",
+                ));
+            }
+        };
+        self.last_node_id = Some(source.node_id);
+        self.version_writer
+            .as_mut()
+            .ok_or_else(|| Error::invariant("text v4 version writer is absent"))?
+            .push(output_record)?;
+        if let Some(doc_len) = doc_len {
+            if doc_len == 0 {
+                return Err(Error::precondition(
+                    "text v4 merged live document has length zero",
+                ));
+            }
+            let encoded = encode_doc_record(DocRecord {
+                node_id: source.node_id,
+                lsn: source.lsn,
+                payload_fingerprint: source.payload_fingerprint,
+                doc_len,
+            });
+            self.documents.write_all(&encoded)?;
+            self.document_hasher.update(&encoded);
+            self.live_count = self
+                .live_count
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("text v4 live count overflows"))?;
+            self.final_total_len = self
+                .final_total_len
+                .checked_add(u64::from(doc_len))
+                .ok_or_else(|| Error::invariant("text v4 final document length overflows"))?;
+            if matches!(self.mode, ExternalBuildMode::Derived) {
+                self.delta_docs = self
+                    .delta_docs
+                    .checked_add(1)
+                    .ok_or_else(|| Error::invariant("text v4 document count overflows"))?;
+                self.delta_total_len = self
+                    .delta_total_len
+                    .checked_add(i64::from(doc_len))
+                    .ok_or_else(|| Error::invariant("text v4 total length overflows"))?;
+            }
+        } else {
+            self.suppress_count = self
+                .suppress_count
+                .checked_add(1)
+                .ok_or_else(|| Error::invariant("text v4 suppress count overflows"))?;
+        }
+        self.effective_count = self
+            .effective_count
+            .checked_add(1)
+            .ok_or_else(|| Error::invariant("text v4 mutation count overflows"))?;
+        self.min_lsn = self.min_lsn.min(source.lsn);
+        self.max_lsn = self.max_lsn.max(source.lsn);
+        Ok(ordinal)
     }
 
     pub fn metrics(&self) -> TextV4ExternalBuildMetrics {
@@ -441,6 +599,11 @@ impl TextV4ExternalBuilder {
     }
 
     fn push_inner(&mut self, mutation: TextV4Mutation) -> Result<()> {
+        if self.presorted {
+            return Err(Error::precondition(
+                "a presorted text v4 builder accepts only merged winners and postings",
+            ));
+        }
         if !matches!(self.mode, ExternalBuildMode::Derived) {
             return Err(Error::precondition(
                 "text v4 reconciled DeltaRun requires push_reconciled",
@@ -672,6 +835,11 @@ impl TextV4ExternalBuilder {
         source: SearchVersionRecord,
         after: Option<TextV4Payload>,
     ) -> Result<()> {
+        if self.presorted {
+            return Err(Error::precondition(
+                "a presorted text v4 builder accepts only merged winners and postings",
+            ));
+        }
         if !matches!(self.mode, ExternalBuildMode::Reconciled(_)) {
             return Err(Error::precondition(
                 "push_reconciled requires a reconciled text v4 DeltaRun builder",
@@ -795,6 +963,11 @@ impl TextV4ExternalBuilder {
     }
 
     fn push_term_delta_inner(&mut self, term: String, delta_df: i64) -> Result<()> {
+        if self.presorted {
+            return Err(Error::precondition(
+                "a presorted text v4 builder accepts only merged winners and postings",
+            ));
+        }
         if !matches!(self.mode, ExternalBuildMode::Reconciled(_)) {
             return Err(Error::precondition(
                 "push_term_delta requires a reconciled text v4 DeltaRun builder",
@@ -1054,7 +1227,33 @@ impl TextV4ExternalBuilder {
 }
 
 impl TextV4ExternalBuilder {
-    pub fn finish(mut self) -> Result<Option<TextV4ExternalArtifact>> {
+    pub fn finish(self) -> Result<Option<TextV4ExternalArtifact>> {
+        if self.presorted {
+            return Err(Error::precondition(
+                "a presorted text v4 builder must finish with finish_presorted",
+            ));
+        }
+        self.finish_inner(None)
+    }
+
+    /// Finish a presorted build: `feed` streams the merged native-filter
+    /// postings, then every term with its postings, in sort order.
+    pub(super) fn finish_presorted(
+        self,
+        feed: &mut dyn FnMut(&mut MergeSink<'_, '_>) -> Result<()>,
+    ) -> Result<Option<TextV4ExternalArtifact>> {
+        if !self.presorted {
+            return Err(Error::precondition(
+                "finish_presorted requires a presorted text v4 builder",
+            ));
+        }
+        self.finish_inner(Some(feed))
+    }
+
+    fn finish_inner(
+        mut self,
+        feed: Option<&mut dyn FnMut(&mut MergeSink<'_, '_>) -> Result<()>>,
+    ) -> Result<Option<TextV4ExternalArtifact>> {
         if self.poisoned {
             return Err(Error::precondition(
                 "cannot finish a poisoned text v4 external builder",
@@ -1124,8 +1323,17 @@ impl TextV4ExternalBuilder {
             self.config.directory_budget(),
             self.config.max_filter_distinct_per_property,
         )?;
+        assembler.df_from_postings =
+            self.presorted && matches!(self.mode, ExternalBuildMode::Derived);
         if let Some(run) = final_run {
             assembler.consume(run, self.config.block_budget())?;
+        }
+        if let Some(feed) = feed {
+            feed(&mut MergeSink {
+                assembler: &mut assembler,
+            })?;
+            assembler.finish_filter()?;
+            assembler.finish_term()?;
         }
         let assembly = assembler.finish()?;
         self.metrics.max_posting_block_bytes = assembly.max_posting_block_bytes;
@@ -1842,6 +2050,33 @@ fn merge_runs(
     output.finish()
 }
 
+/// Write side of a presorted build (see
+/// [`TextV4ExternalBuilder::finish_presorted`]). Native-filter postings come
+/// first, in sort-key order, then terms in lexical order.
+pub(super) struct MergeSink<'s, 'a> {
+    assembler: &'s mut ExternalAssembler<'a>,
+}
+
+impl MergeSink<'_, '_> {
+    /// Sort key of one native-filter value; filter postings must be supplied
+    /// in ascending key order, each key's ordinals strictly increasing.
+    pub(super) fn filter_key(property: &str, value: &SearchFilterValue) -> Result<String> {
+        filter_sort_key(property, value)
+    }
+
+    pub(super) fn filter(&mut self, key: &str, ordinal: u64) -> Result<()> {
+        self.assembler.accept_filter(key, ordinal)
+    }
+
+    pub(super) fn term(&mut self, term: &str, explicit_df: Option<i64>) -> Result<()> {
+        self.assembler.begin_term(term, explicit_df)
+    }
+
+    pub(super) fn posting(&mut self, doc: u64, doc_len: u32, positions: &[u32]) -> Result<()> {
+        self.assembler.accept_posting(doc, doc_len, positions)
+    }
+}
+
 struct ExternalAssembler<'a> {
     output: &'a mut File,
     term_spool: BufWriter<File>,
@@ -1880,6 +2115,8 @@ struct ExternalAssembler<'a> {
     metadata_hasher: Xxh3,
     max_posting_block_bytes: usize,
     max_filter_bytes: usize,
+    /// A presorted base: each term's absolute df is its live posting count.
+    df_from_postings: bool,
 }
 
 struct ExternalAssembly {
@@ -2083,6 +2320,7 @@ impl<'a> ExternalAssembler<'a> {
             metadata_hasher,
             max_posting_block_bytes: 0,
             max_filter_bytes: 0,
+            df_from_postings: false,
         })
     }
 
@@ -2100,34 +2338,112 @@ impl<'a> ExternalAssembler<'a> {
         self.finish_term()
     }
 
-    fn accept(&mut self, record: &TermRecord) -> Result<()> {
-        if let TermRecordKind::Filter { ordinal } = record.kind {
-            if self.saw_term_records || !record.term.starts_with(FILTER_KEY_PREFIX) {
+    fn accept_filter(&mut self, key: &str, ordinal: u64) -> Result<()> {
+        if self.saw_term_records || !key.starts_with(FILTER_KEY_PREFIX) {
+            return Err(Error::invariant(
+                "text v4 filter record appears outside the filter keyspace",
+            ));
+        }
+        if self
+            .current_filter_key
+            .as_ref()
+            .is_some_and(|current| current != key)
+        {
+            self.finish_filter()?;
+        }
+        if self.current_filter_key.is_none() {
+            let (property, value) = decode_filter_sort_key(key)?;
+            self.current_filter_key = Some(key.to_owned());
+            self.current_filter_property = Some(property);
+            self.current_filter_value = Some(value);
+            self.current_filter = Some(FilterAccumulator::new());
+        }
+        let peak = self
+            .current_filter
+            .as_mut()
+            .ok_or_else(|| Error::invariant("text v4 filter accumulator is absent"))?
+            .push(ordinal, self.row_count, self.block_budget)?;
+        self.max_filter_bytes = self.max_filter_bytes.max(peak);
+        Ok(())
+    }
+
+    /// Start `term` in a presorted stream. Terms must be strictly increasing;
+    /// a reconciled delta supplies the term's authenticated signed df.
+    fn begin_term(&mut self, term: &str, explicit_df: Option<i64>) -> Result<()> {
+        if term.is_empty() || term.starts_with(FILTER_KEY_PREFIX) {
+            return Err(Error::invariant(
+                "text v4 merged term is empty or collides with the filter keyspace",
+            ));
+        }
+        self.finish_filter()?;
+        self.saw_term_records = true;
+        if let Some(current) = &self.current_term {
+            if current.as_str() >= term {
                 return Err(Error::invariant(
-                    "text v4 filter record appears outside the filter keyspace",
+                    "text v4 merged terms are not strictly increasing",
                 ));
             }
-            if self
-                .current_filter_key
-                .as_ref()
-                .is_some_and(|key| key != &record.term)
-            {
-                self.finish_filter()?;
+            self.finish_term()?;
+        }
+        self.current_term = Some(term.to_owned());
+        match (self.reconciled, explicit_df) {
+            (true, Some(delta)) => {
+                self.delta_df = delta;
+                self.saw_explicit_df = true;
             }
-            if self.current_filter_key.is_none() {
-                let (property, value) = decode_filter_sort_key(&record.term)?;
-                self.current_filter_key = Some(record.term.clone());
-                self.current_filter_property = Some(property);
-                self.current_filter_value = Some(value);
-                self.current_filter = Some(FilterAccumulator::new());
+            (false, None) => {}
+            _ => {
+                return Err(Error::invariant(
+                    "text v4 merged term statistics disagree with the build mode",
+                ));
             }
-            let peak = self
-                .current_filter
-                .as_mut()
-                .ok_or_else(|| Error::invariant("text v4 filter accumulator is absent"))?
-                .push(ordinal, self.row_count, self.block_budget)?;
-            self.max_filter_bytes = self.max_filter_bytes.max(peak);
-            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// Append one whole posting of the current term. Documents must be
+    /// strictly increasing within the term.
+    fn accept_posting(&mut self, doc: u64, doc_len: u32, positions: &[u32]) -> Result<()> {
+        if self.current_term.is_none() {
+            return Err(Error::invariant("text v4 merged posting has no term"));
+        }
+        let previous = self
+            .current_doc
+            .or_else(|| self.posting_block.last().map(|posting| posting.doc));
+        if previous.is_some_and(|previous| previous >= doc) {
+            return Err(Error::invariant(
+                "text v4 merged postings are not strictly increasing",
+            ));
+        }
+        self.finish_posting()?;
+        if positions.is_empty()
+            || positions.windows(2).any(|pair| pair[0] >= pair[1])
+            || positions.last().is_some_and(|last| *last >= doc_len)
+        {
+            return Err(Error::invariant(
+                "text v4 merged posting positions are inconsistent",
+            ));
+        }
+        let projected = positions
+            .len()
+            .saturating_mul(size_of::<u32>())
+            .saturating_add(size_of::<Posting>());
+        if projected > self.block_budget {
+            return Err(Error::precondition(format!(
+                "one text v4 posting exceeds the {}-byte block workspace",
+                self.block_budget
+            )));
+        }
+        self.current_doc = Some(doc);
+        self.current_doc_len = doc_len;
+        self.current_positions.clear();
+        self.current_positions.extend_from_slice(positions);
+        Ok(())
+    }
+
+    fn accept(&mut self, record: &TermRecord) -> Result<()> {
+        if let TermRecordKind::Filter { ordinal } = record.kind {
+            return self.accept_filter(&record.term, ordinal);
         }
         if record.term.starts_with(FILTER_KEY_PREFIX) {
             return Err(Error::invariant(
@@ -2463,6 +2779,10 @@ impl<'a> ExternalAssembler<'a> {
                     self.delta_df
                 )));
             }
+        }
+        if self.df_from_postings {
+            self.delta_df = i64::try_from(live_doc_freq)
+                .map_err(|_| Error::invariant("text v4 term live df exceeds i64"))?;
         }
         if self.delta_df == 0 && live_doc_freq == 0 {
             self.reset_term();

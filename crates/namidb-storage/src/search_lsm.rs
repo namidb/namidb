@@ -1293,6 +1293,19 @@ pub fn validate_search_lsm(manifest: &Manifest) -> Result<(), SearchLsmValidatio
     Ok(())
 }
 
+/// Validate one generation against `manifest` in isolation: its catalog
+/// binding and its own physical/coverage/event invariants. Cross-generation
+/// checks (unique keys, one claim per descriptor) need
+/// [`validate_search_lsm`]; this answers whether *this* generation can keep
+/// serving and appending while another one is stale.
+pub fn validate_search_lsm_state(
+    manifest: &Manifest,
+    state: &SearchLsmState,
+) -> Result<(), SearchLsmValidationError> {
+    validate_catalog(manifest, state)?;
+    validate_state(manifest, state, &mut HashMap::new())
+}
+
 fn validate_catalog(
     manifest: &Manifest,
     state: &SearchLsmState,

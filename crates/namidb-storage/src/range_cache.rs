@@ -63,10 +63,13 @@ const FOYER_INDEX_SHARD_OVERHEAD_BYTES: usize = PAGE_BYTES;
 /// Default RAM request when a complete NVMe configuration is supplied without
 /// an explicit `NAMIDB_RAM_PAGE_CACHE_MAX_BYTES`.
 /// Requested RAM page tier. It is a share of `NAMIDB_CACHE_MAX_BYTES`, fitted
-/// proportionally beside the other tiers (about 15% of it by default), so a
-/// vector query's quantized navigation pages and a full-text query's posting
+/// proportionally beside the other tiers (about a third of it by default), so
+/// a vector query's quantized navigation pages and a full-text query's posting
 /// ranges stay resident across queries instead of costing a round trip each.
-pub const DEFAULT_RAM_PAGE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+/// Every Search-LSM read (V5/VG6 vectors, FT4 postings) goes through this
+/// tier; at 15% (3.4.1) a 256 MiB cache held 38 MB, half of a 20k x 1024
+/// vector index, and every warm query still paid object-store round trips.
+pub const DEFAULT_RAM_PAGE_CACHE_MAX_BYTES: usize = 1536 * 1024 * 1024;
 /// Largest range admitted by default.
 pub const DEFAULT_RANGE_CACHE_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 /// Canonical fetch/cache page. Normalizing arbitrary reads to this boundary

@@ -420,7 +420,11 @@ pub(crate) async fn prepare_search_flush(
     };
     let mut projected = base.manifest.clone();
     projected.schema = final_schema.clone();
-    let projected_lsm_valid = !committed_catalog_stale && validate_search_lsm(&projected).is_ok();
+    // Staleness is judged per generation: DDL that changes one index's
+    // native-filter set retires only that index's generation. Retiring every
+    // generation because one went stale restarted all of them as Building,
+    // which then could not activate under sustained writes.
+    let _ = committed_catalog_stale;
     let store = manifest_store.store().clone();
     let paths = manifest_store.paths().clone();
     let mut retired = HashSet::new();
@@ -434,7 +438,6 @@ pub(crate) async fn prepare_search_flush(
             &projected,
             SearchLsmKind::Vector,
             &descriptor.name,
-            projected_lsm_valid,
             &mut retired,
         )
         .await?;
@@ -474,7 +477,6 @@ pub(crate) async fn prepare_search_flush(
             &projected,
             SearchLsmKind::Text,
             &descriptor.name,
-            projected_lsm_valid,
             &mut retired,
         )
         .await?;
@@ -1021,6 +1023,23 @@ impl TextWork {
                 &record.properties,
             )
         });
+        if before_payload.is_some() && before_payload == after_payload {
+            // Same text and filters (for example a write that changed only an
+            // embedding): no posting, length or statistic can change, so do
+            // not tokenize either side. The classifier digest only has to be
+            // deterministic over the observed rows.
+            let payload = after_payload.as_ref().expect("checked equal and present");
+            let mut unchanged = Xxh3::new();
+            unchanged.update(b"NamiDB/TextFlushUnchanged/v1");
+            unchanged.update(payload.text.as_bytes());
+            for (property, value) in &payload.filters {
+                unchanged.update(property.as_bytes());
+                unchanged.update(format!("{value:?}").as_bytes());
+            }
+            let fingerprint = Some(unchanged.digest());
+            update_classifier_digest(&mut self.digest, node_id, lsn, fingerprint, fingerprint);
+            return Ok(());
+        }
         // Tokenize each side exactly once: the fingerprint, the BM25 length
         // and the builder's postings all come from the same token list.
         let before_prepared = before_payload
@@ -1339,7 +1358,6 @@ async fn select_or_initialize_state(
     manifest: &Manifest,
     kind: SearchLsmKind,
     index_name: &str,
-    projected_lsm_valid: bool,
     retired: &mut HashSet<Uuid>,
 ) -> Result<SearchLsmState> {
     let signature = catalog_signature(manifest, kind, index_name).ok_or_else(|| {
@@ -1352,7 +1370,10 @@ async fn select_or_initialize_state(
         .iter()
         .filter(|state| state.kind == kind && state.index_name == index_name)
         .collect::<Vec<_>>();
-    if projected_lsm_valid && matches.len() == 1 && matches[0].catalog_signature == signature {
+    if matches.len() == 1
+        && matches[0].catalog_signature == signature
+        && crate::search_lsm::validate_search_lsm_state(manifest, matches[0]).is_ok()
+    {
         return Ok(matches[0].clone());
     }
     for state in matches {
