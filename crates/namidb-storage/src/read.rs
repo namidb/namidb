@@ -8706,7 +8706,7 @@ impl<'mt> Snapshot<'mt> {
 
         crate::cancel::check()?;
         let path = Path::from(absolute.as_str());
-        let meta = match self.store.head(&path).await {
+        let meta = match crate::range_cache::head_create_only(&self.store, &path).await {
             Ok(meta) => meta,
             Err(error) => {
                 let error = Error::ObjectStore(error);
@@ -8881,7 +8881,7 @@ impl<'mt> Snapshot<'mt> {
 
         crate::cancel::check()?;
         let path = Path::from(absolute.as_str());
-        let meta = match self.store.head(&path).await {
+        let meta = match crate::range_cache::head_create_only(&self.store, &path).await {
             Ok(meta) => meta,
             Err(error) => {
                 let error = Error::ObjectStore(error);
@@ -10583,7 +10583,7 @@ impl<'mt> Snapshot<'mt> {
             return Ok(source);
         }
         let path = Path::from(absolute);
-        let meta = self.store.head(&path).await?;
+        let meta = crate::range_cache::head_create_only(&self.store, &path).await?;
         if meta.location != path {
             return Err(Error::Corrupted {
                 path: absolute.to_string(),
@@ -16259,6 +16259,11 @@ mod tests {
         ));
         let original = store.get(&absolute).await.unwrap().bytes().await.unwrap();
         store.delete(&absolute).await.unwrap();
+        // SST objects are create-only, so their HEAD is cached per process;
+        // a sidecar that vanishes under a live cache entry is the deletion
+        // path's job to forget (the sweep prunes it). Model a reader that
+        // never saw it.
+        crate::range_cache::forget_create_only_head(&store, &absolute);
         assert_eq!(
             Snapshot::new(committed.clone(), &empty_view, store.clone(), paths.clone())
                 .try_batch_nodes_have_labels(&doc, &ids)

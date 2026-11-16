@@ -193,6 +193,12 @@ pub struct TextV4ExternalArtifact {
     pub metrics: TextV4ExternalBuildMetrics,
 }
 
+/// Smallest sort-buffer growth step, in records.
+const MIN_SORT_BUFFER_RECORDS: usize = 1024;
+/// Term bytes assumed per record when sizing a sort-buffer growth step, so a
+/// grown buffer leaves room for the terms of the records it will hold.
+const EXPECTED_TERM_BYTES: usize = 16;
+
 /// Incremental external-sort FT4 builder.
 pub struct TextV4ExternalBuilder {
     state: SearchLsmState,
@@ -799,6 +805,7 @@ impl TextV4ExternalBuilder {
             .records
             .len()
             .saturating_add(1)
+            .max(self.records.capacity())
             .checked_mul(size_of::<TermRecord>())
             .and_then(|bytes| bytes.checked_add(self.record_term_bytes))
             .and_then(|bytes| bytes.checked_add(record.term.capacity()))
@@ -807,7 +814,22 @@ impl TextV4ExternalBuilder {
             self.flush_records()?;
         }
         if self.records.len() == self.records.capacity() {
-            self.records.reserve_exact(1);
+            // Grow geometrically, never past what the sort budget can account
+            // for. Growing by exactly one record cost a reallocation per term
+            // occurrence: millions per flush of a text-heavy memtable.
+            let room = self
+                .config
+                .sort_budget()
+                .saturating_sub(self.record_term_bytes)
+                / (size_of::<TermRecord>() + EXPECTED_TERM_BYTES);
+            let target = self
+                .records
+                .len()
+                .saturating_mul(2)
+                .max(MIN_SORT_BUFFER_RECORDS)
+                .min(room)
+                .max(self.records.len() + 1);
+            self.records.reserve_exact(target - self.records.len());
         }
         self.record_term_bytes = self
             .record_term_bytes

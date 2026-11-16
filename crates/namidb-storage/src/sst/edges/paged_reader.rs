@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use object_store::path::Path;
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::{ObjectMeta, ObjectStore};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -290,7 +290,7 @@ pub struct PagedEdgeReader {
 impl PagedEdgeReader {
     /// HEAD the object and open a generation-pinned reader.
     pub async fn open(store: Arc<dyn ObjectStore>, path: Path) -> Result<Self> {
-        let meta = store.head(&path).await?;
+        let meta = crate::range_cache::head_create_only(&store, &path).await?;
         if meta.location != path {
             return Err(Error::Corrupted {
                 path: path.to_string(),

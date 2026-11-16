@@ -22,11 +22,29 @@ vector-index = ["namidb-query/vector-index", "namidb-storage/vector-index"]
 # range-readable wire formats directly, without bringing the query executor
 # into the measurement.
 object-native = ["namidb-storage/vector-index", "namidb-storage/text-index"]
+# `serve` + `http-load`: the real HTTP server on a latency-simulating object
+# store, and the client that measures write throughput and vector search.
+http-load = [
+    "dep:namidb-server",
+    "dep:reqwest",
+    "dep:humantime",
+    "dep:tracing-subscriber",
+    "namidb-server/vector-index",
+    "namidb-server/text-index",
+    "namidb-query/vector-index",
+    "namidb-query/text-index",
+    "namidb-storage/vector-index",
+    "namidb-storage/text-index",
+]
 
 [dependencies]
 namidb-core = { workspace = true }
 namidb-storage = { workspace = true }
 namidb-query = { workspace = true }
+namidb-server = { path = "../namidb-server", optional = true }
+reqwest = { workspace = true, optional = true }
+humantime = { version = "2", optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

@@ -440,7 +440,22 @@ impl TextIndexExternalBuilder {
         }
 
         if self.occurrences.len() == self.occurrences.capacity() {
-            self.occurrences.reserve_exact(1);
+            // Geometric growth within the accounted budget (one reallocation
+            // per occurrence before).
+            let room = self
+                .options
+                .memory_budget_bytes
+                .saturating_sub(self.occurrence_term_bytes.saturating_add(term_bytes))
+                / (size_of::<Occurrence>() + 16);
+            let target = self
+                .occurrences
+                .len()
+                .saturating_mul(2)
+                .max(1024)
+                .min(room)
+                .max(self.occurrences.len() + 1);
+            self.occurrences
+                .reserve_exact(target - self.occurrences.len());
         }
         self.occurrence_term_bytes = self
             .occurrence_term_bytes

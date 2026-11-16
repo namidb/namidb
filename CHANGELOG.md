@@ -15,6 +15,75 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Changed — write throughput on remote object stores
+
+- **A write no longer re-reads the size of every SST sidecar it touches
+  (#212).** Snapshots kept the HEAD answers of the SST objects they read for
+  their own lifetime only, and the writer publishes a new snapshot after every
+  commit, so each write (and each read after it) paid one HEAD round trip per
+  sidecar it probed, under the writer lock. SST objects are create-only and
+  never change, so their HEAD is now kept per process, bounded by
+  `NAMIDB_CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES` (default 16384, `0` turns it
+  off), dropped with the namespace's caches and after any failed read of the
+  object. On a store with 20-40 ms per request and 60 SSTs, a point read went
+  from 243 ms to 7 ms, creating 400 relationships from 828 ms to 157 ms and
+  re-running a 500-row `MERGE` from 617 ms to 342 ms.
+- **A commit waits two object-store round trips instead of three.** The
+  advisory `current.json` PUT no longer runs after the pointer is created: the
+  next commit sends it together with its own pointer create, and every flush
+  (and the Python client's `close()`) sends it too, so an idle writer settles
+  it within one flush interval. The version is durable and found by readers as
+  soon as its pointer exists; the sweep keeps every pointer at or above the
+  version `current.json` names, so a lagging advisory still resolves. An owed
+  advisory is sent only while it is still the newest version (after the next
+  commit's Create-only manifest body landed, or when the next pointer does not
+  exist yet), so a writer fenced by a successor never rolls `current.json`
+  back below versions the successor committed.
+- **The periodic flush no longer holds the writer while it builds and uploads
+  SSTs.** It takes the writer only to commit the pending batch and checkpoint
+  the memtable, and again to commit the manifest that adds the new SSTs.
+  Encoding the node and edge SSTs, building the vector and full-text deltas and
+  uploading them all run with the writer free, so writes keep committing (and
+  are not rejected at the writer-lock timeout) while a large memtable is
+  flushed. Rows written during the flush stay in the memtable and their WAL
+  segments; a flush whose base changed meanwhile (a compaction or DDL
+  committed) is discarded and the next one runs under the writer. The
+  memtable stays bounded meanwhile: once writes made during the build bring
+  it to `NAMIDB_MEMTABLE_STALL_BYTES`, the flush takes the writer back until
+  it installs, so further writes wait as they did behind the synchronous
+  flush instead of growing it by a short stall per write. With a
+  full-text and a vector index on the loaded label, a document load and a
+  vector load running at the same time went from 79 to 535 documents/s and
+  from 5.9 to 66 vectors/s (1 GiB container, 20-40 ms per store request).
+- **The Python client's `flush()` requests a search compaction too.** Like
+  the server's flush loop since 3.3.2, it now compacts after a flush when a
+  vector or full-text index has enough delta segments to merge, not only on
+  the L0 trigger, so a long local load into an indexed label does not reach
+  the segment cap. In the server, a flush whose off-lock build fails (for
+  example at the cap) requests a compaction straight away.
+- **The memtable is sized to the process memory limit.** With
+  `NAMIDB_MEMORY_MAX_BYTES` set (`auto` follows the container limit, as the
+  bundled compose file does), the memtable flush trigger is capped at 1/16 of
+  it and the write stall at 1/8. The defaults, 64 MiB and 256 MiB, suit a
+  host with several GiB; in a 1 GiB container a 256 MiB memtable plus the copy
+  a flush keeps while it uploads left little for compaction and the requests
+  in flight. An explicit setting is capped the same way, and the server logs
+  the values it uses. `namidb_server::memtable_thresholds_within` computes
+  them.
+- **Large `UNWIND` batches fit in one request.** `/v0/cypher` accepts JSON
+  bodies up to `NAMIDB_HTTP_MAX_BODY_BYTES` (`--http-max-body-bytes`, default
+  16 MiB, was a fixed 2 MiB), enough for several hundred 1024-dimension
+  embeddings per request. Each request still reserves about 16x its size of
+  working memory before its JSON is decoded, and a request without a
+  `Content-Length` reserves 16x the limit; with `NAMIDB_MEMORY_MAX_BYTES` set,
+  the limit is therefore capped so one maximum-size request reserves at most a
+  quarter of it (never below the old 2 MiB), and the server logs the value it
+  uses. A larger body gets 413 with the setting's name in the message.
+- **Faster full-text delta builds.** The external sorters of the full-text
+  builders grew their buffers by one record per term occurrence, which cost a
+  reallocation per token of every indexed document at flush; they now grow
+  geometrically within the same memory budget.
+
 ### Fixed
 
 - **A label written in `WHERE` no longer scans every node.**
@@ -100,6 +169,15 @@ crates.io release will establish and document that API explicitly.
   literal property filter folded into its scan, keep the plan as before.
 
 ### Added
+
+- **`namidb-bench serve` and `namidb-bench http-load`** (feature `http-load`):
+  the real HTTP server on a store with simulated object-store latency (default
+  20-40 ms per request, with request counters per operation), and a client
+  that replays a field workload (`field-report`), measures sustained document
+  and vector loads (`bulk`, `vectors`), and measures vector search recall@k
+  and p50/p95 latency against brute-force ground truth on synthetic clustered
+  vectors (`vector-search`). Run `serve` in a memory-limited cgroup to measure
+  a container size.
 
 - `namidb-bench graph-shape-generate` writes a deterministic hub-shaped graph
   (2.4M nodes by default: four `:Device` hubs, the largest holding 1.7M

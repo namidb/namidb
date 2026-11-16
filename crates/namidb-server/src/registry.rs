@@ -64,6 +64,10 @@ pub struct MaintenanceConfig {
     /// Concurrent reads one namespace may run, inside the process-wide
     /// read gate. `0` (the default) means no per-namespace cap.
     pub max_concurrent_queries_per_namespace: usize,
+    /// Memtable bytes at which an off-lock flush build takes the writer back
+    /// until it installs (see `build_background_flush_bounded`). `0` (the
+    /// default) never does.
+    pub memtable_stall_bytes: usize,
 }
 
 impl Default for MaintenanceConfig {
@@ -78,6 +82,7 @@ impl Default for MaintenanceConfig {
             group_commit_window: Duration::ZERO,
             fence_policy: recovery::FencePolicy::Steal,
             max_concurrent_queries_per_namespace: 0,
+            memtable_stall_bytes: 0,
         }
     }
 }
@@ -473,6 +478,7 @@ impl NamespaceRegistry {
             let mut cancel = state.cancel_tx.subscribe();
             let interval = maint.flush_interval;
             let l0_trigger = maint.compaction_l0_trigger;
+            let memtable_stall_bytes = maint.memtable_stall_bytes;
             let ns = state.namespace.clone();
             let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
@@ -481,7 +487,8 @@ impl NamespaceRegistry {
                                    // Back off after a local-persistence flush failure — see the
                                    // single-tenant loop and `FLUSH_FAILURE_RETRY_BACKOFF`.
                 let mut retry_after: Option<Instant> = None;
-                loop {
+                let mut flush_superseded = false;
+                'tick: loop {
                     tokio::select! {
                         biased;
                         _ = cancel.wait_for(|evicted| *evicted) => break,
@@ -495,7 +502,7 @@ impl NamespaceRegistry {
                     // trigger when the L0 high-water mark trips. The
                     // scheduler captures a fresh basis inside its sole
                     // worker, including for its one pending follow-up.
-                    let should_compact = {
+                    let should_compact = 'flush: {
                         let lock_started = Instant::now();
                         let mut w = s.writer.lock().await;
                         metrics.observe_writer_lock(
@@ -527,12 +534,90 @@ impl NamespaceRegistry {
                             .await
                             .is_err()
                             {
-                                continue;
+                                continue 'tick;
                             }
                         }
-                        let schema = w.snapshot().manifest().manifest.schema.clone();
-                        match w.flush(schema.clone()).await {
-                            Ok(_) => {
+                        // SST build and upload with the writer lock released;
+                        // see the single-tenant loop.
+                        let flushed = if std::mem::take(&mut flush_superseded) {
+                            let schema = w.snapshot().manifest().manifest.schema.clone();
+                            w.flush(schema).await.map(|_| None)
+                        } else {
+                            match w.begin_background_flush().await {
+                                Ok(None) => Ok(None),
+                                Ok(Some(ticket)) => {
+                                    drop(w);
+                                    let (built, held) = crate::build_background_flush_bounded(
+                                        ticket,
+                                        &s.writer,
+                                        &s.flush_notify,
+                                        memtable_stall_bytes,
+                                    )
+                                    .await;
+                                    match built {
+                                        Ok(built) => {
+                                            w = match held {
+                                                Some(held) => held,
+                                                None => {
+                                                    let lock_started = Instant::now();
+                                                    let w = s.writer.lock().await;
+                                                    metrics.observe_writer_lock(
+                                                        WriterLockKind::Flush,
+                                                        lock_started.elapsed(),
+                                                        true,
+                                                    );
+                                                    w
+                                                }
+                                            };
+                                            if s.is_retired() {
+                                                drop(w);
+                                                return;
+                                            }
+                                            if let Some(group) = &s.group_commit {
+                                                if crate::commit_group_locked(
+                                                    group,
+                                                    &mut w,
+                                                    &s.snapshot,
+                                                    &s.writer_health,
+                                                    &ns,
+                                                )
+                                                .await
+                                                .is_err()
+                                                {
+                                                    continue 'tick;
+                                                }
+                                            }
+                                            w.install_background_flush(built).await.map(Some)
+                                        }
+                                        Err(e) => {
+                                            error!(namespace = %ns, error = %e, "periodic flush build failed");
+                                            if e.is_local_persistence() {
+                                                s.writer_health.mark_persistence_degraded(
+                                                    crate::persistence_degraded_reason(&e),
+                                                );
+                                                retry_after = Some(
+                                                    Instant::now()
+                                                        + crate::FLUSH_FAILURE_RETRY_BACKOFF,
+                                                );
+                                            }
+                                            // See the single-tenant loop.
+                                            break 'flush !s.is_retired();
+                                        }
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        };
+                        match flushed {
+                            Ok(installed) => {
+                                if matches!(
+                                    installed,
+                                    Some(namidb_storage::BackgroundFlushInstall::Superseded)
+                                ) {
+                                    tracing::debug!(namespace = %ns, "periodic flush superseded; retrying under the writer lock");
+                                    flush_superseded = true;
+                                    s.flush_notify.notify_one();
+                                }
                                 retry_after = None;
                                 s.writer_health.clear_persistence_degraded();
                                 s.snapshot.store(w.owned_snapshot());
