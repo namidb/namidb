@@ -500,6 +500,7 @@ impl NamespaceRegistry {
                         _ = cancel.wait_for(|evicted| *evicted) => break,
                         _ = tick.tick() => {}
                         _ = s.flush_notify.notified() => {}
+                        _ = crate::memory::pressure_flush_requested() => {}
                     }
                     if retry_after.is_some_and(|at| Instant::now() < at) {
                         continue;

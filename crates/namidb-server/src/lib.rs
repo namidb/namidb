@@ -642,7 +642,13 @@ impl AppState {
         kind: WriterLockKind,
     ) -> Option<tokio::sync::MutexGuard<'_, WriterSession>> {
         let started = std::time::Instant::now();
-        let guard = lock_writer_bounded(&self.writer, self.writer_lock_timeout).await;
+        let guard = lock_writer_with_memtable_room(
+            &self.writer,
+            self.writer_lock_timeout,
+            memtable_hard_bytes(self.memtable_stall_bytes),
+            &self.flush_notify,
+        )
+        .await;
         self.metrics
             .observe_writer_lock(kind, started.elapsed(), guard.is_some());
         guard
@@ -1587,6 +1593,9 @@ pub async fn run_with_memory_limits(
                 tokio::select! {
                     _ = tick.tick() => {}
                     _ = state_for_flush.flush_notify.notified() => {}
+                    // Over the memory ceiling after reclaim: the memtable is
+                    // the reconstructible memory left to give back.
+                    _ = memory::pressure_flush_requested() => {}
                 }
                 if retry_after.is_some_and(|at| std::time::Instant::now() < at) {
                     continue;
@@ -2667,6 +2676,68 @@ pub(crate) async fn lock_writer_bounded(
         return Some(writer.lock().await);
     }
     tokio::time::timeout(timeout, writer.lock()).await.ok()
+}
+
+/// Factor of the memtable stall threshold at which a write stops being
+/// merely delayed and waits for a flush to make room (2: a quarter of the
+/// process memory limit, since the stall threshold is an eighth).
+const MEMTABLE_HARD_FACTOR: usize = 2;
+
+/// The memtable size past which foreground writes wait for a flush
+/// (`0` = no bound).
+pub(crate) fn memtable_hard_bytes(stall_bytes: usize) -> usize {
+    stall_bytes.saturating_mul(MEMTABLE_HARD_FACTOR)
+}
+
+/// How often a write held back by a full memtable re-checks it.
+const MEMTABLE_ROOM_POLL: Duration = Duration::from_millis(50);
+
+/// [`lock_writer_bounded`] for a write that will grow the memtable: the
+/// writer is returned only while the memtable is below `hard_bytes`.
+///
+/// Past the stall threshold a write is only delayed, which bounds nothing
+/// when flushes cannot install (a search index at its segment ceiling, a
+/// failing store): a sustained loader then grew the memtable, and with it
+/// the process's anonymous memory, without limit until the memory ceiling
+/// rejected every query. Now the write releases the writer, wakes the flush
+/// and waits, and fails like any writer-lock timeout (a retryable 503 /
+/// transient Bolt failure) when no flush makes room within `timeout`.
+/// `hard_bytes == 0` disables the bound; a zero `timeout` waits as long as
+/// it takes, as the lock itself does.
+pub(crate) async fn lock_writer_with_memtable_room<'w>(
+    writer: &'w tokio::sync::Mutex<WriterSession>,
+    timeout: Duration,
+    hard_bytes: usize,
+    flush_notify: &tokio::sync::Notify,
+) -> Option<tokio::sync::MutexGuard<'w, WriterSession>> {
+    let started = std::time::Instant::now();
+    let mut warned = false;
+    loop {
+        let remaining = if timeout.is_zero() {
+            Duration::ZERO
+        } else {
+            match timeout.checked_sub(started.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => return None,
+            }
+        };
+        let guard = lock_writer_bounded(writer, remaining).await?;
+        let bytes = guard.memtable_bytes();
+        if hard_bytes == 0 || bytes < hard_bytes {
+            return Some(guard);
+        }
+        drop(guard);
+        flush_notify.notify_one();
+        if !warned {
+            warned = true;
+            tracing::warn!(
+                memtable_bytes = bytes,
+                hard_bytes,
+                "write waits for a flush: the memtable is at its hard bound"
+            );
+        }
+        tokio::time::sleep(MEMTABLE_ROOM_POLL).await;
+    }
 }
 
 /// Outcome of awaiting a group-commit ACK under the write deadline.
@@ -5904,7 +5975,13 @@ async fn run_write_section_multi(
     params: Params,
 ) -> WriteSectionMulti {
     let lock_started = std::time::Instant::now();
-    let writer = lock_writer_bounded(&ns_state.writer, shared.writer_lock_timeout).await;
+    let writer = lock_writer_with_memtable_room(
+        &ns_state.writer,
+        shared.writer_lock_timeout,
+        memtable_hard_bytes(shared.memtable_stall_bytes),
+        &ns_state.flush_notify,
+    )
+    .await;
     shared.metrics.observe_writer_lock(
         WriterLockKind::Http,
         lock_started.elapsed(),
@@ -10275,6 +10352,72 @@ mod tests {
             Some(Duration::from_millis(20)),
             "byte backstop with default delay"
         );
+    }
+
+    /// Production wedge on 3.4.1: a flush that could not install (a search
+    /// index at its segment ceiling) left an embedding backfill growing the
+    /// memtable past the stall threshold, where writes were only delayed,
+    /// until the anonymous heap held the process at its memory ceiling and
+    /// every query was rejected. Past twice the stall threshold a write now
+    /// waits for a flush and fails as a writer-busy timeout instead.
+    #[tokio::test]
+    async fn a_full_memtable_holds_writes_until_a_flush_makes_room() {
+        let (store, paths) = namidb_storage::parse_uri("memory://test-memtable-hard").unwrap();
+        let state = AppState::new(
+            WriterSession::open(store, paths).await.unwrap(),
+            None,
+            "t".into(),
+        )
+        .with_memtable_thresholds(0, 256)
+        .with_writer_lock_timeout(Duration::from_millis(200));
+        let hard = memtable_hard_bytes(state.memtable_stall_bytes);
+        assert_eq!(hard, 512);
+        {
+            let mut w = state
+                .lock_writer_bounded(WriterLockKind::Http)
+                .await
+                .expect("an empty memtable admits the write");
+            let mut properties = std::collections::BTreeMap::new();
+            properties.insert(
+                "embedding".to_string(),
+                namidb_core::value::Value::Vec(vec![0.5; 256]),
+            );
+            while w.memtable_bytes() < hard {
+                w.upsert_node(
+                    "P",
+                    namidb_core::id::NodeId::new(),
+                    &namidb_storage::NodeWriteRecord {
+                        properties: properties.clone(),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                w.commit_batch().await.unwrap();
+            }
+        }
+        // No flush task runs here, so nothing makes room: the write times out
+        // (a retryable writer-busy answer) and leaves the flush nudged.
+        let started = std::time::Instant::now();
+        assert!(state
+            .lock_writer_bounded(WriterLockKind::Http)
+            .await
+            .is_none());
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        tokio::time::timeout(Duration::from_secs(1), state.flush_notify.notified())
+            .await
+            .expect("a held-back write must wake the flush");
+        // The flush lock itself is not bounded by the memtable.
+        {
+            let mut w = state.writer.lock().await;
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.flush(schema).await.unwrap();
+            assert!(w.memtable_bytes() < hard);
+        }
+        assert!(state
+            .lock_writer_bounded(WriterLockKind::Http)
+            .await
+            .is_some());
     }
 
     #[tokio::test]
