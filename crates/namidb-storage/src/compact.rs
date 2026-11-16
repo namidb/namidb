@@ -2671,9 +2671,28 @@ fn rebase_search_lsm_for_node_rewrites(
         .iter()
         .map(|state| (state.kind, state.index_name.as_str()))
         .collect::<HashSet<_>>();
+    let input_ids = rewrites
+        .iter()
+        .flat_map(|rewrite| rewrite.inputs.iter().map(|input| input.id))
+        .collect::<HashSet<_>>();
+    // A generation a flush started after prepare (an index first flushed
+    // meanwhile) covers only Nodes SSTs written after the captured manifest,
+    // never this merge's inputs: it needs no rebase. Any other change to the
+    // set of generations still abandons the merge.
+    let appeared_untouched = current_states
+        .iter()
+        .filter(|state| !captured_keys.contains(&(state.kind, state.index_name.as_str())))
+        .all(|state| {
+            state.status == crate::search_lsm::SearchLsmStatus::Building
+                && state
+                    .coverage
+                    .iter()
+                    .all(|coverage| !input_ids.contains(&coverage.node_sst_id))
+        });
     if captured_keys.len() != captured_states.len()
         || current_keys.len() != current_states.len()
-        || captured_keys != current_keys
+        || !captured_keys.is_subset(&current_keys)
+        || !appeared_untouched
     {
         return Err(Error::precondition(
             "abandoning prepared compaction: Search-LSM generation set changed after prepare",

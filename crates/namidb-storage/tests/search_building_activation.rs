@@ -300,3 +300,53 @@ async fn native_hits_label(writer: &WriterSession, index: &str, label: &str) -> 
         .unwrap()
         .map(|hits| hits.len())
 }
+
+/// Per-index precondition. An index registered over existing nodes has no
+/// generation yet, so the next Nodes merge plans a logical rebuild of it.
+/// When a flush lands while that merge is prepared (it appends to the healthy
+/// index and starts the new one), 3.4.1 abandoned the whole compaction: the
+/// Nodes tables were never merged and the rebuild was redone, and abandoned,
+/// on every pass. Now only the conflicting index's rebuilt body is
+/// discarded; the merge and every other index install.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_during_a_rebuild_discards_only_that_index() {
+    let (mut writer, _store, _paths) = writer_with_corpus("per-index-precondition", 30).await;
+    // Fresh L0 so the next compaction has a Nodes merge to do.
+    for ordinal in 30..40u64 {
+        writer
+            .upsert_node("Doc", NodeId::new(), &doc(ordinal))
+            .unwrap();
+    }
+    writer.flush(schema(false)).await.unwrap();
+    writer
+        .register_text_index(
+            TextIndexDescriptor::new("title_ft".into(), "Doc".into(), vec!["title".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&writer, "title_ft"),
+        None,
+        "no generation before a flush"
+    );
+
+    let basis = writer.compaction_basis();
+    let prepared = basis.prepare(&schema(false)).await.unwrap();
+    writer.upsert_node("Doc", NodeId::new(), &doc(40)).unwrap();
+    writer.flush(schema(false)).await.unwrap();
+    let outcome = writer
+        .install_prepared_compaction(prepared)
+        .await
+        .expect("a flush during the rebuild must not abandon the Nodes merge");
+    assert!(outcome.source_ssts_removed > 0, "the Nodes merge installed");
+    let manifest = writer.snapshot().manifest().manifest.clone();
+    namidb_storage::search_lsm::validate_search_lsm(&manifest).unwrap();
+    assert_eq!(status(&writer, "body_ft"), Some(SearchLsmStatus::Active));
+    assert_eq!(native_hits(&writer, "body_ft", "comun").await, Some(41));
+
+    // The discarded index activates through the physical path.
+    writer.compact_search_segments().await.unwrap();
+    assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Active));
+    assert_eq!(native_hits(&writer, "title_ft", "comun").await, Some(41));
+}
