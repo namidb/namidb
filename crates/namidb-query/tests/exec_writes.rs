@@ -5385,8 +5385,8 @@ async fn merge_non_unique_index_unwind_stays_transactional_in_fresh_store() {
     assert_eq!(created.nodes_created, 500);
     assert_eq!(
         writer.unique_index().populate_scans() - scans_before,
-        1,
-        "the growing staged overlay must populate its postings map once"
+        0,
+        "a batched MERGE seeds its keys instead of populating the whole map"
     );
     assert!(
         writer.unique_index().posting_probes() >= postings_before + 499,
@@ -5531,8 +5531,8 @@ async fn indexed_match_unwind_after_staged_state_populates_once() {
     assert_eq!(outcome.rows.len(), 499, "staged rename removes key '1'");
     assert_eq!(
         writer.unique_index().populate_scans() - scans_before,
-        1,
-        "MATCH over a node-mutated overlay gets one transactional population"
+        0,
+        "a batched MATCH over a node-mutated overlay seeds its keys without a label scan"
     );
     assert!(
         writer.unique_index().posting_probes() >= postings_before + 500,

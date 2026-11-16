@@ -44,7 +44,7 @@
 //! correctness.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
 use std::ops::Range;
@@ -1182,12 +1182,15 @@ impl<'mt> Snapshot<'mt> {
 
         // Populate from exactly the view this snapshot exposes. An empty label
         // denotes the id-primary any-label scope; physical nodes are reconciled
-        // once even when they carry multiple labels.
+        // once even when they carry multiple labels. Only the indexed column is
+        // read: the map needs nothing else, and a full scan would decode every
+        // property of the label (all of a large text corpus).
         let views = if label.is_empty() {
-            self.scan_all_nodes_with_predicates_and_projection(&[], None)
+            self.scan_all_nodes_with_predicates_and_projection(&[], Some(&names))
                 .await?
         } else {
-            self.scan_label(label).await?
+            self.scan_label_with_predicates_and_projection(label, &[], Some(&names))
+                .await?
         };
         let entries = views.iter().map(|view| (view.id, &view.properties));
         if self.transactional_property_index_staged {
@@ -1768,10 +1771,11 @@ impl<'mt> Snapshot<'mt> {
             return Ok(Some(ids));
         }
         let views = if label.is_empty() {
-            self.scan_all_nodes_with_predicates_and_projection(&[], None)
+            self.scan_all_nodes_with_predicates_and_projection(&[], Some(&names))
                 .await?
         } else {
-            self.scan_label(label).await?
+            self.scan_label_with_predicates_and_projection(label, &[], Some(&names))
+                .await?
         };
         let entries = views.iter().map(|view| (view.id, &view.properties));
         if self.transactional_property_index_staged {
@@ -2936,27 +2940,180 @@ impl<'mt> Snapshot<'mt> {
             cache.record_equality_lookup();
         }
 
+        // RYOW snapshots: the writer-private postings map is authoritative
+        // per value. Values it does not know yet are resolved in one batch
+        // through the sidecars and seeded, instead of populating the whole
+        // label with a scan.
+        if self.transactional_property_index.is_some() {
+            let (ids_per_value, mut resolved) = self
+                .transactional_string_postings(label, property, values)
+                .await?
+                .expect("transactional index is attached");
+            let mut candidates: BTreeMap<String, BTreeSet<NodeId>> = BTreeMap::new();
+            for (value, ids) in values.iter().zip(&ids_per_value) {
+                let entry = candidates.entry(value.clone()).or_default();
+                entry.extend(ids.iter().filter(|id| !resolved.contains_key(id)));
+            }
+            let pending: Vec<String> = candidates
+                .iter()
+                .filter(|(_, ids)| !ids.is_empty())
+                .map(|(value, _)| value.clone())
+                .collect();
+            if !pending.is_empty() {
+                let pending_candidates = pending
+                    .iter()
+                    .map(|value| (value.clone(), candidates.remove(value).unwrap_or_default()))
+                    .collect();
+                let confirmed = self
+                    .batch_confirm_multi_candidates(label, property, &pending, pending_candidates)
+                    .await?;
+                for view in confirmed.into_iter().flatten() {
+                    resolved.insert(view.id, view);
+                }
+            }
+            return Ok(ids_per_value
+                .into_iter()
+                .zip(values)
+                .map(|(ids, value)| {
+                    let mut matches: Vec<NodeView> = ids
+                        .into_iter()
+                        .filter_map(|id| resolved.get(&id))
+                        .filter(|view| {
+                            matches!(view.properties.get(property), Some(Value::Str(current)) if current == value)
+                        })
+                        .cloned()
+                        .collect();
+                    matches.sort_by_key(|view| view.id);
+                    matches
+                })
+                .collect());
+        }
+
+        self.committed_batch_lookup_nodes_by_property_multi(label, property, values)
+            .await
+    }
+
+    /// Whether every in-scope node SST carries a String point sidecar for
+    /// `(label, property)`, so a point lookup needs no label scan.
+    fn string_property_sidecars_cover(&self, label: &str, property: &str) -> bool {
+        let node_sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
+        node_sst_idxs
+            .into_iter()
+            .filter(|idx| node_sst_can_contain_label(&self.manifest.manifest, *idx, label))
+            .all(|idx| {
+                string_property_sidecar(&self.manifest.manifest.ssts[idx], label, property)
+                    .is_some()
+            })
+    }
+
+    /// Resolve String equality postings through the writer-private
+    /// transactional map, resolving every value it does not know yet.
+    ///
+    /// Returns `None` when no transactional map is attached. Otherwise the
+    /// ids align with `values` and are authoritative for this snapshot. The
+    /// map holds the views already confirmed while seeding (a caller that
+    /// needs them hydrated does not have to read them again).
+    ///
+    /// The unknown values of a batch (at least `TRANSACTIONAL_SEED_MIN_VALUES`
+    /// distinct values) take one batched point lookup: one posting probe per SST, the
+    /// memtable claimants of this overlay, and one batched confirm. That view
+    /// is exact for committed plus staged state, so its answers are seeded as
+    /// known keys. Fewer values, or an in-scope SST without a usable sidecar,
+    /// populate the complete map once from a scan of the indexed column.
+    pub async fn transactional_string_postings(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Option<(Vec<Vec<NodeId>>, HashMap<NodeId, NodeView>)>> {
+        let Some(index) = self.transactional_property_index else {
+            return Ok(None);
+        };
+        let names = vec![property.to_string()];
+        let key_of = |value: &str| {
+            crate::unique_index::encode_probe_key(&[&Value::Str(value.to_string())])
+                .expect("String values are indexable")
+        };
+        let mut resolved: HashMap<NodeId, NodeView> = HashMap::new();
+        let mut unknown: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for value in values {
+            if seen.insert(value.as_str())
+                && index.probe_all(label, &names, &key_of(value)).is_none()
+            {
+                unknown.push(value.clone());
+            }
+        }
+        let distinct = seen.len();
+        if !unknown.is_empty() {
+            // A few values (one-row auto-commit statements) populate the
+            // complete map once, from a scan of the indexed column only: it
+            // then answers every later statement in O(1) and survives
+            // commits and flushes. A batch seeds just its own keys, so a
+            // large label is never scanned for a loader.
+            if label.is_empty()
+                || distinct < TRANSACTIONAL_SEED_MIN_VALUES
+                || !self.string_property_sidecars_cover(label, property)
+            {
+                for value in &unknown {
+                    self.transactional_property_candidates(
+                        label,
+                        property,
+                        &Value::Str(value.clone()),
+                    )
+                    .await?;
+                }
+            } else {
+                let views = self
+                    .committed_batch_lookup_nodes_by_property_multi(label, property, &unknown)
+                    .await?;
+                index.seed_postings(
+                    label,
+                    &names,
+                    unknown.iter().zip(&views).map(|(value, views)| {
+                        (key_of(value), views.iter().map(|view| view.id).collect())
+                    }),
+                    self.transactional_property_index_staged,
+                );
+                for view in views.into_iter().flatten() {
+                    resolved.insert(view.id, view);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(values.len());
+        for value in values {
+            let ids = match index.probe_all(label, &names, &key_of(value)) {
+                Some(ids) => ids,
+                // Defensive: a key that is still unknown takes the
+                // authoritative population path.
+                None => self
+                    .transactional_property_candidates(label, property, &Value::Str(value.clone()))
+                    .await?
+                    .unwrap_or_default(),
+            };
+            out.push(ids);
+        }
+        Ok(Some((out, resolved)))
+    }
+
+    /// The sidecar/claimant body of [`Self::batch_lookup_nodes_by_property_multi`]
+    /// without the transactional map. Exact for this snapshot's view,
+    /// including a staged overlay: memtable claimants walk the overlay and
+    /// every candidate is confirmed against its current view.
+    async fn committed_batch_lookup_nodes_by_property_multi(
+        &self,
+        label: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<Vec<NodeView>>> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut candidates: BTreeMap<String, BTreeSet<NodeId>> = values
             .iter()
             .cloned()
             .map(|value| (value, BTreeSet::new()))
             .collect();
-
-        // RYOW snapshots: the writer-private postings map is authoritative
-        // per value (first probe scans the overlay once).
-        if self.transactional_property_index.is_some() {
-            for (value, ids_out) in &mut candidates {
-                if let Some(ids) = self
-                    .transactional_property_candidates(label, property, &Value::Str(value.clone()))
-                    .await?
-                {
-                    ids_out.extend(ids);
-                }
-            }
-            return self
-                .batch_confirm_multi_candidates(label, property, values, candidates)
-                .await;
-        }
 
         let node_sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
         let have_node_ssts = !node_sst_idxs.is_empty();
@@ -3210,14 +3367,15 @@ impl<'mt> Snapshot<'mt> {
             .transactional_property_candidates(label, property, &Value::Str(value.to_string()))
             .await?
         {
-            let mut out = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(view) = self.lookup_node(label, id).await? {
-                    if matches!(view.properties.get(property), Some(Value::Str(s)) if s == value) {
-                        out.push(view);
-                    }
-                }
-            }
+            // One row-group-aware batch, not one targeted SST walk per id.
+            let views = self.batch_lookup_nodes(label, &ids).await?;
+            let mut out: Vec<NodeView> = views
+                .into_iter()
+                .flatten()
+                .filter(|view| {
+                    matches!(view.properties.get(property), Some(Value::Str(s)) if s == value)
+                })
+                .collect();
             out.sort_by_key(|view| view.id);
             return Ok(out);
         }
@@ -3319,20 +3477,19 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
-        // Confirm each candidate against its current value. `lookup_node`
-        // returns None for a tombstoned id and the live view otherwise; we
-        // drop any whose value no longer matches (the value-changed case).
-        let mut out = Vec::with_capacity(candidates.len());
-        for id in candidates {
-            if let Some(view) = self.lookup_node(label, id).await? {
-                if matches!(view.properties.get(property),
+        // Confirm each candidate against its current value in one batch.
+        // A tombstoned id resolves to None; we drop any whose value no
+        // longer matches (the value-changed case).
+        let candidates: Vec<NodeId> = candidates.into_iter().collect();
+        let views = self.batch_lookup_nodes(label, &candidates).await?;
+        Ok(views
+            .into_iter()
+            .flatten()
+            .filter(|view| {
+                matches!(view.properties.get(property),
                     Some(namidb_core::Value::Str(s)) if s == value)
-                {
-                    out.push(view);
-                }
-            }
-        }
-        Ok(out)
+            })
+            .collect())
     }
 
     /// Resolve a label-agnostic equality predicate, e.g.
@@ -11242,6 +11399,12 @@ fn key_ranges_may_overlap(a: &SstDescriptor, b: &SstDescriptor) -> bool {
 
 /// One authoritative String-property claimant source for a node SST.
 ///
+/// Below this many distinct values, a transactional String postings lookup
+/// populates the complete map (once, from the indexed column) instead of
+/// seeding point answers. One-row auto-commit statements then stay O(1) after
+/// the first; batches never scan the label.
+const TRANSACTIONAL_SEED_MIN_VALUES: usize = 16;
+
 /// Legacy label-scoped SSTs encode schema-unique properties as a single-value
 /// map, while current id-primary SSTs encode the same logical key as a global
 /// equality posting map. A rolling-upgrade manifest can contain both at once,
