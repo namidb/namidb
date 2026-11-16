@@ -7,17 +7,19 @@
 //! batch at a time, with a short pause between batches, for tens of minutes,
 //! into labels that carry full-text indexes over kilobytes of text and
 //! non-unique RANGE indexes on `id`. Some indexes are created after their
-//! label already holds data. A second phase then `MERGE`s one embedding per
-//! node onto existing full-text-indexed nodes (`SET x += r` where `r` holds
-//! only the id and the vector), the rest creating new nodes.
+//! label already holds data. A second phase then sets one embedding per
+//! existing full-text-indexed node (`MATCH ... SET a.embedding = r.v`): only
+//! the vector changes.
 //!
 //! Phases (`--phase`):
 //!
 //! - `text`: the time-bounded text ingestion. Labels load in sequence
 //!   (`Collection`, `Document`, `Passage`, `Revision`); each stops at its row target
 //!   or at its share of `--text-minutes`, whichever comes first.
-//! - `vectors`: `--vectors` embeddings onto `Passage` nodes `passage-0..`, capped
-//!   at `--vector-minutes`.
+//! - `vectors`: `--vectors` embedding-only writes onto the existing `Document`
+//!   nodes (`UNWIND $rows AS r MATCH (a:Document {id:r.id}) SET a.embedding =
+//!   r.v`), cycling over them when there are more vectors than documents,
+//!   capped at `--vector-minutes`.
 //! - `search`: vector recall@k / latency against brute-force ground truth over
 //!   the vectors actually loaded, plus BM25 latency on each full-text index.
 //!
@@ -115,7 +117,8 @@ const PLAN: [LabelPlan; 4] = [
             // document_ft's native-filter set: its generation must be rebuilt.
             "CREATE INDEX document_collection IF NOT EXISTS FOR (n:Document) ON (n.collection_id)",
             "CREATE FULLTEXT INDEX passage_ft IF NOT EXISTS FOR (n:Passage) ON EACH [n.body]",
-            "CREATE VECTOR INDEX passage_emb IF NOT EXISTS ON :Passage(embedding) METRIC cosine DIMENSION {dim}",
+            // Created once `Document` holds data, like the full-text one above.
+            "CREATE VECTOR INDEX document_emb IF NOT EXISTS ON :Document(embedding) METRIC cosine DIMENSION {dim}",
         ],
     },
     LabelPlan {
@@ -267,6 +270,17 @@ impl Client {
                     });
                 }
                 Ok((503, body)) => format!("HTTP 503 {body}"),
+                // The server stopped the query at its memory ceiling: the
+                // batch did not apply and is safe to resend. Log the failed
+                // attempt so the report counts it.
+                Ok((500, body)) if body.to_string().contains("memory") => {
+                    writeln!(
+                        self.log.lock().unwrap(),
+                        "{epoch_ms},{phase},{label},{rows},{:.1},500,{attempts}",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    )?;
+                    format!("HTTP 500 {}", truncate(&body.to_string()))
+                }
                 Ok((status, body)) => {
                     writeln!(
                         self.log.lock().unwrap(),
@@ -450,30 +464,68 @@ fn fxhash(s: &str) -> u64 {
     })
 }
 
-const VECTOR_QUERY: &str = "UNWIND $rows AS r MERGE (x:Passage {id: r.id}) SET x += r";
+/// The embedding backfill exactly as the ingestion service sends it: only the
+/// vector changes on nodes that already carry full-text-indexed text.
+const VECTOR_QUERY: &str = "UNWIND $rows AS r MATCH (a:Document {id:r.id}) SET a.embedding = r.v";
+
+/// Write `i` targets document `i % documents`; a run with more vectors than
+/// documents re-sets embeddings, which is still an embedding-only write.
+fn vector_target(i: usize, documents: usize) -> usize {
+    i % documents
+}
+
+async fn document_count(client: &Client) -> Result<usize> {
+    let outcome = client
+        .commit(
+            "vectors",
+            "count",
+            1,
+            "MATCH (n:Document) RETURN count(n) AS c",
+            &json!({}),
+        )
+        .await?;
+    outcome.body["rows"][0]["c"]
+        .as_u64()
+        .map(|c| c as usize)
+        .ok_or_else(|| anyhow!("no Document count in {}", outcome.body))
+}
 
 async fn vector_phase(client: &Client, config: &LiveConfig) -> Result<()> {
     let gen = VectorGen::new(config.dim, config.clusters, config.seed);
+    let documents = document_count(client).await?;
+    if documents == 0 {
+        return Err(anyhow!(
+            "the vectors phase needs Document nodes from the text phase"
+        ));
+    }
+    eprintln!("vectors onto {documents} Document nodes");
     let budget = Duration::from_secs_f64(config.vector_minutes * 60.0);
     let started = Instant::now();
     let mut loaded = 0usize;
     let mut latencies = Latencies::default();
     let mut retried = 0usize;
+    let mut needing_retry = 0usize;
     while loaded < config.vectors && started.elapsed() < budget {
         let count = config.vector_batch.min(config.vectors - loaded);
         let rows: Vec<Value> = (loaded..loaded + count)
-            .map(|i| json!({ "id": format!("passage-{i}"), "embedding": gen.vector(i) }))
+            .map(|i| {
+                json!({
+                    "id": format!("doc-{}", vector_target(i, documents)),
+                    "v": gen.vector(i),
+                })
+            })
             .collect();
         let outcome = client
             .commit(
                 "vectors",
-                "Passage",
+                "Document",
                 count,
                 VECTOR_QUERY,
                 &json!({ "rows": rows }),
             )
             .await?;
         retried += outcome.attempts - 1;
+        needing_retry += usize::from(outcome.attempts > 1);
         latencies.0.push(outcome.latency_ms);
         loaded += count;
         if loaded % (config.vector_batch * 20) < config.vector_batch {
@@ -488,25 +540,41 @@ async fn vector_phase(client: &Client, config: &LiveConfig) -> Result<()> {
     let secs = started.elapsed().as_secs_f64();
     let mut report = latencies.summary();
     report["vectors"] = json!(loaded);
+    report["documents"] = json!(documents);
     report["secs"] = json!(secs);
     report["vectors_per_sec"] = json!(loaded as f64 / secs.max(1e-9));
     report["retried_requests"] = json!(retried);
-    std::fs::write(config.out.join("vectors.loaded"), loaded.to_string())?;
+    report["requests_needing_retry"] = json!(needing_retry);
+    std::fs::write(
+        config.out.join("vectors.loaded"),
+        format!("{loaded} {documents}"),
+    )?;
     write_report(&config.out, "vectors", &report)
 }
 
 async fn search_phase(client: &Client, config: &LiveConfig) -> Result<()> {
-    let loaded: usize = std::fs::read_to_string(config.out.join("vectors.loaded"))
-        .context("search needs the vectors phase's vectors.loaded")?
-        .trim()
-        .parse()?;
+    let marker = std::fs::read_to_string(config.out.join("vectors.loaded"))
+        .context("search needs the vectors phase's vectors.loaded")?;
+    let mut fields = marker.split_whitespace().map(str::parse::<usize>);
+    let loaded = fields
+        .next()
+        .ok_or_else(|| anyhow!("empty vectors.loaded"))??;
+    let documents = fields
+        .next()
+        .ok_or_else(|| anyhow!("vectors.loaded lacks documents"))??;
+    // The vector a document holds is the last one written to it.
+    let last_write = |document: usize| -> Option<usize> {
+        (document < loaded.min(documents))
+            .then(|| document + documents * ((loaded - 1 - document) / documents))
+    };
+    let indexed = loaded.min(documents);
     let gen = Arc::new(VectorGen::new(config.dim, config.clusters, config.seed));
     let queries: Vec<Vec<f32>> = (0..config.queries).map(|q| gen.query(q)).collect();
     let k = config.k;
     let threads = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .min(16);
-    let chunk = loaded.div_ceil(threads).max(1);
+    let chunk = indexed.div_ceil(threads).max(1);
     let partials: Vec<Vec<Vec<(f32, usize)>>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -514,8 +582,8 @@ async fn search_phase(client: &Client, config: &LiveConfig) -> Result<()> {
                 let queries = &queries;
                 scope.spawn(move || {
                     let mut tops: Vec<Vec<(f32, usize)>> = vec![Vec::new(); queries.len()];
-                    for i in (t * chunk)..((t + 1) * chunk).min(loaded) {
-                        let v = gen.vector(i);
+                    for i in (t * chunk)..((t + 1) * chunk).min(indexed) {
+                        let v = gen.vector(last_write(i).expect("indexed document"));
                         for (q, query) in queries.iter().enumerate() {
                             let score: f32 = v.iter().zip(query).map(|(a, b)| a * b).sum();
                             let top = &mut tops[q];
@@ -541,7 +609,7 @@ async fn search_phase(client: &Client, config: &LiveConfig) -> Result<()> {
         })
         .collect();
 
-    let vector_query = "CALL search.vector({label: 'Passage', property: 'embedding', query: $q, \
+    let vector_query = "CALL search.vector({label: 'Document', property: 'embedding', query: $q, \
                         k: $k, ef: $ef}) YIELD node, score RETURN node.id AS id, score";
     let mut passes = Vec::new();
     for pass in ["cold", "warm"] {
@@ -564,7 +632,7 @@ async fn search_phase(client: &Client, config: &LiveConfig) -> Result<()> {
             let got: std::collections::HashSet<usize> = rows
                 .iter()
                 .filter_map(|row| row["id"].as_str())
-                .filter_map(|id| id.strip_prefix("passage-"))
+                .filter_map(|id| id.strip_prefix("doc-"))
                 .filter_map(|n| n.parse().ok())
                 .collect();
             let hits = truth[q].iter().filter(|i| got.contains(i)).count();
@@ -606,7 +674,13 @@ async fn search_phase(client: &Client, config: &LiveConfig) -> Result<()> {
     write_report(
         &config.out,
         "search",
-        &json!({ "vectors": loaded, "ef": config.ef, "vector": passes, "bm25": fulltext }),
+        &json!({
+            "vectors": loaded,
+            "documents": indexed,
+            "ef": config.ef,
+            "vector": passes,
+            "bm25": fulltext
+        }),
     )
 }
 
