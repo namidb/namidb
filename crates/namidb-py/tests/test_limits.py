@@ -162,7 +162,9 @@ def test_process_memory_stays_bounded(tmp_path) -> None:
                 except namidb.QueryMemoryError:
                     pass
             peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            print((peak - base) // 1024)
+            # ru_maxrss is in bytes on macOS and in KiB elsewhere.
+            unit = 1024 * 1024 if sys.platform == "darwin" else 1024
+            print((peak - base) // unit)
             """
         )
     )
