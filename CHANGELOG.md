@@ -206,6 +206,16 @@ crates.io release will establish and document that API explicitly.
 
 ### Fixed
 
+- **A long chain of operators fails to parse instead of crashing the
+  process.** A generated `WHERE n.k = 0 OR n.k = 1 OR ...` (or `1 + 1 +
+  ...`) is parsed in a loop but builds a tree one level deep per operator,
+  and planning, evaluating and dropping it recursed once per level: about
+  10,000 terms overflowed the 16 MiB query thread stack and aborted the
+  whole server or Python process. An expression may now be at most 2,048
+  operator levels deep (the operators of each chain plus the deepest
+  operand nested in it); past that it fails with a parse error that
+  suggests `x IN $values`. Long lists of small expressions are not
+  affected.
 - **A query stops when its client goes away.** An HTTP client that
   disconnected (or the HTTP request timeout) left its read running to
   completion; the read now stops at its next cooperative check, within
