@@ -978,7 +978,11 @@ fn percent(value: usize, percentage: usize) -> usize {
 }
 
 fn sample_resident_bytes() -> Option<usize> {
-    memory_stats::memory_stats().map(|stats| stats.physical_mem)
+    // Anonymous + shared resident memory on Linux: clean file-backed pages
+    // (compaction's mapped spool inputs) are reclaimable and must not hold
+    // the process "at its ceiling" (see `process_resident_bytes`).
+    namidb_query::process_resident_bytes()
+        .or_else(|| memory_stats::memory_stats().map(|stats| stats.physical_mem))
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -996,6 +1000,20 @@ pub(crate) fn trim_allocator() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_measure_excludes_reclaimable_file_pages() {
+        let status = "Name:\tnamidb\nVmRSS:\t  900000 kB\nRssAnon:\t  300000 kB\n\
+                      RssFile:\t  590000 kB\nRssShmem:\t   10000 kB\n";
+        assert_eq!(
+            namidb_query::exec::parse_unreclaimable_resident(status),
+            Some(310_000 * 1024)
+        );
+        assert_eq!(
+            namidb_query::exec::parse_unreclaimable_resident("VmRSS: 1 kB\n"),
+            None
+        );
+    }
 
     #[test]
     fn memory_limit_parser_accepts_exact_bytes_and_rejects_ambiguous_units() {

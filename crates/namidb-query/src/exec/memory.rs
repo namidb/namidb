@@ -734,19 +734,42 @@ impl GrowthMeter {
 
 // ─────────────────────────── host memory ────────────────────────────
 
-/// Resident set of this process in bytes, where the platform exposes it
-/// cheaply (Linux `/proc/self/statm`). `None` elsewhere.
+/// Memory this process holds that the kernel cannot reclaim on its own, in
+/// bytes: anonymous plus shared resident pages (Linux `RssAnon + RssShmem`).
+/// `None` on other platforms.
+///
+/// Clean file-backed pages are left out. Compaction maps its spooled input
+/// bodies, and the whole resident set (`statm`) counted every page of them
+/// it touched: a large merge pushed the process "to its ceiling" and the
+/// memory guard stopped running writes, although the kernel reclaims those
+/// pages before it would ever OOM-kill the process.
 pub fn process_resident_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let resident_pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
-        Some(resident_pages.saturating_mul(page_size()))
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        parse_unreclaimable_resident(&status).or_else(|| {
+            // Kernels before 4.5 lack the split: fall back to the full RSS.
+            let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+            let resident_pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+            Some(resident_pages.saturating_mul(page_size()))
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
         None
     }
+}
+
+/// `RssAnon + RssShmem` of a `/proc/<pid>/status` body, in bytes.
+pub fn parse_unreclaimable_resident(status: &str) -> Option<usize> {
+    let field = |name: &str| -> Option<usize> {
+        status.lines().find_map(|line| {
+            let rest = line.strip_prefix(name)?.strip_prefix(':')?;
+            let kib: usize = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            Some(kib.saturating_mul(1024))
+        })
+    };
+    Some(field("RssAnon")?.saturating_add(field("RssShmem").unwrap_or(0)))
 }
 
 #[cfg(target_os = "linux")]
