@@ -59,6 +59,15 @@ const MAGIC_FOOTER: &[u8; 4] = b"TGEL";
 /// across versions, so decode accepts anything `<= FORMAT_VERSION`.
 const FORMAT_VERSION: u16 = 2;
 
+/// Format version in a segment's header, or `None` when `header` (the first
+/// six bytes of a segment) does not start with the segment magic.
+pub(crate) fn header_format_version(header: &[u8]) -> Option<u16> {
+    if header.len() < 6 || &header[..4] != MAGIC_HEADER {
+        return None;
+    }
+    Some(u16::from_le_bytes([header[4], header[5]]))
+}
+
 /// A single WAL record. `lsn` is assigned by the writer monotonically and
 /// becomes the durable order of operations within a namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]

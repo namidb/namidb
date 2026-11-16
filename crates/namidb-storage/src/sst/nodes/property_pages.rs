@@ -1821,6 +1821,11 @@ impl NodePropertyPageReader {
         self.header.node_count
     }
 
+    /// Most NodeIds one [`Self::project_node_ids`] call accepts.
+    pub fn max_query_rows(&self) -> usize {
+        self.config.max_query_rows
+    }
+
     pub fn property_count(&self) -> u32 {
         self.header.property_count
     }

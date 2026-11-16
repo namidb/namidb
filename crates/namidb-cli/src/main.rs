@@ -11,6 +11,8 @@
 //! namespace. With `--store file:///path?ns=…` or any other
 //! supported scheme (s3, gs, az), state is durable on the
 //! configured backend.
+//! - `migrate --store <uri> [--dry-run]` — report the storage format and
+//! rewrite NamiDB 2.x node SSTs into the current layout.
 
 // Cosmetic doc-rendering nit (lazy markdown list continuation); allow it.
 #![allow(clippy::doc_lazy_continuation)]
@@ -25,7 +27,10 @@ use namidb_query::{
     explain_query_verbose, parse, plan as build_plan, Params, RuntimeValue, StatsCatalog,
     WriteOutcome,
 };
-use namidb_storage::{copy_namespace_snapshot, parse_uri, NamespacePaths, WriterSession};
+use namidb_storage::{
+    copy_namespace_snapshot, inspect_storage_format, parse_uri, FormatInspection, ManifestStore,
+    NamespacePaths, WriterSession,
+};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
@@ -194,6 +199,26 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Report a namespace's storage format and rewrite the node SSTs NamiDB
+    /// 2.x left in its old layout (embeddings inside the overflow JSON) into
+    /// the current one.
+    ///
+    /// Each SST is rewritten with exactly the same rows, read back and
+    /// compared row by row, then swapped in by its own manifest commit. A
+    /// crash or Ctrl-C keeps every SST already swapped; run it again to
+    /// resume. NamiDB 2.x cannot read the namespace afterwards, so take a
+    /// `backup` first if you may go back. The command claims the namespace's
+    /// writer: stop any server or client that writes it, or it is fenced.
+    /// The replaced SSTs stay on storage until an orphan sweep (the server's
+    /// janitor, or `Client.sweep()` in Python) removes them.
+    Migrate {
+        /// Namespace URI (see `run --help` for schemes).
+        #[arg(long)]
+        store: String,
+        /// Only report the format and what would be rewritten; change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Restore a namespace from a backup made with `backup`.
     ///
     /// The same consistent copy as `backup`, in the recovery direction. The
@@ -317,6 +342,12 @@ fn main() -> anyhow::Result<()> {
                 copy_namespace_cmd("backed up", &from, &to, version, force, verify).await
             })?;
         }
+        Cmd::Migrate { store, dry_run } => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(migrate_cmd(&store, dry_run))?;
+        }
         Cmd::RestorePoints { from, limit } => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -338,6 +369,95 @@ fn main() -> anyhow::Result<()> {
             ))?;
         }
     }
+    Ok(())
+}
+
+fn print_format(inspection: &FormatInspection) {
+    match &inspection.stamp {
+        Some(stamp) => println!(
+            "manifest v{}: storage format {} (written by {}; readers need format {}+)",
+            inspection.manifest_version,
+            stamp.version,
+            if stamp.written_by.is_empty() {
+                "unknown"
+            } else {
+                &stamp.written_by
+            },
+            stamp.min_reader_version,
+        ),
+        None => println!(
+            "manifest v{}: no format stamp (NamiDB 3.3.1 or older); data needs format {}",
+            inspection.manifest_version,
+            inspection.effective_format(),
+        ),
+    }
+    let legacy: Vec<_> = inspection.legacy_node_ssts().collect();
+    println!(
+        "node SSTs: {} ({} in the NamiDB 2.x layout: {} rows, {} bytes)",
+        inspection.node_ssts.len(),
+        legacy.len(),
+        legacy.iter().map(|sst| sst.row_count).sum::<u64>(),
+        legacy.iter().map(|sst| sst.size_bytes).sum::<u64>(),
+    );
+}
+
+async fn migrate_cmd(uri: &str, dry_run: bool) -> anyhow::Result<()> {
+    let (store, paths) = parse_uri(uri)?;
+    let loaded = ManifestStore::new(store.clone(), paths.clone())
+        .load_current()
+        .await?;
+    let inspection = inspect_storage_format(&store, &paths, &loaded.manifest).await?;
+    print_format(&inspection);
+    let total = inspection.legacy_node_ssts().count();
+    if total == 0 {
+        println!("nothing to migrate");
+        return Ok(());
+    }
+    if dry_run {
+        println!("dry run: {total} node SST(s) would be rewritten");
+        return Ok(());
+    }
+    // Running this command is the explicit upgrade.
+    let mut writer = WriterSession::open(store, paths).await?;
+    let legacy = writer.compaction_basis().legacy_node_ssts().await?;
+    let started = std::time::Instant::now();
+    let (mut migrated, mut skipped) = (0usize, 0usize);
+    for (index, sst) in legacy.iter().enumerate() {
+        let step = std::time::Instant::now();
+        let basis = writer.compaction_basis();
+        let (prepared, migration) = match basis.prepare_node_layout_migration(sst.id).await {
+            Ok(done) => done,
+            Err(namidb_storage::Error::Precondition(_)) => {
+                skipped += 1;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        writer.install_prepared_compaction(prepared).await?;
+        migrated += 1;
+        println!(
+            "[{}/{}] L{} node SST: {} rows, {} -> {} bytes, verified, {:.1}s",
+            index + 1,
+            legacy.len(),
+            migration.level,
+            migration.rows,
+            migration.source_bytes,
+            migration.output_bytes,
+            step.elapsed().as_secs_f64(),
+        );
+    }
+    let remaining = writer.compaction_basis().legacy_node_ssts().await?.len();
+    println!(
+        "migrated {migrated} node SST(s){} in {:.1}s; {remaining} left in the 2.x layout; \
+         manifest v{}",
+        if skipped > 0 {
+            format!(" ({skipped} merged away meanwhile)")
+        } else {
+            String::new()
+        },
+        started.elapsed().as_secs_f64(),
+        writer.manifest_version(),
+    );
     Ok(())
 }
 

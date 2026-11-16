@@ -427,6 +427,34 @@ client = namidb.Client(
 )
 ```
 
+## Upgrades and storage formats
+
+Every manifest records the storage format it was written in
+([details](../../docs/architecture/storage-format.md)). Opening a
+namespace never rewrites what is already there:
+
+- A namespace written by a newer NamiDB raises `namidb.StorageFormatError`,
+  read-only or not, and is left untouched. Upgrade the package to open it.
+- A namespace written by NamiDB 2.x opens read-only as before, but
+  `Client(uri)` for writing raises `namidb.StorageFormatError`: whatever
+  this client writes uses the current format, and 2.x cannot read the
+  namespace after that. Take a backup (`namidb backup`), then pass
+  `upgrade=True` once.
+- `client.storage_format()` reports the stamp, the format the data needs,
+  and how many node SSTs are still in the 2.x layout, where every read
+  parses embeddings out of JSON text.
+- `client.migrate(progress=None, dry_run=False)` rewrites those SSTs into
+  the current layout, one verified SST per commit. Reads and writes keep
+  going meanwhile. Stopped half way (an exception, Ctrl-C, a crash), it
+  keeps what it finished; call it again to do the rest.
+
+```python
+client = namidb.Client("file:///data/graph?ns=case", upgrade=True)
+print(client.storage_format()["legacy_node_ssts"])
+report = client.migrate(progress=lambda step: print(step["done"], "/", step["total"]))
+assert report["remaining"] == 0
+```
+
 ## Arrow / pandas / polars output
 
 `pyarrow >= 14` is a hard dependency. Every `QueryResult` can

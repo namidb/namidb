@@ -302,7 +302,8 @@ struct Cli {
 
     /// Memtable byte size at which a committed write triggers a flush
     /// immediately instead of waiting for `--flush-interval`, bounding the
-    /// un-flushed working set by bytes under burst ingest. `0` disables.
+    /// un-flushed working set by bytes under burst ingest. Capped at 1/16
+    /// of `NAMIDB_MEMORY_MAX_BYTES` when that is set. `0` disables.
     #[arg(
         long,
         env = "NAMIDB_MEMTABLE_FLUSH_BYTES",
@@ -312,7 +313,8 @@ struct Cli {
 
     /// Memtable byte size above which committed writes are softly stalled
     /// (backpressure) until the flush catches up — the OOM backstop for
-    /// loaders that outrun the flush. `0` disables.
+    /// loaders that outrun the flush. Capped at 1/8 of
+    /// `NAMIDB_MEMORY_MAX_BYTES` when that is set. `0` disables.
     #[arg(
         long,
         env = "NAMIDB_MEMTABLE_STALL_BYTES",
@@ -356,6 +358,19 @@ struct Cli {
         value_parser = humantime::parse_duration,
     )]
     writer_lock_timeout: Duration,
+
+    /// Largest JSON body `/v0/cypher` accepts, in bytes; larger requests get
+    /// HTTP 413. Each request reserves about 16x its size of working memory
+    /// before decoding (16x this limit without a `Content-Length`), so the
+    /// process memory limit still bounds what many large requests can take
+    /// together. Capped so one maximum-size request reserves at most 1/4 of
+    /// `NAMIDB_MEMORY_MAX_BYTES` when that is set (never below 2 MiB).
+    #[arg(
+        long,
+        env = "NAMIDB_HTTP_MAX_BODY_BYTES",
+        default_value_t = namidb_server::DEFAULT_HTTP_CYPHER_BODY_LIMIT_BYTES
+    )]
+    http_max_body_bytes: usize,
 
     /// Ceiling on a whole HTTP request (body read + handler), returning 408.
     /// Unset derives a value that can never truncate `--query-timeout` /
@@ -490,6 +505,7 @@ fn main() -> anyhow::Result<()> {
         memtable_flush_bytes: cli.memtable_flush_bytes,
         memtable_stall_bytes: cli.memtable_stall_bytes,
         writer_lock_timeout: cli.writer_lock_timeout,
+        http_max_body_bytes: cli.http_max_body_bytes,
         http_request_timeout: cli.http_request_timeout,
         tls_cert: cli.tls_cert,
         tls_key: cli.tls_key,

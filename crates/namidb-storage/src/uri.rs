@@ -64,6 +64,11 @@ pub enum UriError {
 /// Parse a NamiDB storage URI and return a ready-to-use object-store
 /// handle plus the namespace-rooted path layout.
 pub fn parse_uri(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriError> {
+    let (store, paths) = parse_uri_unlayered(uri)?;
+    Ok((apply_store_layer(store), paths))
+}
+
+fn parse_uri_unlayered(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), UriError> {
     if uri.starts_with("memory://") {
         return parse_memory(uri);
     }
@@ -80,6 +85,38 @@ pub fn parse_uri(uri: &str) -> Result<(Arc<dyn ObjectStore>, NamespacePaths), Ur
         return parse_azure(uri);
     }
     Err(UriError::UnsupportedScheme(uri.to_string()))
+}
+
+/// A function that wraps every store [`parse_uri`] (and so [`parse_store`])
+/// returns. See [`set_store_layer`].
+pub type StoreLayer = dyn Fn(Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> + Send + Sync;
+
+static STORE_LAYER: std::sync::RwLock<Option<Arc<StoreLayer>>> = std::sync::RwLock::new(None);
+
+/// Install (or with `None`, remove) a process-wide layer around every store
+/// that [`parse_uri`] and [`parse_store`] build from now on.
+///
+/// This exists for benchmarks and fault-injection harnesses that need to run
+/// an unmodified frontend (the HTTP server, the Python client) against a store
+/// with injected latency or faults. Production frontends never call it. The
+/// layer must forward every operation with the inner store's semantics
+/// (conditional puts included); it only sees stores built after the call.
+#[doc(hidden)]
+pub fn set_store_layer(layer: Option<Arc<StoreLayer>>) {
+    *STORE_LAYER
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = layer;
+}
+
+fn apply_store_layer(store: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+    let layer = STORE_LAYER
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    match layer {
+        Some(layer) => layer(store),
+        None => store,
+    }
 }
 
 /// Parse a storage URI into just the object-store handle, WITHOUT

@@ -152,6 +152,32 @@ pub enum Error {
     )]
     OrphanManifestBody { version: u64 },
 
+    /// The namespace was written in a storage format newer than this build
+    /// supports (see [`crate::format`]). Nothing was read or written.
+    #[error(
+        "namespace was written in storage format {found} by {written_by} and needs \
+         format {required} to {access}; this build of NamiDB supports up to format \
+         {supported}. upgrade NamiDB to open it"
+    )]
+    NewerStorageFormat {
+        found: u32,
+        required: u32,
+        supported: u32,
+        written_by: String,
+        access: &'static str,
+    },
+
+    /// The namespace holds data an older release can still read, and a writer
+    /// opened with [`crate::format::FormatUpgrade::Refuse`] would make it
+    /// unreadable to that release with its first write. Nothing was changed.
+    #[error(
+        "namespace is in storage format {found} (NamiDB 2.x); writing to it with this build \
+         stores new data in format {current}, which NamiDB 2.x cannot read. open it read-only, \
+         or opt in to the upgrade (Python: Client(uri, upgrade=True)) and take a backup first; \
+         `namidb migrate` then rewrites the old SSTs"
+    )]
+    StorageFormatUpgradeRequired { found: u32, current: u32 },
+
     /// A CRC or schema check on a stored artefact failed.
     #[error("corrupted artefact at {path}: {detail}")]
     Corrupted { path: String, detail: String },

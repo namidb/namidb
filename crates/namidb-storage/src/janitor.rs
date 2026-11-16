@@ -328,6 +328,23 @@ pub async fn sweep_orphans(
         honoured.insert(meta.location.as_ref().to_string(), lease);
     }
 
+    // The advisory `current.json` may lag the newest pointer (a commit
+    // defers its PUT, see `ManifestStore::cas_pointer_deferring_advisory`).
+    // When a LIST of the pointer family comes back stale and empty, the
+    // reader starts its forward probe from the version the advisory names,
+    // so that pointer and every one above it must stay. Read it once, before
+    // anything is deleted; a newer advisory only raises the version.
+    let advisory_floor = match store.get(&paths.current_pointer()).await {
+        Ok(res) => {
+            let body = res.bytes().await.map_err(Error::ObjectStore)?;
+            serde_json::from_slice::<crate::manifest::ManifestPointer>(&body)
+                .ok()
+                .map(|pointer| pointer.version)
+        }
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(other) => return Err(Error::ObjectStore(other)),
+    };
+
     // The horizon is the oldest manifest version any live reader is pinned
     // to: the in-process reader horizon (RFC-027) unioned with every
     // unexpired pin lease. Clamp defensively to the current version.
@@ -600,6 +617,9 @@ pub async fn sweep_orphans(
         // Bodies also stay for the restore point window and point leases;
         // history is read by `load_manifest_at`, which needs no pointer.
         if version >= horizon {
+            continue;
+        }
+        if is_pointer && advisory_floor.is_some_and(|floor| version >= floor) {
             continue;
         }
         if !is_pointer && (version >= body_floor || point_versions.contains(&version)) {

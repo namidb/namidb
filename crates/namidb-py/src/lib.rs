@@ -32,6 +32,8 @@ use namidb_query::{
     LowerError, Params, ParseError, Query, QueryMemoryBudget, QueryMemoryExceeded, QueryMemoryPool,
     QueryMemoryScope, Row, RuntimeValue, StatsCatalog,
 };
+mod format;
+
 use namidb_storage::{
     sweep_orphans, CommitOutcome, EdgeListView, EdgeScanCursor, EdgeView, EdgeWriteRecord,
     JanitorReport, ManifestStore, NodeScanCursor, NodeView, NodeWriteRecord, OwnedSnapshot,
@@ -278,7 +280,16 @@ impl Session {
 
     async fn close(&self) -> PyResult<()> {
         match self {
-            Session::Writer(_) => Ok(()),
+            // The last commit's advisory `current.json` may still be owed:
+            // settle it so the next process starts from an exact lower bound.
+            // Best effort and never blocking on a running write: the commit
+            // it describes is already durable and found by the forward probe.
+            Session::Writer(w) => {
+                if let Ok(session) = w.session.try_lock() {
+                    let _ = session.manifest_store().publish_pending_advisory().await;
+                }
+                Ok(())
+            }
             Session::Reader(r) => r.lock().await.release().await.map_err(map_storage_err),
         }
     }
@@ -462,8 +473,15 @@ impl Client {
     /// `auto`: 25% and 80% of the memory available to the process (the
     /// smaller of physical memory and a container limit). `0` disables a
     /// limit.
+    ///
+    /// Opening never rewrites existing data. A namespace written by NamiDB
+    /// 2.x, which that release can still read, raises `StorageFormatError`
+    /// unless `upgrade=True`: anything this client writes uses the current
+    /// storage format, which 2.x cannot read. `migrate()` rewrites the old
+    /// SSTs. A namespace written by a newer NamiDB than this one raises
+    /// `StorageFormatError` whatever the flags.
     #[new]
-    #[pyo3(signature = (uri, cache_bytes=None, *, read_only=false, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8, query_memory_max_bytes=None, memory_max_bytes=None))]
+    #[pyo3(signature = (uri, cache_bytes=None, *, read_only=false, spool_dir=None, auto_sweep_min_age_secs=Some(60), compaction_l0_trigger=8, query_memory_max_bytes=None, memory_max_bytes=None, upgrade=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -475,6 +493,7 @@ impl Client {
         compaction_l0_trigger: usize,
         query_memory_max_bytes: Option<usize>,
         memory_max_bytes: Option<usize>,
+        upgrade: bool,
     ) -> PyResult<Self> {
         let limits = Arc::new(QueryLimits::new(
             resolve_memory_limit(
@@ -515,7 +534,17 @@ impl Client {
                         tokio::spawn(renew_reader_pins(Arc::downgrade(&reader)));
                         Session::Reader(reader)
                     } else {
-                        let writer = WriterSession::open(store.clone(), paths.clone()).await?;
+                        let writer = WriterSession::open_with_options(
+                            store.clone(),
+                            paths.clone(),
+                            namidb_storage::SessionCaches::shared(),
+                            if upgrade {
+                                namidb_storage::FormatUpgrade::Allow
+                            } else {
+                                namidb_storage::FormatUpgrade::Refuse
+                            },
+                        )
+                        .await?;
                         Session::Writer(Arc::new(Writer::new(writer)))
                     })
                 })
@@ -747,22 +776,25 @@ impl Client {
     }
 
     /// Flush the memtable into L0 SSTs, then run a compaction pass when a
-    /// bucket has reached `compaction_l0_trigger` L0 SSTs.
+    /// bucket has reached `compaction_l0_trigger` L0 SSTs or a search index
+    /// has as many delta segments as a pass consolidates.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let session = self.session.writer()?;
-        let l0 = py.allow_threads(|| {
+        let (l0, search_due) = py.allow_threads(|| {
             self.runtime.block_on(async {
                 let mut session = session.lock().await;
                 let schema = session.snapshot().manifest().manifest.schema.clone();
                 session.flush(schema).await.map_err(map_storage_err)?;
-                Ok::<_, PyErr>(session.max_l0_bucket_len())
+                Ok::<_, PyErr>((session.max_l0_bucket_len(), session.search_compaction_due()))
             })
         })?;
         // Embedded mode has no maintenance loop, so without this L0 grows
         // until someone calls compact() and every read fans out across it.
         // The flush is already durable, so a failed pass is only a warning:
         // raising would read as "data not persisted" to a retrying caller.
-        if self.compaction_l0_trigger > 0 && l0 >= self.compaction_l0_trigger {
+        // A search index's delta segments are consolidated before they reach
+        // the cap at which every later flush would fail.
+        if self.compaction_l0_trigger > 0 && (l0 >= self.compaction_l0_trigger || search_due) {
             let session = session.clone();
             let compaction_lock = self.compaction_lock.clone();
             let auto_sweep = self.auto_sweep();
@@ -858,6 +890,74 @@ impl Client {
         // A pin lease that landed mid-sweep deletes nothing; run it again.
         d.set_item("aborted_by_pin", report.aborted_by_pin)?;
         Ok(d.into())
+    }
+
+    /// The namespace's storage format: the stamp of the current manifest
+    /// (`None` when NamiDB 3.3.1 or older committed it), the format the data
+    /// needs (`effective_version`), and how many node SSTs are still in the
+    /// NamiDB 2.x layout. Reads each node SST's footer.
+    fn storage_format(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let inspection = py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let snapshot = self.session.snapshot(None).await?;
+                format::inspect(
+                    self.store.clone(),
+                    self.paths.clone(),
+                    snapshot.manifest().manifest.clone(),
+                )
+                .await
+                .map_err(map_storage_err)
+            })
+        })?;
+        format::inspection_to_py(py, &inspection)
+    }
+
+    /// Rewrite every node SST still in the NamiDB 2.x layout (embeddings
+    /// inside the overflow JSON) into the current layout. Each SST is
+    /// rewritten with exactly the same rows, read back and compared row by
+    /// row, then swapped in by its own manifest commit, so an interrupted
+    /// run (an exception, Ctrl-C, a crash) keeps what it finished and the
+    /// next call resumes with what is left. Reads, writes and compactions
+    /// keep running meanwhile; a compaction waits for at most the one SST
+    /// being rewritten. `progress` is called with a dict after each SST. With
+    /// `dry_run=True` it only reports what it would rewrite. The replaced
+    /// SSTs are left for the sweep (the automatic one when
+    /// `auto_sweep_min_age_secs` is set, else `sweep()`).
+    #[pyo3(signature = (*, progress=None, dry_run=false))]
+    fn migrate(
+        &self,
+        py: Python<'_>,
+        progress: Option<Bound<'_, PyAny>>,
+        dry_run: bool,
+    ) -> PyResult<Py<PyDict>> {
+        let writer = self.session.writer()?;
+        let report = format::migrate(
+            py,
+            &self.runtime,
+            writer,
+            &self.compaction_lock,
+            progress.as_ref(),
+            dry_run,
+        )?;
+        if let Some((manifest_store, min_age)) = self.auto_sweep() {
+            let migrated: usize = report
+                .bind(py)
+                .get_item("migrated")?
+                .map_or(Ok(0), |v| v.extract())?;
+            if migrated > 0 {
+                let _compaction_guard =
+                    py.allow_threads(|| self.runtime.block_on(self.compaction_lock.lock()));
+                py.allow_threads(|| {
+                    self.runtime.block_on(async {
+                        let guard = writer.lock().await;
+                        // The migration is installed; a failed sweep only
+                        // leaves the old SSTs for the next one.
+                        let _ = sweep_locked(&guard, &manifest_store, min_age, true).await;
+                    })
+                });
+            }
+        }
+        Ok(report)
     }
 
     /// Look up a single node by `(label, id)`.
@@ -2619,6 +2719,9 @@ fn row_to_py_dict<'py>(
 // ── Error mapping ─────────────────────────────────────────────────────
 
 fn map_storage_err(e: namidb_storage::Error) -> PyErr {
+    if let Some(err) = format::map_format_err(&e) {
+        return err;
+    }
     PyRuntimeError::new_err(format!("namidb storage error: {e}"))
 }
 
@@ -2830,6 +2933,14 @@ fn _lib(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("QueryMemoryError", py.get_type_bound::<QueryMemoryError>())?;
     m.add_class::<CancelToken>()?;
+    m.add(
+        "StorageFormatError",
+        py.get_type_bound::<format::StorageFormatError>(),
+    )?;
+    m.add(
+        "STORAGE_FORMAT_VERSION",
+        namidb_storage::STORAGE_FORMAT_VERSION,
+    )?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

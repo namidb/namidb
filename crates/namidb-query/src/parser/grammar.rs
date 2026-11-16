@@ -54,7 +54,13 @@ struct Parser<'src> {
     pos: usize,
     /// Current expression-nesting depth, bounded by [`MAX_EXPRESSION_DEPTH`].
     depth: usize,
+    /// Outcome and end position of every node-like `(` parsed so far, keyed
+    /// by `(token position, depth)`; see [`Self::parse_node_like_paren`].
+    node_paren_memo: NodeParenMemo,
 }
+
+type NodeParenMemo =
+    std::collections::HashMap<(usize, usize), (Result<Expression, ParseError>, usize)>;
 
 type ReturnTail = (Vec<OrderItem>, Option<Expression>, Option<Expression>);
 
@@ -65,6 +71,7 @@ impl<'src> Parser<'src> {
             tokens,
             pos: 0,
             depth: 0,
+            node_paren_memo: NodeParenMemo::new(),
         }
     }
 
@@ -1752,6 +1759,68 @@ impl<'src> Parser<'src> {
         }
     }
 
+    /// A `(` that opens like a node pattern: a pattern predicate when a
+    /// relationship follows, else a parenthesised expression (`(n:A OR n:B)`,
+    /// `(n {k: v})` as a map projection), else a lone node pattern.
+    ///
+    /// Trying both alternatives parses the text inside twice, and the inner
+    /// text can itself hold such parens (`(n {a: (n {a: …})})`), so without
+    /// care the work doubles with every nesting level. The outcome at a given
+    /// token position and depth never changes, so it is parsed once and
+    /// replayed: polynomial in the query length whatever the nesting, where
+    /// re-parsing was exponential in it.
+    fn parse_node_like_paren(&mut self) -> Result<Expression, ParseError> {
+        let key = (self.pos, self.depth);
+        if let Some((result, end)) = self.node_paren_memo.get(&key) {
+            let result = result.clone();
+            self.pos = *end;
+            return result;
+        }
+        let result = self.parse_node_like_paren_uncached();
+        self.node_paren_memo.insert(key, (result.clone(), self.pos));
+        result
+    }
+
+    fn parse_node_like_paren_uncached(&mut self) -> Result<Expression, ParseError> {
+        // `(n:A OR n:B)` and `(n:A AND n.x = 1)` open like a node
+        // pattern but are parenthesised label predicates. A
+        // pattern predicate needs at least one relationship, so
+        // a lone node pattern — or one that does not parse —
+        // falls back to a paren expression when that parses.
+        let (pos, depth) = (self.pos, self.depth);
+        let pattern = self.parse_pattern_element();
+        if let Ok(element) = &pattern {
+            if !element.chain.is_empty() {
+                let element = pattern?;
+                let span = element.span;
+                return Ok(Expression {
+                    kind: ExpressionKind::Exists(Box::new(element)),
+                    span,
+                });
+            }
+        }
+        let (after_pattern, depth_after) = (self.pos, self.depth);
+        self.pos = pos;
+        self.depth = depth;
+        self.bump();
+        let inner = self
+            .parse_expression()
+            .and_then(|inner| self.expect(&Token::RParen).map(|_| inner));
+        match (inner, pattern) {
+            (Ok(inner), _) => Ok(inner),
+            (Err(_), Ok(element)) => {
+                self.pos = after_pattern;
+                self.depth = depth_after;
+                let span = element.span;
+                Ok(Expression {
+                    kind: ExpressionKind::Exists(Box::new(element)),
+                    span,
+                })
+            }
+            (Err(_), Err(pattern_error)) => Err(pattern_error),
+        }
+    }
+
     fn parse_pattern_element(&mut self) -> Result<PatternElement, ParseError> {
         let head = self.parse_node_pattern()?;
         let start = head.span.start;
@@ -2392,12 +2461,7 @@ impl<'src> Parser<'src> {
             }
             Some(Token::LParen) => {
                 if self.starts_pattern_node() {
-                    let element = self.parse_pattern_element()?;
-                    let span = element.span;
-                    Ok(Expression {
-                        kind: ExpressionKind::Exists(Box::new(element)),
-                        span,
-                    })
+                    self.parse_node_like_paren()
                 } else {
                     self.bump();
                     let inner = self.parse_expression()?;

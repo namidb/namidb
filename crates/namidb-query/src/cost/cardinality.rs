@@ -881,7 +881,7 @@ fn leaf(plan: &LogicalPlan, rows: f64, bindings: BTreeMap<String, BindingMeta>) 
 /// for every source row, so the fan-out adds). `edge_type = None`
 /// (untyped expansion `(-[]-)`) sums over every edge type the catalog
 /// knows about.
-fn branch_factor(
+pub(crate) fn branch_factor(
     catalog: &StatsCatalog,
     edge_type: Option<&[String]>,
     direction: RelationshipDirection,

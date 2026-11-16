@@ -42,6 +42,7 @@ use namidb_core::{LabelDictionary, Schema};
 
 use crate::error::{Error, Result};
 use crate::fence::{Epoch, WriterFence};
+use crate::format::StorageFormat;
 use crate::paths::NamespacePaths;
 use crate::search_lsm::SearchLsmState;
 use crate::sst::bloom::BloomDescriptor;
@@ -108,6 +109,11 @@ pub struct Manifest {
     /// and therefore empty by default.
     #[serde(default)]
     pub search_lsm: Vec<SearchLsmState>,
+    /// Storage format stamp (see [`crate::format`]). `None` in manifests
+    /// committed by NamiDB 3.3.1 and older; every version this build
+    /// commits carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_format: Option<StorageFormat>,
 }
 
 impl Manifest {
@@ -126,6 +132,7 @@ impl Manifest {
             text_indexes: Vec::new(),
             search_index_builds: Vec::new(),
             search_lsm: Vec::new(),
+            storage_format: Some(StorageFormat::current()),
         }
     }
 
@@ -146,6 +153,7 @@ impl Manifest {
             text_indexes: self.text_indexes.clone(),
             search_index_builds: self.search_index_builds.clone(),
             search_lsm: self.search_lsm.clone(),
+            storage_format: Some(StorageFormat::successor(self.storage_format.as_ref())),
         }
     }
 }
@@ -868,6 +876,17 @@ pub struct WalSegmentDescriptor {
 pub struct ManifestStore {
     store: Arc<dyn ObjectStore>,
     paths: NamespacePaths,
+    /// The advisory `current.json` this store has written and the one it
+    /// still owes (see [`Self::cas_pointer_deferring_advisory`]).
+    advisory: Arc<std::sync::Mutex<AdvisoryState>>,
+}
+
+#[derive(Debug, Default)]
+struct AdvisoryState {
+    /// Highest pointer version this store has published to `current.json`.
+    written: Option<u64>,
+    /// A newer pointer whose advisory publication was deferred.
+    pending: Option<(u64, Bytes)>,
 }
 
 impl std::fmt::Debug for ManifestStore {
@@ -922,7 +941,11 @@ impl LoadedManifest {
 
 impl ManifestStore {
     pub fn new(store: Arc<dyn ObjectStore>, paths: NamespacePaths) -> Self {
-        Self { store, paths }
+        Self {
+            store,
+            paths,
+            advisory: Arc::new(std::sync::Mutex::new(AdvisoryState::default())),
+        }
     }
 
     pub fn paths(&self) -> &NamespacePaths {
@@ -1006,7 +1029,8 @@ impl ManifestStore {
 
         // Publish the advisory `current.json` for the freshly-bootstrapped
         // namespace (see `write_advisory_current`).
-        self.write_advisory_current(pointer_bytes).await?;
+        self.write_advisory_current(pointer.version, pointer_bytes)
+            .await?;
 
         Ok(LoadedManifest::new(
             pointer,
@@ -1026,6 +1050,7 @@ impl ManifestStore {
         let res = self.store.get(&path).await?;
         let body = res.bytes().await?;
         let manifest: Manifest = serde_json::from_slice(&body)?;
+        crate::format::ensure_readable(&manifest)?;
         Ok(manifest)
     }
 
@@ -1038,6 +1063,7 @@ impl ManifestStore {
         let manifest_res = self.store.get(&manifest_path).await?;
         let manifest_body = manifest_res.bytes().await?;
         let manifest: Manifest = serde_json::from_slice(&manifest_body)?;
+        crate::format::ensure_readable(&manifest)?;
 
         if manifest.version != pointer.version {
             return Err(Error::Corrupted {
@@ -1246,6 +1272,7 @@ impl ManifestStore {
         new_manifest: &Manifest,
     ) -> Result<ManifestPointer> {
         fence.assert_alive(base.manifest.epoch)?;
+        crate::format::ensure_writable(&base.manifest)?;
         if new_manifest.version != base.manifest.version + 1 {
             return Err(Error::invariant(format!(
                 "new manifest version {} must be {} (base + 1)",
@@ -1355,6 +1382,42 @@ impl ManifestStore {
         new_manifest: Manifest,
         pointer: ManifestPointer,
     ) -> Result<LoadedManifest> {
+        self.cas_pointer_inner(fence, base, new_manifest, pointer, false)
+            .await
+    }
+
+    /// [`Self::cas_pointer`] that returns as soon as the pointer create has
+    /// landed, leaving the advisory `current.json` PUT owed instead of
+    /// waiting a third round trip for it.
+    ///
+    /// The version is durable and authoritative once its pointer exists; the
+    /// advisory is only a non-LIST lower bound for
+    /// [`Self::max_pointer_version`], and the forward probe advances from any
+    /// older advisory to the true current. The owed PUT is sent by the next
+    /// commit (overlapped with its pointer create, once its body has landed),
+    /// by [`Self::publish_pending_advisory`] (which every flush runs), or is
+    /// superseded by a newer inline write. Meanwhile the janitor
+    /// keeps every pointer at or above the version `current.json` names, so
+    /// a stale advisory still resolves.
+    pub async fn cas_pointer_deferring_advisory(
+        &self,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        new_manifest: Manifest,
+        pointer: ManifestPointer,
+    ) -> Result<LoadedManifest> {
+        self.cas_pointer_inner(fence, base, new_manifest, pointer, true)
+            .await
+    }
+
+    async fn cas_pointer_inner(
+        &self,
+        fence: &WriterFence,
+        base: &LoadedManifest,
+        new_manifest: Manifest,
+        pointer: ManifestPointer,
+        defer_advisory: bool,
+    ) -> Result<LoadedManifest> {
         let pointer_path = self.paths.pointer_version(pointer.version);
         let pointer_bytes: Bytes = serde_json::to_vec(&pointer)?.into();
         let put_res = match self.put_create(&pointer_path, pointer_bytes.clone()).await {
@@ -1386,11 +1449,16 @@ impl ManifestStore {
 
         // Publish the advisory `current.json` so the version is findable via
         // a non-LIST read on EC stores even after the janitor reclaims `p0`.
-        // See `write_advisory_current`. A failure here is a commit failure:
-        // the pointer Create already succeeded (the version is durable), but
-        // until the advisory lands it is not reliably discoverable, so we
-        // surface the error rather than leave a half-published version.
-        self.write_advisory_current(pointer_bytes.clone()).await?;
+        // See `write_advisory_current`. Inline, a failure here is a commit
+        // failure: the pointer Create already succeeded (the version is
+        // durable), but we surface the error rather than leave the advisory
+        // behind. Deferred, the PUT is owed to the next publication instead.
+        if defer_advisory {
+            self.defer_advisory(pointer.version, pointer_bytes);
+        } else {
+            self.write_advisory_current(pointer.version, pointer_bytes)
+                .await?;
+        }
 
         Ok(LoadedManifest::new(
             pointer,
@@ -1563,7 +1631,7 @@ impl ManifestStore {
                             "adopted orphan manifest body: published the pointer of an \
                              interrupted commit"
                         );
-                        self.write_advisory_current(pointer_bytes).await?;
+                        self.write_advisory_current(version, pointer_bytes).await?;
                     }
                     // Someone (possibly the interrupted writer itself)
                     // published first; the pointer advances either way.
@@ -1607,6 +1675,10 @@ impl ManifestStore {
         if orphan.version != version || orphan.epoch < base.manifest.epoch {
             return Ok(None);
         }
+        // An interrupted commit of a newer release: this build can judge
+        // neither whether it is complete nor what it references, so it must
+        // neither publish nor delete it.
+        crate::format::ensure_writable(&orphan)?;
 
         // Every SST the orphan adds over the base must still be durable.
         // Flush/compaction PUT SSTs strictly before the manifest body, so
@@ -1763,13 +1835,130 @@ impl ManifestStore {
     /// body, and the forward probe in `load_pointer` then advances to the
     /// true current. Its failure is treated as a commit failure: until it is
     /// durable the version is not reliably findable on an EC store.
-    async fn write_advisory_current(&self, pointer_bytes: Bytes) -> Result<()> {
+    async fn write_advisory_current(&self, version: u64, pointer_bytes: Bytes) -> Result<()> {
         let path = self.paths.current_pointer();
         self.store
             .put(&path, PutPayload::from(pointer_bytes))
             .await
             .map_err(Error::ObjectStore)?;
+        let mut advisory = self
+            .advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        advisory.written = Some(advisory.written.map_or(version, |w| w.max(version)));
+        if advisory
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending <= version)
+        {
+            advisory.pending = None;
+        }
         Ok(())
+    }
+
+    fn defer_advisory(&self, version: u64, pointer_bytes: Bytes) {
+        let mut advisory = self
+            .advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if advisory.written.is_some_and(|written| written >= version) {
+            return;
+        }
+        if advisory
+            .pending
+            .as_ref()
+            .is_none_or(|(pending, _)| *pending < version)
+        {
+            advisory.pending = Some((version, pointer_bytes));
+        }
+    }
+
+    /// Whether a deferred advisory `current.json` PUT is still owed.
+    pub fn has_pending_advisory(&self) -> bool {
+        self.advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .is_some()
+    }
+
+    /// Send the advisory `current.json` PUT a deferred commit owes, if any,
+    /// unless the namespace has already moved past it.
+    ///
+    /// The owed version is only worth publishing while it is still the
+    /// newest one: a writer that was fenced (or partitioned) while it owed an
+    /// advisory must not, when it next ticks, roll `current.json` back below
+    /// versions its successor committed. The janitor keeps pointers at or
+    /// above the advisory it reads, but one it already reclaimed under a newer
+    /// advisory cannot come back, and a reader whose LIST is stale would then
+    /// find an advisory that names a missing pointer. So the PUT is sent only
+    /// when the next pointer does not exist yet; when it does, the owed
+    /// advisory is dropped (a lagging advisory is a valid lower bound, a
+    /// regressed one is not needed by anyone).
+    ///
+    /// A failure keeps it owed (unless a newer one was deferred meanwhile)
+    /// and is returned; callers on the write path log it and carry on, since
+    /// the commit it describes is already durable and discoverable.
+    pub async fn publish_pending_advisory(&self) -> Result<()> {
+        let Some((version, bytes)) = self.pending_advisory() else {
+            return Ok(());
+        };
+        match self
+            .store
+            .head(&self.paths.pointer_version(version.saturating_add(1)))
+            .await
+        {
+            Ok(_) => {
+                self.drop_pending_advisory(version);
+                return Ok(());
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(other) => return Err(Error::ObjectStore(other)),
+        }
+        self.write_advisory_current(version, bytes).await
+    }
+
+    /// [`Self::publish_pending_advisory`] for a caller that has just proven
+    /// the owed version is still the newest: `WriterSession::commit_batch`
+    /// sends it only after its Create-only manifest body for the next version
+    /// landed, which no writer could have done had anyone committed past it.
+    /// It then rides in the same round trip as the pointer create.
+    ///
+    /// The owed version is captured when this is CALLED, not when the
+    /// returned future is first polled, so a pointer create running beside
+    /// it can never have its own, just-deferred advisory sent here.
+    pub(crate) fn publish_pending_advisory_unchecked(
+        &self,
+    ) -> impl std::future::Future<Output = Result<()>> + '_ {
+        let pending = self.pending_advisory();
+        async move {
+            match pending {
+                Some((version, bytes)) => self.write_advisory_current(version, bytes).await,
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn pending_advisory(&self) -> Option<(u64, Bytes)> {
+        self.advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .clone()
+    }
+
+    fn drop_pending_advisory(&self, version: u64) {
+        let mut advisory = self
+            .advisory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if advisory
+            .pending
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending == version)
+        {
+            advisory.pending = None;
+        }
     }
 }
 
@@ -2453,6 +2642,38 @@ mod tests {
         let next = loaded.manifest.next_version(fence.writer_id);
         let committed = ms.commit(&fence, &loaded, next).await.unwrap();
         assert_eq!(committed.manifest.version, 3);
+    }
+
+    #[tokio::test]
+    async fn stalled_commit_of_a_newer_format_is_neither_published_nor_deleted() {
+        let (store, paths) = store();
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let base = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let mut orphan = base.manifest.next_version(Uuid::now_v7());
+        orphan.storage_format = Some(crate::format::StorageFormat {
+            version: crate::format::STORAGE_FORMAT_VERSION + 1,
+            min_reader_version: crate::format::STORAGE_FORMAT_VERSION + 1,
+            min_writer_version: crate::format::STORAGE_FORMAT_VERSION + 1,
+            written_by: "namidb 9.0.0".into(),
+        });
+        let body_path = paths.manifest_version(orphan.version);
+        store
+            .put(
+                &body_path,
+                Bytes::from(serde_json::to_vec(&orphan).unwrap()).into(),
+            )
+            .await
+            .unwrap();
+        let err = ms.repair_stalled_commit(&base).await.unwrap_err();
+        assert!(matches!(err, Error::NewerStorageFormat { .. }), "{err}");
+        assert!(store.head(&body_path).await.is_ok(), "orphan body deleted");
+        assert!(
+            store
+                .head(&paths.pointer_version(orphan.version))
+                .await
+                .is_err(),
+            "orphan published"
+        );
     }
 
     #[tokio::test]

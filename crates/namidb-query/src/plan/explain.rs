@@ -431,6 +431,7 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
             direction,
             rel_alias,
             target_alias,
+            target_labels,
             length,
             optional,
             ..
@@ -449,6 +450,9 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 let _ = write!(out, " rel={}", r);
             }
             let _ = write!(out, " target={}", target_alias);
+            for label in target_labels {
+                let _ = write!(out, ":{}", label);
+            }
             if let Some(len) = length {
                 if len.min == len.max {
                     let _ = write!(out, " length={}", len.min);

@@ -19,6 +19,11 @@ use clap::{Parser, Subcommand};
 #[cfg(feature = "vector-index")]
 mod ann_bench;
 mod dataset;
+mod graph_shape;
+#[cfg(feature = "http-load")]
+mod http_load;
+#[cfg(feature = "http-load")]
+mod latency_store;
 mod loader;
 #[cfg(feature = "object-native")]
 mod object_native;
@@ -178,6 +183,51 @@ enum Cmd {
         #[arg(short = 'S', long, default_value_t = 42)]
         seed: u64,
     },
+    /// Write the hub-shaped graph (`graph_shape.rs`): a few `:Device` hubs,
+    /// one holding most `ON_DEVICE` edges, and a small `:Call` label. Writes
+    /// into `--uri` with the current engine, or NDJSON for
+    /// `bench/load_ndjson.py` with `--ndjson-dir`.
+    GraphShapeGenerate {
+        /// Namespace URI, e.g. `file:///data/shape?ns=shape`.
+        #[arg(long)]
+        uri: Option<String>,
+        /// Emit NDJSON here instead of writing a namespace.
+        #[arg(long)]
+        ndjson_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 2_400_000)]
+        nodes: u64,
+        #[arg(long, default_value_t = 4)]
+        hubs: u64,
+        #[arg(long, default_value_t = 1_700_000)]
+        hub_max_degree: u64,
+        #[arg(long, default_value_t = 2_958)]
+        calls: u64,
+        #[arg(long, default_value_t = 64)]
+        embedding_dim: usize,
+        #[arg(long, default_value_t = 250_000)]
+        flush_every: u64,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
+    },
+    /// Run one read query read-only against a namespace and print a JSON
+    /// report (plan, rows, wall time per run, peak RSS). `$hubs` / `$hub`
+    /// are bound to the `:Device` ids automatically.
+    GraphShapeQuery {
+        #[arg(long)]
+        uri: String,
+        #[arg(long)]
+        query: String,
+        /// Extra parameters as a JSON object.
+        #[arg(long)]
+        params: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
+        /// SST cache size; the Python client's default is 64 MiB.
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        cache_bytes: usize,
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
     /// Gate V5/FT3, incremental VG6/FT4 and paged forward/inverse graph SSTs.
     ///
     /// Corpus generation and builders are streaming. Search readers use an
@@ -254,6 +304,80 @@ enum Cmd {
         #[arg(long, default_value_t = 16)]
         max_in_flight: u64,
     },
+    /// Run the real HTTP server on a store with simulated object-store
+    /// latency (see `http-load`).
+    #[cfg(feature = "http-load")]
+    Serve {
+        /// Storage URI, e.g. `file:///tmp/nb?ns=bench` (`?ns=` optional with
+        /// `--multi-tenant`).
+        #[arg(long)]
+        store: String,
+        #[arg(long, default_value = "127.0.0.1:18480")]
+        listen: std::net::SocketAddr,
+        /// Per-request latency lower bound, in milliseconds.
+        #[arg(long, default_value_t = 20)]
+        latency_min_ms: u64,
+        /// Per-request latency upper bound, in milliseconds.
+        #[arg(long, default_value_t = 40)]
+        latency_max_ms: u64,
+        /// Transfer rate charged on bodies, in MiB/s (0 = unlimited).
+        #[arg(long, default_value_t = 100)]
+        bandwidth_mib_per_sec: u64,
+        #[arg(long)]
+        multi_tenant: bool,
+        #[arg(long, default_value = "0s", value_parser = humantime::parse_duration)]
+        group_commit_window: std::time::Duration,
+        /// `NAMIDB_MEMORY_MAX_BYTES` semantics: bytes, `auto` (90% of the
+        /// cgroup limit) or `0` (off).
+        #[arg(long, default_value = "auto")]
+        memory_max_bytes: String,
+        #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
+        flush_interval: std::time::Duration,
+        #[arg(long, default_value = "300s", value_parser = humantime::parse_duration)]
+        compaction_interval: std::time::Duration,
+        /// Where to publish the store request counters (JSON, every 100 ms).
+        #[arg(long)]
+        counters_file: Option<PathBuf>,
+    },
+    /// Drive a server over HTTP and report write throughput / vector search.
+    #[cfg(feature = "http-load")]
+    HttpLoad {
+        #[arg(long, default_value = "http://127.0.0.1:18480")]
+        url: String,
+        /// Multi-tenant namespace (`/<ns>/v0/cypher`); omit for single-tenant.
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long, value_enum)]
+        scenario: http_load::Scenario,
+        /// Rows to load (`bulk`, `vectors`) or the corpus size (`vector-search`).
+        #[arg(long, default_value_t = 10_000)]
+        count: usize,
+        #[arg(long, default_value_t = 500)]
+        batch: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Approximate JSON size of one document node.
+        #[arg(long, default_value_t = 3000)]
+        node_bytes: usize,
+        #[arg(long, default_value_t = 1024)]
+        dim: usize,
+        #[arg(long, default_value_t = 256)]
+        clusters: usize,
+        #[arg(long, default_value_t = 100)]
+        queries: usize,
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        #[arg(long, default_value_t = 64)]
+        ef: usize,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
+        /// The `serve --counters-file`, to report store requests per step.
+        #[arg(long)]
+        counters_file: Option<PathBuf>,
+        /// Create the constraint and the vector/fulltext indexes first.
+        #[arg(long)]
+        setup: bool,
+    },
 }
 
 #[tokio::main]
@@ -266,6 +390,51 @@ async fn main() -> Result<()> {
                 "generated dataset @ scale={scale} seed={seed} into {}: {sizes:?}",
                 out.display()
             );
+        }
+        Cmd::GraphShapeGenerate {
+            uri,
+            ndjson_dir,
+            nodes,
+            hubs,
+            hub_max_degree,
+            calls,
+            embedding_dim,
+            flush_every,
+            seed,
+        } => {
+            let cfg = graph_shape::ShapeConfig {
+                nodes,
+                hubs,
+                hub_max_degree,
+                calls,
+                embedding_dim,
+                flush_every,
+                seed,
+            };
+            match (uri, ndjson_dir) {
+                (Some(uri), None) => graph_shape::write_direct(&cfg, &uri).await?,
+                (None, Some(dir)) => graph_shape::write_ndjson(&cfg, &dir)?,
+                _ => anyhow::bail!("pass exactly one of --uri or --ndjson-dir"),
+            }
+        }
+        Cmd::GraphShapeQuery {
+            uri,
+            query,
+            params,
+            repeat,
+            cache_bytes,
+            timeout_ms,
+        } => {
+            let report = graph_shape::run_query(
+                &uri,
+                &query,
+                params.as_deref(),
+                repeat,
+                cache_bytes,
+                timeout_ms,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Cmd::Run {
             scale,
@@ -604,6 +773,75 @@ async fn main() -> Result<()> {
             if !passed {
                 anyhow::bail!("object-native gates failed: {}", failures.join("; "));
             }
+        }
+        #[cfg(feature = "http-load")]
+        Cmd::Serve {
+            store,
+            listen,
+            latency_min_ms,
+            latency_max_ms,
+            bandwidth_mib_per_sec,
+            multi_tenant,
+            group_commit_window,
+            memory_max_bytes,
+            flush_interval,
+            compaction_interval,
+            counters_file,
+        } => {
+            http_load::serve(http_load::ServeConfig {
+                store,
+                listen,
+                latency: latency_store::LatencyModel::new(
+                    latency_min_ms,
+                    latency_max_ms,
+                    bandwidth_mib_per_sec,
+                ),
+                multi_tenant,
+                group_commit_window,
+                memory_max_bytes,
+                flush_interval,
+                compaction_interval,
+                counters_file,
+            })
+            .await?;
+        }
+        #[cfg(feature = "http-load")]
+        Cmd::HttpLoad {
+            url,
+            namespace,
+            scenario,
+            count,
+            batch,
+            concurrency,
+            node_bytes,
+            dim,
+            clusters,
+            queries,
+            k,
+            ef,
+            seed,
+            counters_file,
+            setup,
+        } => {
+            let report = http_load::http_load(http_load::LoadConfig {
+                url,
+                namespace,
+                scenario,
+                count,
+                batch,
+                concurrency,
+                node_bytes,
+                dim,
+                clusters,
+                queries,
+                k,
+                ef,
+                seed,
+                counters_file,
+                setup,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())

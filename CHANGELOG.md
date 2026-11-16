@@ -40,6 +40,72 @@ crates.io release will establish and document that API explicitly.
   (`task.cancel()`, `asyncio.wait_for`) stops the statement's work too. Each
   statement runs on a worker thread of its own.
 
+- **Manifests record their storage format.** Every manifest version now
+  carries `storage_format`: the format its writer used (`version`), the
+  oldest format a reader needs (`min_reader_version`), the oldest format a
+  writer needs (`min_writer_version`), and the release that wrote it
+  (`written_by`). Format 1 is the NamiDB 2.x layout, format 2 the 3.x one.
+  A manifest that needs a newer reader is refused on load with "namespace
+  was written in storage format N by namidb X ...; upgrade NamiDB to open
+  it", by every reader, writer, backup and sweep, before anything is
+  claimed or deleted; one that needs a newer writer opens read-only only,
+  and stalled-commit repair neither publishes nor deletes a newer
+  release's interrupted commit.
+  Until now nothing marked the format, so a release could open, rewrite
+  and sweep data from a newer one. Manifests written by 3.3.1 and older
+  carry no stamp; for those the format is inferred from the node SST
+  footers and WAL headers. Releases up to 3.3.1 ignore the field, so they
+  still open what this release writes. See
+  `docs/architecture/storage-format.md`.
+- **`namidb migrate` and Python `Client.migrate()` rewrite NamiDB 2.x node
+  SSTs into the current layout.** A namespace compacted by 2.x keeps its
+  embeddings as JSON text inside the node SSTs until something rewrites
+  them, and a lone, fully compacted SST was never rewritten. The migration
+  rewrites each such SST with exactly the same rows at the same level, reads
+  the new SST back and compares it with the old one row by row, and swaps
+  it in with its own manifest commit. A crash, an error or Ctrl-C keeps
+  every SST it finished; running it again resumes with the rest. Reads,
+  writes and compactions keep running meanwhile: in Python a compaction,
+  including the one a `flush()` triggers, waits for at most the SST being
+  rewritten. `namidb migrate --dry-run` and
+  `Client.storage_format()` report the stamp and how many node SSTs, rows
+  and bytes are still in the 2.x layout; `migrate(progress=...)` reports
+  each SST. On a store of 20,000 `:Doc` nodes with 384-float embeddings
+  written and compacted by 2.6.19, the migration took 7.3 s, shrank the
+  node SST from 37.1 MB to 28.6 MB, and cut the CPU time of
+  `MATCH (d:Doc) WHERE d.kind = 'call' RETURN d` (2,858 whole nodes) from
+  1.81 s to 1.15 s (median of 7); projections that leave the embedding
+  out did not change.
+- **Server: a namespace in a newer storage format answers 409.** In
+  multi-tenant mode, `/{ns}/v0/cypher`, `/health` and the admin routes
+  answer `409` with `code: "unsupported_storage_format"` and the release
+  that wrote it, instead of a retryable `503`, and leave the namespace
+  untouched; the other namespaces keep serving. 3.3.1 opened such a
+  namespace, claimed it and dropped the newer release's fields from the
+  manifest. `GET /v0/version` now reports `storage_format`, the newest
+  format the server reads.
+- `CompactionBasis::legacy_node_ssts`,
+  `CompactionBasis::prepare_node_layout_migration`,
+  `WriterSession::open_with_options` with `FormatUpgrade`, and
+  `inspect_storage_format` in `namidb-storage`.
+
+- **`namidb-bench serve` and `namidb-bench http-load`** (feature `http-load`):
+  the real HTTP server on a store with simulated object-store latency (default
+  20-40 ms per request, with request counters per operation), and a client
+  that replays a field workload (`field-report`), measures sustained document
+  and vector loads (`bulk`, `vectors`), and measures vector search recall@k
+  and p50/p95 latency against brute-force ground truth on synthetic clustered
+  vectors (`vector-search`). Run `serve` in a memory-limited cgroup to measure
+  a container size.
+
+- `namidb-bench graph-shape-generate` writes a deterministic hub-shaped graph
+  (2.4M nodes by default: four `:Device` hubs, the largest holding 1.7M
+  `ON_DEVICE` edges, 2,958 `:Call` nodes, 64-float embeddings) straight into a
+  namespace, or as NDJSON that `bench/load_ndjson.py` loads through any
+  released Python package, to compare layouts written by older releases.
+  `namidb-bench graph-shape-query` times a read query against it and reports
+  the plan, rows, run times and peak RSS. See `bench/README.md`.
+
 ### Changed
 
 - **Server: `NAMIDB_QUERY_MEMORY_MAX_BYTES=auto` bounds queries without a
@@ -56,6 +122,87 @@ crates.io release will establish and document that API explicitly.
   transaction hands its worker's other connections to the rest of the
   runtime while it runs. Concurrency stays bounded by
   `NAMIDB_MAX_CONCURRENT_QUERIES`.
+
+- **Python: opening a NamiDB 2.x namespace for writing needs
+  `upgrade=True`.** `Client(uri)` claimed the namespace and wrote whatever
+  came next in the 3.x format, after which 2.x could no longer read any of
+  it ("node SST schema does not match the declared node schema"), with no
+  warning. It now raises the new `namidb.StorageFormatError` before
+  touching anything when the namespace's data can still be read by 2.x.
+  Open it with `read_only=True` to read it as it is, or take a backup and
+  pass `upgrade=True` once; the stamp that open writes records the upgrade,
+  so later opens need no flag. Namespaces already written by 3.x open as
+  before. The server, the CLI and the Rust `WriterSession::open` keep
+  opening such namespaces, as before.
+
+### Changed — write throughput on remote object stores
+
+- **A write no longer re-reads the size of every SST sidecar it touches
+  (#212).** Snapshots kept the HEAD answers of the SST objects they read for
+  their own lifetime only, and the writer publishes a new snapshot after every
+  commit, so each write (and each read after it) paid one HEAD round trip per
+  sidecar it probed, under the writer lock. SST objects are create-only and
+  never change, so their HEAD is now kept per process, bounded by
+  `NAMIDB_CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES` (default 16384, `0` turns it
+  off), dropped with the namespace's caches and after any failed read of the
+  object. On a store with 20-40 ms per request and 60 SSTs, a point read went
+  from 243 ms to 7 ms, creating 400 relationships from 828 ms to 157 ms and
+  re-running a 500-row `MERGE` from 617 ms to 342 ms.
+- **A commit waits two object-store round trips instead of three.** The
+  advisory `current.json` PUT no longer runs after the pointer is created: the
+  next commit sends it together with its own pointer create, and every flush
+  (and the Python client's `close()`) sends it too, so an idle writer settles
+  it within one flush interval. The version is durable and found by readers as
+  soon as its pointer exists; the sweep keeps every pointer at or above the
+  version `current.json` names, so a lagging advisory still resolves. An owed
+  advisory is sent only while it is still the newest version (after the next
+  commit's Create-only manifest body landed, or when the next pointer does not
+  exist yet), so a writer fenced by a successor never rolls `current.json`
+  back below versions the successor committed.
+- **The periodic flush no longer holds the writer while it builds and uploads
+  SSTs.** It takes the writer only to commit the pending batch and checkpoint
+  the memtable, and again to commit the manifest that adds the new SSTs.
+  Encoding the node and edge SSTs, building the vector and full-text deltas and
+  uploading them all run with the writer free, so writes keep committing (and
+  are not rejected at the writer-lock timeout) while a large memtable is
+  flushed. Rows written during the flush stay in the memtable and their WAL
+  segments; a flush whose base changed meanwhile (a compaction or DDL
+  committed) is discarded and the next one runs under the writer. The
+  memtable stays bounded meanwhile: once writes made during the build bring
+  it to `NAMIDB_MEMTABLE_STALL_BYTES`, the flush takes the writer back until
+  it installs, so further writes wait as they did behind the synchronous
+  flush instead of growing it by a short stall per write. With a
+  full-text and a vector index on the loaded label, a document load and a
+  vector load running at the same time went from 79 to 535 documents/s and
+  from 5.9 to 66 vectors/s (1 GiB container, 20-40 ms per store request).
+- **The Python client's `flush()` requests a search compaction too.** Like
+  the server's flush loop since 3.3.2, it now compacts after a flush when a
+  vector or full-text index has enough delta segments to merge, not only on
+  the L0 trigger, so a long local load into an indexed label does not reach
+  the segment cap. In the server, a flush whose off-lock build fails (for
+  example at the cap) requests a compaction straight away.
+- **The memtable is sized to the process memory limit.** With
+  `NAMIDB_MEMORY_MAX_BYTES` set (`auto` follows the container limit, as the
+  bundled compose file does), the memtable flush trigger is capped at 1/16 of
+  it and the write stall at 1/8. The defaults, 64 MiB and 256 MiB, suit a
+  host with several GiB; in a 1 GiB container a 256 MiB memtable plus the copy
+  a flush keeps while it uploads left little for compaction and the requests
+  in flight. An explicit setting is capped the same way, and the server logs
+  the values it uses. `namidb_server::memtable_thresholds_within` computes
+  them.
+- **Large `UNWIND` batches fit in one request.** `/v0/cypher` accepts JSON
+  bodies up to `NAMIDB_HTTP_MAX_BODY_BYTES` (`--http-max-body-bytes`, default
+  16 MiB, was a fixed 2 MiB), enough for several hundred 1024-dimension
+  embeddings per request. Each request still reserves about 16x its size of
+  working memory before its JSON is decoded, and a request without a
+  `Content-Length` reserves 16x the limit; with `NAMIDB_MEMORY_MAX_BYTES` set,
+  the limit is therefore capped so one maximum-size request reserves at most a
+  quarter of it (never below the old 2 MiB), and the server logs the value it
+  uses. A larger body gets 413 with the setting's name in the message.
+- **Faster full-text delta builds.** The external sorters of the full-text
+  builders grew their buffers by one record per term occurrence, which cost a
+  reallocation per token of every indexed document at flush; they now grow
+  geometrically within the same memory budget.
 
 ### Fixed
 
@@ -100,6 +247,132 @@ crates.io release will establish and document that API explicitly.
   (and the namespace and scan gates) at once while its thread ran on to the
   next cooperative check, so clients that disconnected over and over could
   keep more reads running than the gates allow.
+
+- **A label written in `WHERE` no longer scans every node.**
+  `MATCH (n:Device)` read only the `:Device` nodes, but
+  `MATCH (n) WHERE n:Device` planned a scan of every node of every label
+  (`NodeScan label=*` under `Filter(__label_eq(n, 'Device'))`), and so did
+  `n:A OR n:B` and the `(n:A|B)` pattern. On a 2.4M-node graph each of those
+  went past 6 GB of memory within half a minute; they now answer in 0.2 to
+  630 ms under 170 MB (`count` of a label from `WHERE n:Device` in 0.2 ms, as
+  from the pattern). The planner now plans them from labels:
+  - a label conjunct scopes the scan to that label. With several (`n:A:B`,
+    `n:A AND n:B`) it scans the one with the fewest nodes and keeps the others
+    as filters, as it keeps `NOT n:L` and any other predicate;
+  - a disjunction in which every branch requires a label (`n:A OR n:B`,
+    `(n:A AND n.x > 1) OR n:B`, `(n:A|B)`) becomes a `UNION ALL` of label
+    scans whose branches are disjoint (branch *i* drops the nodes an earlier
+    branch already returned), so nothing is returned twice and no
+    de-duplication state is needed. A pattern predicate on such a variable
+    (`WHERE (n:A OR n:B) AND (n)-[:R]->()`) stays a correlated check per
+    row: decorrelating it would build its inner side from one branch's label
+    and drop the other branch's rows;
+  - `WHERE m:L` on the far end of a single hop becomes that hop's own label
+    check, so it is proved before the neighbour is read.
+
+  It applies to any pattern variable, after `WITH` and inside `OPTIONAL
+  MATCH`. A predicate that can hold for a node without any particular label
+  (`NOT n:L` alone, `n:A OR n.x = 1`) still scans every node, since there is
+  no label to start from.
+- **`WHERE (n:A OR n:B)` and `WHERE (n:A AND n.x = 1)` parse.** A
+  parenthesised predicate that opened with a label test was taken for a
+  pattern and failed with "expected `)`, found `OR`". Such a parenthesis is
+  now tried as a pattern and as an expression, and the outcome at each
+  position is remembered, so the parse time no longer doubles with every
+  level those parentheses nest (tried naively, a 1 KB query of nested
+  `(n)--(m {a: …} x)` would take 2^depth steps before execution and its
+  timeout even began).
+- **A hop from an id-pinned hub starts at the other end.**
+  `MATCH (d:Device)<-[:ON_DEVICE]-(c:Call) WHERE elementId(d) IN $ids` always
+  started at the pinned nodes and walked every one of their edges, checking
+  each neighbour for `:Call`. When the pinned node is a hub (here 1.7M
+  `ON_DEVICE` edges against 2,958 `:Call` nodes) it now scans `:Call`, follows
+  each call's edge to its device and keeps the pinned ones. The choice is
+  costed from the edge type's per-direction average degree and the label's
+  node count, and the scan must be at least 4x cheaper; with missing
+  statistics, an untyped hop or an unlabelled far end the pinned start stays.
+  Anchor inversion, which re-anchors a scan at an id-pinned target, asks the
+  same question, so the two rewrites never undo each other. With the two
+  fixes below, that query went from 5.8 s to 1.3 s on a 2.4M-node graph, and
+  the `WHERE elementId(d) IN $ids AND c:Call` spelling, which ran for more
+  than 150 s, takes 1.5 s.
+- **A projected scan of a small label reads each property page once.** A
+  scan that names the properties it needs (`MATCH (c:Call) RETURN c.ts`) over
+  a compacted node SST with property pages probed the pages once per
+  ~1,000-row Parquet batch, for the members of the label in that batch. A
+  label of a few thousand nodes spread over a 2.4M-row SST paid a page read
+  per member: `MATCH (c:Call) RETURN c.ts, c.duration` (2,958 rows) took
+  6.9 s, longer than returning the whole nodes, and takes 0.9 s now. The
+  members of up to 65,536 rows share one probe, and on a compacted SST with
+  no newer versions the rows outside the label are no longer kept as shadow
+  entries. A store whose node SST was written by 2.x, with the embeddings in
+  the overflow JSON, gets the same gain (9.7 s to 1.1 s); returning whole
+  nodes still costs more there (1.3 s against 0.8 s for the 2,958 `:Call`
+  nodes), since every embedding is parsed from JSON text.
+- **An Expand over many seeds reads their first hop concurrently.** Each
+  seed's adjacency read is a few dependent range reads of the edge SST, about
+  0.35 ms each on local disk and more on object storage, and seeds were read
+  one after another: 2,958 calls following one `ON_DEVICE` edge each spent
+  over a second waiting on reads. When the edge SSTs' degree histograms bound
+  every partner list by 1,024, the first hop of all seeds is now read with 16
+  reads in flight, within the operator's existing 1M-edge memo budget; a run
+  of hubs is still read one at a time. A single-hop Expand-Into (both ends
+  already bound) runs its edge probes the same way. The reads run ahead one
+  window of 4,096 input rows at a time, so the read-ahead state is bounded
+  by the window, never by the size of the operator's input.
+- **A hop to a node an earlier clause bound starts from that node.**
+  `MATCH (c:Call) MATCH (d)<-[:ON_DEVICE]-(c)` (or `… WITH c MATCH …`, or
+  inside `OPTIONAL MATCH`) planned a scan of every node for `d`, a cross
+  product with every `c` row, and an edge probe per pair: rows × nodes work
+  and memory before anything was pruned. The hop now walks each `c`'s own
+  edges. With a labelled far end (`(d:Device)`) it does so only when the
+  edge type's average degree from the bound side is no larger than the
+  label's node count; an id seek or index lookup on the far end, and a
+  literal property filter folded into its scan, keep the plan as before.
+
+## [3.3.2] - 2026-11-15
+
+### Fixed
+
+- **A bulk load into a label with search indexes no longer wedges every
+  flush of the namespace.** Two shapes made the periodic flush fail on every
+  attempt, so the memtable could only grow, writes queued behind the
+  retried flush (write timeouts, then memory-pressure rejections) and the
+  process could finally be killed for memory, replaying the same writes on
+  restart:
+  - *More distinct values of a native search filter than the per-segment
+    cap.* An explicitly indexed, non-unique Bool/String property on the
+    label of a full-text or vector index (for example a `CREATE INDEX` on
+    `n.id` without a `UNIQUE` constraint) is a native search filter. A flush
+    or compaction that saw more than 4096 distinct values of it failed with
+    `text v4 filter property id exceeds explicit distinct-value cap 4096`
+    (or `vector native filter 'id' exceeds 4096 distinct values`). The
+    segment now omits that property whole and advertises only the filters
+    it carries completely; a filtered search on the omitted property takes
+    the exact fallback path, as it does for any segment without the filter.
+    Low-cardinality filters in the same segment stay native.
+  - *One large document.* The full-text builder refused any document whose
+    conservative tokenization estimate (64 bytes per byte of text, before
+    plus after image) exceeded a per-record workspace carved from
+    `NAMIDB_INDEX_BUILD_MEMORY_BYTES` divided across every search index of
+    the namespace — about 100 KiB of text with a 128 MiB budget and five
+    indexes — with `one text v4 mutation can require more than the
+    N-byte per-record workspace`. Such a document is now indexed (the sort
+    buffer still spills within its budget) and reported in a warning. A
+    single node mutation larger than the flush's before-image chunk budget
+    likewise forms a chunk of its own instead of failing the flush.
+- **A search index at its segment cap no longer stalls flushes until the
+  next compaction tick.** Each flush adds a delta segment to every changed
+  full-text or vector index and refuses to add one past
+  `NAMIDB_SEARCH_LSM_MAX_SEGMENTS` (8), failing with `search index '…' has 8
+  active segments … compact it before flushing another delta`. The server
+  requested a compaction after a flush only when the L0 high-water mark
+  tripped, so under a sustained load into a search-indexed label every flush
+  failed until the periodic compaction ran (up to its interval), and writes
+  queued behind the retried flush. The flush loop now requests a compaction
+  whenever a search index has enough delta segments to merge, including
+  right after a flush refused at the cap.
+
 
 ## [3.3.1] - 2026-11-05
 
@@ -4551,7 +4824,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.3.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.3.2...HEAD
+[3.3.2]: https://github.com/namidb/namidb/compare/v3.3.1...v3.3.2
 [3.3.1]: https://github.com/namidb/namidb/compare/v3.3.0...v3.3.1
 [3.3.0]: https://github.com/namidb/namidb/compare/v3.2.1...v3.3.0
 [3.2.1]: https://github.com/namidb/namidb/compare/v3.2.0...v3.2.1

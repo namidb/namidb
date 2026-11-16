@@ -1913,8 +1913,73 @@ pub(crate) async fn execute_expand(
     const NEIGHBOUR_MEMO_MAX_EDGES: usize = 1_000_000;
     let mut neighbour_memo: HashMap<NodeId, Arc<Vec<EdgeView>>> = HashMap::new();
     let mut neighbour_memo_edges: usize = 0;
+    // Each adjacency read or Expand-Into probe is a few dependent range reads
+    // of the edge SST; one seed after the other they add up to a
+    // millisecond-scale wait per seed (2,958 seeds of a degree-1 hop took
+    // over a second). Read the first hop of the seeds ahead with bounded
+    // concurrency instead, one window of input rows at a time, so the
+    // read-ahead state stays bounded by the window whatever the input size;
+    // see `prefetch_seed_neighbours` / `prefetch_exact_edges`.
+    let mut exact_memo: HashMap<(NodeId, NodeId), Vec<EdgeView>> = HashMap::new();
+    let prefetch = cap.is_none() && shortest == crate::plan::ShortestMode::None && rows.len() > 1;
+    let exact_prefetch = prefetch && back_reference && max == 1;
+    let mut seed_prefetch = prefetch
+        && !exact_prefetch
+        && !edge_types.is_empty()
+        && persisted_degree_bound(snapshot, &edge_types, direction)
+            .is_some_and(|bound| bound <= SEED_PREFETCH_MAX_DEGREE);
+    let mut prefetched_until = 0usize;
+    // Accounts `out` and both memos: the neighbour memo can hold up to
+    // NEIGHBOUR_MEMO_MAX_EDGES edges with their properties, which a query's
+    // memory limit must see.
     let mut meter = crate::exec::memory::GrowthMeter::new();
-    for row in rows {
+    let mut exact_memo_bytes = 0usize;
+    let mut rows = rows;
+    for row_index in 0..rows.len() {
+        if row_index >= prefetched_until && (exact_prefetch || seed_prefetch) {
+            let window_end = row_index
+                .saturating_add(SEED_PREFETCH_WINDOW)
+                .min(rows.len());
+            let window = &rows[row_index..window_end];
+            if exact_prefetch {
+                // The previous window's probes are dropped with it.
+                exact_memo.clear();
+                meter.release(exact_memo_bytes);
+                exact_memo = prefetch_exact_edges(
+                    window,
+                    source,
+                    target_alias,
+                    &edge_types,
+                    direction,
+                    snapshot,
+                    edge_read_mode,
+                )
+                .await?;
+                if meter.active() {
+                    exact_memo_bytes = exact_memo
+                        .values()
+                        .map(|edges| estimate_edges_bytes(edges))
+                        .fold(0usize, usize::saturating_add);
+                    meter.add(exact_memo_bytes)?;
+                }
+            } else {
+                seed_prefetch = prefetch_seed_neighbours(
+                    window,
+                    source,
+                    &edge_types,
+                    direction,
+                    snapshot,
+                    edge_read_mode,
+                    &mut neighbour_memo,
+                    &mut neighbour_memo_edges,
+                    NEIGHBOUR_MEMO_MAX_EDGES,
+                    &mut meter,
+                )
+                .await?;
+            }
+            prefetched_until = window_end;
+        }
+        let row = std::mem::take(&mut rows[row_index]);
         // Deadline + row-cap guards: a multi-seed (or variable-length)
         // expansion is the most expensive operator, so bound it at every
         // seed boundary and fail fast before `out` grows past the cap.
@@ -2128,6 +2193,9 @@ pub(crate) async fn execute_expand(
                 probe.tick()?;
                 let neighbours: Arc<Vec<EdgeView>> = if back_reference && max == 1 {
                     Arc::new(match existing_target_id {
+                        Some(target) if exact_memo.contains_key(&(step.tail, target)) => {
+                            exact_memo[&(step.tail, target)].clone()
+                        }
                         Some(target) => {
                             exact_edges_between_any(
                                 snapshot,
@@ -2157,6 +2225,9 @@ pub(crate) async fn execute_expand(
                     if neighbour_memo_edges.saturating_add(fetched.len())
                         <= NEIGHBOUR_MEMO_MAX_EDGES
                     {
+                        if meter.active() {
+                            meter.add(estimate_edges_bytes(&fetched))?;
+                        }
                         neighbour_memo_edges += fetched.len();
                         neighbour_memo.insert(step.tail, Arc::clone(&fetched));
                     }
@@ -7002,6 +7073,166 @@ async fn neighbours_of_any(
     Ok(all)
 }
 
+/// Reads of one Expand's first hop in flight at once.
+const SEED_PREFETCH_CONCURRENCY: usize = 16;
+
+/// Largest partner list, per seed, that [`prefetch_seed_neighbours`] reads
+/// ahead. Above it the seeds are read one at a time as before, so a run of
+/// hubs never holds `SEED_PREFETCH_CONCURRENCY` huge lists at once.
+const SEED_PREFETCH_MAX_DEGREE: u64 = 1_024;
+
+/// Upper bound of the partner count any one node can have over `edge_types`
+/// in `direction` across the persisted edge SSTs: the sum of every matching
+/// SST's maximum degree. Memtable edges are not counted (they are already
+/// resident). `None` when no SST of those types exists.
+fn persisted_degree_bound(
+    snapshot: &Snapshot<'_>,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+) -> Option<u64> {
+    use namidb_storage::manifest::{KindSpecificStats, SstKind};
+    let wanted = |kind: SstKind| match direction {
+        RelationshipDirection::Right => kind == SstKind::EdgesFwd,
+        RelationshipDirection::Left => kind == SstKind::EdgesInv,
+        RelationshipDirection::Both => matches!(kind, SstKind::EdgesFwd | SstKind::EdgesInv),
+    };
+    let mut bound: Option<u64> = None;
+    for desc in &snapshot.manifest().manifest.ssts {
+        if !wanted(desc.kind) || !edge_types.contains(&desc.scope) {
+            continue;
+        }
+        let KindSpecificStats::Edges {
+            degree_histogram, ..
+        } = &desc.kind_specific
+        else {
+            continue;
+        };
+        bound = Some(
+            bound
+                .unwrap_or(0)
+                .saturating_add(degree_histogram.max_degree),
+        );
+    }
+    bound
+}
+
+/// Input rows of one Expand whose first hop is read ahead at a time. The
+/// read-ahead state (the window's distinct seeds or endpoint pairs, and the
+/// probe results of the Expand-Into form) is bounded by this, not by the
+/// operator's input size.
+const SEED_PREFETCH_WINDOW: usize = 4_096;
+
+/// Read the first-hop adjacency of every distinct seed in `rows` (one window
+/// of an Expand's input) with [`SEED_PREFETCH_CONCURRENCY`] reads in flight,
+/// into the Expand's neighbour memo. The caller only asks when the edge
+/// statistics bound every seed's partner list by
+/// [`SEED_PREFETCH_MAX_DEGREE`]. Stops at the memo's edge budget; seeds left
+/// out are read on demand by the per-row loop, exactly as without the
+/// prefetch. The memo is keyed by node alone, so a later hop reuses an entry
+/// just like the loop's own memo hits. Returns `false` once the budget is
+/// spent, so later windows do not read ahead only to discard.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_seed_neighbours(
+    rows: &[Row],
+    source: &str,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    snapshot: &Snapshot<'_>,
+    mode: EdgeReadMode,
+    memo: &mut HashMap<NodeId, Arc<Vec<EdgeView>>>,
+    memo_edges: &mut usize,
+    max_memo_edges: usize,
+    meter: &mut crate::exec::memory::GrowthMeter,
+) -> Result<bool, ExecError> {
+    use futures::stream::{self, StreamExt};
+    let mut seen = std::collections::HashSet::new();
+    let seeds: Vec<NodeId> = rows
+        .iter()
+        .filter_map(|row| match row.get(source) {
+            Some(RuntimeValue::Node(n)) => Some(n.id),
+            _ => None,
+        })
+        .filter(|id| !memo.contains_key(id) && seen.insert(*id))
+        .collect();
+    if seeds.len() < 2 {
+        return Ok(true);
+    }
+    let mut reads = stream::iter(seeds)
+        .map(|id| async move {
+            neighbours_of_any(snapshot, edge_types, direction, id, mode)
+                .await
+                .map(|edges| (id, edges))
+        })
+        .buffered(SEED_PREFETCH_CONCURRENCY);
+    while let Some(read) = reads.next().await {
+        crate::exec::limits::check_deadline()?;
+        let (id, edges) = read?;
+        if memo_edges.saturating_add(edges.len()) > max_memo_edges {
+            return Ok(false);
+        }
+        if meter.active() {
+            meter.add(estimate_edges_bytes(&edges))?;
+        }
+        *memo_edges += edges.len();
+        memo.insert(id, Arc::new(edges));
+    }
+    Ok(true)
+}
+
+/// Estimated heap footprint of a memoised partner list, for the query's
+/// working-memory account.
+fn estimate_edges_bytes(edges: &[EdgeView]) -> usize {
+    edges.iter().map(EdgeView::estimated_bytes).fold(
+        std::mem::size_of_val(edges).saturating_add(64),
+        usize::saturating_add,
+    )
+}
+
+/// Run the Expand-Into probe of every row of `rows` (one window of a
+/// single-hop, back-referencing Expand's input) with
+/// [`SEED_PREFETCH_CONCURRENCY`] probes in flight. Each probe is a point read
+/// whatever the endpoints' degrees, and returns at most one edge per type and
+/// direction, so the map holds at most a window's worth of small entries.
+async fn prefetch_exact_edges(
+    rows: &[Row],
+    source: &str,
+    target: &str,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    snapshot: &Snapshot<'_>,
+    mode: EdgeReadMode,
+) -> Result<HashMap<(NodeId, NodeId), Vec<EdgeView>>, ExecError> {
+    use futures::stream::{self, StreamExt};
+    let mut seen = std::collections::HashSet::new();
+    let pairs: Vec<(NodeId, NodeId)> = rows
+        .iter()
+        .filter_map(|row| match (row.get(source), row.get(target)) {
+            (Some(RuntimeValue::Node(from)), Some(RuntimeValue::Node(to))) => {
+                Some((from.id, to.id))
+            }
+            _ => None,
+        })
+        .filter(|pair| seen.insert(*pair))
+        .collect();
+    let mut out = HashMap::with_capacity(pairs.len());
+    if pairs.len() < 2 {
+        return Ok(out);
+    }
+    let mut probes = stream::iter(pairs)
+        .map(|(from, to)| async move {
+            exact_edges_between_any(snapshot, edge_types, direction, from, to, mode)
+                .await
+                .map(|edges| ((from, to), edges))
+        })
+        .buffered(SEED_PREFETCH_CONCURRENCY);
+    while let Some(probe) = probes.next().await {
+        crate::exec::limits::check_deadline()?;
+        let (pair, edges) = probe?;
+        out.insert(pair, edges);
+    }
+    Ok(out)
+}
+
 /// Exact Expand-Into probe for a pattern whose two endpoint aliases are
 /// already bound. Physical edge identity is `(type, src, dst)`, so a
 /// single-hop MATCH must not enumerate either endpoint's full adjacency just
@@ -7870,7 +8101,20 @@ pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>,
                 .saturating_add(right_bytes.saturating_mul(left.len())),
         )?;
     }
-    let mut out = Vec::with_capacity(left.len() * right.len());
+    // `|L| x |R|` can exceed what the process can ever allocate (two
+    // 100k-row sides make 10^10 rows): reserving it up front aborted the
+    // whole process instead of failing the query. Reserve a bounded start,
+    // grow fallibly, and account the rows as they are produced, so the
+    // product stops at the query's memory budget or row cap, or with an
+    // error when an allocation is refused.
+    let total = left
+        .len()
+        .checked_mul(right.len())
+        .ok_or_else(|| cross_product_too_large(left.len(), right.len(), usize::MAX))?;
+    let mut out: Vec<Row> = Vec::new();
+    out.try_reserve_exact(total.min(METER_STRIDE))
+        .map_err(|_| cross_product_too_large(left.len(), right.len(), total))?;
+    let mut meter = crate::exec::memory::GrowthMeter::new();
     // The product is pure CPU with no storage read underneath, so without
     // an in-loop probe `MATCH (a:N), (b:N)` ran to completion past the
     // query timeout and an admin cancel.
@@ -7878,6 +8122,15 @@ pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>,
     for l in &left {
         for r in &right {
             guard.tick()?;
+            if out.len() % METER_STRIDE == 0 {
+                crate::exec::limits::check_row_cap(out.len())?;
+                meter.observe(&out)?;
+            }
+            if out.len() == out.capacity() {
+                let grow = out.len().min(total - out.len()).max(1);
+                out.try_reserve(grow)
+                    .map_err(|_| cross_product_too_large(left.len(), right.len(), total))?;
+            }
             let mut merged = l.clone();
             for (k, v) in &r.bindings {
                 merged.set(k.clone(), v.clone());
@@ -7886,6 +8139,23 @@ pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>,
         }
     }
     Ok(out)
+}
+
+/// The error for a cross product whose row buffer could not be allocated:
+/// the query's memory limit when one is in scope, otherwise a plain error
+/// naming the product's size.
+fn cross_product_too_large(left: usize, right: usize, total: usize) -> ExecError {
+    if crate::exec::memory::memory_scoped() {
+        let needed = total.saturating_mul(std::mem::size_of::<Row>());
+        if let Err(error) = crate::exec::memory::check_transient(needed) {
+            return error;
+        }
+        return crate::exec::memory::scoped_memory_error();
+    }
+    ExecError::Runtime(format!(
+        "cross product of {left} x {right} rows is too large to allocate; \
+         add a join predicate, LIMIT or aggregation"
+    ))
 }
 
 pub(crate) fn dedup_rows(rows: Vec<Row>) -> Result<Vec<Row>, ExecError> {
@@ -10639,12 +10909,29 @@ fn cross_product_factor(
         leaves: left_leaves,
     } = left;
 
-    let mut out_leaves = Vec::with_capacity(left_leaves.len() * right.leaves.len());
+    // Fallible and bounded, as in the flat product: reserving `|L| x |R|`
+    // up front aborted the process when the allocation was refused.
+    let total = left_leaves
+        .len()
+        .checked_mul(right.leaves.len())
+        .ok_or_else(|| {
+            cross_product_too_large(left_leaves.len(), right.leaves.len(), usize::MAX)
+        })?;
+    let mut out_leaves: Vec<FactorIdx> = Vec::new();
+    out_leaves
+        .try_reserve_exact(total.min(METER_STRIDE))
+        .map_err(|_| cross_product_too_large(left_leaves.len(), right.leaves.len(), total))?;
     // Same in-loop deadline / cancel probe as the flat product.
     let mut guard = crate::exec::limits::DeadlineProbe::new();
     for &l in &left_leaves {
         for &r in &right.leaves {
             guard.tick()?;
+            if out_leaves.len() == out_leaves.capacity() {
+                let grow = out_leaves.len().min(total - out_leaves.len()).max(1);
+                out_leaves.try_reserve(grow).map_err(|_| {
+                    cross_product_too_large(left_leaves.len(), right.leaves.len(), total)
+                })?;
+            }
             let r_row = right.arena.materialize(r, None);
             let mut slots: Vec<Slot> = Vec::with_capacity(r_row.bindings.len());
             for (name, value) in r_row.bindings {
@@ -11947,6 +12234,39 @@ mod tests {
             Ok(_) => panic!("operator ignored a fired guard"),
             Err(e) => e,
         }
+    }
+
+    #[tokio::test]
+    async fn cross_product_stops_at_the_row_cap_without_reserving_the_product() {
+        // 4,000 x 4,000 rows: reserving the whole product up front is 16M
+        // rows of buffer before the first one exists. Growing on demand
+        // lets the row cap stop it after a few thousand.
+        let left = int_rows("a", 4_000);
+        let right = int_rows("b", 4_000);
+        let e = crate::exec::limits::with_limits(None, Some(5_000), async {
+            cross_product(left, right)
+        })
+        .await
+        .expect_err("product past the row cap");
+        assert!(matches!(e, ExecError::RowCap(5_000)), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn cross_product_stops_at_the_memory_budget_while_it_grows() {
+        // A product past a small budget fails the query with a memory
+        // error instead of allocating.
+        let left = int_rows("a", 2_000);
+        let right = int_rows("b", 2_000);
+        let budget = Arc::new(crate::exec::memory::QueryMemoryBudget::new(256 * 1024));
+        let e = crate::exec::memory::with_query_memory(Some(budget), async {
+            cross_product(left, right)
+        })
+        .await
+        .expect_err("product past the memory budget");
+        assert!(matches!(e, ExecError::MemoryLimit(_)), "{e:?}");
+        // Without any limit the product is still exact.
+        let rows = cross_product(int_rows("a", 300), int_rows("b", 200)).unwrap();
+        assert_eq!(rows.len(), 60_000);
     }
 
     #[tokio::test]

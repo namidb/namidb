@@ -64,6 +64,10 @@ pub struct MaintenanceConfig {
     /// Concurrent reads one namespace may run, inside the process-wide
     /// read gate. `0` (the default) means no per-namespace cap.
     pub max_concurrent_queries_per_namespace: usize,
+    /// Memtable bytes at which an off-lock flush build takes the writer back
+    /// until it installs (see `build_background_flush_bounded`). `0` (the
+    /// default) never does.
+    pub memtable_stall_bytes: usize,
 }
 
 impl Default for MaintenanceConfig {
@@ -78,6 +82,7 @@ impl Default for MaintenanceConfig {
             group_commit_window: Duration::ZERO,
             fence_policy: recovery::FencePolicy::Steal,
             max_concurrent_queries_per_namespace: 0,
+            memtable_stall_bytes: 0,
         }
     }
 }
@@ -389,6 +394,12 @@ impl NamespaceRegistry {
                 namidb_storage::Error::PointerResolveStale => {
                     RegistryError::Unavailable(e.to_string())
                 }
+                // Data from a newer release: nothing is wrong with this
+                // server, it is too old for the namespace (409).
+                namidb_storage::Error::NewerStorageFormat { .. }
+                | namidb_storage::Error::StorageFormatUpgradeRequired { .. } => {
+                    RegistryError::UnsupportedFormat(e.to_string())
+                }
                 other => RegistryError::OpenFailed(other.to_string()),
             })?;
 
@@ -473,6 +484,7 @@ impl NamespaceRegistry {
             let mut cancel = state.cancel_tx.subscribe();
             let interval = maint.flush_interval;
             let l0_trigger = maint.compaction_l0_trigger;
+            let memtable_stall_bytes = maint.memtable_stall_bytes;
             let ns = state.namespace.clone();
             let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
@@ -481,7 +493,8 @@ impl NamespaceRegistry {
                                    // Back off after a local-persistence flush failure — see the
                                    // single-tenant loop and `FLUSH_FAILURE_RETRY_BACKOFF`.
                 let mut retry_after: Option<Instant> = None;
-                loop {
+                let mut flush_superseded = false;
+                'tick: loop {
                     tokio::select! {
                         biased;
                         _ = cancel.wait_for(|evicted| *evicted) => break,
@@ -495,7 +508,7 @@ impl NamespaceRegistry {
                     // trigger when the L0 high-water mark trips. The
                     // scheduler captures a fresh basis inside its sole
                     // worker, including for its one pending follow-up.
-                    let should_compact = {
+                    let should_compact = 'flush: {
                         let lock_started = Instant::now();
                         let mut w = s.writer.lock().await;
                         metrics.observe_writer_lock(
@@ -527,16 +540,95 @@ impl NamespaceRegistry {
                             .await
                             .is_err()
                             {
-                                continue;
+                                continue 'tick;
                             }
                         }
-                        let schema = w.snapshot().manifest().manifest.schema.clone();
-                        match w.flush(schema.clone()).await {
-                            Ok(_) => {
+                        // SST build and upload with the writer lock released;
+                        // see the single-tenant loop.
+                        let flushed = if std::mem::take(&mut flush_superseded) {
+                            let schema = w.snapshot().manifest().manifest.schema.clone();
+                            w.flush(schema).await.map(|_| None)
+                        } else {
+                            match w.begin_background_flush().await {
+                                Ok(None) => Ok(None),
+                                Ok(Some(ticket)) => {
+                                    drop(w);
+                                    let (built, held) = crate::build_background_flush_bounded(
+                                        ticket,
+                                        &s.writer,
+                                        &s.flush_notify,
+                                        memtable_stall_bytes,
+                                    )
+                                    .await;
+                                    match built {
+                                        Ok(built) => {
+                                            w = match held {
+                                                Some(held) => held,
+                                                None => {
+                                                    let lock_started = Instant::now();
+                                                    let w = s.writer.lock().await;
+                                                    metrics.observe_writer_lock(
+                                                        WriterLockKind::Flush,
+                                                        lock_started.elapsed(),
+                                                        true,
+                                                    );
+                                                    w
+                                                }
+                                            };
+                                            if s.is_retired() {
+                                                drop(w);
+                                                return;
+                                            }
+                                            if let Some(group) = &s.group_commit {
+                                                if crate::commit_group_locked(
+                                                    group,
+                                                    &mut w,
+                                                    &s.snapshot,
+                                                    &s.writer_health,
+                                                    &ns,
+                                                )
+                                                .await
+                                                .is_err()
+                                                {
+                                                    continue 'tick;
+                                                }
+                                            }
+                                            w.install_background_flush(built).await.map(Some)
+                                        }
+                                        Err(e) => {
+                                            error!(namespace = %ns, error = %e, "periodic flush build failed");
+                                            if e.is_local_persistence() {
+                                                s.writer_health.mark_persistence_degraded(
+                                                    crate::persistence_degraded_reason(&e),
+                                                );
+                                                retry_after = Some(
+                                                    Instant::now()
+                                                        + crate::FLUSH_FAILURE_RETRY_BACKOFF,
+                                                );
+                                            }
+                                            // See the single-tenant loop.
+                                            break 'flush !s.is_retired();
+                                        }
+                                    }
+                                }
+                                Err(e) => Err(e),
+                            }
+                        };
+                        match flushed {
+                            Ok(installed) => {
+                                if matches!(
+                                    installed,
+                                    Some(namidb_storage::BackgroundFlushInstall::Superseded)
+                                ) {
+                                    tracing::debug!(namespace = %ns, "periodic flush superseded; retrying under the writer lock");
+                                    flush_superseded = true;
+                                    s.flush_notify.notify_one();
+                                }
                                 retry_after = None;
                                 s.writer_health.clear_persistence_degraded();
                                 s.snapshot.store(w.owned_snapshot());
-                                l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger
+                                (l0_trigger > 0 && w.max_l0_bucket_len() >= l0_trigger)
+                                    || w.search_compaction_due()
                             }
                             Err(e) => {
                                 error!(namespace = %ns, error = %e, "periodic flush failed");
@@ -560,7 +652,11 @@ impl NamespaceRegistry {
                                     )
                                     .await;
                                 }
-                                false
+                                // A search index at its segment cap refuses
+                                // every flush until a compaction merges its
+                                // deltas: request it now, not at the next
+                                // periodic tick.
+                                !s.is_retired() && w.search_compaction_due()
                             }
                         }
                     };
@@ -945,6 +1041,11 @@ pub enum RegistryError {
     /// the client should retry. Mapped to 503, distinct from `OpenFailed`'s
     /// 500 so a retryable race is not reported as a server bug.
     Unavailable(String),
+    /// The namespace's storage format does not allow this build to open it
+    /// (see `namidb_storage::format`). Mapped to 409 with
+    /// `code: "unsupported_storage_format"`: retrying will not help, and it
+    /// is not a server fault.
+    UnsupportedFormat(String),
 }
 
 impl std::fmt::Display for RegistryError {
@@ -954,6 +1055,7 @@ impl std::fmt::Display for RegistryError {
             Self::OpenFailed(msg) => write!(f, "failed to open namespace: {}", msg),
             Self::AtCapacity => write!(f, "namespace registry at capacity"),
             Self::Unavailable(msg) => write!(f, "namespace temporarily unavailable: {}", msg),
+            Self::UnsupportedFormat(msg) => write!(f, "cannot open namespace: {}", msg),
         }
     }
 }
@@ -970,6 +1072,16 @@ impl IntoResponse for RegistryError {
                 "namespace registry at capacity".to_string(),
             ),
             Self::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            Self::UnsupportedFormat(msg) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": msg,
+                        "code": "unsupported_storage_format",
+                    })),
+                )
+                    .into_response();
+            }
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
@@ -991,6 +1103,62 @@ mod tests {
         let (store, _) = namidb_storage::parse_uri(&format!("memory://{uri_ns}")).unwrap();
         let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
         NamespaceRegistry::new(store, String::new(), 1, Duration::ZERO, metrics, maint)
+    }
+
+    /// A namespace a newer release wrote is refused with 409 and a stable
+    /// code, and left exactly as it was: the registry claims nothing.
+    #[tokio::test]
+    async fn a_namespace_in_a_newer_storage_format_is_refused_with_409() {
+        use namidb_storage::{ManifestStore, StorageFormat, WriterFence};
+        use object_store::ObjectStoreExt;
+        let (store, _) = namidb_storage::parse_uri("memory://registry-newer-format").unwrap();
+        let paths = NamespacePaths::new("", NamespaceId::new("future").unwrap());
+        drop(
+            WriterSession::open(store.clone(), paths.clone())
+                .await
+                .unwrap(),
+        );
+        let manifests = ManifestStore::new(store.clone(), paths.clone());
+        let base = manifests.load_current().await.unwrap();
+        let mut next = base.manifest.next_version(uuid::Uuid::now_v7());
+        next.storage_format = Some(StorageFormat {
+            version: 9,
+            min_reader_version: 9,
+            min_writer_version: 9,
+            written_by: "namidb 9.0.0".into(),
+        });
+        let stamped = manifests
+            .commit(&WriterFence::new(base.manifest.epoch), &base, next)
+            .await
+            .unwrap();
+
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let reg = NamespaceRegistry::new(
+            store.clone(),
+            String::new(),
+            4,
+            Duration::from_secs(60),
+            metrics,
+            MaintenanceConfig::default(),
+        );
+        let Err(err) = reg.get_or_open("future").await else {
+            panic!("a namespace in a newer format must be refused");
+        };
+        assert!(matches!(err, RegistryError::UnsupportedFormat(_)), "{err}");
+        assert!(err.to_string().contains("namidb 9.0.0"), "{err}");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "unsupported_storage_format");
+
+        // Untouched: the pointer still names the stamped version.
+        let pointer_after = store
+            .head(&paths.pointer_version(stamped.manifest.version + 1))
+            .await;
+        assert!(pointer_after.is_err(), "the registry must not claim it");
     }
 
     /// Open `ns`, retrying while the current occupant ages past the idle

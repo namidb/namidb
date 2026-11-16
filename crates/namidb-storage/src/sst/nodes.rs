@@ -53,7 +53,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
 use memmap2::MmapOptions;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
     ParquetRecordBatchReaderBuilder, RowFilter, RowSelection, RowSelector,
@@ -1433,7 +1433,7 @@ async fn pin_node_sst_source(
     path: ObjectPath,
     expected_size: u64,
 ) -> Result<PinnedObjectRangeSource> {
-    let meta = store.head(&path).await?;
+    let meta = crate::range_cache::head_create_only(&store, &path).await?;
     if meta.location != path {
         return Err(Error::Corrupted {
             path: path.to_string(),
@@ -2293,6 +2293,7 @@ mod tests {
     use crate::range_cache::{ImmutableRangeCache, RangeCacheConfig};
 
     use super::*;
+    use object_store::ObjectStoreExt;
 
     #[derive(Debug, Default)]
     struct NodeRangeProbeState {
@@ -3408,8 +3409,9 @@ mod tests {
 
         assert_eq!(
             probe.state.heads.load(AtomicOrdering::SeqCst) - initial_heads,
-            6,
-            "each public async API must HEAD exactly once"
+            1,
+            "the create-only object is HEADed once per process; every later \
+             async API reuses that answer"
         );
         assert_eq!(
             probe.state.full_gets.load(AtomicOrdering::SeqCst),
