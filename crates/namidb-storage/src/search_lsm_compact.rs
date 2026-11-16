@@ -752,6 +752,97 @@ pub(super) fn select_search_compactions(
     Ok(selections)
 }
 
+/// The delta runs a search-delta pass may install while bases are built
+/// elsewhere: routine runs that start past the protected prefix of their
+/// index (shortened to start there when they do not), plus a run over the
+/// deltas past that prefix of a generation whose base or activation is due.
+/// A Building generation gains one delta per flush until its activation
+/// installs; merging them meanwhile keeps it below the flush ceiling.
+pub(super) fn delta_runs_past(
+    manifest: &Manifest,
+    selections: Vec<SearchCompactionSelection>,
+    protected: &std::collections::HashMap<(SearchLsmKind, String), usize>,
+    policy: SearchCompactionPolicy,
+) -> Result<Vec<SearchCompactionSelection>> {
+    let mut runs = Vec::new();
+    for selection in selections {
+        let state = &selection.captured_state;
+        let floor = protected
+            .get(&(state.kind, state.index_name.clone()))
+            .copied();
+        match selection.mode {
+            SearchCompactionMode::DeltaRun => match floor {
+                Some(floor) if selection.selected_segment_start < floor => {
+                    if let Some(run) = delta_run_from(manifest, state, floor, policy)? {
+                        runs.push(run);
+                    }
+                }
+                _ => runs.push(selection),
+            },
+            SearchCompactionMode::BasePrefix => {
+                let first_delta = state
+                    .segments
+                    .iter()
+                    .position(|segment| segment.role == SearchSegmentRole::Delta)
+                    .unwrap_or(state.segments.len());
+                let start = floor.unwrap_or(0).max(first_delta);
+                if state.segments.len().saturating_sub(start) >= policy.delta_trigger_segments {
+                    if let Some(run) = delta_run_from(manifest, state, start, policy)? {
+                        runs.push(run);
+                    }
+                }
+            }
+        }
+    }
+    Ok(runs)
+}
+
+/// One DeltaRun over `state`'s segments from `start` (the newest
+/// [`MAX_PRESSURE_DELTA_RUN`] at most), if at least two complete deltas are
+/// there.
+fn delta_run_from(
+    manifest: &Manifest,
+    state: &SearchLsmState,
+    start: usize,
+    policy: SearchCompactionPolicy,
+) -> Result<Option<SearchCompactionSelection>> {
+    let start = start.max(state.segments.len().saturating_sub(MAX_PRESSURE_DELTA_RUN));
+    let selected = state.segments.get(start..).unwrap_or_default();
+    if selected.len() < MIN_SEARCH_LSM_SEGMENTS
+        || selected.iter().any(|segment| {
+            segment.role != SearchSegmentRole::Delta
+                || segment.payload != SearchSegmentPayload::Complete
+        })
+    {
+        return Ok(None);
+    }
+    let mut descriptors = Vec::with_capacity(selected.len());
+    for segment in selected {
+        let matches = manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.id == segment.sst_id)
+            .collect::<Vec<_>>();
+        let [descriptor] = matches.as_slice() else {
+            return Ok(None);
+        };
+        descriptors.push((*descriptor).clone());
+    }
+    Ok(Some(SearchCompactionSelection {
+        mode: SearchCompactionMode::DeltaRun,
+        captured_state: state.clone(),
+        selected_segment_start: start,
+        selected_descriptors: descriptors,
+        selected_event_ranges: compressed_event_union(
+            selected
+                .iter()
+                .flat_map(|segment| segment.event_ranges.iter().copied()),
+        )?,
+        captured_coverage_digest: super::input_coverage_digest(&state.coverage)?,
+        hard_segment_cap: policy.hard_segment_cap,
+    }))
+}
+
 /// A Building generation that a physical base build can activate: it has
 /// seen at least one flush (events and a barrier).
 pub(super) fn building_activation_eligible(state: &SearchLsmState) -> bool {
@@ -1172,12 +1263,9 @@ pub(super) fn rebase_prepared_search_compaction(
     }
 
     let mut rebased = working_state.clone();
-    if captured.status == SearchLsmStatus::Building {
-        if selection.mode != SearchCompactionMode::BasePrefix {
-            return Err(Error::invariant(
-                "a Building Search-LSM generation can only be activated by a base",
-            ));
-        }
+    if captured.status == SearchLsmStatus::Building
+        && selection.mode == SearchCompactionMode::BasePrefix
+    {
         rebased.status = SearchLsmStatus::Active;
     }
     match selection.mode {
@@ -1378,7 +1466,8 @@ impl SearchVersionRangeSource for LocalSegmentSource {
 fn segment_merge_supported(selection: &SearchCompactionSelection) -> bool {
     let selected = &selection.captured_state.segments[selection.selected_segment_start..];
     selection.captured_state.kind == SearchLsmKind::Text
-        && selection.captured_state.status == SearchLsmStatus::Active
+        && (selection.captured_state.status == SearchLsmStatus::Active
+            || selection.mode == SearchCompactionMode::DeltaRun)
         && !selected.is_empty()
         && selected.iter().all(|segment| {
             segment.format == SearchSegmentFormat::TextV4
@@ -2922,7 +3011,9 @@ fn validate_built_compaction(
         projected.ssts.push(output.descriptor.clone());
     }
     let mut rebased = rebased;
-    if prepared.selection.captured_state.status == SearchLsmStatus::Building {
+    if prepared.selection.captured_state.status == SearchLsmStatus::Building
+        && prepared.selection.mode == SearchCompactionMode::BasePrefix
+    {
         let retired = complete_building_activation(
             &mut rebased,
             prepared.selection.captured_state.next_event_seq,

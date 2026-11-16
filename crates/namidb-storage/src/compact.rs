@@ -77,7 +77,7 @@
 //! body are retained in full.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -251,38 +251,67 @@ pub struct CompactionBasis {
     pub(crate) manifest_store: ManifestStore,
     pub(crate) fence: WriterFence,
     pub(crate) base: LoadedManifest,
-    /// Search indexes whose physical consolidation this basis must not plan
-    /// (see [`Self::excluding_search_indexes`]).
-    pub(crate) excluded_search: HashSet<(crate::search_lsm::SearchLsmKind, String)>,
+    /// Search indexes with a base build in flight elsewhere, and the
+    /// segment prefix that build replaces (see
+    /// [`Self::protecting_search_prefixes`]).
+    pub(crate) protected_search: HashMap<(crate::search_lsm::SearchLsmKind, String), usize>,
 }
 
 impl CompactionBasis {
-    /// Do not plan physical Search-LSM consolidation for `keys`: another
-    /// pass is preparing a base for them, and a delta run installed meanwhile
-    /// would change the segment prefix that base replaces and abandon it.
-    pub fn excluding_search_indexes(
+    /// Another pass is building a base for these indexes over their first
+    /// `prefix` segments. This basis plans no base for them, and its delta
+    /// runs merge only segments past that prefix: a run that rewrote any of
+    /// them would abandon the in-flight base, while the deltas flushed since
+    /// still merge (a base build can take minutes on a large corpus).
+    pub fn protecting_search_prefixes(
         mut self,
-        keys: impl IntoIterator<Item = (crate::search_lsm::SearchLsmKind, String)>,
+        prefixes: impl IntoIterator<Item = ((crate::search_lsm::SearchLsmKind, String), usize)>,
     ) -> Self {
-        self.excluded_search.extend(keys);
+        self.protected_search.extend(prefixes);
         self
     }
 
-    /// `true` when a delta-run consolidation outside the excluded indexes is
-    /// due. Metadata only.
+    fn scoped_search_selections(
+        &self,
+        scope: CompactionScope,
+    ) -> Result<Vec<search_lsm_compact::SearchCompactionSelection>> {
+        scoped_search_selections(
+            &self.base.manifest,
+            search_lsm_compact::SearchCompactionPolicy::for_scheduling(),
+            scope,
+            &self.protected_search,
+        )
+    }
+
+    /// `true` when a delta-run consolidation is due (past any protected
+    /// prefix). Metadata only.
     pub fn search_delta_compaction_due(&self) -> bool {
-        let policy = search_lsm_compact::SearchCompactionPolicy::for_scheduling();
-        search_lsm_compact::select_search_compactions(&self.base.manifest, policy)
-            .map(|selections| {
-                selections.iter().any(|selection| {
-                    selection.mode == search_lsm_compact::SearchCompactionMode::DeltaRun
-                        && !self.excluded_search.contains(&(
-                            selection.captured_state.kind,
-                            selection.captured_state.index_name.clone(),
-                        ))
-                })
-            })
+        self.scoped_search_selections(CompactionScope::SearchDeltas)
+            .map(|selections| !selections.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Indexes [`Self::prepare_search_bases`] would build a base for (or
+    /// activate) from this basis, each with the segment prefix that base
+    /// replaces. Metadata only.
+    pub fn planned_search_bases(&self) -> Vec<((crate::search_lsm::SearchLsmKind, String), usize)> {
+        self.scoped_search_selections(CompactionScope::SearchBases)
+            .map(|selections| {
+                selections
+                    .into_iter()
+                    .map(|selection| {
+                        let prefix = selection.captured_state.segments.len();
+                        (
+                            (
+                                selection.captured_state.kind,
+                                selection.captured_state.index_name,
+                            ),
+                            prefix,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Manifest version this basis was captured at.
@@ -336,19 +365,12 @@ impl CompactionBasis {
     /// `true` when a vector/full-text index of this basis has search segments
     /// due for consolidation (metadata only).
     pub fn search_compaction_due(&self) -> bool {
-        if self.excluded_search.is_empty() {
+        if self.protected_search.is_empty() {
             return search_compaction_due(&self.base.manifest);
         }
-        let policy = search_lsm_compact::SearchCompactionPolicy::for_scheduling();
-        match search_lsm_compact::select_search_compactions(&self.base.manifest, policy) {
-            Ok(selections) => selections.iter().any(|selection| {
-                !self.excluded_search.contains(&(
-                    selection.captured_state.kind,
-                    selection.captured_state.index_name.clone(),
-                ))
-            }),
-            Err(_) => true,
-        }
+        self.scoped_search_selections(CompactionScope::SearchOnly)
+            .map(|selections| !selections.is_empty())
+            .unwrap_or(true)
     }
 
     /// Prepare only the due Search-LSM consolidations of this basis: no Nodes
@@ -370,29 +392,6 @@ impl CompactionBasis {
     pub async fn prepare_search_bases(&self, schema: &Schema) -> Result<PreparedCompaction> {
         self.prepare_scoped(schema, CompactionScope::SearchBases)
             .await
-    }
-
-    /// Search indexes [`Self::prepare_search_bases`] would build a base for
-    /// (or activate) from this basis. Metadata only.
-    pub fn planned_search_bases(&self) -> Vec<(crate::search_lsm::SearchLsmKind, String)> {
-        let policy = search_lsm_compact::SearchCompactionPolicy::for_scheduling();
-        search_lsm_compact::select_search_compactions(&self.base.manifest, policy)
-            .map(|selections| {
-                selections
-                    .into_iter()
-                    .filter(|selection| {
-                        selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
-                    })
-                    .map(|selection| {
-                        (
-                            selection.captured_state.kind,
-                            selection.captured_state.index_name,
-                        )
-                    })
-                    .filter(|key| !self.excluded_search.contains(key))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// [`Self::prepare_search_only`] restricted to delta-run consolidations:
@@ -423,10 +422,39 @@ impl CompactionBasis {
             compaction_base_bytes(),
             compaction_level_ratio(),
             scope,
-            &self.excluded_search,
+            &self.protected_search,
         )
         .await
     }
+}
+
+/// The physical Search-LSM consolidations one pass of `scope` plans.
+fn scoped_search_selections(
+    manifest: &crate::manifest::Manifest,
+    policy: search_lsm_compact::SearchCompactionPolicy,
+    scope: CompactionScope,
+    protected: &HashMap<(crate::search_lsm::SearchLsmKind, String), usize>,
+) -> Result<Vec<search_lsm_compact::SearchCompactionSelection>> {
+    let mut selections = search_lsm_compact::select_search_compactions(manifest, policy)?;
+    let unprotected = |selection: &search_lsm_compact::SearchCompactionSelection| {
+        !protected.contains_key(&(
+            selection.captured_state.kind,
+            selection.captured_state.index_name.clone(),
+        ))
+    };
+    match scope {
+        CompactionScope::Full | CompactionScope::SearchOnly => selections.retain(unprotected),
+        CompactionScope::SearchBases => selections.retain(|selection| {
+            selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
+                && unprotected(selection)
+        }),
+        CompactionScope::SearchDeltas => {
+            selections =
+                search_lsm_compact::delta_runs_past(manifest, selections, protected, policy)?;
+        }
+        CompactionScope::WithoutPhysicalSearch => selections.clear(),
+    }
+    Ok(selections)
 }
 
 /// What one prepare pass may rewrite.
@@ -1667,7 +1695,7 @@ async fn prepare_leveled(
         base_bytes,
         ratio,
         CompactionScope::Full,
-        &HashSet::new(),
+        &HashMap::new(),
     )
     .await
 }
@@ -1680,7 +1708,7 @@ async fn prepare_leveled_scoped(
     base_bytes: u64,
     ratio: u64,
     scope: CompactionScope,
-    excluded_search: &HashSet<(crate::search_lsm::SearchLsmKind, String)>,
+    protected_search: &HashMap<(crate::search_lsm::SearchLsmKind, String), usize>,
 ) -> Result<PreparedCompaction> {
     fence.assert_alive(base.manifest.epoch)?;
 
@@ -1747,23 +1775,7 @@ async fn prepare_leveled_scoped(
     let mut node_rewrites = Vec::new();
     let search_policy = search_lsm_compact::SearchCompactionPolicy::from_env()?;
     let mut search_selections =
-        search_lsm_compact::select_search_compactions(&base.manifest, search_policy)?;
-    match scope {
-        CompactionScope::Full | CompactionScope::SearchOnly => {}
-        CompactionScope::SearchDeltas => search_selections.retain(|selection| {
-            selection.mode == search_lsm_compact::SearchCompactionMode::DeltaRun
-        }),
-        CompactionScope::SearchBases => search_selections.retain(|selection| {
-            selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
-        }),
-        CompactionScope::WithoutPhysicalSearch => search_selections.clear(),
-    }
-    search_selections.retain(|selection| {
-        !excluded_search.contains(&(
-            selection.captured_state.kind,
-            selection.captured_state.index_name.clone(),
-        ))
-    });
+        scoped_search_selections(&base.manifest, search_policy, scope, protected_search)?;
 
     // Node tombstone GC needs the merge authoritative for every node key it
     // touches. Nodes are id-primary, so a key can live in any node SST
@@ -2691,6 +2703,76 @@ fn rebase_search_lsm_for_node_rewrites(
     Ok(rebased)
 }
 
+/// Per-index precondition for logical search rebuilds: an index whose
+/// generation changed after prepare (a flush appended to it) keeps its
+/// current state, and only its rebuilt body is discarded (left for the orphan
+/// sweep). The Nodes merge and every other index still install. 3.4.1
+/// abandoned the whole compaction instead, so under sustained writes the
+/// Nodes tables and the rebuild were redone, and abandoned, on every pass.
+fn drop_conflicting_search_replacements(
+    prepared: &mut PreparedCompaction,
+    current: &crate::manifest::Manifest,
+) {
+    let conflicting = prepared
+        .replaced_search_lsm
+        .iter()
+        .filter(|(kind, name)| {
+            let captured = prepared
+                .base_search_lsm
+                .iter()
+                .filter(|state| state.kind == *kind && state.index_name == *name)
+                .collect::<Vec<_>>();
+            let now = current
+                .search_lsm
+                .iter()
+                .filter(|state| state.kind == *kind && state.index_name == *name)
+                .collect::<Vec<_>>();
+            captured != now
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for (kind, name) in conflicting {
+        let sst_kind = kind.sst_kind();
+        let current_ids = current
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.kind == sst_kind && descriptor.scope == name)
+            .map(|descriptor| descriptor.id)
+            .collect::<HashSet<_>>();
+        let rebuilt = prepared
+            .new_descs
+            .iter()
+            .filter(|descriptor| {
+                descriptor.kind == sst_kind
+                    && descriptor.scope == name
+                    && !current_ids.contains(&descriptor.id)
+            })
+            .count();
+        prepared.new_descs.retain(|descriptor| {
+            !(descriptor.kind == sst_kind
+                && descriptor.scope == name
+                && !current_ids.contains(&descriptor.id))
+        });
+        prepared.removed_ids.retain(|id| !current_ids.contains(id));
+        prepared
+            .search_build_states
+            .retain(|state| !(state.kind == sst_kind && state.name == name));
+        prepared.search_lsm_activations.retain(|activation| {
+            !(activation.state.kind == kind && activation.state.index_name == name)
+        });
+        prepared
+            .replaced_search_lsm
+            .retain(|(other_kind, other)| !(*other_kind == kind && *other == name));
+        tracing::info!(
+            index = %name,
+            ?kind,
+            discarded_bodies = rebuilt,
+            "search index changed while its rebuild was prepared; keeping its current \
+             generation and installing the rest of the compaction"
+        );
+    }
+}
+
 fn verify_search_replacement_inputs(
     captured_states: &[SearchLsmState],
     current_states: &[SearchLsmState],
@@ -2836,6 +2918,8 @@ pub async fn install_prepared(
         )));
     }
 
+    let mut prepared = prepared;
+    drop_conflicting_search_replacements(&mut prepared, &current.manifest);
     verify_search_replacement_inputs(
         &prepared.base_search_lsm,
         &current.manifest.search_lsm,
@@ -3058,7 +3142,10 @@ pub async fn install_prepared(
     let activations_in_prepare = prepared
         .search_compactions
         .iter()
-        .filter(|search| search.selection.captured_state.status == SearchLsmStatus::Building)
+        .filter(|search| {
+            search.selection.captured_state.status == SearchLsmStatus::Building
+                && search.selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
+        })
         .map(|search| {
             (
                 search.selection.captured_state.kind,

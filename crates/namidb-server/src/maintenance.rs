@@ -652,8 +652,10 @@ async fn run_compaction_pass(
     }
 }
 
-/// Search indexes a long pass is consolidating itself.
-type SearchKeys = std::collections::HashSet<(namidb_storage::search_lsm::SearchLsmKind, String)>;
+/// Search indexes a long pass is building a base for, with the segment prefix
+/// that base replaces.
+type SearchKeys =
+    std::collections::HashMap<(namidb_storage::search_lsm::SearchLsmKind, String), usize>;
 
 /// How often delta consolidations run while a long pass is in flight.
 const CONCURRENT_DELTA_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -661,13 +663,13 @@ const CONCURRENT_DELTA_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Releases the search indexes a pass registered as in flight.
 struct InFlightSearch<'a> {
     set: &'a StdMutex<SearchKeys>,
-    keys: Vec<(namidb_storage::search_lsm::SearchLsmKind, String)>,
+    keys: Vec<((namidb_storage::search_lsm::SearchLsmKind, String), usize)>,
 }
 
 impl Drop for InFlightSearch<'_> {
     fn drop(&mut self) {
         let mut set = self.set.lock().expect("in-flight search set poisoned");
-        for key in &self.keys {
+        for (key, _) in &self.keys {
             set.remove(key);
         }
     }
@@ -713,17 +715,17 @@ async fn run_scoped_pass(
         }
         writer.compaction_basis()
     };
-    // A search pass skips the indexes another in-flight pass consolidates; a
-    // SearchOnly pass registers its own for the delta passes that run while
-    // it builds.
+    // A search pass leaves alone the segment prefix another in-flight pass is
+    // building a base over; a SearchOnly pass registers its own for the delta
+    // passes that run while it builds.
     let basis = match scope {
         PassScope::WithoutSearch => basis,
         PassScope::SearchDeltas | PassScope::SearchOnly => {
-            let excluded = in_flight
+            let protected = in_flight
                 .lock()
                 .expect("in-flight search set poisoned")
                 .clone();
-            basis.excluding_search_indexes(excluded)
+            basis.protecting_search_prefixes(protected)
         }
     };
     let _in_flight_guard = (scope == PassScope::SearchOnly).then(|| {

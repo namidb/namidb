@@ -2269,7 +2269,7 @@ impl WriterSession {
             manifest_store: self.manifest_store.clone(),
             fence: self.fence,
             base: self.current.clone(),
-            excluded_search: Default::default(),
+            protected_search: Default::default(),
         }
     }
 
