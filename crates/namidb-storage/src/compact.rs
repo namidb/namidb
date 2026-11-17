@@ -2729,6 +2729,99 @@ fn rebase_search_lsm_for_node_rewrites(
 /// sweep). The Nodes merge and every other index still install. 3.4.1
 /// abandoned the whole compaction instead, so under sustained writes the
 /// Nodes tables and the rebuild were redone, and abandoned, on every pass.
+/// The catalog changes since `prepared`'s basis that invalidate its outputs.
+///
+/// A search-only compaction depends on no catalog beyond its own index's,
+/// whose generation identity (catalog signature, generation id) the
+/// per-index checks verify: an index whose catalog changed restarts its
+/// generation, and one that was dropped loses it. Every other plan depends
+/// on the schema only through what its Nodes and edge outputs carry (the
+/// rewritten labels' and edge types' definitions, the indexed-property
+/// sidecars, composite indexes), and on the search catalogs only through the
+/// indexes it was planned with. A new label or property elsewhere, or a newly
+/// created index, does not invalidate it; in 3.4.1 any schema or catalog
+/// change abandoned it.
+fn catalog_drift(
+    prepared: &PreparedCompaction,
+    current: &crate::manifest::Manifest,
+) -> Vec<&'static str> {
+    let search_kind = |kind: SstKind| matches!(kind, SstKind::VectorGraph | SstKind::TextIndex);
+    let removed_kinds = prepared.removed_ids.iter().map(|id| {
+        current
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == *id)
+            .map(|descriptor| descriptor.kind)
+    });
+    let search_only = prepared.node_rewrites.is_empty()
+        && prepared
+            .new_descs
+            .iter()
+            .all(|descriptor| search_kind(descriptor.kind))
+        && removed_kinds
+            .clone()
+            .all(|kind| kind.is_none_or(search_kind));
+    if search_only {
+        return Vec::new();
+    }
+    let mut drift = Vec::new();
+    let base = &prepared.base_schema;
+    let now = &current.schema;
+    if base != now {
+        let mut labels = HashSet::new();
+        let mut edges = false;
+        for kind_scope in prepared
+            .new_descs
+            .iter()
+            .map(|descriptor| (Some(descriptor.kind), descriptor.scope.as_str()))
+            .chain(
+                prepared
+                    .node_rewrites
+                    .iter()
+                    .flat_map(|rewrite| rewrite.inputs.iter())
+                    .map(|descriptor| (Some(descriptor.kind), descriptor.scope.as_str())),
+            )
+            .chain(removed_kinds.map(|kind| (kind, "")))
+        {
+            match kind_scope {
+                (Some(SstKind::Nodes), scope) => {
+                    labels.insert(scope);
+                }
+                (Some(SstKind::EdgesFwd | SstKind::EdgesInv), _) => edges = true,
+                _ => {}
+            }
+        }
+        let carried_changed = crate::flush::union_indexed_props(base)
+            != crate::flush::union_indexed_props(now)
+            || base.indexes != now.indexes
+            || base.constraints != now.constraints
+            || labels
+                .iter()
+                .any(|label| base.label(label) != now.label(label))
+            || (edges && base.edge_types != now.edge_types);
+        if carried_changed {
+            drift.push("schema");
+        }
+    }
+    // Indexes created meanwhile start their own generations, which the
+    // install rebases over; a changed or dropped one invalidates its rebuild.
+    if !prepared
+        .base_vector_indexes
+        .iter()
+        .all(|index| current.vector_indexes.contains(index))
+    {
+        drift.push("vector indexes");
+    }
+    if !prepared
+        .base_text_indexes
+        .iter()
+        .all(|index| current.text_indexes.contains(index))
+    {
+        drift.push("text indexes");
+    }
+    drift
+}
+
 fn drop_conflicting_search_replacements(
     prepared: &mut PreparedCompaction,
     current: &crate::manifest::Manifest,
@@ -2918,16 +3011,7 @@ pub async fn install_prepared(
     }
     fence.assert_alive(current.manifest.epoch)?;
 
-    let mut catalog_drift = Vec::new();
-    if current.manifest.schema != prepared.base_schema {
-        catalog_drift.push("schema");
-    }
-    if current.manifest.vector_indexes != prepared.base_vector_indexes {
-        catalog_drift.push("vector indexes");
-    }
-    if current.manifest.text_indexes != prepared.base_text_indexes {
-        catalog_drift.push("text indexes");
-    }
+    let catalog_drift = catalog_drift(&prepared, &current.manifest);
     if !catalog_drift.is_empty() {
         return Err(Error::precondition(format!(
             "abandoning prepared compaction (basis v{}): {} changed in manifest v{}; \
@@ -6110,7 +6194,11 @@ mod tests {
             .get_mut("Doc")
             .unwrap()
             .properties
-            .push(PropertyDef::new("title", DataType::Utf8, false).unwrap());
+            .push(
+                PropertyDef::new("title", DataType::Utf8, false)
+                    .unwrap()
+                    .with_indexed(true),
+            );
         let ddl = ms.commit(&fence, &basis, ddl_manifest).await.unwrap();
         let error = install_prepared(&ms, &fence, &ddl, prepared)
             .await
@@ -6118,6 +6206,75 @@ mod tests {
         assert!(error.to_string().contains("schema"));
         let still_current = ms.load_current().await.unwrap();
         assert_eq!(still_current.manifest.version, ddl.manifest.version);
+    }
+
+    #[tokio::test]
+    async fn install_node_rewrite_survives_schema_changes_it_does_not_carry() {
+        let s = store();
+        let p = paths("compact-search-rebase-ddl-unrelated");
+        let ms = ManifestStore::new(s, p);
+        let boot = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(boot.manifest.epoch);
+        let fixture = active_rewrite_manifest();
+        let mut seeded = boot.manifest.next_version(fence.writer_id);
+        seeded.schema = fixture.schema;
+        seeded.ssts = fixture.ssts;
+        seeded.vector_indexes = fixture.vector_indexes;
+        seeded.search_lsm = fixture.search_lsm;
+        let basis = ms.commit(&fence, &boot, seeded).await.unwrap();
+
+        let output = rewrite_test_descriptor(Uuid::from_u128(0x105), SstKind::Nodes, "", 1, 20);
+        let rewrite = rewrite_plan(&basis.manifest, Some(output.clone()));
+        let prepared = PreparedCompaction {
+            new_descs: vec![output],
+            removed_ids: rewrite
+                .inputs
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .collect(),
+            bloom_count: 0,
+            base_version: basis.manifest.version,
+            base_schema: basis.manifest.schema.clone(),
+            base_vector_indexes: basis.manifest.vector_indexes.clone(),
+            base_text_indexes: basis.manifest.text_indexes.clone(),
+            base_search_lsm: basis.manifest.search_lsm.clone(),
+            node_rewrites: vec![rewrite],
+            search_compactions: Vec::new(),
+            search_build_states: Vec::new(),
+            consolidated_base_markers: Vec::new(),
+            unadoptable_search_markers: Vec::new(),
+            search_lsm_activations: Vec::new(),
+            replaced_search_lsm: Vec::new(),
+        };
+
+        let mut ddl_manifest = basis.manifest.next_version(fence.writer_id);
+        ddl_manifest
+            .schema
+            .labels
+            .get_mut("Doc")
+            .unwrap()
+            .properties
+            .push(PropertyDef::new("title", DataType::Utf8, false).unwrap());
+        // A new label written meanwhile changes the schema too.
+        ddl_manifest.schema.labels.insert(
+            "Note".into(),
+            namidb_core::schema::LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("text", DataType::Utf8, true).unwrap()],
+            },
+        );
+        let ddl = ms.commit(&fence, &basis, ddl_manifest).await.unwrap();
+        // Neither changes what the rewritten Nodes SST carries (its columns,
+        // indexed-property sidecars, composite indexes): it installs.
+        let installed = install_prepared(&ms, &fence, &ddl, prepared).await.unwrap();
+        assert!(installed.source_ssts_removed > 0);
+        assert!(installed.committed.manifest.version > ddl.manifest.version);
+        assert!(installed
+            .committed
+            .manifest
+            .schema
+            .labels
+            .contains_key("Note"));
     }
 
     /// Exercises the production prepare/install seam, including immutable PUT

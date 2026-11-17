@@ -1236,7 +1236,13 @@ pub(super) fn rebase_prepared_search_compaction(
     // Coverage may have been rewritten by a Nodes merge meanwhile: events
     // keep their identity across such rewrites, so only the segment and
     // proven-empty prefixes this compaction replaces must be unchanged.
-    super::verify_search_segments_append_only(captured, current)?;
+    let delta_at = match selection.mode {
+        SearchCompactionMode::BasePrefix => {
+            super::verify_search_segments_append_only(captured, current)?;
+            selection.selected_segment_start
+        }
+        SearchCompactionMode::DeltaRun => delta_run_position(captured, current, selection)?,
+    };
     if super::input_coverage_digest(&captured.coverage)? != selection.captured_coverage_digest {
         return Err(Error::invariant(
             "prepared Search-LSM coverage digest disagrees with its captured state",
@@ -1323,8 +1329,14 @@ pub(super) fn rebase_prepared_search_compaction(
             }
         }
         SearchCompactionMode::DeltaRun => {
-            let selected_start = selection.selected_segment_start;
-            let captured_end = captured.segments.len();
+            // Where the selected run sits now: its captured position, or
+            // after a base that replaced the prefix before it meanwhile.
+            let selected_start = delta_at;
+            let captured_end = delta_at
+                + captured
+                    .segments
+                    .len()
+                    .saturating_sub(selection.selected_segment_start);
             let mut segments = Vec::with_capacity(
                 selected_start
                     .saturating_add(usize::from(prepared.output.is_some()))
@@ -1394,6 +1406,67 @@ pub(super) fn rebase_prepared_search_compaction(
         )));
     }
     Ok(rebased)
+}
+
+/// Position of a DeltaRun's selected segments in the current generation.
+///
+/// Normally the generation only advanced append-only from the captured state
+/// and the run sits where it was captured. A base build (or the activation of
+/// a Building generation) may instead have installed meanwhile over the
+/// segments before the run: the delta loop never selects what a base in
+/// flight replaces, so the run is still present as one contiguous slice, now
+/// after the new base. The run still merges into the same place, so it
+/// rebases there instead of abandoning work that is still valid.
+fn delta_run_position(
+    captured: &SearchLsmState,
+    current: &SearchLsmState,
+    selection: &SearchCompactionSelection,
+) -> Result<usize> {
+    let append_only = super::verify_search_segments_append_only(captured, current);
+    if append_only.is_ok() {
+        return Ok(selection.selected_segment_start);
+    }
+    let selected = captured
+        .segments
+        .get(selection.selected_segment_start..)
+        .unwrap_or_default();
+    let same_generation = current.kind == captured.kind
+        && current.index_name == captured.index_name
+        && current.catalog_signature == captured.catalog_signature
+        && current.generation_id == captured.generation_id
+        && current.next_event_seq >= captured.next_event_seq;
+    if !same_generation || selected.is_empty() {
+        return append_only.map(|()| selection.selected_segment_start);
+    }
+    let mut positions = (0..=current.segments.len().saturating_sub(selected.len()))
+        .filter(|&at| current.segments[at..].starts_with(selected));
+    let (Some(at), None) = (positions.next(), positions.next()) else {
+        return append_only.map(|()| selection.selected_segment_start);
+    };
+    let events = |segments: &[crate::search_lsm::SearchSegmentRef]| {
+        segments
+            .iter()
+            .flat_map(|segment| segment.event_ranges.iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let run = events(selected);
+    let run_start = run.iter().map(|range| range.start).min();
+    let run_end = run.iter().map(|range| range.end).max();
+    let (Some(run_start), Some(run_end)) = (run_start, run_end) else {
+        return append_only.map(|()| selection.selected_segment_start);
+    };
+    // The segments before the run must hold only older events and the ones
+    // after it only newer events, exactly as when the run was captured.
+    let ordered = events(&current.segments[..at])
+        .iter()
+        .all(|range| range.end <= run_start)
+        && events(&current.segments[at + selected.len()..])
+            .iter()
+            .all(|range| range.start >= run_end);
+    if !ordered {
+        return append_only.map(|()| selection.selected_segment_start);
+    }
+    Ok(at)
 }
 
 /// Metadata for one planned Nodes SST input. Bodies do not travel here: the

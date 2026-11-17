@@ -1106,64 +1106,15 @@ pub async fn run_with_memory_max_bytes(
     run_with_memory_limits(config, memory_max_bytes, query_memory_max_bytes).await
 }
 
-/// Build an off-lock flush (`BackgroundFlush::build`) without letting the
-/// memtable grow past `stall_bytes` meanwhile.
+/// Consecutive superseded off-lock flushes after which the flush loop
+/// flushes under the writer lock, so a stream of DDL can never starve flushes.
 ///
-/// While the writer is free, writes keep committing into the memtable, which
-/// still holds every row being flushed until the install. The write stall
-/// past `stall_bytes` is only a short delay per write, so on its own nothing
-/// would bound how far a long build (a slow store, a large full-text delta)
-/// lets the memtable grow: the bound the flush used to give by holding the
-/// writer throughout. Each committed write past the flush threshold wakes
-/// `flush_notify`; on each wake the memtable is measured, and once it has
-/// reached `stall_bytes` the writer is taken and held until the build ends,
-/// so writes wait (and fail at the writer-lock timeout) exactly as they did
-/// behind the synchronous flush. The held guard is returned for the install.
-/// `stall_bytes == 0` disables the bound.
-pub(crate) async fn build_background_flush_bounded<'w>(
-    ticket: namidb_storage::BackgroundFlush,
-    writer: &'w tokio::sync::Mutex<WriterSession>,
-    flush_notify: &tokio::sync::Notify,
-    stall_bytes: usize,
-) -> (
-    namidb_storage::Result<namidb_storage::BuiltBackgroundFlush>,
-    Option<tokio::sync::MutexGuard<'w, WriterSession>>,
-) {
-    let build = ticket.build();
-    tokio::pin!(build);
-    if stall_bytes == 0 {
-        return (build.await, None);
-    }
-    let mut woken = false;
-    let outcome = loop {
-        tokio::select! {
-            built = &mut build => break (built, None),
-            () = flush_notify.notified() => {
-                woken = true;
-                // Keep the build running while the writer is acquired.
-                let guard = tokio::select! {
-                    built = &mut build => break (built, None),
-                    guard = writer.lock() => guard,
-                };
-                if guard.memtable_bytes() >= stall_bytes {
-                    tracing::debug!(
-                        memtable_bytes = guard.memtable_bytes(),
-                        stall_bytes,
-                        "memtable reached the stall threshold during an off-lock flush; \
-                         holding the writer until it installs"
-                    );
-                    break (build.await, Some(guard));
-                }
-            }
-        }
-    };
-    if woken {
-        // The wake-ups consumed here were meant for the flush loop: rows
-        // committed during the build may already be past the flush threshold.
-        flush_notify.notify_one();
-    }
-    outcome
-}
+/// A flush under the lock builds and uploads the whole memtable while every
+/// write waits: with a large memtable and a busy store that is minutes, past
+/// the write timeout. A superseded flush is therefore first retried off-lock;
+/// compactions do not supersede a flush (it rebases over them), so a second
+/// consecutive supersede means DDL kept landing.
+pub(crate) const SUPERSEDED_FLUSHES_BEFORE_LOCKED: u32 = 2;
 
 /// Fraction of the process memory limit the memtable may reach before a
 /// committed write triggers a flush (1/16) or is stalled (1/8).
@@ -1482,7 +1433,6 @@ pub async fn run_with_memory_limits(
             group_commit_window: config.group_commit_window,
             fence_policy: config.fence_policy,
             max_concurrent_queries_per_namespace: max_concurrent_queries_per_namespace(),
-            memtable_stall_bytes: config.memtable_stall_bytes,
         };
         let registry = NamespaceRegistry::new(
             store,
@@ -1625,7 +1575,7 @@ pub async fn run_with_memory_limits(
                                // available and the degraded state can be observed; the next
                                // attempt after the window self-heals once the disk clears.
             let mut retry_after: Option<std::time::Instant> = None;
-            let mut flush_superseded = false;
+            let mut flush_superseded = 0u32;
             'tick: loop {
                 // Flush on the timer OR when a committed write crossed the
                 // memtable byte threshold (`after_commit_backpressure`
@@ -1676,9 +1626,10 @@ pub async fn run_with_memory_limits(
                     // released (`WriterSession::begin_background_flush`):
                     // writes keep committing while a large memtable is
                     // encoded and uploaded, instead of queueing behind it.
-                    // After a superseded attempt the next one flushes under
-                    // the lock, so a busy compactor can never starve flushes.
-                    let flushed = if std::mem::take(&mut flush_superseded) {
+                    // After repeated superseded attempts the next one
+                    // flushes under the lock, so DDL can never starve flushes.
+                    let flushed = if flush_superseded >= SUPERSEDED_FLUSHES_BEFORE_LOCKED {
+                        flush_superseded = 0;
                         let schema = w.snapshot().manifest().manifest.schema.clone();
                         w.try_flush(schema).await.map(|_| None)
                     } else {
@@ -1686,28 +1637,18 @@ pub async fn run_with_memory_limits(
                             Ok(None) => Ok(None),
                             Ok(Some(ticket)) => {
                                 drop(w);
-                                let (built, held) = build_background_flush_bounded(
-                                    ticket,
-                                    &state_for_flush.writer,
-                                    &state_for_flush.flush_notify,
-                                    state_for_flush.memtable_stall_bytes,
-                                )
-                                .await;
-                                match built {
+                                // Writes keep committing while it builds;
+                                // the memtable's hard bound (not the writer
+                                // lock) holds them back if it fills up.
+                                match ticket.build().await {
                                     Ok(built) => {
-                                        w = match held {
-                                            Some(held) => held,
-                                            None => {
-                                                let lock_started = std::time::Instant::now();
-                                                let w = state_for_flush.writer.lock().await;
-                                                state_for_flush.metrics.observe_writer_lock(
-                                                    WriterLockKind::Flush,
-                                                    lock_started.elapsed(),
-                                                    true,
-                                                );
-                                                w
-                                            }
-                                        };
+                                        let lock_started = std::time::Instant::now();
+                                        w = state_for_flush.writer.lock().await;
+                                        state_for_flush.metrics.observe_writer_lock(
+                                            WriterLockKind::Flush,
+                                            lock_started.elapsed(),
+                                            true,
+                                        );
                                         // Writes grouped while the flush was
                                         // built are answered through the group
                                         // before the install commits them.
@@ -1766,14 +1707,17 @@ pub async fn run_with_memory_limits(
                                 installed,
                                 Some(namidb_storage::BackgroundFlushInstall::Superseded)
                             ) {
-                                // A compaction/DDL committed meanwhile; the
-                                // rows stay in the memtable for the next pass,
-                                // which runs at once and under the lock.
-                                tracing::debug!(
-                                    "periodic flush superseded; retrying under the writer lock"
+                                // DDL committed meanwhile; the rows stay in
+                                // the memtable for the next pass, which runs
+                                // at once.
+                                flush_superseded += 1;
+                                tracing::info!(
+                                    consecutive = flush_superseded,
+                                    "periodic flush superseded; retrying"
                                 );
-                                flush_superseded = true;
                                 state_for_flush.flush_notify.notify_one();
+                            } else {
+                                flush_superseded = 0;
                             }
                             retry_after = None;
                             state_for_flush.writer_health.clear_persistence_degraded();

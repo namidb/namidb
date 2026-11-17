@@ -350,3 +350,172 @@ async fn a_flush_during_a_rebuild_discards_only_that_index() {
     assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Active));
     assert_eq!(native_hits(&writer, "title_ft", "common").await, Some(41));
 }
+
+fn generation_segments(writer: &WriterSession, name: &str) -> usize {
+    writer
+        .snapshot()
+        .manifest()
+        .manifest
+        .search_lsm
+        .iter()
+        .find(|state| state.kind == SearchLsmKind::Text && state.index_name == name)
+        .map(|state| state.segments.len())
+        .unwrap()
+}
+
+/// A Building generation gains one delta per flush until its activation
+/// installs. Delta runs merge those deltas meanwhile (only past the prefix
+/// the activation in flight replaces), and a run whose activation installs
+/// first still installs after it instead of being abandoned: in 3.4.1 a
+/// Building generation's deltas were never merged and it reached the segment
+/// ceiling, then held flushes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delta_runs_merge_a_building_generation_and_survive_its_activation() {
+    let (mut writer, _store, _paths) = writer_with_corpus("building-deltas", 30).await;
+    writer
+        .register_text_index(
+            TextIndexDescriptor::new("title_ft".into(), "Doc".into(), vec!["title".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut next = 30u64;
+    let mut flush_one = |writer: &mut WriterSession| {
+        writer
+            .upsert_node("Doc", NodeId::new(), &doc(next))
+            .unwrap();
+        next += 1;
+    };
+    for _ in 0..6 {
+        flush_one(&mut writer);
+        writer.flush(schema(false)).await.unwrap();
+    }
+    assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Building));
+    let building_deltas = generation_segments(&writer, "title_ft");
+    assert!(
+        building_deltas >= 6,
+        "one delta per flush: {building_deltas}"
+    );
+
+    // A delta pass alone merges the Building generation's deltas.
+    let deltas = writer
+        .compaction_basis()
+        .prepare_search_deltas(&schema(false))
+        .await
+        .unwrap();
+    assert!(
+        !deltas.is_noop(),
+        "a Building generation's deltas are merged"
+    );
+    writer.install_prepared_compaction(deltas).await.unwrap();
+    assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Building));
+    let merged = generation_segments(&writer, "title_ft");
+    assert!(merged < building_deltas, "{merged} >= {building_deltas}");
+
+    // The activation is prepared over the current segments; flushes land
+    // and a delta pass merges only the deltas past that prefix.
+    let basis = writer.compaction_basis();
+    let protected = basis.planned_search_bases();
+    assert!(
+        protected
+            .iter()
+            .any(|((kind, name), _)| *kind == SearchLsmKind::Text && name == "title_ft"),
+        "the activation is planned: {protected:?}"
+    );
+    let activation = basis.prepare_search_bases(&schema(false)).await.unwrap();
+    for _ in 0..6 {
+        flush_one(&mut writer);
+        writer.flush(schema(false)).await.unwrap();
+    }
+    let tail = writer
+        .compaction_basis()
+        .protecting_search_prefixes(protected)
+        .prepare_search_deltas(&schema(false))
+        .await
+        .unwrap();
+    assert!(
+        !tail.is_noop(),
+        "the deltas past the protected prefix merge"
+    );
+
+    // The activation installs first; the delta run rebases after the new
+    // base instead of being abandoned.
+    writer
+        .install_prepared_compaction(activation)
+        .await
+        .unwrap();
+    assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Active));
+    let before_tail = generation_segments(&writer, "title_ft");
+    let outcome = writer.install_prepared_compaction(tail).await.unwrap();
+    assert!(outcome.source_ssts_removed > 0);
+    let after_tail = generation_segments(&writer, "title_ft");
+    assert!(after_tail < before_tail, "{after_tail} >= {before_tail}");
+    assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Active));
+    assert_eq!(native_hits(&writer, "title_ft", "common").await, Some(42));
+    assert_eq!(native_hits(&writer, "title_ft", "t41").await, Some(1));
+    assert_eq!(native_hits(&writer, "body_ft", "common").await, Some(42));
+
+    // A Nodes merge and a full search pass keep every document.
+    writer.compact_l0(&schema(false)).await.unwrap();
+    writer.compact_search_segments().await.unwrap();
+    assert_eq!(native_hits(&writer, "title_ft", "common").await, Some(42));
+}
+
+/// A delta consolidation does not depend on the schema beyond its own
+/// index's catalog, so a new label or property written meanwhile (which
+/// changes the schema) no longer abandons it. In 3.4.1 it was abandoned
+/// ("schema changed in manifest vN").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delta_run_installs_across_an_unrelated_schema_change() {
+    let (mut writer, _store, _paths) = writer_with_corpus("delta-schema-drift", 30).await;
+    for ordinal in 30..36 {
+        writer
+            .upsert_node("Doc", NodeId::new(), &doc(ordinal))
+            .unwrap();
+        writer.flush(schema(false)).await.unwrap();
+    }
+    let before = generation_segments(&writer, "body_ft");
+    let deltas = writer
+        .compaction_basis()
+        .prepare_search_deltas(&schema(false))
+        .await
+        .unwrap();
+    assert!(
+        !deltas.is_noop(),
+        "a delta run is due over {before} segments"
+    );
+
+    let mut widened = schema(false);
+    widened.labels.insert(
+        "Note".into(),
+        LabelDef {
+            name: "Note".into(),
+            properties: vec![PropertyDef::new("text", DataType::Utf8, true).unwrap()],
+        },
+    );
+    let mut note = BTreeMap::new();
+    note.insert("text".into(), CoreValue::Str("note".into()));
+    writer
+        .upsert_node(
+            "Note",
+            NodeId::new(),
+            &NodeWriteRecord {
+                properties: note,
+                schema_version: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    writer.flush(widened.clone()).await.unwrap();
+    assert!(writer
+        .snapshot()
+        .manifest()
+        .manifest
+        .schema
+        .labels
+        .contains_key("Note"));
+
+    writer.install_prepared_compaction(deltas).await.unwrap();
+    assert!(generation_segments(&writer, "body_ft") < before);
+    assert_eq!(native_hits(&writer, "body_ft", "common").await, Some(36));
+}
