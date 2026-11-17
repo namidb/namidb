@@ -835,7 +835,7 @@ impl ServerBackend {
             // bounded so queued writes fail fast behind a stuck writer.
             // On success we refresh the snapshot cell so subsequent reads
             // see the just-committed records (RFC-021).
-            let writer_lock = self.state.lock_writer_bounded(WriterLockKind::Bolt);
+            let writer_lock = self.state.lock_writer_for_write(WriterLockKind::Bolt);
             tokio::pin!(writer_lock);
             let writer = tokio::select! {
                 writer = &mut writer_lock => writer,
@@ -1544,6 +1544,16 @@ impl Backend for ServerBackend {
         // of pinning the connection. Held across RUNs (and client
         // think-time) until COMMIT/ROLLBACK — see TxState.
         let timeout = self.state.writer_lock_timeout();
+        // A transaction holds the writer across client round trips, so it
+        // waits for memtable room first, like any write.
+        if !self.state.wait_for_memtable_room(timeout).await {
+            self.state.metrics.observe_writer_lock(
+                WriterLockKind::BoltTransaction,
+                std::time::Duration::ZERO,
+                false,
+            );
+            return Err(writer_busy_error());
+        }
         let lock = self.state.writer.clone().lock_owned();
         let lock_started = std::time::Instant::now();
         let writer = if timeout.is_zero() {

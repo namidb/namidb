@@ -19,10 +19,10 @@ use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
 
-fn schema(estado_indexed: bool) -> Schema {
-    let mut estado = PropertyDef::new("estado", DataType::Utf8, true).unwrap();
-    if estado_indexed {
-        estado = estado.with_indexed(true);
+fn schema(status_indexed: bool) -> Schema {
+    let mut status = PropertyDef::new("status", DataType::Utf8, true).unwrap();
+    if status_indexed {
+        status = status.with_indexed(true);
     }
     SchemaBuilder::new()
         .label(LabelDef {
@@ -30,7 +30,7 @@ fn schema(estado_indexed: bool) -> Schema {
             properties: vec![
                 PropertyDef::new("body", DataType::Utf8, true).unwrap(),
                 PropertyDef::new("title", DataType::Utf8, true).unwrap(),
-                estado,
+                status,
             ],
         })
         .unwrap()
@@ -41,13 +41,13 @@ fn doc(ordinal: u64) -> NodeWriteRecord {
     let mut properties = BTreeMap::new();
     properties.insert(
         "body".into(),
-        CoreValue::Str(format!("cuerpo comun texto{ordinal}")),
+        CoreValue::Str(format!("body common text{ordinal}")),
     );
     properties.insert(
         "title".into(),
-        CoreValue::Str(format!("titulo comun t{ordinal}")),
+        CoreValue::Str(format!("title common t{ordinal}")),
     );
-    properties.insert("estado".into(), CoreValue::Str("vigente".into()));
+    properties.insert("status".into(), CoreValue::Str("open".into()));
     NodeWriteRecord {
         properties,
         schema_version: 1,
@@ -163,13 +163,13 @@ async fn an_index_created_over_existing_nodes_activates_under_concurrent_flushes
 
     // Every document — before the index, during the build, after it.
     assert_eq!(
-        native_hits(&writer, "title_ft", "comun").await,
+        native_hits(&writer, "title_ft", "common").await,
         Some(next as usize)
     );
     assert_eq!(native_hits(&writer, "title_ft", "t3").await, Some(1));
     assert_eq!(native_hits(&writer, "title_ft", "t33").await, Some(1));
     assert_eq!(
-        native_hits(&writer, "body_ft", "comun").await,
+        native_hits(&writer, "body_ft", "common").await,
         Some(next as usize)
     );
 
@@ -182,21 +182,21 @@ async fn an_index_created_over_existing_nodes_activates_under_concurrent_flushes
     writer.flush(schema(false)).await.unwrap();
     writer.compact_l0(&schema(false)).await.unwrap();
     assert_eq!(
-        native_hits(&writer, "title_ft", "comun").await,
+        native_hits(&writer, "title_ft", "common").await,
         Some(next as usize)
     );
     drop(writer);
     let reopened = WriterSession::open(store, paths).await.unwrap();
     assert_eq!(
-        native_hits(&reopened, "title_ft", "comun").await,
+        native_hits(&reopened, "title_ft", "common").await,
         Some(next as usize)
     );
 }
 
-fn two_label_schema(estado_indexed: bool) -> Schema {
-    let mut estado = PropertyDef::new("estado", DataType::Utf8, true).unwrap();
-    if estado_indexed {
-        estado = estado.with_indexed(true);
+fn two_label_schema(status_indexed: bool) -> Schema {
+    let mut status = PropertyDef::new("status", DataType::Utf8, true).unwrap();
+    if status_indexed {
+        status = status.with_indexed(true);
     }
     SchemaBuilder::new()
         .label(LabelDef {
@@ -204,7 +204,7 @@ fn two_label_schema(estado_indexed: bool) -> Schema {
             properties: vec![
                 PropertyDef::new("body", DataType::Utf8, true).unwrap(),
                 PropertyDef::new("title", DataType::Utf8, true).unwrap(),
-                estado,
+                status,
             ],
         })
         .unwrap()
@@ -293,7 +293,7 @@ async fn native_hits_label(writer: &WriterSession, index: &str, label: &str) -> 
         .text_search(
             index,
             label,
-            &namidb_storage::text::parse_query("comun"),
+            &namidb_storage::text::parse_query("common"),
             None,
         )
         .await
@@ -343,10 +343,10 @@ async fn a_flush_during_a_rebuild_discards_only_that_index() {
     let manifest = writer.snapshot().manifest().manifest.clone();
     namidb_storage::search_lsm::validate_search_lsm(&manifest).unwrap();
     assert_eq!(status(&writer, "body_ft"), Some(SearchLsmStatus::Active));
-    assert_eq!(native_hits(&writer, "body_ft", "comun").await, Some(41));
+    assert_eq!(native_hits(&writer, "body_ft", "common").await, Some(41));
 
     // The discarded index activates through the physical path.
     writer.compact_search_segments().await.unwrap();
     assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Active));
-    assert_eq!(native_hits(&writer, "title_ft", "comun").await, Some(41));
+    assert_eq!(native_hits(&writer, "title_ft", "common").await, Some(41));
 }

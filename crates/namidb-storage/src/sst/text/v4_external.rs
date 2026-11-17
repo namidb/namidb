@@ -494,11 +494,9 @@ impl TextV4ExternalBuilder {
             .ok_or_else(|| Error::invariant("text v4 version writer is absent"))?
             .push(output_record)?;
         if let Some(doc_len) = doc_len {
-            if doc_len == 0 {
-                return Err(Error::precondition(
-                    "text v4 merged live document has length zero",
-                ));
-            }
+            // A live document can have no tokens (empty or punctuation-only
+            // text): a fresh build records it with length zero and no
+            // postings, and so does the merge.
             let encoded = encode_doc_record(DocRecord {
                 node_id: source.node_id,
                 lsn: source.lsn,

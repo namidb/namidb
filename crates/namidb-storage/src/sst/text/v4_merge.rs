@@ -587,7 +587,7 @@ mod tests {
         TextV4BuildContext {
             sst_id: Uuid::from_u128(id),
             event_ranges: vec![SearchEventRange::new(events.start, events.end)],
-            complete_filter_properties: vec!["estado".into(), "vigente".into()],
+            complete_filter_properties: vec!["status".into(), "open".into()],
         }
     }
 
@@ -605,8 +605,8 @@ mod tests {
     }
 
     const WORDS: [&str; 12] = [
-        "acuerdo", "articulo", "banco", "codigo", "decreto", "ley", "norma", "pena", "plazo",
-        "reforma", "tributo", "zona",
+        "amber", "birch", "cedar", "delta", "ember", "fjord", "glade", "harbor", "island",
+        "juniper", "kestrel", "lagoon",
     ];
 
     fn payload(node: u64, version: u64) -> TextV4Payload {
@@ -618,15 +618,22 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             words.push(WORDS[(state >> 33) as usize % WORDS.len()]);
         }
-        words.push(if version % 2 == 0 { "par" } else { "impar" });
+        words.push(if version % 2 == 0 { "even" } else { "odd" });
+        // Live documents with no tokens: a fresh build keeps them with
+        // length zero and no postings, and so must a merge.
+        let text = if matches!((node, version), (5, 2) | (61, 1)) {
+            "-- !!".to_owned()
+        } else {
+            words.join(" ")
+        };
         TextV4Payload {
-            text: words.join(" "),
+            text,
             filters: BTreeMap::from([
                 (
-                    "estado".into(),
+                    "status".into(),
                     SearchFilterValue::String(format!("e{}", (node + version) % 3)),
                 ),
-                ("vigente".into(), SearchFilterValue::Bool(node % 4 != 0)),
+                ("open".into(), SearchFilterValue::Bool(node % 4 != 0)),
             ]),
         }
     }

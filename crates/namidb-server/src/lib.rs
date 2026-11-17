@@ -642,6 +642,21 @@ impl AppState {
         kind: WriterLockKind,
     ) -> Option<tokio::sync::MutexGuard<'_, WriterSession>> {
         let started = std::time::Instant::now();
+        let guard = lock_writer_bounded(&self.writer, self.writer_lock_timeout).await;
+        self.metrics
+            .observe_writer_lock(kind, started.elapsed(), guard.is_some());
+        guard
+    }
+
+    /// [`Self::lock_writer_bounded`] for a data write: also waits while the
+    /// memtable is at its hard bound (see [`lock_writer_with_memtable_room`]).
+    /// Schema DDL keeps the plain bounded lock, so an operator can still drop
+    /// an index while writes are held back.
+    pub(crate) async fn lock_writer_for_write(
+        &self,
+        kind: WriterLockKind,
+    ) -> Option<tokio::sync::MutexGuard<'_, WriterSession>> {
+        let started = std::time::Instant::now();
         let guard = lock_writer_with_memtable_room(
             &self.writer,
             self.writer_lock_timeout,
@@ -652,6 +667,32 @@ impl AppState {
         self.metrics
             .observe_writer_lock(kind, started.elapsed(), guard.is_some());
         guard
+    }
+
+    /// Wait, without taking the writer, until the last published memtable
+    /// size is below its hard bound; `false` once `timeout` (when non-zero)
+    /// elapses first. For an explicit transaction, which then holds the
+    /// writer across client round trips.
+    pub(crate) async fn wait_for_memtable_room(&self, timeout: Duration) -> bool {
+        let hard = memtable_hard_bytes(self.memtable_stall_bytes);
+        if hard == 0 {
+            return true;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            if self
+                .memtable_bytes_gauge
+                .load(std::sync::atomic::Ordering::Relaxed)
+                < hard
+            {
+                return true;
+            }
+            self.flush_notify.notify_one();
+            if !timeout.is_zero() && started.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(MEMTABLE_ROOM_POLL).await;
+        }
     }
 
     /// Set the per-read-query timeout (builder style). `Duration::ZERO`
@@ -4149,7 +4190,7 @@ async fn run_write_section(
     plan: namidb_query::LogicalPlan,
     params: Params,
 ) -> WriteSection {
-    let Some(mut writer) = state.lock_writer_bounded(WriterLockKind::Http).await else {
+    let Some(mut writer) = state.lock_writer_for_write(WriterLockKind::Http).await else {
         return WriteSection::Busy;
     };
     let budget = state.memory.query_budget();
@@ -10374,7 +10415,7 @@ mod tests {
         assert_eq!(hard, 512);
         {
             let mut w = state
-                .lock_writer_bounded(WriterLockKind::Http)
+                .lock_writer_for_write(WriterLockKind::Http)
                 .await
                 .expect("an empty memtable admits the write");
             let mut properties = std::collections::BTreeMap::new();
@@ -10395,15 +10436,28 @@ mod tests {
                 .unwrap();
                 w.commit_batch().await.unwrap();
             }
+            // Publish the gauge as the write path does after a commit.
+            let _ = state.after_commit_backpressure(&w);
         }
         // No flush task runs here, so nothing makes room: the write times out
         // (a retryable writer-busy answer) and leaves the flush nudged.
         let started = std::time::Instant::now();
         assert!(state
-            .lock_writer_bounded(WriterLockKind::Http)
+            .lock_writer_for_write(WriterLockKind::Http)
             .await
             .is_none());
         assert!(started.elapsed() >= Duration::from_millis(200));
+        // An explicit transaction's BEGIN waits for room like a write; schema
+        // DDL is not held back, so an index can still be dropped.
+        assert!(
+            !state
+                .wait_for_memtable_room(Duration::from_millis(100))
+                .await
+        );
+        assert!(state
+            .lock_writer_bounded(WriterLockKind::Http)
+            .await
+            .is_some());
         tokio::time::timeout(Duration::from_secs(1), state.flush_notify.notified())
             .await
             .expect("a held-back write must wake the flush");
@@ -10413,11 +10467,17 @@ mod tests {
             let schema = w.snapshot().manifest().manifest.schema.clone();
             w.flush(schema).await.unwrap();
             assert!(w.memtable_bytes() < hard);
+            let _ = state.after_commit_backpressure(&w);
         }
         assert!(state
-            .lock_writer_bounded(WriterLockKind::Http)
+            .lock_writer_for_write(WriterLockKind::Http)
             .await
             .is_some());
+        assert!(
+            state
+                .wait_for_memtable_room(Duration::from_millis(100))
+                .await
+        );
     }
 
     #[tokio::test]

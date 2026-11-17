@@ -2041,16 +2041,29 @@ pub(super) async fn prepare_search_compactions(
     // A full-text base over FT4 segments folds by merging postings; only the
     // rest (vector bases, legacy or shadow bases, Building generations) scan
     // the node corpus.
+    let mut built = Vec::with_capacity(base_selections.len() + delta_selections.len());
+    // A merge that fails falls back to the node scan, so one unexpected
+    // segment never holds back every base of the pass.
     #[cfg(feature = "text-index")]
-    let (base_selections, delta_selections) = {
-        let (merged, scanned): (Vec<_>, Vec<_>) = base_selections
+    let base_selections = {
+        let (merged, mut scanned): (Vec<_>, Vec<_>) = base_selections
             .into_iter()
             .partition(segment_merge_supported);
-        let mut delta_selections = delta_selections;
-        delta_selections.extend(merged);
-        (scanned, delta_selections)
+        for selection in merged {
+            match build_text_segment_merge(store.clone(), paths, base, selection.clone()).await {
+                Ok(merged) => built.push(merged),
+                Err(error) => {
+                    tracing::warn!(
+                        index = %selection.captured_state.index_name,
+                        %error,
+                        "text segment merge failed; rebuilding the base from node documents"
+                    );
+                    scanned.push(selection);
+                }
+            }
+        }
+        scanned
     };
-    let mut built = Vec::with_capacity(base_selections.len() + delta_selections.len());
 
     if !base_selections.is_empty() {
         let mut plan = Vec::new();
@@ -2150,13 +2163,8 @@ pub(super) async fn prepare_search_compactions(
             SearchCompactionMode::DeltaRun => {
                 build_delta_run_compaction(store.clone(), paths, base, selection).await?
             }
-            #[cfg(feature = "text-index")]
             SearchCompactionMode::BasePrefix => {
-                build_text_segment_merge(store.clone(), paths, base, selection).await?
-            }
-            #[cfg(not(feature = "text-index"))]
-            SearchCompactionMode::BasePrefix => {
-                return Err(Error::invariant("BasePrefix routed to the segment merge"))
+                return Err(Error::invariant("BasePrefix routed to the delta runs"))
             }
         });
     }
