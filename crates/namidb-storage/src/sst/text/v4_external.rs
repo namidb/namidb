@@ -1240,7 +1240,7 @@ impl TextV4ExternalBuilder {
     /// postings, then every term with its postings, in sort order.
     pub(super) fn finish_presorted(
         self,
-        feed: &mut dyn FnMut(&mut MergeSink<'_, '_>) -> Result<()>,
+        feed: &mut MergeFeed<'_>,
     ) -> Result<Option<TextV4ExternalArtifact>> {
         if !self.presorted {
             return Err(Error::precondition(
@@ -1252,7 +1252,7 @@ impl TextV4ExternalBuilder {
 
     fn finish_inner(
         mut self,
-        feed: Option<&mut dyn FnMut(&mut MergeSink<'_, '_>) -> Result<()>>,
+        feed: Option<&mut MergeFeed<'_>>,
     ) -> Result<Option<TextV4ExternalArtifact>> {
         if self.poisoned {
             return Err(Error::precondition(
@@ -2049,6 +2049,9 @@ fn merge_runs(
     }
     output.finish()
 }
+
+/// The callback a presorted merge drives a [`MergeSink`] with.
+pub(super) type MergeFeed<'f> = dyn for<'s, 'a> FnMut(&mut MergeSink<'s, 'a>) -> Result<()> + 'f;
 
 /// Write side of a presorted build (see
 /// [`TextV4ExternalBuilder::finish_presorted`]). Native-filter postings come

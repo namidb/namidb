@@ -737,15 +737,13 @@ mod tests {
             doc_count_delta: readers[1].delta_docs() + readers[2].delta_docs(),
             total_len_delta: readers[1].delta_total_len() + readers[2].delta_total_len(),
         };
-        let merged_delta = (|| {
-            merge_text_v4_segments(
-                &state(),
-                context(9, 1..3),
-                config(dir),
-                Some(stats),
-                &readers[1..],
-            )
-        })()
+        let merged_delta = merge_text_v4_segments(
+            &state(),
+            context(9, 1..3),
+            config(dir),
+            Some(stats),
+            &readers[1..],
+        )
         .unwrap();
         let mut fresh = TextV4ExternalBuilder::with_config_reconciled(
             &state(),
@@ -797,7 +795,7 @@ mod tests {
 
         // BasePrefix: base + both deltas into one absolute base.
         let merged_base =
-            (|| merge_text_v4_segments(&state(), context(10, 0..3), config(dir), None, &readers))()
+            merge_text_v4_segments(&state(), context(10, 0..3), config(dir), None, &readers)
                 .unwrap();
         let mut fresh =
             TextV4ExternalBuilder::with_config_base(&state(), context(10, 0..3), config(dir))
@@ -855,15 +853,13 @@ mod tests {
             doc_count_delta: 2,
             total_len_delta: readers[0].delta_total_len() + readers[1].delta_total_len(),
         };
-        let error = (|| {
-            merge_text_v4_segments(
-                &state(),
-                context(3, 0..2),
-                config(dir),
-                Some(stats),
-                &readers,
-            )
-        })()
+        let error = merge_text_v4_segments(
+            &state(),
+            context(3, 0..2),
+            config(dir),
+            Some(stats),
+            &readers,
+        )
         .unwrap_err();
         assert!(
             error.to_string().contains("conflicting search versions"),

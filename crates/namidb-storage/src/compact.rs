@@ -1700,6 +1700,7 @@ async fn prepare_leveled(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_leveled_scoped(
     manifest_store: &ManifestStore,
     fence: &WriterFence,
