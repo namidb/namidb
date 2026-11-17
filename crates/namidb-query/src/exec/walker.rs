@@ -58,6 +58,11 @@ pub enum ExecError {
     /// tells a deterministic budget overrun from pressure that a retry can
     /// outlast.
     MemoryLimit(crate::exec::memory::QueryMemoryExceeded),
+    /// A vector search whose index exists but is still building (it cannot
+    /// serve natively yet) ran out of time on the exact scan it falls back
+    /// to. Carries the message with the index's progress. Transient: the
+    /// same search succeeds natively once the index is online.
+    IndexBuilding(String),
 }
 
 impl fmt::Display for ExecError {
@@ -73,6 +78,7 @@ impl fmt::Display for ExecError {
                 write!(f, "query exceeded the configured row cap of {cap}")
             }
             ExecError::MemoryLimit(exceeded) => write!(f, "{exceeded}"),
+            ExecError::IndexBuilding(message) => write!(f, "{message}"),
         }
     }
 }
@@ -6530,52 +6536,94 @@ async fn vector_search_rows(
     let score_only = source_filter.is_none();
     let projection: Option<Vec<String>> = score_only.then(|| vec![property.to_string()]);
 
-    // (sort_key, NodeId, score_value, row) — sort_key is "lower is better"
-    // (higher-is-better metrics are negated), so an ascending sort yields the
-    // top-k. NodeId is the stable tie-break shared with the ANN path.
-    let mut scored: Vec<(f64, NodeId, f64, Row)> = Vec::new();
-    let nodes = match label {
-        Some(label_name) => {
-            snapshot
-                .scan_label_with_predicates_and_projection(label_name, &[], projection.as_deref())
-                .await?
-        }
-        None => {
-            snapshot
-                .scan_all_nodes_with_predicates_and_projection(&[], projection.as_deref())
-                .await?
-        }
-    };
-    for n in nodes {
+    // Only the best `limit` candidates are kept while the scan streams, so the
+    // working set is k rows plus one scan batch whatever the label's size. A
+    // corpus-sized candidate list (every embedding of the label decoded at
+    // once) is what made a k=1 search fail its memory budget on a large label
+    // whose vector index was still building.
+    let mut top = VectorTopK::new(limit);
+    let mut consider = |n: namidb_storage::NodeView| -> Result<(), ExecError> {
         crate::exec::limits::check_deadline()?;
         let id = n.id;
         let node = NodeValue::from(n);
-        let mut row = Row::new();
-        row.set(alias.to_string(), RuntimeValue::Node(Box::new(node)));
-
         // This predicate belongs to the source below TopN. Evaluate it before
         // even reading/scoring the embedding: a row excluded by metadata must
         // not make the KNN fail because its embedding is malformed.
+        let mut row = Row::new();
+        row.set(alias.to_string(), RuntimeValue::Node(Box::new(node)));
         if let Some(filter) = source_filter {
             if evaluate(filter, &row, params)?.as_bool() != Some(true) {
-                continue;
+                return Ok(());
             }
         }
         let Some(RuntimeValue::Node(node)) = row.get(alias) else {
             unreachable!("vector source row must bind its node")
         };
         let Some(emb) = node.properties.get(property) else {
-            continue;
+            return Ok(());
         };
         let Some((score, higher_is_better)) = vector_score(distance, emb, q, span)? else {
-            continue;
+            return Ok(());
         };
         let sort_key = if higher_is_better { -score } else { score };
-        scored.push((sort_key, id, score, row));
+        // A score-only candidate is reloaded whole once it wins; dropping its
+        // decoded embedding now keeps a kept candidate as small as its id.
+        let row = if score_only { Row::new() } else { row };
+        top.offer(sort_key, id, score, row);
+        Ok(())
+    };
+    let scan: Result<(), ExecError> = async {
+        match label {
+            Some(label_name) if score_only && snapshot.node_scan_is_disjoint() => {
+                // Compacted layout: stream only the embedding column, one row
+                // group at a time.
+                let projection = projection.clone().unwrap_or_default();
+                snapshot
+                    .visit_label_with_projection::<_, ExecError>(label_name, &projection, |view| {
+                        consider(view)
+                    })
+                    .await?;
+            }
+            Some(label_name) => {
+                // Overlapping node versions (a backfill rewrote nodes that are not
+                // merged yet) or a source filter: reconcile one id-ordered batch
+                // at a time instead of materialising the label.
+                let mut cursor = snapshot.label_scan_cursor(label_name).await?;
+                loop {
+                    let mut batch = cursor.next_batch(snapshot, VECTOR_FLAT_SCAN_BATCH).await?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for mut view in batch.drain(..) {
+                        if let Some(requested) = &projection {
+                            view.properties
+                                .retain(|name, _| requested.iter().any(|r| r == name));
+                        }
+                        consider(view)?;
+                    }
+                    // Only the top-k candidates outlive the batch.
+                    crate::exec::memory::release_storage_rows();
+                }
+            }
+            None => {
+                for n in snapshot
+                    .scan_all_nodes_with_predicates_and_projection(&[], projection.as_deref())
+                    .await?
+                {
+                    consider(n)?;
+                }
+            }
+        }
+        Ok(())
     }
-
-    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    scored.truncate(limit);
+    .await;
+    if matches!(scan, Err(ExecError::Timeout)) {
+        if let Some(message) = building_vector_index_message(snapshot, label, property, distance) {
+            return Err(ExecError::IndexBuilding(message));
+        }
+    }
+    scan?;
+    let mut scored = top.into_sorted();
     if score_only {
         let ids: Vec<NodeId> = scored.iter().map(|(_, id, _, _)| *id).collect();
         let views = snapshot
@@ -6599,6 +6647,130 @@ async fn vector_search_rows(
         out.push(row);
     }
     Ok(out)
+}
+
+/// When a vector index covers `(label, property, distance)` but is still
+/// building, the message a flat-scan timeout is reported with: which index,
+/// how far its build is, and when to retry.
+fn building_vector_index_message(
+    snapshot: &Snapshot<'_>,
+    label: Option<&str>,
+    property: &str,
+    distance: crate::plan::logical::VectorDistance,
+) -> Option<String> {
+    use crate::plan::logical::VectorDistance;
+    use namidb_storage::manifest::VectorMetric;
+    use namidb_storage::search_progress::{index_state, IndexState};
+    let label = label?;
+    let metric = match distance {
+        VectorDistance::Cosine => VectorMetric::Cosine,
+        VectorDistance::Dot => VectorMetric::Dot,
+        VectorDistance::Euclidean => VectorMetric::Euclidean,
+    };
+    let manifest = &snapshot.manifest().manifest;
+    let descriptor = manifest
+        .vector_indexes
+        .iter()
+        .find(|descriptor| descriptor.matches(label, property, metric))?;
+    let (state, percent) = index_state(
+        manifest,
+        namidb_storage::search_lsm::SearchLsmKind::Vector,
+        &descriptor.name,
+    );
+    (state == IndexState::Building).then(|| {
+        format!(
+            "vector index `{}` on :{label}({property}) is BUILDING ({percent:.0}% done). Until it \
+             is ONLINE a vector search scans every :{label} node, and that scan exceeded the query \
+             timeout. Retry when SHOW INDEXES reports the index ONLINE.",
+            descriptor.name
+        )
+    })
+}
+
+/// Nodes reconciled per batch by the flat vector scan's cursor.
+const VECTOR_FLAT_SCAN_BATCH: usize = 256;
+
+/// The `limit` best flat-scan candidates, ranked like the index path:
+/// ascending sort key ("lower is better"), then `NodeId`.
+struct VectorTopK {
+    limit: usize,
+    heap: std::collections::BinaryHeap<VectorCandidate>,
+}
+
+struct VectorCandidate {
+    sort_key: f64,
+    id: NodeId,
+    score: f64,
+    row: Row,
+}
+
+impl PartialEq for VectorCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for VectorCandidate {}
+
+impl PartialOrd for VectorCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VectorCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key
+            .total_cmp(&other.sort_key)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl VectorTopK {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: std::collections::BinaryHeap::with_capacity(limit.min(4096).saturating_add(1)),
+        }
+    }
+
+    fn offer(&mut self, sort_key: f64, id: NodeId, score: f64, row: Row) {
+        if self.limit == 0 {
+            return;
+        }
+        let candidate = VectorCandidate {
+            sort_key,
+            id,
+            score,
+            row,
+        };
+        if self.heap.len() < self.limit {
+            self.heap.push(candidate);
+        } else if self
+            .heap
+            .peek()
+            .is_some_and(|worst| candidate.cmp(worst) == std::cmp::Ordering::Less)
+        {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    /// `(sort_key, id, score, row)` best first.
+    fn into_sorted(self) -> Vec<(f64, NodeId, f64, Row)> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.sort_key,
+                    candidate.id,
+                    candidate.score,
+                    candidate.row,
+                )
+            })
+            .collect()
+    }
 }
 
 /// RFC-030 (`vector-index`): serve a `VectorSearch` from the Vamana index when

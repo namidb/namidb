@@ -2269,6 +2269,7 @@ impl WriterSession {
             manifest_store: self.manifest_store.clone(),
             fence: self.fence,
             base: self.current.clone(),
+            protected_search: Default::default(),
         }
     }
 
@@ -2449,6 +2450,9 @@ impl WriterSession {
             tracing::warn!(error = %error, "advisory current.json PUT failed; still owed");
         }
         let schema = self.resolve_pending_types(schema).await?;
+        if self.memtable.is_empty() {
+            self.start_idle_search_generations().await?;
+        }
         let frozen = self.memtable.freeze();
         let mut restore = FrozenMemtableRestoreGuard::new(
             &mut self.memtable,
@@ -2512,6 +2516,35 @@ impl WriterSession {
         Ok(outcome)
     }
 
+    /// Start a Building generation for every search index created over
+    /// existing nodes that no flush has started yet (see
+    /// [`crate::search_lsm_flush::idle_building_generations`]), so an idle
+    /// namespace activates it too. Returns whether a manifest was committed.
+    pub async fn start_idle_search_generations(&mut self) -> Result<bool> {
+        let store = self.manifest_store.store().clone();
+        let paths = self.manifest_store.paths().clone();
+        let (states, descriptors) = crate::search_lsm_flush::idle_building_generations(
+            &store,
+            &paths,
+            &self.current.manifest,
+        )
+        .await?;
+        if states.is_empty() {
+            return Ok(false);
+        }
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        let mut next = self.current.manifest.next_version(self.fence.writer_id);
+        next.ssts.extend(descriptors);
+        next.search_lsm.extend(states);
+        let committed = self
+            .manifest_store
+            .commit(&self.fence, &self.current, next)
+            .await?;
+        self.current = committed;
+        self.refresh_published();
+        Ok(true)
+    }
+
     /// Start a flush whose expensive part runs WITHOUT the writer.
     ///
     /// [`Self::flush`] holds `&mut self` while it encodes the memtable into
@@ -2549,6 +2582,7 @@ impl WriterSession {
         let schema = self.current.manifest.schema.clone();
         let schema = self.resolve_pending_types(schema).await?;
         if self.memtable.is_empty() {
+            self.start_idle_search_generations().await?;
             return Ok(None);
         }
         self.fence.assert_alive(self.current.manifest.epoch)?;
@@ -5568,13 +5602,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_compaction_rejects_concurrent_search_index_ddl() {
+    async fn prepared_compaction_survives_concurrent_search_index_ddl() {
         use crate::manifest::{VectorMetric, VectorQuantization};
 
+        // A Nodes merge does not carry search indexes: a vector or full-text
+        // index registered while it was prepared must neither abandon it nor
+        // be lost by its install. (Up to 3.4.1 any catalog change abandoned
+        // every prepared compaction of the namespace.)
         let mut session = seeded_two_l0_person_session("ingest-prep-search-ddl-drift").await;
         let basis = session.compaction_basis();
         let compact_schema = basis.schema().clone();
         let prepared = basis.prepare(&compact_schema).await.unwrap();
+        assert!(!prepared.is_noop());
 
         session
             .register_vector_index(
@@ -5601,19 +5640,17 @@ mod tests {
             .await
             .unwrap();
         let ddl_manifest = session.current.manifest.clone();
-        let err = session
+        session
             .install_prepared_compaction(prepared)
             .await
-            .unwrap_err();
+            .expect("an unrelated search index DDL does not abandon a Nodes merge");
 
-        assert!(matches!(err, Error::Precondition(_)), "{err:?}");
-        let message = err.to_string();
-        assert!(message.contains("vector indexes"), "{message}");
-        assert!(message.contains("text indexes"), "{message}");
-        assert_eq!(
-            session.current.manifest, ddl_manifest,
-            "rejected install must preserve both registered index descriptors"
-        );
+        let installed = session.current.manifest.clone();
+        assert!(installed.version > ddl_manifest.version);
+        assert_eq!(installed.vector_indexes, ddl_manifest.vector_indexes);
+        assert_eq!(installed.text_indexes, ddl_manifest.text_indexes);
+        assert_eq!(installed.schema, ddl_manifest.schema);
+        crate::search_lsm::validate_search_lsm(&installed).unwrap();
         assert_eq!(
             session
                 .manifest_store
@@ -5621,8 +5658,7 @@ mod tests {
                 .await
                 .unwrap()
                 .manifest,
-            ddl_manifest,
-            "rejected install must not commit a durable manifest"
+            installed
         );
     }
 

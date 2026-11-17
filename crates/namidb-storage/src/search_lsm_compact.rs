@@ -199,6 +199,9 @@ fn pressure_segments(policy: SearchCompactionPolicy) -> usize {
         .max(policy.delta_trigger_segments)
 }
 
+/// Most deltas one pressure-relief DeltaRun merges.
+const MAX_PRESSURE_DELTA_RUN: usize = 16;
+
 /// Deltas up to this size always join a tier.
 const TIER_SMALL_DELTA_BYTES: u64 = 1024 * 1024;
 
@@ -600,6 +603,15 @@ pub(super) fn select_search_compactions(
     for state in manifest
         .search_lsm
         .iter()
+        .filter(|state| building_activation_eligible(state))
+    {
+        if let Some(selection) = select_building_activation(manifest, state, policy)? {
+            selections.push(selection);
+        }
+    }
+    for state in manifest
+        .search_lsm
+        .iter()
         .filter(|state| state.status == SearchLsmStatus::Active && !state.segments.is_empty())
     {
         if state.next_event_seq == 0 {
@@ -639,9 +651,25 @@ pub(super) fn select_search_compactions(
         // output waits for peers of its size instead of being rewritten by
         // every later run (which made each row's rewrites grow with the
         // number of flushes). Under pressure, merge them whatever their sizes.
-        let delta_run_len = ((tiered_run >= policy.delta_trigger_segments)
+        let mut delta_run_len = ((tiered_run >= policy.delta_trigger_segments)
             || (under_pressure && trailing_deltas >= policy.delta_trigger_segments))
             .then_some(policy.delta_trigger_segments);
+        // At the ceiling, a routine run too short to get back below it used
+        // to force a corpus-wide base rebuild. Merging the whole trailing
+        // delta tail (bounded) frees the flush slot for the cost of the tail
+        // alone; the base remains the route only when the tail cannot.
+        if state.segments.len() >= policy.hard_segment_cap {
+            let routine_output = delta_run_len
+                .map(|len| state.segments.len() - len + 1)
+                .unwrap_or(usize::MAX);
+            let tail = trailing_deltas.min(MAX_PRESSURE_DELTA_RUN);
+            if routine_output >= policy.hard_segment_cap
+                && tail >= MIN_SEARCH_LSM_SEGMENTS
+                && state.segments.len() - tail + 1 < policy.hard_segment_cap
+            {
+                delta_run_len = Some(tail);
+            }
+        }
         let delta_run_output_len = delta_run_len.and_then(|len| {
             state
                 .segments
@@ -724,6 +752,244 @@ pub(super) fn select_search_compactions(
     Ok(selections)
 }
 
+/// The delta runs a search-delta pass may install while bases are built
+/// elsewhere: routine runs that start past the protected prefix of their
+/// index (shortened to start there when they do not), plus a run over the
+/// deltas past that prefix of a generation whose base or activation is due.
+/// A Building generation gains one delta per flush until its activation
+/// installs; merging them meanwhile keeps it below the flush ceiling.
+pub(super) fn delta_runs_past(
+    manifest: &Manifest,
+    selections: Vec<SearchCompactionSelection>,
+    protected: &std::collections::HashMap<(SearchLsmKind, String), usize>,
+    policy: SearchCompactionPolicy,
+) -> Result<Vec<SearchCompactionSelection>> {
+    let mut runs = Vec::new();
+    for selection in selections {
+        let state = &selection.captured_state;
+        let floor = protected
+            .get(&(state.kind, state.index_name.clone()))
+            .copied();
+        match selection.mode {
+            SearchCompactionMode::DeltaRun => match floor {
+                Some(floor) if selection.selected_segment_start < floor => {
+                    if let Some(run) = delta_run_from(manifest, state, floor, policy)? {
+                        runs.push(run);
+                    }
+                }
+                _ => runs.push(selection),
+            },
+            SearchCompactionMode::BasePrefix => {
+                let first_delta = state
+                    .segments
+                    .iter()
+                    .position(|segment| segment.role == SearchSegmentRole::Delta)
+                    .unwrap_or(state.segments.len());
+                let start = floor.unwrap_or(0).max(first_delta);
+                if state.segments.len().saturating_sub(start) >= policy.delta_trigger_segments {
+                    if let Some(run) = delta_run_from(manifest, state, start, policy)? {
+                        runs.push(run);
+                    }
+                }
+            }
+        }
+    }
+    Ok(runs)
+}
+
+/// One DeltaRun over `state`'s segments from `start` (the newest
+/// [`MAX_PRESSURE_DELTA_RUN`] at most), if at least two complete deltas are
+/// there.
+fn delta_run_from(
+    manifest: &Manifest,
+    state: &SearchLsmState,
+    start: usize,
+    policy: SearchCompactionPolicy,
+) -> Result<Option<SearchCompactionSelection>> {
+    let start = start.max(state.segments.len().saturating_sub(MAX_PRESSURE_DELTA_RUN));
+    let selected = state.segments.get(start..).unwrap_or_default();
+    if selected.len() < MIN_SEARCH_LSM_SEGMENTS
+        || selected.iter().any(|segment| {
+            segment.role != SearchSegmentRole::Delta
+                || segment.payload != SearchSegmentPayload::Complete
+        })
+    {
+        return Ok(None);
+    }
+    let mut descriptors = Vec::with_capacity(selected.len());
+    for segment in selected {
+        let matches = manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.id == segment.sst_id)
+            .collect::<Vec<_>>();
+        let [descriptor] = matches.as_slice() else {
+            return Ok(None);
+        };
+        descriptors.push((*descriptor).clone());
+    }
+    Ok(Some(SearchCompactionSelection {
+        mode: SearchCompactionMode::DeltaRun,
+        captured_state: state.clone(),
+        selected_segment_start: start,
+        selected_descriptors: descriptors,
+        selected_event_ranges: compressed_event_union(
+            selected
+                .iter()
+                .flat_map(|segment| segment.event_ranges.iter().copied()),
+        )?,
+        captured_coverage_digest: super::input_coverage_digest(&state.coverage)?,
+        hard_segment_cap: policy.hard_segment_cap,
+    }))
+}
+
+/// A Building generation that a physical base build can activate: it has
+/// seen at least one flush (events and a barrier).
+pub(super) fn building_activation_eligible(state: &SearchLsmState) -> bool {
+    state.status == SearchLsmStatus::Building
+        && state.next_event_seq > 0
+        && state.compat_barrier_sst_id.is_some()
+}
+
+/// Plan the activation of a Building generation: one authoritative base over
+/// every visible Nodes SST that owns the generation's whole event prefix.
+///
+/// A generation starts Building when its index is created (or its catalog
+/// changes) over existing nodes: its flush deltas describe only later
+/// changes. The base scans the corpus once and, on install, replaces every
+/// captured segment, covers the Nodes SSTs that predate the generation and
+/// flips it Active. Like any BasePrefix it rebases over the flushes that land
+/// while it builds, so sustained writes cannot outrun it.
+fn select_building_activation(
+    manifest: &Manifest,
+    state: &SearchLsmState,
+    policy: SearchCompactionPolicy,
+) -> Result<Option<SearchCompactionSelection>> {
+    let mut descriptors = Vec::with_capacity(state.segments.len());
+    for segment in &state.segments {
+        let matches = manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.id == segment.sst_id)
+            .collect::<Vec<_>>();
+        let [descriptor] = matches.as_slice() else {
+            return Ok(None);
+        };
+        if descriptor.kind != state.kind.sst_kind() || descriptor.scope != state.index_name {
+            return Ok(None);
+        }
+        descriptors.push((*descriptor).clone());
+    }
+    let Ok(ranges) = compressed_event_union(
+        state
+            .segments
+            .iter()
+            .flat_map(|segment| segment.event_ranges.iter().copied())
+            .chain(state.proven_empty_event_ranges.iter().copied()),
+    ) else {
+        return Ok(None);
+    };
+    if ranges.as_slice() != [SearchEventRange::new(0, state.next_event_seq)]
+        || state
+            .segments
+            .iter()
+            .any(|segment| segment.role != SearchSegmentRole::Delta)
+    {
+        tracing::warn!(
+            index = %state.index_name,
+            "Building Search-LSM generation does not own one contiguous event prefix; \
+             leaving it to the logical rebuild"
+        );
+        return Ok(None);
+    }
+    if !manifest
+        .ssts
+        .iter()
+        .any(|descriptor| descriptor.kind == SstKind::Nodes)
+    {
+        return Ok(None);
+    }
+    Ok(Some(SearchCompactionSelection {
+        mode: SearchCompactionMode::BasePrefix,
+        captured_state: state.clone(),
+        selected_segment_start: 0,
+        selected_descriptors: descriptors,
+        selected_event_ranges: ranges,
+        captured_coverage_digest: super::input_coverage_digest(&state.coverage)?,
+        hard_segment_cap: policy.hard_segment_cap,
+    }))
+}
+
+/// Complete an activation once the projected Nodes set is known: every Nodes
+/// SST the generation does not cover predates it (flushes cover what they
+/// write; a Nodes merge refuses to mix covered and uncovered inputs) and its
+/// content is therefore in the activation base, which owns `0..frontier`.
+/// Same-scope bodies that are neither segments nor the barrier (legacy bases
+/// a logical rebuild left behind) are returned for removal.
+pub(super) fn complete_building_activation(
+    state: &mut SearchLsmState,
+    frontier: u64,
+    empty_proof_digest: Option<u64>,
+    ssts: &[SstDescriptor],
+) -> Result<Vec<Uuid>> {
+    if state.status != SearchLsmStatus::Active || frontier == 0 {
+        return Err(Error::invariant(
+            "Search-LSM activation completion requires an activated generation",
+        ));
+    }
+    let disposition = match empty_proof_digest {
+        None => CoverageDisposition::Segment,
+        Some(digest) if digest != 0 => CoverageDisposition::ProvenEmpty {
+            classifier_version: EMPTY_BASE_CLASSIFIER_VERSION,
+            before_after_digest: digest,
+        },
+        Some(_) => {
+            return Err(Error::invariant(
+                "empty Search-LSM activation lacks a non-zero winner proof",
+            ))
+        }
+    };
+    let visible = ssts
+        .iter()
+        .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+        .map(|descriptor| descriptor.id)
+        .collect::<HashSet<_>>();
+    state
+        .coverage
+        .retain(|coverage| visible.contains(&coverage.node_sst_id));
+    let covered = state
+        .coverage
+        .iter()
+        .map(|coverage| coverage.node_sst_id)
+        .collect::<HashSet<_>>();
+    for descriptor in ssts
+        .iter()
+        .filter(|descriptor| descriptor.kind == SstKind::Nodes && !covered.contains(&descriptor.id))
+    {
+        state.coverage.push(crate::search_lsm::SearchCoverage {
+            node_sst_id: descriptor.id,
+            node_sst_max_lsn: descriptor.max_lsn,
+            event_ranges: vec![SearchEventRange::new(0, frontier)],
+            disposition,
+        });
+    }
+    let data = state
+        .segments
+        .iter()
+        .map(|segment| segment.sst_id)
+        .chain(state.compat_barrier_sst_id)
+        .collect::<HashSet<_>>();
+    Ok(ssts
+        .iter()
+        .filter(|descriptor| {
+            descriptor.kind == state.kind.sst_kind()
+                && descriptor.scope == state.index_name
+                && !data.contains(&descriptor.id)
+        })
+        .map(|descriptor| descriptor.id)
+        .collect())
+}
+
 pub(super) fn search_compaction_needed(
     manifest: &Manifest,
     policy: SearchCompactionPolicy,
@@ -771,7 +1037,9 @@ fn verify_selected_descriptors(
         .selected_segment_start
         .checked_add(selection.selected_descriptors.len())
         .ok_or_else(|| Error::invariant("Search-LSM selected segment range overflows"))?;
-    if selection.selected_descriptors.is_empty()
+    let activation = selection.captured_state.status == SearchLsmStatus::Building
+        && selection.mode == SearchCompactionMode::BasePrefix;
+    if (selection.selected_descriptors.is_empty() && !activation)
         || selected_end != selection.captured_state.segments.len()
         || selection
             .selected_descriptors
@@ -965,7 +1233,16 @@ pub(super) fn rebase_prepared_search_compaction(
     let selection = &prepared.selection;
     let captured = &selection.captured_state;
     let current = current_state_for(manifest, selection)?;
-    super::verify_search_state_append_only(captured, current)?;
+    // Coverage may have been rewritten by a Nodes merge meanwhile: events
+    // keep their identity across such rewrites, so only the segment and
+    // proven-empty prefixes this compaction replaces must be unchanged.
+    let delta_at = match selection.mode {
+        SearchCompactionMode::BasePrefix => {
+            super::verify_search_segments_append_only(captured, current)?;
+            selection.selected_segment_start
+        }
+        SearchCompactionMode::DeltaRun => delta_run_position(captured, current, selection)?,
+    };
     if super::input_coverage_digest(&captured.coverage)? != selection.captured_coverage_digest {
         return Err(Error::invariant(
             "prepared Search-LSM coverage digest disagrees with its captured state",
@@ -992,6 +1269,11 @@ pub(super) fn rebase_prepared_search_compaction(
     }
 
     let mut rebased = working_state.clone();
+    if captured.status == SearchLsmStatus::Building
+        && selection.mode == SearchCompactionMode::BasePrefix
+    {
+        rebased.status = SearchLsmStatus::Active;
+    }
     match selection.mode {
         SearchCompactionMode::BasePrefix => {
             if selection.selected_segment_start != 0 {
@@ -1047,8 +1329,14 @@ pub(super) fn rebase_prepared_search_compaction(
             }
         }
         SearchCompactionMode::DeltaRun => {
-            let selected_start = selection.selected_segment_start;
-            let captured_end = captured.segments.len();
+            // Where the selected run sits now: its captured position, or
+            // after a base that replaced the prefix before it meanwhile.
+            let selected_start = delta_at;
+            let captured_end = delta_at
+                + captured
+                    .segments
+                    .len()
+                    .saturating_sub(selection.selected_segment_start);
             let mut segments = Vec::with_capacity(
                 selected_start
                     .saturating_add(usize::from(prepared.output.is_some()))
@@ -1120,6 +1408,67 @@ pub(super) fn rebase_prepared_search_compaction(
     Ok(rebased)
 }
 
+/// Position of a DeltaRun's selected segments in the current generation.
+///
+/// Normally the generation only advanced append-only from the captured state
+/// and the run sits where it was captured. A base build (or the activation of
+/// a Building generation) may instead have installed meanwhile over the
+/// segments before the run: the delta loop never selects what a base in
+/// flight replaces, so the run is still present as one contiguous slice, now
+/// after the new base. The run still merges into the same place, so it
+/// rebases there instead of abandoning work that is still valid.
+fn delta_run_position(
+    captured: &SearchLsmState,
+    current: &SearchLsmState,
+    selection: &SearchCompactionSelection,
+) -> Result<usize> {
+    let append_only = super::verify_search_segments_append_only(captured, current);
+    if append_only.is_ok() {
+        return Ok(selection.selected_segment_start);
+    }
+    let selected = captured
+        .segments
+        .get(selection.selected_segment_start..)
+        .unwrap_or_default();
+    let same_generation = current.kind == captured.kind
+        && current.index_name == captured.index_name
+        && current.catalog_signature == captured.catalog_signature
+        && current.generation_id == captured.generation_id
+        && current.next_event_seq >= captured.next_event_seq;
+    if !same_generation || selected.is_empty() {
+        return append_only.map(|()| selection.selected_segment_start);
+    }
+    let mut positions = (0..=current.segments.len().saturating_sub(selected.len()))
+        .filter(|&at| current.segments[at..].starts_with(selected));
+    let (Some(at), None) = (positions.next(), positions.next()) else {
+        return append_only.map(|()| selection.selected_segment_start);
+    };
+    let events = |segments: &[crate::search_lsm::SearchSegmentRef]| {
+        segments
+            .iter()
+            .flat_map(|segment| segment.event_ranges.iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let run = events(selected);
+    let run_start = run.iter().map(|range| range.start).min();
+    let run_end = run.iter().map(|range| range.end).max();
+    let (Some(run_start), Some(run_end)) = (run_start, run_end) else {
+        return append_only.map(|()| selection.selected_segment_start);
+    };
+    // The segments before the run must hold only older events and the ones
+    // after it only newer events, exactly as when the run was captured.
+    let ordered = events(&current.segments[..at])
+        .iter()
+        .all(|range| range.end <= run_start)
+        && events(&current.segments[at + selected.len()..])
+            .iter()
+            .all(|range| range.start >= run_end);
+    if !ordered {
+        return append_only.map(|()| selection.selected_segment_start);
+    }
+    Ok(at)
+}
+
 /// Metadata for one planned Nodes SST input. Bodies do not travel here: the
 /// producer fetches them in activation order and streams each over a bounded
 /// channel, so at most one unactivated body is ever in flight per lookahead
@@ -1127,6 +1476,7 @@ pub(super) fn rebase_prepared_search_compaction(
 struct SearchNodeSourcePlan {
     min_key: [u8; 16],
     size_bytes: u64,
+    row_count: u64,
     label_def: LabelDef,
     scope: String,
 }
@@ -1158,6 +1508,268 @@ impl SearchVersionRangeSource for CompactionSearchRangeSource {
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         self.pinned.read_ranges(ranges).await
     }
+}
+
+/// A whole segment body fetched to the local spool (file-backed), read by
+/// range without further object-store requests.
+#[cfg(feature = "text-index")]
+#[derive(Debug)]
+struct LocalSegmentSource {
+    body: Bytes,
+}
+
+#[cfg(feature = "text-index")]
+#[async_trait::async_trait]
+impl SearchVersionRangeSource for LocalSegmentSource {
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        let start = usize::try_from(range.start)
+            .map_err(|_| Error::invariant("local segment range start exceeds usize"))?;
+        let end = usize::try_from(range.end)
+            .map_err(|_| Error::invariant("local segment range end exceeds usize"))?;
+        if start > end || end > self.body.len() {
+            return Err(Error::invariant(format!(
+                "local segment range {start}..{end} leaves its {}-byte body",
+                self.body.len()
+            )));
+        }
+        Ok(self.body.slice(start..end))
+    }
+}
+
+#[cfg(feature = "text-index")]
+fn segment_merge_supported(selection: &SearchCompactionSelection) -> bool {
+    let selected = &selection.captured_state.segments[selection.selected_segment_start..];
+    selection.captured_state.kind == SearchLsmKind::Text
+        && (selection.captured_state.status == SearchLsmStatus::Active
+            || selection.mode == SearchCompactionMode::DeltaRun)
+        && !selected.is_empty()
+        && selected.iter().all(|segment| {
+            segment.format == SearchSegmentFormat::TextV4
+                && segment.payload == SearchSegmentPayload::Complete
+        })
+        && match selection.mode {
+            SearchCompactionMode::DeltaRun => true,
+            // A base fold must cover the generation's whole event prefix; a
+            // generation whose events do not yet account for every Nodes SST
+            // (no base) needs the corpus scan.
+            SearchCompactionMode::BasePrefix => {
+                selection.selected_segment_start == 0 && selected[0].role == SearchSegmentRole::Base
+            }
+        }
+}
+
+/// Fold the selected FT4 segments into one by merging their postings (see
+/// `sst/text/v4_merge.rs`): no node reads and no re-tokenization, so the work
+/// is linear in the selected segments' bytes. A DeltaRun yields a signed
+/// delta; a BasePrefix over a FT4 base yields the new absolute base.
+#[cfg(feature = "text-index")]
+async fn build_text_segment_merge(
+    store: Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    base: &LoadedManifest,
+    selection: SearchCompactionSelection,
+) -> Result<BuiltSearchCompaction> {
+    let started = Instant::now();
+    let manifest = &base.manifest;
+    let matches = manifest
+        .text_indexes
+        .iter()
+        .filter(|descriptor| descriptor.name == selection.captured_state.index_name)
+        .collect::<Vec<_>>();
+    let [descriptor] = matches.as_slice() else {
+        return Err(Error::precondition(
+            "text segment merge catalog entry is missing or ambiguous",
+        ));
+    };
+    let descriptor = (*descriptor).clone();
+    let selected_segments =
+        selection.captured_state.segments[selection.selected_segment_start..].to_vec();
+    if selected_segments.len() != selection.selected_descriptors.len() {
+        return Err(Error::invariant(
+            "text segment merge segment/descriptor cardinality differs",
+        ));
+    }
+    // Every merged source must carry a filter for it to stay complete.
+    let catalog_filters = crate::search_lsm::text_native_filter_properties(manifest, &descriptor);
+    let filters = catalog_filters
+        .into_iter()
+        .filter(|property| {
+            selected_segments.iter().all(|segment| {
+                segment
+                    .complete_filter_properties
+                    .binary_search(property)
+                    .is_ok()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // One sequential GET per source to the file-backed spool, fetched
+    // concurrently: the merge then reads ranges locally.
+    let fetches = selection
+        .selected_descriptors
+        .iter()
+        .map(|source| {
+            let store = store.clone();
+            async move { super::get_sst_body(store.as_ref(), paths, source).await }
+        })
+        .collect::<Vec<_>>();
+    let bodies = futures::future::try_join_all(fetches).await?;
+    let mut readers = Vec::with_capacity(bodies.len());
+    let mut input_bytes = 0u64;
+    for ((body, segment), source_descriptor) in bodies
+        .into_iter()
+        .zip(&selected_segments)
+        .zip(&selection.selected_descriptors)
+    {
+        input_bytes = input_bytes.saturating_add(source_descriptor.size_bytes);
+        let len = body.len() as u64;
+        let source: Arc<dyn SearchVersionRangeSource> = Arc::new(LocalSegmentSource { body });
+        let reader = crate::sst::text::v4::TextV4Reader::open(
+            source,
+            len,
+            &selection.captured_state,
+            segment,
+        )
+        .await
+        .map_err(|error| Error::Corrupted {
+            path: source_descriptor.path.clone(),
+            detail: error.to_string(),
+        })?;
+        readers.push(reader);
+    }
+
+    let stats = match selection.mode {
+        SearchCompactionMode::DeltaRun => {
+            let SearchSegmentStats::Text {
+                doc_count: SearchStatValue::Delta(doc_count_delta),
+                total_len: SearchStatValue::Delta(total_len_delta),
+                term_df_violation_count: 0,
+            } = summed_delta_stats(&selection)?
+            else {
+                return Err(Error::invariant(
+                    "text DeltaRun selected invalid signed statistics",
+                ));
+            };
+            Some(crate::sst::text::v4::ReconciledTextDeltaStats {
+                doc_count_delta,
+                total_len_delta,
+            })
+        }
+        SearchCompactionMode::BasePrefix => None,
+    };
+    let mut config = crate::sst::text::v4::TextV4ExternalBuildConfig::from_env(
+        crate::sst::text::v4::TextV4BuildOptions::default(),
+    )?;
+    config.memory_budget_bytes = super::per_collector_index_build_memory_bytes(1)?
+        .ok_or_else(|| Error::invariant("text segment merge has no build memory share"))?;
+    let context = crate::sst::text::v4::TextV4BuildContext {
+        sst_id: Uuid::now_v7(),
+        event_ranges: selection.selected_event_ranges.clone(),
+        complete_filter_properties: filters,
+    };
+    let state = selection.captured_state.clone();
+    let merged = tokio::task::spawn_blocking(move || {
+        crate::sst::text::v4::merge_text_v4_segments(&state, context, config, stats, &readers)
+    })
+    .await
+    .map_err(|error| Error::invariant(format!("text segment merge panicked: {error}")))??;
+
+    let Some(artifact) = merged.artifact else {
+        if selection.mode == SearchCompactionMode::DeltaRun {
+            return Err(Error::invariant(
+                "non-empty text DeltaRun segment merge produced no output",
+            ));
+        }
+        // Every winner is a suppression: the generation is empty.
+        return Ok(BuiltSearchCompaction {
+            prepared: PreparedSearchCompaction {
+                selection,
+                output: None,
+                empty_proof_digest: Some(merged.winner_digest),
+                metrics: SearchCompactionBuildMetrics {
+                    input_bytes,
+                    input_rows: merged.input_rows,
+                    touched_rows: merged.touched_rows,
+                    prepare_millis: elapsed_millis(started),
+                    ..Default::default()
+                },
+            },
+            file: None,
+        });
+    };
+    let segment = artifact.output.segment.clone();
+    if segment.mutation_count != merged.written_rows
+        || artifact.output.version_table.record_count != segment.mutation_count
+        || artifact.output.object_len != artifact.len
+        || (selection.mode == SearchCompactionMode::DeltaRun
+            && merged.touched_rows != segment.mutation_count)
+    {
+        return Err(Error::invariant(
+            "text segment merge output counts disagree with its winner stream",
+        ));
+    }
+    let file_name = format!(
+        "{}-{}-{}.ft4",
+        segment.sst_id.simple(),
+        SstKind::TextIndex.path_tag(),
+        descriptor.name
+    );
+    let output_descriptor = SstDescriptor {
+        id: segment.sst_id,
+        kind: SstKind::TextIndex,
+        scope: descriptor.name,
+        level: SstLevel(1),
+        path: super::relative_sst_path(1, &file_name),
+        size_bytes: artifact.len,
+        row_count: segment.mutation_count,
+        created_at: Utc::now(),
+        min_key: artifact.output.version_table.min_node_id,
+        max_key: artifact.output.version_table.max_node_id,
+        min_lsn: segment.min_lsn,
+        max_lsn: segment.max_lsn,
+        schema_version_min: 0,
+        schema_version_max: 0,
+        property_stats: Vec::new(),
+        kind_specific: KindSpecificStats::TextIndex {
+            doc_count: segment.live_payload_count,
+            term_count: 0,
+            total_len: merged.live_total_len,
+        },
+        bloom: None,
+        unique_property_indices: Vec::new(),
+        equality_property_indices: Vec::new(),
+        composite_equality_indices: Vec::new(),
+        label_index: None,
+        node_locator: None,
+        per_label_property_stats: Vec::new(),
+    };
+    let scratch_bytes = artifact
+        .metrics
+        .spool_bytes_written
+        .saturating_add(artifact.metrics.filter_spool_bytes);
+    Ok(BuiltSearchCompaction {
+        prepared: PreparedSearchCompaction {
+            selection,
+            output: Some(PreparedSearchPayload {
+                descriptor: output_descriptor,
+                segment: segment.clone(),
+            }),
+            empty_proof_digest: None,
+            metrics: SearchCompactionBuildMetrics {
+                input_bytes,
+                output_bytes: artifact.len,
+                input_rows: merged.input_rows,
+                touched_rows: merged.touched_rows,
+                live_rows: segment.live_payload_count,
+                peak_workspace_bytes: artifact.metrics.peak_logical_memory_bytes as u64,
+                scratch_bytes,
+                spill_bytes: scratch_bytes,
+                prepare_millis: elapsed_millis(started),
+                peak_resident_input_bytes: 0,
+            },
+        },
+        file: Some(artifact.file),
+    })
 }
 
 #[cfg(any(feature = "vector-index", feature = "text-index"))]
@@ -1500,7 +2112,32 @@ pub(super) async fn prepare_search_compactions(
     let (base_selections, delta_selections): (Vec<_>, Vec<_>) = selections
         .into_iter()
         .partition(|selection| selection.mode == SearchCompactionMode::BasePrefix);
+    // A full-text base over FT4 segments folds by merging postings; only the
+    // rest (vector bases, legacy or shadow bases, Building generations) scan
+    // the node corpus.
     let mut built = Vec::with_capacity(base_selections.len() + delta_selections.len());
+    // A merge that fails falls back to the node scan, so one unexpected
+    // segment never holds back every base of the pass.
+    #[cfg(feature = "text-index")]
+    let base_selections = {
+        let (merged, mut scanned): (Vec<_>, Vec<_>) = base_selections
+            .into_iter()
+            .partition(segment_merge_supported);
+        for selection in merged {
+            match build_text_segment_merge(store.clone(), paths, base, selection.clone()).await {
+                Ok(merged) => built.push(merged),
+                Err(error) => {
+                    tracing::warn!(
+                        index = %selection.captured_state.index_name,
+                        %error,
+                        "text segment merge failed; rebuilding the base from node documents"
+                    );
+                    scanned.push(selection);
+                }
+            }
+        }
+        scanned
+    };
 
     if !base_selections.is_empty() {
         let mut plan = Vec::new();
@@ -1532,6 +2169,7 @@ pub(super) async fn prepare_search_compactions(
             plan.push(SearchNodeSourcePlan {
                 min_key: descriptor.min_key,
                 size_bytes: descriptor.size_bytes,
+                row_count: descriptor.row_count,
                 label_def,
                 scope: descriptor.scope.clone(),
             });
@@ -1539,7 +2177,7 @@ pub(super) async fn prepare_search_compactions(
         }
         if plan.is_empty() {
             return Err(Error::invariant(
-                "active Search-LSM BasePrefix compaction has no Nodes SST inputs",
+                "Search-LSM BasePrefix compaction has no Nodes SST inputs",
             ));
         }
 
@@ -1596,7 +2234,14 @@ pub(super) async fn prepare_search_compactions(
     }
 
     for selection in delta_selections {
-        built.push(build_delta_run_compaction(store.clone(), paths, base, selection).await?);
+        built.push(match selection.mode {
+            SearchCompactionMode::DeltaRun => {
+                build_delta_run_compaction(store.clone(), paths, base, selection).await?
+            }
+            SearchCompactionMode::BasePrefix => {
+                return Err(Error::invariant("BasePrefix routed to the delta runs"))
+            }
+        });
     }
 
     let mut prepared = Vec::with_capacity(built.len());
@@ -1675,6 +2320,18 @@ async fn build_delta_run_compaction(
         SearchLsmKind::Text => {
             #[cfg(feature = "text-index")]
             {
+                if segment_merge_supported(&selection) {
+                    match build_text_segment_merge(store.clone(), paths, base, selection.clone())
+                        .await
+                    {
+                        Ok(built) => return Ok(built),
+                        Err(error) => tracing::warn!(
+                            index = %selection.captured_state.index_name,
+                            %error,
+                            "text segment merge failed; rebuilding the run from node documents"
+                        ),
+                    }
+                }
                 build_text_delta_run(store, paths, base, selection).await
             }
             #[cfg(not(feature = "text-index"))]
@@ -1710,13 +2367,11 @@ fn vector_payload_from_node(
     if !node.labels.contains(&descriptor.label) {
         return None;
     }
-    let vector = match node.properties.get(&descriptor.property)? {
-        Value::Vec(vector) => vector.clone(),
-        Value::VecI8 { codes, scale } => {
-            codes.iter().map(|code| f32::from(*code) * *scale).collect()
-        }
-        _ => return None,
-    };
+    let vector = node
+        .properties
+        .get(&descriptor.property)?
+        .embedding_f32(descriptor.dim as usize)?
+        .into_owned();
     if vector.len() != descriptor.dim as usize
         || vector.iter().any(|component| !component.is_finite())
     {
@@ -1754,6 +2409,21 @@ fn reconcile_vector_payload(
         (SearchVersionOperation::Suppress, None)
             if record.payload_fingerprint
                 == crate::sst::search_delta::search_suppress_fingerprint() =>
+        {
+            Ok(None)
+        }
+        // Up to 3.4.1 a flush recorded a bare numeric list as no embedding
+        // (a suppression); it reads as one now. The delta keeps what it
+        // recorded, and the next base build indexes the list.
+        (SearchVersionOperation::Suppress, Some(_))
+            if record.payload_fingerprint
+                == crate::sst::search_delta::search_suppress_fingerprint()
+                && node.is_some_and(|node| {
+                    matches!(
+                        node.properties.get(&descriptor.property),
+                        Some(Value::List(_))
+                    )
+                }) =>
         {
             Ok(None)
         }
@@ -2436,6 +3106,20 @@ fn validate_built_compaction(
     if let Some(output) = &prepared.output {
         projected.ssts.push(output.descriptor.clone());
     }
+    let mut rebased = rebased;
+    if prepared.selection.captured_state.status == SearchLsmStatus::Building
+        && prepared.selection.mode == SearchCompactionMode::BasePrefix
+    {
+        let retired = complete_building_activation(
+            &mut rebased,
+            prepared.selection.captured_state.next_event_seq,
+            prepared.empty_proof_digest,
+            &projected.ssts,
+        )?;
+        projected
+            .ssts
+            .retain(|descriptor| !retired.contains(&descriptor.id));
+    }
     let position = projected
         .search_lsm
         .iter()
@@ -2582,21 +3266,11 @@ impl VectorBaseWork {
             update_winner_digest(&mut self.digest, node_id, lsn, true, None);
             return Ok(());
         };
-        let decoded;
-        let vector: &[f32] = match value {
-            Value::Vec(vector) => vector,
-            Value::VecI8 { codes, scale } => {
-                decoded = codes
-                    .iter()
-                    .map(|code| f32::from(*code) * *scale)
-                    .collect::<Vec<_>>();
-                &decoded
-            }
-            _ => {
-                update_winner_digest(&mut self.digest, node_id, lsn, true, None);
-                return Ok(());
-            }
+        let Some(vector) = value.embedding_f32(self.descriptor.dim as usize) else {
+            update_winner_digest(&mut self.digest, node_id, lsn, true, None);
+            return Ok(());
         };
+        let vector: &[f32] = &vector;
         if vector.len() != self.descriptor.dim as usize
             || vector.iter().any(|component| !component.is_finite())
         {
@@ -2985,6 +3659,14 @@ fn build_search_compactions_blocking(
 ) -> Result<Vec<BuiltSearchCompaction>> {
     let per_builder_memory = super::per_collector_index_build_memory_bytes(selections.len())?
         .ok_or_else(|| Error::invariant("Search-LSM compaction has no build memory share"))?;
+    // `SHOW INDEXES` reports a Building generation's progress from this.
+    let progress = crate::search_progress::begin_build(
+        selections
+            .iter()
+            .map(|selection| selection.captured_state.generation_id),
+        plan.iter()
+            .fold(0u64, |total, entry| total.saturating_add(entry.row_count)),
+    );
     let mut works = Vec::with_capacity(selections.len());
     for selection in selections {
         match selection.captured_state.kind {
@@ -3144,6 +3826,7 @@ fn build_search_compactions_blocking(
         let Some(Reverse(entry)) = heap.pop() else {
             break;
         };
+        progress.scanned(1);
         let exhausted = {
             let source = cursors[entry.src]
                 .as_mut()
@@ -3179,6 +3862,7 @@ fn build_search_compactions_blocking(
         }
     }
 
+    progress.scan_finished();
     let mut finished = works
         .into_iter()
         .filter_map(|work| work.finish(input_bytes, started).transpose())

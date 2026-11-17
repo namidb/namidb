@@ -533,38 +533,14 @@ async fn run_compaction_pass(
     metrics: &Metrics,
     cancel: Option<&watch::Receiver<bool>>,
 ) -> namidb_storage::Result<CompactionPass> {
-    // Search segments first, in passes of their own: every flush that touches
+    // Search segments first, in a pass of their own: every flush that touches
     // an indexed label adds one, and neither a Nodes merge (which reads and
-    // rewrites the corpus) nor a vector base rebuild may hold back the cheap
-    // delta consolidations that keep each index below its segment ceiling.
-    // Each pass installs on its own, so a slow later pass never delays an
-    // earlier one's result.
+    // rewrites the corpus) nor a base build may hold back the cheap delta
+    // consolidations that keep each index below its segment ceiling.
+    let in_flight = StdMutex::new(SearchKeys::new());
     let mut applied = None;
-    for scope in [PassScope::SearchDeltas, PassScope::SearchOnly] {
-        match run_scoped_pass(
-            scope,
-            trigger,
-            writer,
-            snapshot,
-            writer_health,
-            namespace,
-            metrics,
-            cancel,
-        )
-        .await
-        {
-            Ok(CompactionPass::Cancelled) => return Ok(CompactionPass::Cancelled),
-            Ok(pass @ CompactionPass::Applied { .. }) => applied = Some(pass),
-            Ok(CompactionPass::Noop) => {}
-            Err(error) => {
-                // The next pass plans the remaining search work again; a
-                // persistent failure is reported by the periodic passes.
-                warn!(namespace, ?trigger, ?scope, %error, "search compaction pass failed");
-            }
-        }
-    }
-    let full = run_scoped_pass(
-        PassScope::WithoutSearch,
+    match run_scoped_pass(
+        PassScope::SearchDeltas,
         trigger,
         writer,
         snapshot,
@@ -572,11 +548,130 @@ async fn run_compaction_pass(
         namespace,
         metrics,
         cancel,
+        &in_flight,
     )
-    .await?;
-    match (applied, full) {
+    .await
+    {
+        Ok(CompactionPass::Cancelled) => return Ok(CompactionPass::Cancelled),
+        Ok(pass @ CompactionPass::Applied { .. }) => applied = Some(pass),
+        Ok(CompactionPass::Noop) => {}
+        Err(error) => {
+            warn!(namespace, ?trigger, scope = ?PassScope::SearchDeltas, %error, "search compaction pass failed");
+        }
+    }
+
+    // The long passes — base builds/activations, then the Nodes and edge
+    // merges — can take minutes on a large corpus. Delta runs keep landing
+    // meanwhile, for every index the long passes are not consolidating
+    // themselves: a delta installed under a base being built for the same
+    // index would change the segment prefix the base replaces.
+    let long_done = std::sync::atomic::AtomicBool::new(false);
+    let wake = tokio::sync::Notify::new();
+    let long = async {
+        let mut search_applied = None;
+        match run_scoped_pass(
+            PassScope::SearchOnly,
+            trigger,
+            writer,
+            snapshot,
+            writer_health,
+            namespace,
+            metrics,
+            cancel,
+            &in_flight,
+        )
+        .await
+        {
+            Ok(CompactionPass::Cancelled) => {
+                long_done.store(true, std::sync::atomic::Ordering::Release);
+                wake.notify_one();
+                return Ok(CompactionPass::Cancelled);
+            }
+            Ok(pass @ CompactionPass::Applied { .. }) => search_applied = Some(pass),
+            Ok(CompactionPass::Noop) => {}
+            Err(error) => {
+                // The next pass plans the remaining search work again; a
+                // persistent failure is reported by the periodic passes.
+                warn!(namespace, ?trigger, scope = ?PassScope::SearchOnly, %error, "search compaction pass failed");
+            }
+        }
+        let full = run_scoped_pass(
+            PassScope::WithoutSearch,
+            trigger,
+            writer,
+            snapshot,
+            writer_health,
+            namespace,
+            metrics,
+            cancel,
+            &in_flight,
+        )
+        .await;
+        long_done.store(true, std::sync::atomic::Ordering::Release);
+        wake.notify_one();
+        full.map(|full| match (search_applied, full) {
+            (Some(applied), CompactionPass::Noop) => applied,
+            (_, full) => full,
+        })
+    };
+    let deltas = async {
+        let mut delta_applied = None;
+        loop {
+            let _ = tokio::time::timeout(CONCURRENT_DELTA_INTERVAL, wake.notified()).await;
+            if long_done.load(std::sync::atomic::Ordering::Acquire) || is_cancelled(cancel) {
+                return delta_applied;
+            }
+            match run_scoped_pass(
+                PassScope::SearchDeltas,
+                trigger,
+                writer,
+                snapshot,
+                writer_health,
+                namespace,
+                metrics,
+                cancel,
+                &in_flight,
+            )
+            .await
+            {
+                Ok(pass @ CompactionPass::Applied { .. }) => delta_applied = Some(pass),
+                Ok(CompactionPass::Cancelled) => return delta_applied,
+                Ok(CompactionPass::Noop) => {}
+                Err(error) => {
+                    warn!(namespace, ?trigger, scope = ?PassScope::SearchDeltas, %error, "concurrent search delta pass failed");
+                }
+            }
+        }
+    };
+    let (full, delta_applied) = tokio::join!(long, deltas);
+    let full = full?;
+    match (applied.or(delta_applied), full) {
+        (_, CompactionPass::Cancelled) => Ok(CompactionPass::Cancelled),
         (Some(applied), CompactionPass::Noop) => Ok(applied),
         (_, full) => Ok(full),
+    }
+}
+
+/// Search indexes a long pass is building a base for, with the segment prefix
+/// that base replaces.
+type SearchKeys =
+    std::collections::HashMap<(namidb_storage::search_lsm::SearchLsmKind, String), usize>;
+
+/// How often delta consolidations run while a long pass is in flight.
+const CONCURRENT_DELTA_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Releases the search indexes a pass registered as in flight.
+struct InFlightSearch<'a> {
+    set: &'a StdMutex<SearchKeys>,
+    keys: Vec<((namidb_storage::search_lsm::SearchLsmKind, String), usize)>,
+}
+
+impl Drop for InFlightSearch<'_> {
+    fn drop(&mut self) {
+        let mut set = self.set.lock().expect("in-flight search set poisoned");
+        for (key, _) in &self.keys {
+            set.remove(key);
+        }
     }
 }
 
@@ -585,8 +680,9 @@ async fn run_compaction_pass(
 enum PassScope {
     /// Search-LSM delta runs only (`CompactionBasis::prepare_search_deltas`).
     SearchDeltas,
-    /// Every due Search-LSM consolidation, base rebuilds included
-    /// (`CompactionBasis::prepare_search_only`).
+    /// Search-LSM base builds and Building activations
+    /// (`CompactionBasis::prepare_search_bases`); delta runs keep running in
+    /// their own passes meanwhile.
     SearchOnly,
     /// Nodes and edges (`CompactionBasis::prepare_without_search`); the
     /// search passes above already ran.
@@ -603,6 +699,7 @@ async fn run_scoped_pass(
     namespace: &str,
     metrics: &Metrics,
     cancel: Option<&watch::Receiver<bool>>,
+    in_flight: &StdMutex<SearchKeys>,
 ) -> namidb_storage::Result<CompactionPass> {
     let basis = {
         let wait_started = Instant::now();
@@ -618,10 +715,35 @@ async fn run_scoped_pass(
         }
         writer.compaction_basis()
     };
+    // A search pass leaves alone the segment prefix another in-flight pass is
+    // building a base over; a SearchOnly pass registers its own for the delta
+    // passes that run while it builds.
+    let basis = match scope {
+        PassScope::WithoutSearch => basis,
+        PassScope::SearchDeltas | PassScope::SearchOnly => {
+            let protected = in_flight
+                .lock()
+                .expect("in-flight search set poisoned")
+                .clone();
+            basis.protecting_search_prefixes(protected)
+        }
+    };
+    let _in_flight_guard = (scope == PassScope::SearchOnly).then(|| {
+        let keys = basis.planned_search_bases();
+        in_flight
+            .lock()
+            .expect("in-flight search set poisoned")
+            .extend(keys.iter().cloned());
+        InFlightSearch {
+            set: in_flight,
+            keys,
+        }
+    });
 
     let l0_before = basis.max_l0_bucket_len();
     let due = match scope {
-        PassScope::SearchDeltas | PassScope::SearchOnly => basis.search_compaction_due(),
+        PassScope::SearchDeltas => basis.search_delta_compaction_due(),
+        PassScope::SearchOnly => !basis.planned_search_bases().is_empty(),
         PassScope::WithoutSearch => basis.needs_compaction(),
     };
     if !due {
@@ -647,7 +769,7 @@ async fn run_scoped_pass(
     let prepare_started = Instant::now();
     let prepared = match scope {
         PassScope::SearchDeltas => basis.prepare_search_deltas(&schema).await,
-        PassScope::SearchOnly => basis.prepare_search_only(&schema).await,
+        PassScope::SearchOnly => basis.prepare_search_bases(&schema).await,
         PassScope::WithoutSearch => basis.prepare_without_search(&schema).await,
     };
     let prepared = match prepared {

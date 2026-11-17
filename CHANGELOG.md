@@ -15,6 +15,112 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **`SHOW INDEXES` reports each index's state.** Two new columns: `state`
+  (`ONLINE`, or `BUILDING` while a vector or full-text index cannot serve
+  searches natively yet) and `populationPercent` (100 when online, otherwise
+  the progress of the build that activates it). `/metrics` adds
+  `namidb_search_indexes{kind,state}` and
+  `namidb_search_index_builds_in_flight`.
+
+### Fixed
+
+- **A vector index created after its embeddings were loaded activates and
+  indexes them.** Embeddings written while no vector index covered the
+  property are stored as plain numeric lists. When the index was created
+  afterwards, the build skipped those lists, the generation stayed
+  `Building`, and every background compaction of the namespace was abandoned
+  ("Building Search-LSM ... has partial coverage for the selected Nodes
+  inputs"). A k=1 vector search then scanned the whole label and could fail
+  its memory budget (413). The activation build now reads a numeric list of
+  the index's declared dimension as an embedding (other lengths are still
+  skipped), a Building generation is activated by a physical base build, and
+  an index created on an idle namespace starts building at the next flush
+  tick instead of waiting for a write. Nothing has to be reloaded: the index
+  activates on its own after the upgrade.
+- **A vector search while its index is building stays bounded.** The exact
+  scan a search falls back to keeps only the best `k` candidates and streams
+  just the embedding column (or reconciles the label in batches while node
+  versions overlap), so its memory no longer grows with the label. When that
+  scan exceeds the query timeout the error says the index is building and how
+  far it is (HTTP 503 `index_building`, a transient error for drivers),
+  instead of a timeout or a 413.
+- **Full-text compaction merges postings instead of rebuilding them.** A
+  Search-LSM compaction of FT4 segments read every node it covered back from
+  the node tables and re-tokenized it, so its time and scratch space grew with
+  the corpus (several GB of spool per pass on a few hundred thousand
+  documents) and it fell behind sustained ingestion. FT4 segments are now
+  merged directly: version tables by node id, postings per term and per
+  filter value, with no node read and no re-tokenizing. The cost is linear in
+  the merged segments, and the output is byte-for-byte what a fresh build
+  writes, so the format is unchanged.
+- **Compactions are no longer abandoned by unrelated writes.** A Nodes merge
+  rebuilds only the search indexes that need it, and its install precondition
+  is per index: when a flush appended to an index the merge was rebuilding,
+  only that index's rebuild is dropped, while the merge and every other index
+  install. A physical search compaction checks only the segments it replaces.
+  In 3.4.1 either change abandoned the whole compaction ("physically replaced
+  Search-LSM generation changed after prepare"), and under sustained writes
+  the same work was redone and abandoned on every pass.
+- **New and changed indexes leave `Building` under sustained writes.** An
+  index created over existing nodes, or whose filter catalog changed, is now
+  activated by a physical base build that rebases over the flushes landing
+  meanwhile. In 3.4.1 it stayed `Building`, gained one segment per flush up to
+  the ceiling and then held flushes back. A schema change that makes one
+  index stale now restarts only that index, not every one.
+- **A delta consolidation survives a base build installing first.** The
+  delta runs that consolidate segments past a base build in flight (or past
+  the activation of a `Building` index) were abandoned when that base
+  installed before them ("did not advance append-only from the captured
+  prefix"). They now rebase after the new base, where their segments still
+  are. A `Building` index's per-flush deltas are merged while it waits for
+  its activation.
+- **Schema changes no longer abandon unrelated compactions.** Any schema or
+  index-catalog change since a compaction's prepare abandoned it, including
+  a new label or property first written by a data write. A search-segment
+  consolidation now depends only on its own index's generation, and a Nodes
+  or edge merge only on what its outputs carry (the rewritten labels' and
+  edge types' definitions, indexed-property sidecars, composite indexes,
+  constraints) and on the indexes it rebuilt; an index created meanwhile
+  does not invalidate it.
+- **Writes no longer wait behind a long flush build.** When the memtable
+  reached the stall threshold during an off-lock flush, the flush took the
+  writer lock and held it until its build and upload finished, so on a slow
+  store every write queued for minutes (a 175 s write was measured) and
+  failed at the 30 s write timeout. The memtable's hard bound now holds
+  writes back instead, without the writer lock. A flush superseded by DDL is
+  retried off-lock before it falls back to flushing under the lock.
+- **Embedding-only writes do no full-text work.** A write that changes only
+  non-indexed properties (`MATCH (a:Doc {id: r.id}) SET a.embedding = r.v`)
+  is no longer tokenized, writes no full-text segment and triggers no
+  full-text rebuild.
+- **Delta consolidation keeps running during long compactions.** Search delta
+  runs now also run every 5 s while a base build or Nodes merge is in flight,
+  leaving alone the segments that build replaces.
+- **Memory: the memtable has a hard bound.** Past the stall threshold a write
+  was only delayed, so while flushes could not install (an index at its
+  segment ceiling) a sustained loader grew the memtable, and the process's
+  anonymous memory, without limit until the memory ceiling rejected every
+  query. Writes now wait for a flush once the memtable reaches a quarter of
+  `NAMIDB_MEMORY_MAX_BYTES`, and fail as a retryable 503 "writer is busy" if
+  none makes room in time. When a reclaim pass leaves the process over its
+  ceiling with caches already dropped, the server flushes the memtables
+  instead of waiting for the next periodic flush.
+- **Memory: the ceiling counts only memory the process cannot give back.**
+  The query-memory guard and the pressure sampler measured total resident
+  memory, which includes file-backed pages of the compaction spool and of
+  mapped segment files that the kernel reclaims on demand. A large compaction
+  made the guard stop or reject queries ("memory pressure") although the heap
+  was well below the ceiling. On Linux they now read `RssAnon + RssShmem`.
+- **Range page cache share.** The RAM page tier requests 1.5 GiB instead of
+  512 MiB in the cache split, about a third of `NAMIDB_CACHE_MAX_BYTES`
+  instead of 15%. The total cache bound is unchanged.
+- **Corrected: 3.4.1 vector recall.** The 3.4.1 notes gave recall@10 ~0.99
+  for clustered bases at the default `ef`. Measured on a 1024-dimension
+  corpus of a few hundred thousand vectors, recall@10 is ~0.955 at `ef=64`;
+  raise `ef` for more.
+
 ## [3.4.1] - 2026-11-16
 
 ### Fixed

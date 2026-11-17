@@ -42,6 +42,7 @@ pub mod restore_point;
 pub mod route_telemetry;
 pub mod search_lsm;
 pub(crate) mod search_lsm_flush;
+pub mod search_progress;
 pub mod search_workspace;
 pub(crate) mod spooled_object;
 pub mod sst;

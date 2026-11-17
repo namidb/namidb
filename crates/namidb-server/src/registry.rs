@@ -64,10 +64,6 @@ pub struct MaintenanceConfig {
     /// Concurrent reads one namespace may run, inside the process-wide
     /// read gate. `0` (the default) means no per-namespace cap.
     pub max_concurrent_queries_per_namespace: usize,
-    /// Memtable bytes at which an off-lock flush build takes the writer back
-    /// until it installs (see `build_background_flush_bounded`). `0` (the
-    /// default) never does.
-    pub memtable_stall_bytes: usize,
 }
 
 impl Default for MaintenanceConfig {
@@ -82,7 +78,6 @@ impl Default for MaintenanceConfig {
             group_commit_window: Duration::ZERO,
             fence_policy: recovery::FencePolicy::Steal,
             max_concurrent_queries_per_namespace: 0,
-            memtable_stall_bytes: 0,
         }
     }
 }
@@ -484,7 +479,6 @@ impl NamespaceRegistry {
             let mut cancel = state.cancel_tx.subscribe();
             let interval = maint.flush_interval;
             let l0_trigger = maint.compaction_l0_trigger;
-            let memtable_stall_bytes = maint.memtable_stall_bytes;
             let ns = state.namespace.clone();
             let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
@@ -493,13 +487,14 @@ impl NamespaceRegistry {
                                    // Back off after a local-persistence flush failure — see the
                                    // single-tenant loop and `FLUSH_FAILURE_RETRY_BACKOFF`.
                 let mut retry_after: Option<Instant> = None;
-                let mut flush_superseded = false;
+                let mut flush_superseded = 0u32;
                 'tick: loop {
                     tokio::select! {
                         biased;
                         _ = cancel.wait_for(|evicted| *evicted) => break,
                         _ = tick.tick() => {}
                         _ = s.flush_notify.notified() => {}
+                        _ = crate::memory::pressure_flush_requested() => {}
                     }
                     if retry_after.is_some_and(|at| Instant::now() < at) {
                         continue;
@@ -546,7 +541,9 @@ impl NamespaceRegistry {
                         }
                         // SST build and upload with the writer lock released;
                         // see the single-tenant loop.
-                        let flushed = if std::mem::take(&mut flush_superseded) {
+                        let flushed = if flush_superseded >= crate::SUPERSEDED_FLUSHES_BEFORE_LOCKED
+                        {
+                            flush_superseded = 0;
                             let schema = w.snapshot().manifest().manifest.schema.clone();
                             w.try_flush(schema).await.map(|_| None)
                         } else {
@@ -554,28 +551,15 @@ impl NamespaceRegistry {
                                 Ok(None) => Ok(None),
                                 Ok(Some(ticket)) => {
                                     drop(w);
-                                    let (built, held) = crate::build_background_flush_bounded(
-                                        ticket,
-                                        &s.writer,
-                                        &s.flush_notify,
-                                        memtable_stall_bytes,
-                                    )
-                                    .await;
-                                    match built {
+                                    match ticket.build().await {
                                         Ok(built) => {
-                                            w = match held {
-                                                Some(held) => held,
-                                                None => {
-                                                    let lock_started = Instant::now();
-                                                    let w = s.writer.lock().await;
-                                                    metrics.observe_writer_lock(
-                                                        WriterLockKind::Flush,
-                                                        lock_started.elapsed(),
-                                                        true,
-                                                    );
-                                                    w
-                                                }
-                                            };
+                                            let lock_started = Instant::now();
+                                            w = s.writer.lock().await;
+                                            metrics.observe_writer_lock(
+                                                WriterLockKind::Flush,
+                                                lock_started.elapsed(),
+                                                true,
+                                            );
                                             if s.is_retired() {
                                                 drop(w);
                                                 return;
@@ -628,9 +612,15 @@ impl NamespaceRegistry {
                                     installed,
                                     Some(namidb_storage::BackgroundFlushInstall::Superseded)
                                 ) {
-                                    tracing::debug!(namespace = %ns, "periodic flush superseded; retrying under the writer lock");
-                                    flush_superseded = true;
+                                    flush_superseded += 1;
+                                    tracing::info!(
+                                        namespace = %ns,
+                                        consecutive = flush_superseded,
+                                        "periodic flush superseded; retrying"
+                                    );
                                     s.flush_notify.notify_one();
+                                } else {
+                                    flush_superseded = 0;
                                 }
                                 retry_after = None;
                                 s.writer_health.clear_persistence_degraded();

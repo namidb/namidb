@@ -792,6 +792,12 @@ impl MemoryGovernor {
 
         if resident <= self.resume_bytes {
             self.pressure_active.store(false, Ordering::Release);
+        } else if reclaim && resident >= self.reclaim_bytes {
+            // Caches are gone and the allocator trimmed, yet the process is
+            // still over the reclaim threshold: what remains reconstructible
+            // is the memtables. Flush them rather than reject queries until
+            // a periodic tick happens to.
+            request_pressure_flush();
         }
 
         Some(resident)
@@ -977,8 +983,30 @@ fn percent(value: usize, percentage: usize) -> usize {
     ((value as u128 * percentage as u128) / 100).min(usize::MAX as u128) as usize
 }
 
+/// Process-wide wake-up for every namespace's flush loop, raised when a
+/// reclaim pass leaves the process over its reclaim threshold.
+fn pressure_flush_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Wake every flush loop now waiting (see [`pressure_flush_requested`]).
+pub(crate) fn request_pressure_flush() {
+    pressure_flush_notify().notify_waiters();
+}
+
+/// Resolves when a reclaim pass asks the flush loops to give the memtables'
+/// memory back.
+pub(crate) async fn pressure_flush_requested() {
+    pressure_flush_notify().notified().await;
+}
+
 fn sample_resident_bytes() -> Option<usize> {
-    memory_stats::memory_stats().map(|stats| stats.physical_mem)
+    // Anonymous + shared resident memory on Linux: clean file-backed pages
+    // (compaction's mapped spool inputs) are reclaimable and must not hold
+    // the process "at its ceiling" (see `process_resident_bytes`).
+    namidb_query::process_resident_bytes()
+        .or_else(|| memory_stats::memory_stats().map(|stats| stats.physical_mem))
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -996,6 +1024,35 @@ pub(crate) fn trim_allocator() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_pressure_flush_wakes_every_waiting_flush_loop() {
+        let first = tokio::spawn(pressure_flush_requested());
+        let second = tokio::spawn(pressure_flush_requested());
+        // Let both register before the wake-up.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        request_pressure_flush();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            first.await.unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .expect("both flush loops woke");
+    }
+
+    #[test]
+    fn resident_measure_excludes_reclaimable_file_pages() {
+        let status = "Name:\tnamidb\nVmRSS:\t  900000 kB\nRssAnon:\t  300000 kB\n\
+                      RssFile:\t  590000 kB\nRssShmem:\t   10000 kB\n";
+        assert_eq!(
+            namidb_query::exec::parse_unreclaimable_resident(status),
+            Some(310_000 * 1024)
+        );
+        assert_eq!(
+            namidb_query::exec::parse_unreclaimable_resident("VmRSS: 1 kB\n"),
+            None
+        );
+    }
 
     #[test]
     fn memory_limit_parser_accepts_exact_bytes_and_rejects_ambiguous_units() {

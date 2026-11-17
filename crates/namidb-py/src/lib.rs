@@ -28,9 +28,9 @@ use namidb_core::{NodeId, Value};
 use namidb_query::exec::{NodeValue, RelValue};
 use namidb_query::{
     execute_with_limits, execute_write_with_deadline, parse as cypher_parse, plan as build_plan,
-    show_constraints_rows, show_indexes_rows, show_schema_columns, with_query_memory, ExecError,
-    LowerError, Params, ParseError, Query, QueryMemoryBudget, QueryMemoryExceeded, QueryMemoryPool,
-    QueryMemoryScope, Row, RuntimeValue, StatsCatalog,
+    show_constraints_rows, show_indexes_columns, show_indexes_rows, show_schema_columns,
+    with_query_memory, ExecError, LowerError, Params, ParseError, Query, QueryMemoryBudget,
+    QueryMemoryExceeded, QueryMemoryPool, QueryMemoryScope, Row, RuntimeValue, StatsCatalog,
 };
 mod format;
 
@@ -2073,7 +2073,10 @@ async fn run_read(
             ShowKind::Indexes => show_indexes_rows(manifest),
         };
         return Ok(Some(QueryResult {
-            columns: show_schema_columns(),
+            columns: match c.kind {
+                ShowKind::Constraints => show_schema_columns(),
+                ShowKind::Indexes => show_indexes_columns(),
+            },
             rows,
         }));
     }

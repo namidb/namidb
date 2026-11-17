@@ -648,6 +648,53 @@ impl AppState {
         guard
     }
 
+    /// [`Self::lock_writer_bounded`] for a data write: also waits while the
+    /// memtable is at its hard bound (see [`lock_writer_with_memtable_room`]).
+    /// Schema DDL keeps the plain bounded lock, so an operator can still drop
+    /// an index while writes are held back.
+    pub(crate) async fn lock_writer_for_write(
+        &self,
+        kind: WriterLockKind,
+    ) -> Option<tokio::sync::MutexGuard<'_, WriterSession>> {
+        let started = std::time::Instant::now();
+        let guard = lock_writer_with_memtable_room(
+            &self.writer,
+            self.writer_lock_timeout,
+            memtable_hard_bytes(self.memtable_stall_bytes),
+            &self.flush_notify,
+        )
+        .await;
+        self.metrics
+            .observe_writer_lock(kind, started.elapsed(), guard.is_some());
+        guard
+    }
+
+    /// Wait, without taking the writer, until the last published memtable
+    /// size is below its hard bound; `false` once `timeout` (when non-zero)
+    /// elapses first. For an explicit transaction, which then holds the
+    /// writer across client round trips.
+    pub(crate) async fn wait_for_memtable_room(&self, timeout: Duration) -> bool {
+        let hard = memtable_hard_bytes(self.memtable_stall_bytes);
+        if hard == 0 {
+            return true;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            if self
+                .memtable_bytes_gauge
+                .load(std::sync::atomic::Ordering::Relaxed)
+                < hard
+            {
+                return true;
+            }
+            self.flush_notify.notify_one();
+            if !timeout.is_zero() && started.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(MEMTABLE_ROOM_POLL).await;
+        }
+    }
+
     /// Set the per-read-query timeout (builder style). `Duration::ZERO`
     /// leaves reads unbounded.
     pub fn with_query_timeout(mut self, timeout: Duration) -> Self {
@@ -1059,64 +1106,15 @@ pub async fn run_with_memory_max_bytes(
     run_with_memory_limits(config, memory_max_bytes, query_memory_max_bytes).await
 }
 
-/// Build an off-lock flush (`BackgroundFlush::build`) without letting the
-/// memtable grow past `stall_bytes` meanwhile.
+/// Consecutive superseded off-lock flushes after which the flush loop
+/// flushes under the writer lock, so a stream of DDL can never starve flushes.
 ///
-/// While the writer is free, writes keep committing into the memtable, which
-/// still holds every row being flushed until the install. The write stall
-/// past `stall_bytes` is only a short delay per write, so on its own nothing
-/// would bound how far a long build (a slow store, a large full-text delta)
-/// lets the memtable grow: the bound the flush used to give by holding the
-/// writer throughout. Each committed write past the flush threshold wakes
-/// `flush_notify`; on each wake the memtable is measured, and once it has
-/// reached `stall_bytes` the writer is taken and held until the build ends,
-/// so writes wait (and fail at the writer-lock timeout) exactly as they did
-/// behind the synchronous flush. The held guard is returned for the install.
-/// `stall_bytes == 0` disables the bound.
-pub(crate) async fn build_background_flush_bounded<'w>(
-    ticket: namidb_storage::BackgroundFlush,
-    writer: &'w tokio::sync::Mutex<WriterSession>,
-    flush_notify: &tokio::sync::Notify,
-    stall_bytes: usize,
-) -> (
-    namidb_storage::Result<namidb_storage::BuiltBackgroundFlush>,
-    Option<tokio::sync::MutexGuard<'w, WriterSession>>,
-) {
-    let build = ticket.build();
-    tokio::pin!(build);
-    if stall_bytes == 0 {
-        return (build.await, None);
-    }
-    let mut woken = false;
-    let outcome = loop {
-        tokio::select! {
-            built = &mut build => break (built, None),
-            () = flush_notify.notified() => {
-                woken = true;
-                // Keep the build running while the writer is acquired.
-                let guard = tokio::select! {
-                    built = &mut build => break (built, None),
-                    guard = writer.lock() => guard,
-                };
-                if guard.memtable_bytes() >= stall_bytes {
-                    tracing::debug!(
-                        memtable_bytes = guard.memtable_bytes(),
-                        stall_bytes,
-                        "memtable reached the stall threshold during an off-lock flush; \
-                         holding the writer until it installs"
-                    );
-                    break (build.await, Some(guard));
-                }
-            }
-        }
-    };
-    if woken {
-        // The wake-ups consumed here were meant for the flush loop: rows
-        // committed during the build may already be past the flush threshold.
-        flush_notify.notify_one();
-    }
-    outcome
-}
+/// A flush under the lock builds and uploads the whole memtable while every
+/// write waits: with a large memtable and a busy store that is minutes, past
+/// the write timeout. A superseded flush is therefore first retried off-lock;
+/// compactions do not supersede a flush (it rebases over them), so a second
+/// consecutive supersede means DDL kept landing.
+pub(crate) const SUPERSEDED_FLUSHES_BEFORE_LOCKED: u32 = 2;
 
 /// Fraction of the process memory limit the memtable may reach before a
 /// committed write triggers a flush (1/16) or is stalled (1/8).
@@ -1435,7 +1433,6 @@ pub async fn run_with_memory_limits(
             group_commit_window: config.group_commit_window,
             fence_policy: config.fence_policy,
             max_concurrent_queries_per_namespace: max_concurrent_queries_per_namespace(),
-            memtable_stall_bytes: config.memtable_stall_bytes,
         };
         let registry = NamespaceRegistry::new(
             store,
@@ -1578,7 +1575,7 @@ pub async fn run_with_memory_limits(
                                // available and the degraded state can be observed; the next
                                // attempt after the window self-heals once the disk clears.
             let mut retry_after: Option<std::time::Instant> = None;
-            let mut flush_superseded = false;
+            let mut flush_superseded = 0u32;
             'tick: loop {
                 // Flush on the timer OR when a committed write crossed the
                 // memtable byte threshold (`after_commit_backpressure`
@@ -1587,6 +1584,9 @@ pub async fn run_with_memory_limits(
                 tokio::select! {
                     _ = tick.tick() => {}
                     _ = state_for_flush.flush_notify.notified() => {}
+                    // Over the memory ceiling after reclaim: the memtable is
+                    // the reconstructible memory left to give back.
+                    _ = memory::pressure_flush_requested() => {}
                 }
                 if retry_after.is_some_and(|at| std::time::Instant::now() < at) {
                     continue;
@@ -1626,9 +1626,10 @@ pub async fn run_with_memory_limits(
                     // released (`WriterSession::begin_background_flush`):
                     // writes keep committing while a large memtable is
                     // encoded and uploaded, instead of queueing behind it.
-                    // After a superseded attempt the next one flushes under
-                    // the lock, so a busy compactor can never starve flushes.
-                    let flushed = if std::mem::take(&mut flush_superseded) {
+                    // After repeated superseded attempts the next one
+                    // flushes under the lock, so DDL can never starve flushes.
+                    let flushed = if flush_superseded >= SUPERSEDED_FLUSHES_BEFORE_LOCKED {
+                        flush_superseded = 0;
                         let schema = w.snapshot().manifest().manifest.schema.clone();
                         w.try_flush(schema).await.map(|_| None)
                     } else {
@@ -1636,28 +1637,18 @@ pub async fn run_with_memory_limits(
                             Ok(None) => Ok(None),
                             Ok(Some(ticket)) => {
                                 drop(w);
-                                let (built, held) = build_background_flush_bounded(
-                                    ticket,
-                                    &state_for_flush.writer,
-                                    &state_for_flush.flush_notify,
-                                    state_for_flush.memtable_stall_bytes,
-                                )
-                                .await;
-                                match built {
+                                // Writes keep committing while it builds;
+                                // the memtable's hard bound (not the writer
+                                // lock) holds them back if it fills up.
+                                match ticket.build().await {
                                     Ok(built) => {
-                                        w = match held {
-                                            Some(held) => held,
-                                            None => {
-                                                let lock_started = std::time::Instant::now();
-                                                let w = state_for_flush.writer.lock().await;
-                                                state_for_flush.metrics.observe_writer_lock(
-                                                    WriterLockKind::Flush,
-                                                    lock_started.elapsed(),
-                                                    true,
-                                                );
-                                                w
-                                            }
-                                        };
+                                        let lock_started = std::time::Instant::now();
+                                        w = state_for_flush.writer.lock().await;
+                                        state_for_flush.metrics.observe_writer_lock(
+                                            WriterLockKind::Flush,
+                                            lock_started.elapsed(),
+                                            true,
+                                        );
                                         // Writes grouped while the flush was
                                         // built are answered through the group
                                         // before the install commits them.
@@ -1716,14 +1707,17 @@ pub async fn run_with_memory_limits(
                                 installed,
                                 Some(namidb_storage::BackgroundFlushInstall::Superseded)
                             ) {
-                                // A compaction/DDL committed meanwhile; the
-                                // rows stay in the memtable for the next pass,
-                                // which runs at once and under the lock.
-                                tracing::debug!(
-                                    "periodic flush superseded; retrying under the writer lock"
+                                // DDL committed meanwhile; the rows stay in
+                                // the memtable for the next pass, which runs
+                                // at once.
+                                flush_superseded += 1;
+                                tracing::info!(
+                                    consecutive = flush_superseded,
+                                    "periodic flush superseded; retrying"
                                 );
-                                flush_superseded = true;
                                 state_for_flush.flush_notify.notify_one();
+                            } else {
+                                flush_superseded = 0;
                             }
                             retry_after = None;
                             state_for_flush.writer_health.clear_persistence_degraded();
@@ -2282,6 +2276,8 @@ fn exec_error_classification(
     use namidb_query::exec::ExecError;
     match e {
         ExecError::Timeout => (StatusCode::GATEWAY_TIMEOUT, Some("timeout")),
+        // Retry once the index is online (SHOW INDEXES reports its progress).
+        ExecError::IndexBuilding(_) => (StatusCode::SERVICE_UNAVAILABLE, Some("index_building")),
         ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
             (StatusCode::CONFLICT, Some("cancelled"))
         }
@@ -2338,6 +2334,7 @@ fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'st
     use namidb_query::exec::ExecError;
     match e {
         ExecError::Timeout => ("Neo.ClientError.Transaction.TransactionTimedOut", "57014"),
+        ExecError::IndexBuilding(_) => ("Neo.TransientError.General.DatabaseUnavailable", "53000"),
         ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
             ("Neo.TransientError.Transaction.Terminated", "57014")
         }
@@ -2667,6 +2664,68 @@ pub(crate) async fn lock_writer_bounded(
         return Some(writer.lock().await);
     }
     tokio::time::timeout(timeout, writer.lock()).await.ok()
+}
+
+/// Factor of the memtable stall threshold at which a write stops being
+/// merely delayed and waits for a flush to make room (2: a quarter of the
+/// process memory limit, since the stall threshold is an eighth).
+const MEMTABLE_HARD_FACTOR: usize = 2;
+
+/// The memtable size past which foreground writes wait for a flush
+/// (`0` = no bound).
+pub(crate) fn memtable_hard_bytes(stall_bytes: usize) -> usize {
+    stall_bytes.saturating_mul(MEMTABLE_HARD_FACTOR)
+}
+
+/// How often a write held back by a full memtable re-checks it.
+const MEMTABLE_ROOM_POLL: Duration = Duration::from_millis(50);
+
+/// [`lock_writer_bounded`] for a write that will grow the memtable: the
+/// writer is returned only while the memtable is below `hard_bytes`.
+///
+/// Past the stall threshold a write is only delayed, which bounds nothing
+/// when flushes cannot install (a search index at its segment ceiling, a
+/// failing store): a sustained loader then grew the memtable, and with it
+/// the process's anonymous memory, without limit until the memory ceiling
+/// rejected every query. Now the write releases the writer, wakes the flush
+/// and waits, and fails like any writer-lock timeout (a retryable 503 /
+/// transient Bolt failure) when no flush makes room within `timeout`.
+/// `hard_bytes == 0` disables the bound; a zero `timeout` waits as long as
+/// it takes, as the lock itself does.
+pub(crate) async fn lock_writer_with_memtable_room<'w>(
+    writer: &'w tokio::sync::Mutex<WriterSession>,
+    timeout: Duration,
+    hard_bytes: usize,
+    flush_notify: &tokio::sync::Notify,
+) -> Option<tokio::sync::MutexGuard<'w, WriterSession>> {
+    let started = std::time::Instant::now();
+    let mut warned = false;
+    loop {
+        let remaining = if timeout.is_zero() {
+            Duration::ZERO
+        } else {
+            match timeout.checked_sub(started.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => return None,
+            }
+        };
+        let guard = lock_writer_bounded(writer, remaining).await?;
+        let bytes = guard.memtable_bytes();
+        if hard_bytes == 0 || bytes < hard_bytes {
+            return Some(guard);
+        }
+        drop(guard);
+        flush_notify.notify_one();
+        if !warned {
+            warned = true;
+            tracing::warn!(
+                memtable_bytes = bytes,
+                hard_bytes,
+                "write waits for a flush: the memtable is at its hard bound"
+            );
+        }
+        tokio::time::sleep(MEMTABLE_ROOM_POLL).await;
+    }
 }
 
 /// Outcome of awaiting a group-commit ACK under the write deadline.
@@ -4078,7 +4137,7 @@ async fn run_write_section(
     plan: namidb_query::LogicalPlan,
     params: Params,
 ) -> WriteSection {
-    let Some(mut writer) = state.lock_writer_bounded(WriterLockKind::Http).await else {
+    let Some(mut writer) = state.lock_writer_for_write(WriterLockKind::Http).await else {
         return WriteSection::Busy;
     };
     let budget = state.memory.query_budget();
@@ -4343,7 +4402,10 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             }
         };
         let json_rows = row_values(&rows);
-        let columns = namidb_query::show_schema_columns();
+        let columns = match c.kind {
+            namidb_query::parser::ast::ShowKind::Constraints => namidb_query::show_schema_columns(),
+            namidb_query::parser::ast::ShowKind::Indexes => namidb_query::show_indexes_columns(),
+        };
         return ObservedQuery {
             kind: Some(QueryKind::Read),
             ok: true,
@@ -5904,7 +5966,13 @@ async fn run_write_section_multi(
     params: Params,
 ) -> WriteSectionMulti {
     let lock_started = std::time::Instant::now();
-    let writer = lock_writer_bounded(&ns_state.writer, shared.writer_lock_timeout).await;
+    let writer = lock_writer_with_memtable_room(
+        &ns_state.writer,
+        shared.writer_lock_timeout,
+        memtable_hard_bytes(shared.memtable_stall_bytes),
+        &ns_state.flush_notify,
+    )
+    .await;
     shared.metrics.observe_writer_lock(
         WriterLockKind::Http,
         lock_started.elapsed(),
@@ -6201,7 +6269,14 @@ async fn run_cypher_multi(
             ok: true,
             elapsed: started.elapsed(),
             response: Json(CypherResponse {
-                columns: namidb_query::show_schema_columns(),
+                columns: match c.kind {
+                    namidb_query::parser::ast::ShowKind::Constraints => {
+                        namidb_query::show_schema_columns()
+                    }
+                    namidb_query::parser::ast::ShowKind::Indexes => {
+                        namidb_query::show_indexes_columns()
+                    }
+                },
                 rows: json_rows,
                 write_outcome: None,
             })
@@ -7905,6 +7980,11 @@ mod tests {
             "namidb_search_route_total{kind=\"text\",route=\"fallback\"}",
             "namidb_search_route_total{kind=\"vector\",route=\"native\"}",
             "namidb_search_route_total{kind=\"vector\",route=\"fallback\"}",
+            "namidb_search_indexes{kind=\"vector\",state=\"online\"}",
+            "namidb_search_indexes{kind=\"vector\",state=\"building\"}",
+            "namidb_search_indexes{kind=\"text\",state=\"online\"}",
+            "namidb_search_indexes{kind=\"text\",state=\"building\"}",
+            "namidb_search_index_builds_in_flight ",
         ] {
             assert!(
                 text.contains(series),
@@ -8983,6 +9063,15 @@ mod tests {
             .map(|p| p.as_str().unwrap())
             .collect();
         assert_eq!(props, ["slug"]);
+        let cols: Vec<&str> = body["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert!(cols.ends_with(&["state", "populationPercent"]), "{cols:?}");
+        assert_eq!(doc["state"], "ONLINE");
+        assert_eq!(doc["populationPercent"], 100.0);
     }
 
     #[cfg(feature = "text-index")]
@@ -10274,6 +10363,91 @@ mod tests {
             bytes_only.write_stall_for(0, 1024),
             Some(Duration::from_millis(20)),
             "byte backstop with default delay"
+        );
+    }
+
+    /// Production wedge on 3.4.1: a flush that could not install (a search
+    /// index at its segment ceiling) left an embedding backfill growing the
+    /// memtable past the stall threshold, where writes were only delayed,
+    /// until the anonymous heap held the process at its memory ceiling and
+    /// every query was rejected. Past twice the stall threshold a write now
+    /// waits for a flush and fails as a writer-busy timeout instead.
+    #[tokio::test]
+    async fn a_full_memtable_holds_writes_until_a_flush_makes_room() {
+        let (store, paths) = namidb_storage::parse_uri("memory://test-memtable-hard").unwrap();
+        let state = AppState::new(
+            WriterSession::open(store, paths).await.unwrap(),
+            None,
+            "t".into(),
+        )
+        .with_memtable_thresholds(0, 256)
+        .with_writer_lock_timeout(Duration::from_millis(200));
+        let hard = memtable_hard_bytes(state.memtable_stall_bytes);
+        assert_eq!(hard, 512);
+        {
+            let mut w = state
+                .lock_writer_for_write(WriterLockKind::Http)
+                .await
+                .expect("an empty memtable admits the write");
+            let mut properties = std::collections::BTreeMap::new();
+            properties.insert(
+                "embedding".to_string(),
+                namidb_core::value::Value::Vec(vec![0.5; 256]),
+            );
+            while w.memtable_bytes() < hard {
+                w.upsert_node(
+                    "P",
+                    namidb_core::id::NodeId::new(),
+                    &namidb_storage::NodeWriteRecord {
+                        properties: properties.clone(),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                w.commit_batch().await.unwrap();
+            }
+            // Publish the gauge as the write path does after a commit.
+            let _ = state.after_commit_backpressure(&w);
+        }
+        // No flush task runs here, so nothing makes room: the write times out
+        // (a retryable writer-busy answer) and leaves the flush nudged.
+        let started = std::time::Instant::now();
+        assert!(state
+            .lock_writer_for_write(WriterLockKind::Http)
+            .await
+            .is_none());
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        // An explicit transaction's BEGIN waits for room like a write; schema
+        // DDL is not held back, so an index can still be dropped.
+        assert!(
+            !state
+                .wait_for_memtable_room(Duration::from_millis(100))
+                .await
+        );
+        assert!(state
+            .lock_writer_bounded(WriterLockKind::Http)
+            .await
+            .is_some());
+        tokio::time::timeout(Duration::from_secs(1), state.flush_notify.notified())
+            .await
+            .expect("a held-back write must wake the flush");
+        // The flush lock itself is not bounded by the memtable.
+        {
+            let mut w = state.writer.lock().await;
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.flush(schema).await.unwrap();
+            assert!(w.memtable_bytes() < hard);
+            let _ = state.after_commit_backpressure(&w);
+        }
+        assert!(state
+            .lock_writer_for_write(WriterLockKind::Http)
+            .await
+            .is_some());
+        assert!(
+            state
+                .wait_for_memtable_room(Duration::from_millis(100))
+                .await
         );
     }
 

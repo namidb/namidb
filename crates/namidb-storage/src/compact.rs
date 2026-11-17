@@ -77,7 +77,7 @@
 //! body are retained in full.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -234,6 +234,9 @@ impl PreparedCompaction {
         self.removed_ids.is_empty()
             && self.search_lsm_activations.is_empty()
             && self.unadoptable_search_markers.is_empty()
+            // An activation of a generation that has no segment yet replaces
+            // nothing, but it still installs.
+            && self.search_compactions.is_empty()
     }
 
     /// Manifest version the prepare ran against.
@@ -251,9 +254,69 @@ pub struct CompactionBasis {
     pub(crate) manifest_store: ManifestStore,
     pub(crate) fence: WriterFence,
     pub(crate) base: LoadedManifest,
+    /// Search indexes with a base build in flight elsewhere, and the
+    /// segment prefix that build replaces (see
+    /// [`Self::protecting_search_prefixes`]).
+    pub(crate) protected_search: HashMap<(crate::search_lsm::SearchLsmKind, String), usize>,
 }
 
 impl CompactionBasis {
+    /// Another pass is building a base for these indexes over their first
+    /// `prefix` segments. This basis plans no base for them, and its delta
+    /// runs merge only segments past that prefix: a run that rewrote any of
+    /// them would abandon the in-flight base, while the deltas flushed since
+    /// still merge (a base build can take minutes on a large corpus).
+    pub fn protecting_search_prefixes(
+        mut self,
+        prefixes: impl IntoIterator<Item = ((crate::search_lsm::SearchLsmKind, String), usize)>,
+    ) -> Self {
+        self.protected_search.extend(prefixes);
+        self
+    }
+
+    fn scoped_search_selections(
+        &self,
+        scope: CompactionScope,
+    ) -> Result<Vec<search_lsm_compact::SearchCompactionSelection>> {
+        scoped_search_selections(
+            &self.base.manifest,
+            search_lsm_compact::SearchCompactionPolicy::for_scheduling(),
+            scope,
+            &self.protected_search,
+        )
+    }
+
+    /// `true` when a delta-run consolidation is due (past any protected
+    /// prefix). Metadata only.
+    pub fn search_delta_compaction_due(&self) -> bool {
+        self.scoped_search_selections(CompactionScope::SearchDeltas)
+            .map(|selections| !selections.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Indexes [`Self::prepare_search_bases`] would build a base for (or
+    /// activate) from this basis, each with the segment prefix that base
+    /// replaces. Metadata only.
+    pub fn planned_search_bases(&self) -> Vec<((crate::search_lsm::SearchLsmKind, String), usize)> {
+        self.scoped_search_selections(CompactionScope::SearchBases)
+            .map(|selections| {
+                selections
+                    .into_iter()
+                    .map(|selection| {
+                        let prefix = selection.captured_state.segments.len();
+                        (
+                            (
+                                selection.captured_state.kind,
+                                selection.captured_state.index_name,
+                            ),
+                            prefix,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Manifest version this basis was captured at.
     pub fn manifest_version(&self) -> u64 {
         self.base.manifest.version
@@ -305,7 +368,12 @@ impl CompactionBasis {
     /// `true` when a vector/full-text index of this basis has search segments
     /// due for consolidation (metadata only).
     pub fn search_compaction_due(&self) -> bool {
-        search_compaction_due(&self.base.manifest)
+        if self.protected_search.is_empty() {
+            return search_compaction_due(&self.base.manifest);
+        }
+        self.scoped_search_selections(CompactionScope::SearchOnly)
+            .map(|selections| !selections.is_empty())
+            .unwrap_or(true)
     }
 
     /// Prepare only the due Search-LSM consolidations of this basis: no Nodes
@@ -318,6 +386,14 @@ impl CompactionBasis {
     /// prepared compaction.
     pub async fn prepare_search_only(&self, schema: &Schema) -> Result<PreparedCompaction> {
         self.prepare_scoped(schema, CompactionScope::SearchOnly)
+            .await
+    }
+
+    /// [`Self::prepare_search_only`] restricted to base builds and Building
+    /// activations: the long search work, for a caller that runs delta
+    /// consolidations in passes of their own meanwhile.
+    pub async fn prepare_search_bases(&self, schema: &Schema) -> Result<PreparedCompaction> {
+        self.prepare_scoped(schema, CompactionScope::SearchBases)
             .await
     }
 
@@ -349,9 +425,39 @@ impl CompactionBasis {
             compaction_base_bytes(),
             compaction_level_ratio(),
             scope,
+            &self.protected_search,
         )
         .await
     }
+}
+
+/// The physical Search-LSM consolidations one pass of `scope` plans.
+fn scoped_search_selections(
+    manifest: &crate::manifest::Manifest,
+    policy: search_lsm_compact::SearchCompactionPolicy,
+    scope: CompactionScope,
+    protected: &HashMap<(crate::search_lsm::SearchLsmKind, String), usize>,
+) -> Result<Vec<search_lsm_compact::SearchCompactionSelection>> {
+    let mut selections = search_lsm_compact::select_search_compactions(manifest, policy)?;
+    let unprotected = |selection: &search_lsm_compact::SearchCompactionSelection| {
+        !protected.contains_key(&(
+            selection.captured_state.kind,
+            selection.captured_state.index_name.clone(),
+        ))
+    };
+    match scope {
+        CompactionScope::Full | CompactionScope::SearchOnly => selections.retain(unprotected),
+        CompactionScope::SearchBases => selections.retain(|selection| {
+            selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
+                && unprotected(selection)
+        }),
+        CompactionScope::SearchDeltas => {
+            selections =
+                search_lsm_compact::delta_runs_past(manifest, selections, protected, policy)?;
+        }
+        CompactionScope::WithoutPhysicalSearch => selections.clear(),
+    }
+    Ok(selections)
 }
 
 /// What one prepare pass may rewrite.
@@ -364,6 +470,8 @@ enum CompactionScope {
     /// Search-LSM delta-run consolidations only: no base rebuild, so the pass
     /// is short and proportional to the changed rows.
     SearchDeltas,
+    /// Search-LSM base builds and Building activations only.
+    SearchBases,
     /// Nodes and edges, plus any logical search rebuild a Nodes merge needs,
     /// but no physical Search-LSM consolidation (a search-scoped pass does
     /// that work).
@@ -917,6 +1025,41 @@ fn node_descriptor_needs_non_record_migration(
 }
 
 fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
+    !search_indexes_needing_rebuild(manifest).is_empty()
+}
+
+/// Whether one generation is served (or activated) by the physical Search-LSM
+/// path and so needs no logical rebuild from a Nodes merge.
+///
+/// An Active generation must validate on its own. A Building generation that
+/// validates, carries events and a barrier is activated by a physical base
+/// build (`search_lsm_compact`), which rebases over concurrent flushes; a
+/// logical rebuild of it would be outrun by every flush under sustained
+/// writes. Validity is judged per generation, so one stale index no longer
+/// forces every other index through a rebuild.
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
+fn search_state_is_physical(
+    manifest: &crate::manifest::Manifest,
+    state: &crate::search_lsm::SearchLsmState,
+) -> bool {
+    if crate::search_lsm::validate_search_lsm_state(manifest, state).is_err() {
+        return false;
+    }
+    match state.status {
+        crate::search_lsm::SearchLsmStatus::Active => true,
+        crate::search_lsm::SearchLsmStatus::Building => {
+            search_lsm_compact::building_activation_eligible(state)
+        }
+    }
+}
+
+/// The `(kind, name)` of every registered search index the next authoritative
+/// Nodes merge must rebuild logically.
+fn search_indexes_needing_rebuild(
+    manifest: &crate::manifest::Manifest,
+) -> HashSet<(SstKind, String)> {
+    #[allow(unused_mut)]
+    let mut needing = HashSet::new();
     let max_node_lsn = manifest
         .ssts
         .iter()
@@ -924,9 +1067,8 @@ fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
         .map(|sst| sst.max_lsn)
         .max()
         .unwrap_or(0);
-    let valid_lsm = crate::search_lsm::validate_search_lsm(manifest).is_ok();
     #[cfg(feature = "vector-index")]
-    if manifest.vector_indexes.iter().any(|index| {
+    for index in &manifest.vector_indexes {
         let matching_states = manifest
             .search_lsm
             .iter()
@@ -935,31 +1077,30 @@ fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
                     && state.index_name == index.name
             })
             .collect::<Vec<_>>();
-        if !matching_states.is_empty() {
-            return !(valid_lsm
-                && matching_states.len() == 1
-                && matching_states[0].status == crate::search_lsm::SearchLsmStatus::Active);
-        }
-        if legacy_search_base_needs_adoption(
+        let needs = if !matching_states.is_empty() {
+            !(matching_states.len() == 1 && search_state_is_physical(manifest, matching_states[0]))
+        } else if legacy_search_base_needs_adoption(
             manifest,
             crate::search_lsm::SearchLsmKind::Vector,
             &index.name,
             max_node_lsn,
         ) {
-            return false;
+            false
+        } else {
+            let signature = vector_catalog_signature(manifest, index);
+            !manifest.search_index_builds.iter().any(|state| {
+                state.kind == SstKind::VectorGraph
+                    && state.name == index.name
+                    && state.catalog_signature == signature
+                    && state.max_node_lsn >= max_node_lsn
+            })
+        };
+        if needs {
+            needing.insert((SstKind::VectorGraph, index.name.clone()));
         }
-        let signature = vector_catalog_signature(manifest, index);
-        !manifest.search_index_builds.iter().any(|state| {
-            state.kind == SstKind::VectorGraph
-                && state.name == index.name
-                && state.catalog_signature == signature
-                && state.max_node_lsn >= max_node_lsn
-        })
-    }) {
-        return true;
     }
     #[cfg(feature = "text-index")]
-    if manifest.text_indexes.iter().any(|index| {
+    for index in &manifest.text_indexes {
         let matching_states = manifest
             .search_lsm
             .iter()
@@ -968,31 +1109,30 @@ fn search_indexes_need_rebuild(manifest: &crate::manifest::Manifest) -> bool {
                     && state.index_name == index.name
             })
             .collect::<Vec<_>>();
-        if !matching_states.is_empty() {
-            return !(valid_lsm
-                && matching_states.len() == 1
-                && matching_states[0].status == crate::search_lsm::SearchLsmStatus::Active);
-        }
-        if legacy_search_base_needs_adoption(
+        let needs = if !matching_states.is_empty() {
+            !(matching_states.len() == 1 && search_state_is_physical(manifest, matching_states[0]))
+        } else if legacy_search_base_needs_adoption(
             manifest,
             crate::search_lsm::SearchLsmKind::Text,
             &index.name,
             max_node_lsn,
         ) {
-            return false;
+            false
+        } else {
+            let signature = text_catalog_signature(index);
+            !manifest.search_index_builds.iter().any(|state| {
+                state.kind == SstKind::TextIndex
+                    && state.name == index.name
+                    && state.catalog_signature == signature
+                    && state.max_node_lsn >= max_node_lsn
+            })
+        };
+        if needs {
+            needing.insert((SstKind::TextIndex, index.name.clone()));
         }
-        let signature = text_catalog_signature(index);
-        !manifest.search_index_builds.iter().any(|state| {
-            state.kind == SstKind::TextIndex
-                && state.name == index.name
-                && state.catalog_signature == signature
-                && state.max_node_lsn >= max_node_lsn
-        })
-    }) {
-        return true;
     }
-    let _ = (max_node_lsn, valid_lsm);
-    false
+    let _ = max_node_lsn;
+    needing
 }
 
 fn legacy_search_base_needs_adoption(
@@ -1558,10 +1698,12 @@ async fn prepare_leveled(
         base_bytes,
         ratio,
         CompactionScope::Full,
+        &HashMap::new(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_leveled_scoped(
     manifest_store: &ManifestStore,
     fence: &WriterFence,
@@ -1570,6 +1712,7 @@ async fn prepare_leveled_scoped(
     base_bytes: u64,
     ratio: u64,
     scope: CompactionScope,
+    protected_search: &HashMap<(crate::search_lsm::SearchLsmKind, String), usize>,
 ) -> Result<PreparedCompaction> {
     fence.assert_alive(base.manifest.epoch)?;
 
@@ -1618,7 +1761,7 @@ async fn prepare_leveled_scoped(
 
     if matches!(
         scope,
-        CompactionScope::SearchOnly | CompactionScope::SearchDeltas
+        CompactionScope::SearchOnly | CompactionScope::SearchDeltas | CompactionScope::SearchBases
     ) {
         // No Nodes/edge merge and therefore no logical search rebuild: only
         // the physical Search-LSM selections below run.
@@ -1636,14 +1779,7 @@ async fn prepare_leveled_scoped(
     let mut node_rewrites = Vec::new();
     let search_policy = search_lsm_compact::SearchCompactionPolicy::from_env()?;
     let mut search_selections =
-        search_lsm_compact::select_search_compactions(&base.manifest, search_policy)?;
-    match scope {
-        CompactionScope::Full | CompactionScope::SearchOnly => {}
-        CompactionScope::SearchDeltas => search_selections.retain(|selection| {
-            selection.mode == search_lsm_compact::SearchCompactionMode::DeltaRun
-        }),
-        CompactionScope::WithoutPhysicalSearch => search_selections.clear(),
-    }
+        scoped_search_selections(&base.manifest, search_policy, scope, protected_search)?;
 
     // Node tombstone GC needs the merge authoritative for every node key it
     // touches. Nodes are id-primary, so a key can live in any node SST
@@ -1663,7 +1799,12 @@ async fn prepare_leveled_scoped(
         .map(|d| d.scope.as_str())
         .collect();
     let node_gc_safe = node_scopes.len() <= 1;
-    let rebuild_search = node_gc_safe && search_indexes_need_rebuild(&base.manifest);
+    let search_rebuild_set = if node_gc_safe {
+        search_indexes_needing_rebuild(&base.manifest)
+    } else {
+        HashSet::new()
+    };
+    let rebuild_search = !search_rebuild_set.is_empty();
 
     // Nodes.
     for (label, sources) in node_buckets {
@@ -1796,16 +1937,33 @@ async fn prepare_leveled_scoped(
         // `gc` is still required: a stale search generation may only rebuild
         // from an authoritative, full-corpus merge.
         let rebuild_search_for_bucket = gc && rebuild_search;
+        // Rebuild only the indexes that need it: replacing a healthy
+        // generation too would retire it, and any flush appending to it while
+        // this merge runs would abandon the whole compaction.
         let index_specs = NodeMergeIndexSpecs {
             #[cfg(feature = "vector-index")]
             vector: if rebuild_search_for_bucket {
-                base.manifest.vector_indexes.clone()
+                base.manifest
+                    .vector_indexes
+                    .iter()
+                    .filter(|index| {
+                        search_rebuild_set.contains(&(SstKind::VectorGraph, index.name.clone()))
+                    })
+                    .cloned()
+                    .collect()
             } else {
                 Vec::new()
             },
             #[cfg(feature = "text-index")]
             text: if rebuild_search_for_bucket {
-                base.manifest.text_indexes.clone()
+                base.manifest
+                    .text_indexes
+                    .iter()
+                    .filter(|index| {
+                        search_rebuild_set.contains(&(SstKind::TextIndex, index.name.clone()))
+                    })
+                    .cloned()
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -2239,7 +2397,32 @@ fn verify_node_rewrite_inputs(
     Ok(())
 }
 
-fn verify_search_state_append_only(
+/// Same generation, same status, events only advanced.
+fn verify_search_generation_unchanged(
+    captured: &SearchLsmState,
+    current: &SearchLsmState,
+) -> Result<()> {
+    if current.kind != captured.kind
+        || current.index_name != captured.index_name
+        || current.catalog_signature != captured.catalog_signature
+        || current.generation_id != captured.generation_id
+        || current.status != captured.status
+        || current.next_event_seq < captured.next_event_seq
+    {
+        return Err(Error::precondition(format!(
+            "abandoning prepared compaction: Search-LSM generation '{}' was replaced or \
+             changed status after prepare",
+            captured.index_name
+        )));
+    }
+    Ok(())
+}
+
+/// Append-only check for a physical search compaction, which replaces segments and proven-empty
+/// ranges but never reads coverage beyond the dispositions it rewrites on the
+/// working state. Nodes merges rewrite coverage while preserving event
+/// identity, so they need not abandon an in-flight search compaction.
+pub(super) fn verify_search_segments_append_only(
     captured: &SearchLsmState,
     current: &SearchLsmState,
 ) -> Result<()> {
@@ -2254,8 +2437,7 @@ fn verify_search_state_append_only(
         && current.segments.starts_with(&captured.segments)
         && current
             .proven_empty_event_ranges
-            .starts_with(&captured.proven_empty_event_ranges)
-        && current.coverage.starts_with(&captured.coverage);
+            .starts_with(&captured.proven_empty_event_ranges);
     if !identity_matches || !prefix_matches {
         return Err(Error::precondition(format!(
             "abandoning prepared compaction: Search-LSM generation '{}' did not advance \
@@ -2386,11 +2568,31 @@ fn rewrite_one_state_coverage(
         if captured_inputs.is_empty() {
             return Ok(false);
         }
-        return Err(Error::precondition(format!(
-            "abandoning prepared compaction: Building Search-LSM '{}' has partial coverage for \
-             the selected Nodes inputs",
-            captured.index_name
-        )));
+        // A Building generation mixes Nodes SSTs that predate it (uncovered)
+        // with ones flushed since (covered). Their merge is left uncovered,
+        // like the older inputs: the activation base covers every uncovered
+        // Nodes SST over the events it owns, and the newer inputs' events
+        // stay owned by their segments. Coverage is metadata here — reads of
+        // a Building generation do not consult it — so refusing the merge
+        // (3.4.1) only wedged the Nodes tables until the index activated.
+        for coverage in &captured_inputs {
+            let matches = current
+                .coverage
+                .iter()
+                .filter(|candidate| candidate.node_sst_id == coverage.node_sst_id)
+                .collect::<Vec<_>>();
+            if matches.as_slice() != [coverage] {
+                return Err(Error::precondition(format!(
+                    "abandoning prepared compaction: Nodes input coverage {} changed after \
+                     prepare",
+                    coverage.node_sst_id
+                )));
+            }
+        }
+        current
+            .coverage
+            .retain(|coverage| !input_ids.contains(&coverage.node_sst_id));
+        return Ok(true);
     }
     for coverage in &captured_inputs {
         let matches = current
@@ -2473,9 +2675,28 @@ fn rebase_search_lsm_for_node_rewrites(
         .iter()
         .map(|state| (state.kind, state.index_name.as_str()))
         .collect::<HashSet<_>>();
+    let input_ids = rewrites
+        .iter()
+        .flat_map(|rewrite| rewrite.inputs.iter().map(|input| input.id))
+        .collect::<HashSet<_>>();
+    // A generation a flush started after prepare (an index first flushed
+    // meanwhile) covers only Nodes SSTs written after the captured manifest,
+    // never this merge's inputs: it needs no rebase. Any other change to the
+    // set of generations still abandons the merge.
+    let appeared_untouched = current_states
+        .iter()
+        .filter(|state| !captured_keys.contains(&(state.kind, state.index_name.as_str())))
+        .all(|state| {
+            state.status == crate::search_lsm::SearchLsmStatus::Building
+                && state
+                    .coverage
+                    .iter()
+                    .all(|coverage| !input_ids.contains(&coverage.node_sst_id))
+        });
     if captured_keys.len() != captured_states.len()
         || current_keys.len() != current_states.len()
-        || captured_keys != current_keys
+        || !captured_keys.is_subset(&current_keys)
+        || !appeared_untouched
     {
         return Err(Error::precondition(
             "abandoning prepared compaction: Search-LSM generation set changed after prepare",
@@ -2488,7 +2709,11 @@ fn rebase_search_lsm_for_node_rewrites(
             .iter()
             .find(|state| state.kind == captured.kind && state.index_name == captured.index_name)
             .expect("state key sets checked above");
-        verify_search_state_append_only(captured, current)?;
+        // Only the coverage entries of the rewritten inputs must be unchanged
+        // (checked per input below); a search compaction that replaced
+        // segments meanwhile keeps every event, so the inherited event ranges
+        // stay owned and the merge need not be abandoned.
+        verify_search_generation_unchanged(captured, current)?;
         let mut state = current.clone();
         let mut changed = false;
         for rewrite in rewrites {
@@ -2499,6 +2724,169 @@ fn rebase_search_lsm_for_node_rewrites(
         }
     }
     Ok(rebased)
+}
+
+/// Per-index precondition for logical search rebuilds: an index whose
+/// generation changed after prepare (a flush appended to it) keeps its
+/// current state, and only its rebuilt body is discarded (left for the orphan
+/// sweep). The Nodes merge and every other index still install. 3.4.1
+/// abandoned the whole compaction instead, so under sustained writes the
+/// Nodes tables and the rebuild were redone, and abandoned, on every pass.
+/// The catalog changes since `prepared`'s basis that invalidate its outputs.
+///
+/// A search-only compaction depends on no catalog beyond its own index's,
+/// whose generation identity (catalog signature, generation id) the
+/// per-index checks verify: an index whose catalog changed restarts its
+/// generation, and one that was dropped loses it. Every other plan depends
+/// on the schema only through what its Nodes and edge outputs carry (the
+/// rewritten labels' and edge types' definitions, the indexed-property
+/// sidecars, composite indexes), and on the search catalogs only through the
+/// indexes it was planned with. A new label or property elsewhere, or a newly
+/// created index, does not invalidate it; in 3.4.1 any schema or catalog
+/// change abandoned it.
+fn catalog_drift(
+    prepared: &PreparedCompaction,
+    current: &crate::manifest::Manifest,
+) -> Vec<&'static str> {
+    let search_kind = |kind: SstKind| matches!(kind, SstKind::VectorGraph | SstKind::TextIndex);
+    let removed_kinds = prepared.removed_ids.iter().map(|id| {
+        current
+            .ssts
+            .iter()
+            .find(|descriptor| descriptor.id == *id)
+            .map(|descriptor| descriptor.kind)
+    });
+    let search_only = prepared.node_rewrites.is_empty()
+        && prepared
+            .new_descs
+            .iter()
+            .all(|descriptor| search_kind(descriptor.kind))
+        && removed_kinds
+            .clone()
+            .all(|kind| kind.is_none_or(search_kind));
+    if search_only {
+        return Vec::new();
+    }
+    let mut drift = Vec::new();
+    let base = &prepared.base_schema;
+    let now = &current.schema;
+    if base != now {
+        let mut labels = HashSet::new();
+        let mut edges = false;
+        for kind_scope in prepared
+            .new_descs
+            .iter()
+            .map(|descriptor| (Some(descriptor.kind), descriptor.scope.as_str()))
+            .chain(
+                prepared
+                    .node_rewrites
+                    .iter()
+                    .flat_map(|rewrite| rewrite.inputs.iter())
+                    .map(|descriptor| (Some(descriptor.kind), descriptor.scope.as_str())),
+            )
+            .chain(removed_kinds.map(|kind| (kind, "")))
+        {
+            match kind_scope {
+                (Some(SstKind::Nodes), scope) => {
+                    labels.insert(scope);
+                }
+                (Some(SstKind::EdgesFwd | SstKind::EdgesInv), _) => edges = true,
+                _ => {}
+            }
+        }
+        let carried_changed = crate::flush::union_indexed_props(base)
+            != crate::flush::union_indexed_props(now)
+            || base.indexes != now.indexes
+            || base.constraints != now.constraints
+            || labels
+                .iter()
+                .any(|label| base.label(label) != now.label(label))
+            || (edges && base.edge_types != now.edge_types);
+        if carried_changed {
+            drift.push("schema");
+        }
+    }
+    // Indexes created meanwhile start their own generations, which the
+    // install rebases over; a changed or dropped one invalidates its rebuild.
+    if !prepared
+        .base_vector_indexes
+        .iter()
+        .all(|index| current.vector_indexes.contains(index))
+    {
+        drift.push("vector indexes");
+    }
+    if !prepared
+        .base_text_indexes
+        .iter()
+        .all(|index| current.text_indexes.contains(index))
+    {
+        drift.push("text indexes");
+    }
+    drift
+}
+
+fn drop_conflicting_search_replacements(
+    prepared: &mut PreparedCompaction,
+    current: &crate::manifest::Manifest,
+) {
+    let conflicting = prepared
+        .replaced_search_lsm
+        .iter()
+        .filter(|(kind, name)| {
+            let captured = prepared
+                .base_search_lsm
+                .iter()
+                .filter(|state| state.kind == *kind && state.index_name == *name)
+                .collect::<Vec<_>>();
+            let now = current
+                .search_lsm
+                .iter()
+                .filter(|state| state.kind == *kind && state.index_name == *name)
+                .collect::<Vec<_>>();
+            captured != now
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for (kind, name) in conflicting {
+        let sst_kind = kind.sst_kind();
+        let current_ids = current
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.kind == sst_kind && descriptor.scope == name)
+            .map(|descriptor| descriptor.id)
+            .collect::<HashSet<_>>();
+        let rebuilt = prepared
+            .new_descs
+            .iter()
+            .filter(|descriptor| {
+                descriptor.kind == sst_kind
+                    && descriptor.scope == name
+                    && !current_ids.contains(&descriptor.id)
+            })
+            .count();
+        prepared.new_descs.retain(|descriptor| {
+            !(descriptor.kind == sst_kind
+                && descriptor.scope == name
+                && !current_ids.contains(&descriptor.id))
+        });
+        prepared.removed_ids.retain(|id| !current_ids.contains(id));
+        prepared
+            .search_build_states
+            .retain(|state| !(state.kind == sst_kind && state.name == name));
+        prepared.search_lsm_activations.retain(|activation| {
+            !(activation.state.kind == kind && activation.state.index_name == name)
+        });
+        prepared
+            .replaced_search_lsm
+            .retain(|(other_kind, other)| !(*other_kind == kind && *other == name));
+        tracing::info!(
+            index = %name,
+            ?kind,
+            discarded_bodies = rebuilt,
+            "search index changed while its rebuild was prepared; keeping its current \
+             generation and installing the rest of the compaction"
+        );
+    }
 }
 
 fn verify_search_replacement_inputs(
@@ -2612,10 +3000,7 @@ pub async fn install_prepared(
     current: &LoadedManifest,
     prepared: PreparedCompaction,
 ) -> Result<CompactionOutcome> {
-    if prepared.removed_ids.is_empty()
-        && prepared.search_lsm_activations.is_empty()
-        && prepared.unadoptable_search_markers.is_empty()
-    {
+    if prepared.is_noop() {
         debug!("compactor found no bucket worth merging; nothing to install");
         return Ok(CompactionOutcome {
             committed: current.clone(),
@@ -2626,16 +3011,7 @@ pub async fn install_prepared(
     }
     fence.assert_alive(current.manifest.epoch)?;
 
-    let mut catalog_drift = Vec::new();
-    if current.manifest.schema != prepared.base_schema {
-        catalog_drift.push("schema");
-    }
-    if current.manifest.vector_indexes != prepared.base_vector_indexes {
-        catalog_drift.push("vector indexes");
-    }
-    if current.manifest.text_indexes != prepared.base_text_indexes {
-        catalog_drift.push("text indexes");
-    }
+    let catalog_drift = catalog_drift(&prepared, &current.manifest);
     if !catalog_drift.is_empty() {
         return Err(Error::precondition(format!(
             "abandoning prepared compaction (basis v{}): {} changed in manifest v{}; \
@@ -2646,6 +3022,8 @@ pub async fn install_prepared(
         )));
     }
 
+    let mut prepared = prepared;
+    drop_conflicting_search_replacements(&mut prepared, &current.manifest);
     verify_search_replacement_inputs(
         &prepared.base_search_lsm,
         &current.manifest.search_lsm,
@@ -2865,8 +3243,47 @@ pub async fn install_prepared(
         installed_activation_count += 1;
     }
 
+    let activations_in_prepare = prepared
+        .search_compactions
+        .iter()
+        .filter(|search| {
+            search.selection.captured_state.status == SearchLsmStatus::Building
+                && search.selection.mode == search_lsm_compact::SearchCompactionMode::BasePrefix
+        })
+        .map(|search| {
+            (
+                search.selection.captured_state.kind,
+                search.selection.captured_state.index_name.clone(),
+                search.selection.captured_state.next_event_seq,
+                search.empty_proof_digest,
+            )
+        })
+        .collect::<Vec<_>>();
     let mut rebased_barriers = Vec::new();
-    for state in rebased_search_states {
+    for mut state in rebased_search_states {
+        if let Some((_, _, frontier, empty_proof)) = activations_in_prepare
+            .iter()
+            .find(|(kind, name, _, _)| *kind == state.kind && *name == state.index_name)
+        {
+            let retired = search_lsm_compact::complete_building_activation(
+                &mut state,
+                *frontier,
+                *empty_proof,
+                &next.ssts,
+            )?;
+            if !retired.is_empty() {
+                next.ssts
+                    .retain(|descriptor| !retired.contains(&descriptor.id));
+                source_count = source_count.saturating_add(retired.len());
+            }
+            tracing::info!(
+                index = %state.index_name,
+                kind = ?state.kind,
+                segments = state.segments.len(),
+                retired_legacy_bodies = retired.len(),
+                "activated Building Search-LSM generation from a physical base"
+            );
+        }
         let final_state = match prepare_rebased_barrier(manifest_store.paths(), &state)? {
             Some(rotation) => {
                 next.ssts
@@ -4402,18 +4819,10 @@ impl VectorMemberCollector {
             return Ok(());
         };
 
-        let decoded;
-        let vector: &[f32] = match val {
-            Value::Vec(vector) => vector,
-            Value::VecI8 { codes, scale } => {
-                decoded = codes
-                    .iter()
-                    .map(|&code| code as f32 * *scale)
-                    .collect::<Vec<_>>();
-                &decoded
-            }
-            _ => return Ok(()),
+        let Some(vector) = val.embedding_f32(self.desc.dim as usize) else {
+            return Ok(());
         };
+        let vector: &[f32] = &vector;
 
         // Including every configured property with Null for absence is what
         // lets V5 distinguish "supported but no row matches" from an
@@ -5777,7 +6186,11 @@ mod tests {
             .get_mut("Doc")
             .unwrap()
             .properties
-            .push(PropertyDef::new("title", DataType::Utf8, false).unwrap());
+            .push(
+                PropertyDef::new("title", DataType::Utf8, false)
+                    .unwrap()
+                    .with_indexed(true),
+            );
         let ddl = ms.commit(&fence, &basis, ddl_manifest).await.unwrap();
         let error = install_prepared(&ms, &fence, &ddl, prepared)
             .await
@@ -5785,6 +6198,75 @@ mod tests {
         assert!(error.to_string().contains("schema"));
         let still_current = ms.load_current().await.unwrap();
         assert_eq!(still_current.manifest.version, ddl.manifest.version);
+    }
+
+    #[tokio::test]
+    async fn install_node_rewrite_survives_schema_changes_it_does_not_carry() {
+        let s = store();
+        let p = paths("compact-search-rebase-ddl-unrelated");
+        let ms = ManifestStore::new(s, p);
+        let boot = ms.bootstrap(Uuid::now_v7()).await.unwrap();
+        let fence = WriterFence::new(boot.manifest.epoch);
+        let fixture = active_rewrite_manifest();
+        let mut seeded = boot.manifest.next_version(fence.writer_id);
+        seeded.schema = fixture.schema;
+        seeded.ssts = fixture.ssts;
+        seeded.vector_indexes = fixture.vector_indexes;
+        seeded.search_lsm = fixture.search_lsm;
+        let basis = ms.commit(&fence, &boot, seeded).await.unwrap();
+
+        let output = rewrite_test_descriptor(Uuid::from_u128(0x105), SstKind::Nodes, "", 1, 20);
+        let rewrite = rewrite_plan(&basis.manifest, Some(output.clone()));
+        let prepared = PreparedCompaction {
+            new_descs: vec![output],
+            removed_ids: rewrite
+                .inputs
+                .iter()
+                .map(|descriptor| descriptor.id)
+                .collect(),
+            bloom_count: 0,
+            base_version: basis.manifest.version,
+            base_schema: basis.manifest.schema.clone(),
+            base_vector_indexes: basis.manifest.vector_indexes.clone(),
+            base_text_indexes: basis.manifest.text_indexes.clone(),
+            base_search_lsm: basis.manifest.search_lsm.clone(),
+            node_rewrites: vec![rewrite],
+            search_compactions: Vec::new(),
+            search_build_states: Vec::new(),
+            consolidated_base_markers: Vec::new(),
+            unadoptable_search_markers: Vec::new(),
+            search_lsm_activations: Vec::new(),
+            replaced_search_lsm: Vec::new(),
+        };
+
+        let mut ddl_manifest = basis.manifest.next_version(fence.writer_id);
+        ddl_manifest
+            .schema
+            .labels
+            .get_mut("Doc")
+            .unwrap()
+            .properties
+            .push(PropertyDef::new("title", DataType::Utf8, false).unwrap());
+        // A new label written meanwhile changes the schema too.
+        ddl_manifest.schema.labels.insert(
+            "Note".into(),
+            namidb_core::schema::LabelDef {
+                name: "Note".into(),
+                properties: vec![PropertyDef::new("text", DataType::Utf8, true).unwrap()],
+            },
+        );
+        let ddl = ms.commit(&fence, &basis, ddl_manifest).await.unwrap();
+        // Neither changes what the rewritten Nodes SST carries (its columns,
+        // indexed-property sidecars, composite indexes): it installs.
+        let installed = install_prepared(&ms, &fence, &ddl, prepared).await.unwrap();
+        assert!(installed.source_ssts_removed > 0);
+        assert!(installed.committed.manifest.version > ddl.manifest.version);
+        assert!(installed
+            .committed
+            .manifest
+            .schema
+            .labels
+            .contains_key("Note"));
     }
 
     /// Exercises the production prepare/install seam, including immutable PUT

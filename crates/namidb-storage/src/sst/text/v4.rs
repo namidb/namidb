@@ -41,11 +41,14 @@ use crate::text::{
 
 #[path = "v4_external.rs"]
 mod external;
+#[path = "v4_merge.rs"]
+mod merge;
 
 pub use external::{
     ReconciledTextDeltaStats, TextV4ExternalArtifact, TextV4ExternalBuildConfig,
     TextV4ExternalBuildMetrics, TextV4ExternalBuilder,
 };
+pub use merge::{merge_text_v4_segments, TextV4MergeOutput};
 
 pub const MAGIC_V4: &[u8; 8] = b"NAMIFT04";
 const TRAILER_MAGIC: &[u8; 8] = b"NFT4END!";
