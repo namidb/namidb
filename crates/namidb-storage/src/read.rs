@@ -9770,6 +9770,15 @@ impl<'mt> Snapshot<'mt> {
         property: &str,
     ) -> Result<Vec<(NodeId, Option<Vec<f32>>)>> {
         let dict = &self.manifest.manifest.label_dict;
+        // A bare numeric list of the index's dimension is an embedding too
+        // (written before the index existed); without an index no list is.
+        let dim = self
+            .manifest
+            .manifest
+            .vector_indexes
+            .iter()
+            .find(|descriptor| descriptor.label == label && descriptor.property == property)
+            .map_or(0, |descriptor| descriptor.dim as usize);
         // (node_id) → (winning lsn, Some(embedding) | None=suppress).
         let mut latest: BTreeMap<NodeId, (u64, Option<Vec<f32>>)> = BTreeMap::new();
         for (mk, entry) in self.node_entries() {
@@ -9781,7 +9790,10 @@ impl<'mt> Snapshot<'mt> {
                 MemOp::Upsert(payload) => {
                     let rec = NodeWriteRecord::decode(payload)?;
                     if record_carries_label(&rec, label, dict) {
-                        embedding_as_f32(rec.properties.get(property))
+                        rec.properties
+                            .get(property)
+                            .and_then(|value| value.embedding_f32(dim))
+                            .map(std::borrow::Cow::into_owned)
                     } else {
                         // A memtable version that no longer carries `label`
                         // supersedes any indexed row for this id → suppress.
@@ -11815,21 +11827,6 @@ fn node_sst_can_contain_label(manifest: &Manifest, idx: usize, label: &str) -> b
     true
 }
 
-/// Decode an embedding property value to `Vec<f32>` for a vector delta scan:
-/// a stored `Vec` directly, an int8-quantized `VecI8` dequantized via
-/// `code * scale` (matching the build hook and `coerce_vector`). Any other
-/// value (or absence) yields `None` — the node has no usable embedding.
-#[cfg(feature = "vector-index")]
-fn embedding_as_f32(v: Option<&Value>) -> Option<Vec<f32>> {
-    match v {
-        Some(Value::Vec(v)) => Some(v.clone()),
-        Some(Value::VecI8 { codes, scale }) => {
-            Some(codes.iter().map(|&c| c as f32 * *scale).collect())
-        }
-        _ => None,
-    }
-}
-
 /// Resolve interned `LabelId`s to label names via `dict`. Falls back to a
 /// singleton `{scope_fallback}` when there are no ids (a legacy single-label
 /// record/SST), or to an empty set when the fallback is empty.
@@ -12452,13 +12449,25 @@ impl std::fmt::Debug for PinnedSnapshot {
 pub struct SnapshotCell {
     inner: std::sync::Mutex<Arc<OwnedSnapshot>>,
     registry: Arc<SnapshotRegistry>,
+    /// Key of this cell's search index state counts in
+    /// [`crate::search_progress`].
+    progress_id: u64,
+}
+
+impl Drop for SnapshotCell {
+    fn drop(&mut self) {
+        crate::search_progress::forget_cell(self.progress_id);
+    }
 }
 
 impl SnapshotCell {
     pub fn new(snap: Arc<OwnedSnapshot>) -> Self {
+        let progress_id = crate::search_progress::next_cell_id();
+        crate::search_progress::record_cell(progress_id, &snap.manifest().manifest);
         Self {
             inner: std::sync::Mutex::new(snap),
             registry: Arc::new(SnapshotRegistry::default()),
+            progress_id,
         }
     }
 
@@ -12484,6 +12493,7 @@ impl SnapshotCell {
     /// Publish a new snapshot. The previous Arc is dropped once
     /// every reader holding it lets go.
     pub fn store(&self, snap: Arc<OwnedSnapshot>) {
+        crate::search_progress::record_cell(self.progress_id, &snap.manifest().manifest);
         *self.inner.lock().expect("snapshot cell poisoned") = snap;
     }
 

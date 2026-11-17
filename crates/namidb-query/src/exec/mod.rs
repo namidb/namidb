@@ -30,7 +30,9 @@ pub use memory::{
     QueryMemoryExceeded, QueryMemoryPool, QueryMemoryScope,
 };
 pub use row::Row;
-pub use show::{show_constraints_rows, show_indexes_rows, show_schema_columns};
+pub use show::{
+    show_constraints_rows, show_indexes_columns, show_indexes_rows, show_schema_columns,
+};
 pub use value::{NodeValue, RelValue, RuntimeValue};
 pub use walker::{execute, execute_factor_path, execute_flat_path, execute_with_limits, ExecError};
 pub use writer::{

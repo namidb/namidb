@@ -531,6 +531,14 @@ fn with_budget<R>(f: impl FnOnce(&QueryMemoryBudget) -> R) -> Option<R> {
     BUDGET.try_with(|budget| f(budget)).ok()
 }
 
+/// The storage rows reported so far were consumed and dropped by the running
+/// operator (a streaming scan that keeps only a bounded summary of them), so
+/// they stop counting against the query. Without this a long streaming scan
+/// is charged for every row it ever read, as if it had kept them all.
+pub(crate) fn release_storage_rows() {
+    let _ = with_budget(|budget| budget.storage_bytes.store(0, Ordering::Release));
+}
+
 /// Whether a budget is scoped on this task.
 #[inline]
 pub(crate) fn memory_scoped() -> bool {

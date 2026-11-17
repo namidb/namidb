@@ -443,3 +443,112 @@ async fn factorised_path_is_bounded_like_the_flat_path() {
     assert!(charged >= namidb_query::exec::memory::estimate_row_vec_bytes(&factor) / 2);
     assert!(charged < 32 * MIB, "charged {charged}");
 }
+
+/// A k=1 vector search with no index scans the label exactly, and must stay
+/// bounded by k, not by the label: here the label's rows (text plus a
+/// 64-dimension embedding stored as a bare numeric list, rewritten after a
+/// flush so two versions of every node overlap) are several times the
+/// budget. Up to 3.4.1 the scan kept every candidate, and the streaming scan
+/// that replaced it was still charged for every row it had read, so a
+/// large label failed with a 413 although the search keeps one row.
+#[tokio::test]
+async fn flat_k1_vector_search_is_bounded_by_k_not_by_the_label() {
+    const DIM: usize = 64;
+    const DOCS: usize = 3_000;
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("mem-flat-knn").unwrap());
+    let mut writer = WriterSession::open(Arc::new(InMemory::new()), paths)
+        .await
+        .unwrap();
+    let embedding = |i: usize| {
+        CoreValue::List(
+            (0..DIM)
+                .map(|axis| {
+                    let value = if axis == 0 {
+                        i as f64 / DOCS as f64
+                    } else {
+                        ((i * 31 + axis * 7) % 101) as f64 / 101.0
+                    };
+                    CoreValue::F64(value + 0.01)
+                })
+                .collect(),
+        )
+    };
+    let body = "lorem ipsum dolor sit amet ".repeat(80);
+    let ids: Vec<NodeId> = (0..DOCS).map(|_| NodeId::new()).collect();
+    for (i, id) in ids.iter().enumerate() {
+        let mut p = BTreeMap::new();
+        p.insert("title".into(), CoreValue::Str(format!("doc-{i}")));
+        p.insert("body".into(), CoreValue::Str(body.clone()));
+        writer
+            .upsert_node(
+                "Doc",
+                *id,
+                &NodeWriteRecord {
+                    properties: p,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Default::default()).await.unwrap();
+    // The backfill: every node rewritten with its embedding.
+    for (i, id) in ids.iter().enumerate() {
+        let mut p = BTreeMap::new();
+        p.insert("title".into(), CoreValue::Str(format!("doc-{i}")));
+        p.insert("body".into(), CoreValue::Str(body.clone()));
+        p.insert("embedding".into(), embedding(i));
+        writer
+            .upsert_node(
+                "Doc",
+                *id,
+                &NodeWriteRecord {
+                    properties: p,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(Default::default()).await.unwrap();
+
+    let target = 1_234;
+    let CoreValue::List(items) = embedding(target) else {
+        unreachable!()
+    };
+    let query = items
+        .iter()
+        .map(|item| match item {
+            CoreValue::F64(value) => *value as f32,
+            _ => unreachable!(),
+        })
+        .collect::<Vec<f32>>();
+    let mut params = Params::new();
+    params.insert("q".into(), namidb_query::RuntimeValue::Vector(query));
+    // The label is ~3000 x (2 KB of text + 64 numbers), twice over.
+    let limit = 2 * MIB;
+    let budget = Arc::new(QueryMemoryBudget::new(limit));
+    let snap = writer.snapshot();
+    let plan = lower(
+        &parse(
+            "CALL search.vector({label:'Doc', property:'embedding', query:$q, k:1}) \
+             YIELD node, score RETURN node.title AS title, score",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let rows = with_query_memory(
+        Some(Arc::clone(&budget)),
+        execute_with_limits(&plan, &snap, &params, None, None),
+    )
+    .await
+    .expect("a k=1 search fits a budget far below the label's size");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("title"),
+        Some(&namidb_query::RuntimeValue::String(format!("doc-{target}")))
+    );
+    assert!(budget.peak_bytes() <= limit, "peak {}", budget.peak_bytes());
+}

@@ -2276,6 +2276,8 @@ fn exec_error_classification(
     use namidb_query::exec::ExecError;
     match e {
         ExecError::Timeout => (StatusCode::GATEWAY_TIMEOUT, Some("timeout")),
+        // Retry once the index is online (SHOW INDEXES reports its progress).
+        ExecError::IndexBuilding(_) => (StatusCode::SERVICE_UNAVAILABLE, Some("index_building")),
         ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
             (StatusCode::CONFLICT, Some("cancelled"))
         }
@@ -2332,6 +2334,7 @@ fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'st
     use namidb_query::exec::ExecError;
     match e {
         ExecError::Timeout => ("Neo.ClientError.Transaction.TransactionTimedOut", "57014"),
+        ExecError::IndexBuilding(_) => ("Neo.TransientError.General.DatabaseUnavailable", "53000"),
         ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
             ("Neo.TransientError.Transaction.Terminated", "57014")
         }
@@ -4399,7 +4402,10 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             }
         };
         let json_rows = row_values(&rows);
-        let columns = namidb_query::show_schema_columns();
+        let columns = match c.kind {
+            namidb_query::parser::ast::ShowKind::Constraints => namidb_query::show_schema_columns(),
+            namidb_query::parser::ast::ShowKind::Indexes => namidb_query::show_indexes_columns(),
+        };
         return ObservedQuery {
             kind: Some(QueryKind::Read),
             ok: true,
@@ -6263,7 +6269,14 @@ async fn run_cypher_multi(
             ok: true,
             elapsed: started.elapsed(),
             response: Json(CypherResponse {
-                columns: namidb_query::show_schema_columns(),
+                columns: match c.kind {
+                    namidb_query::parser::ast::ShowKind::Constraints => {
+                        namidb_query::show_schema_columns()
+                    }
+                    namidb_query::parser::ast::ShowKind::Indexes => {
+                        namidb_query::show_indexes_columns()
+                    }
+                },
                 rows: json_rows,
                 write_outcome: None,
             })
@@ -7967,6 +7980,11 @@ mod tests {
             "namidb_search_route_total{kind=\"text\",route=\"fallback\"}",
             "namidb_search_route_total{kind=\"vector\",route=\"native\"}",
             "namidb_search_route_total{kind=\"vector\",route=\"fallback\"}",
+            "namidb_search_indexes{kind=\"vector\",state=\"online\"}",
+            "namidb_search_indexes{kind=\"vector\",state=\"building\"}",
+            "namidb_search_indexes{kind=\"text\",state=\"online\"}",
+            "namidb_search_indexes{kind=\"text\",state=\"building\"}",
+            "namidb_search_index_builds_in_flight ",
         ] {
             assert!(
                 text.contains(series),
@@ -9045,6 +9063,15 @@ mod tests {
             .map(|p| p.as_str().unwrap())
             .collect();
         assert_eq!(props, ["slug"]);
+        let cols: Vec<&str> = body["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert!(cols.ends_with(&["state", "populationPercent"]), "{cols:?}");
+        assert_eq!(doc["state"], "ONLINE");
+        assert_eq!(doc["populationPercent"], 100.0);
     }
 
     #[cfg(feature = "text-index")]

@@ -234,6 +234,9 @@ impl PreparedCompaction {
         self.removed_ids.is_empty()
             && self.search_lsm_activations.is_empty()
             && self.unadoptable_search_markers.is_empty()
+            // An activation of a generation that has no segment yet replaces
+            // nothing, but it still installs.
+            && self.search_compactions.is_empty()
     }
 
     /// Manifest version the prepare ran against.
@@ -2997,10 +3000,7 @@ pub async fn install_prepared(
     current: &LoadedManifest,
     prepared: PreparedCompaction,
 ) -> Result<CompactionOutcome> {
-    if prepared.removed_ids.is_empty()
-        && prepared.search_lsm_activations.is_empty()
-        && prepared.unadoptable_search_markers.is_empty()
-    {
+    if prepared.is_noop() {
         debug!("compactor found no bucket worth merging; nothing to install");
         return Ok(CompactionOutcome {
             committed: current.clone(),
@@ -4819,18 +4819,10 @@ impl VectorMemberCollector {
             return Ok(());
         };
 
-        let decoded;
-        let vector: &[f32] = match val {
-            Value::Vec(vector) => vector,
-            Value::VecI8 { codes, scale } => {
-                decoded = codes
-                    .iter()
-                    .map(|&code| code as f32 * *scale)
-                    .collect::<Vec<_>>();
-                &decoded
-            }
-            _ => return Ok(()),
+        let Some(vector) = val.embedding_f32(self.desc.dim as usize) else {
+            return Ok(());
         };
+        let vector: &[f32] = &vector;
 
         // Including every configured property with Null for absence is what
         // lets V5 distinguish "supported but no row matches" from an

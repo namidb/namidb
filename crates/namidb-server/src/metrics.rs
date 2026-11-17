@@ -990,6 +990,34 @@ impl Metrics {
                 )
             })
             .unwrap_or_default();
+        let indexes = namidb_storage::search_progress::index_state_counts();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_search_indexes Vector and full-text indexes of the open namespaces by \
+             state. A building index answers searches with a scan until its generation activates."
+        );
+        let _ = writeln!(out, "# TYPE namidb_search_indexes gauge");
+        for (kind, state, value) in [
+            ("vector", "online", indexes.vector_online),
+            ("vector", "building", indexes.vector_building),
+            ("text", "online", indexes.text_online),
+            ("text", "building", indexes.text_building),
+        ] {
+            let _ = writeln!(
+                out,
+                "namidb_search_indexes{{kind=\"{kind}\",state=\"{state}\"}} {value}"
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP namidb_search_index_builds_in_flight Search index base builds running now."
+        );
+        let _ = writeln!(out, "# TYPE namidb_search_index_builds_in_flight gauge");
+        let _ = writeln!(
+            out,
+            "namidb_search_index_builds_in_flight {}",
+            namidb_storage::search_progress::builds_in_flight()
+        );
         let routes = namidb_storage::route_telemetry::snapshot();
         let _ = writeln!(
             out,

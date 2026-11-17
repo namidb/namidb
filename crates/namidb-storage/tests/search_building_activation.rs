@@ -519,3 +519,195 @@ async fn a_delta_run_installs_across_an_unrelated_schema_change() {
     assert!(generation_segments(&writer, "body_ft") < before);
     assert_eq!(native_hits(&writer, "body_ft", "common").await, Some(36));
 }
+
+fn vector_status(writer: &WriterSession, name: &str) -> Option<SearchLsmStatus> {
+    writer
+        .snapshot()
+        .manifest()
+        .manifest
+        .search_lsm
+        .iter()
+        .find(|state| state.kind == SearchLsmKind::Vector && state.index_name == name)
+        .map(|state| state.status)
+}
+
+fn bare_list(ordinal: u64, dim: usize) -> CoreValue {
+    // A JSON array parameter is stored as a list of floats when no vector
+    // index covers the property at write time. Integers can appear in it too.
+    CoreValue::List(
+        (0..dim)
+            .map(|axis| {
+                if axis == 0 {
+                    CoreValue::I64(1)
+                } else {
+                    CoreValue::F64(((ordinal * 31 + axis as u64 * 7) % 97) as f64 / 97.0)
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The embeddings were written as bare lists BEFORE the vector index existed,
+/// then the index was created and nothing was written afterwards. Up to 3.4.1
+/// no flush ever started its generation (nothing to flush), and the build
+/// skipped bare lists anyway: the index never served and every search
+/// scanned the label. The idle generation now starts at the next flush tick,
+/// its activation base coerces lists of the declared dimension, and both
+/// search indexes created after the data activate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vector_index_created_after_bare_list_embeddings_activates_while_idle() {
+    const DIM: usize = 8;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("late-vector").unwrap());
+    let mut writer = WriterSession::open(store.clone(), paths.clone())
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for ordinal in 0..40u64 {
+        let mut record = doc(ordinal);
+        match ordinal {
+            // A wrong-dimension list is not an embedding of this index.
+            36 | 37 => {
+                record
+                    .properties
+                    .insert("embedding".into(), bare_list(ordinal, DIM - 1));
+            }
+            // No embedding at all.
+            38 | 39 => {}
+            _ => {
+                record
+                    .properties
+                    .insert("embedding".into(), bare_list(ordinal, DIM));
+            }
+        }
+        let id = NodeId::new();
+        writer.upsert_node("Doc", id, &record).unwrap();
+        ids.push(id);
+        if ordinal % 10 == 9 {
+            writer.flush(schema(false)).await.unwrap();
+        }
+    }
+    writer.flush(schema(false)).await.unwrap();
+    writer.compact_l0(&schema(false)).await.unwrap();
+
+    writer
+        .register_vector_index(
+            namidb_storage::manifest::VectorIndexDescriptor {
+                name: "doc_emb".into(),
+                label: "Doc".into(),
+                property: "embedding".into(),
+                dim: DIM as u32,
+                metric: namidb_storage::manifest::VectorMetric::Cosine,
+                r: 16,
+                l_build: 32,
+                alpha: 1.2,
+                quantization: namidb_storage::manifest::VectorQuantization::None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    writer
+        .register_text_index(
+            TextIndexDescriptor::new("title_ft".into(), "Doc".into(), vec!["title".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    // Idle: the periodic flush finds nothing to flush, but starts both
+    // generations.
+    writer.flush(schema(false)).await.unwrap();
+    assert_eq!(
+        vector_status(&writer, "doc_emb"),
+        Some(SearchLsmStatus::Building)
+    );
+    assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Building));
+    namidb_storage::search_lsm::validate_search_lsm(&writer.snapshot().manifest().manifest)
+        .unwrap();
+    // What `SHOW INDEXES` and `/metrics` report while it builds.
+    {
+        use namidb_storage::search_progress::{index_state, IndexState, IndexStateCounts};
+        let snapshot = writer.snapshot();
+        let manifest = &snapshot.manifest().manifest;
+        assert_eq!(
+            index_state(manifest, SearchLsmKind::Vector, "doc_emb"),
+            (IndexState::Building, 0.0)
+        );
+        assert_eq!(
+            index_state(manifest, SearchLsmKind::Text, "title_ft").0,
+            IndexState::Building
+        );
+        let counts = IndexStateCounts::of(manifest);
+        assert_eq!((counts.vector_building, counts.vector_online), (1, 0));
+        assert_eq!((counts.text_building, counts.text_online), (1, 0));
+    }
+    // A second idle tick changes nothing.
+    let version = writer.snapshot().manifest_version();
+    writer.flush(schema(false)).await.unwrap();
+    assert_eq!(writer.snapshot().manifest_version(), version);
+    assert!(writer.search_compaction_due(), "activation is scheduled");
+
+    let basis = writer.compaction_basis();
+    let prepared = basis.prepare_search_only(&schema(false)).await.unwrap();
+    writer.install_prepared_compaction(prepared).await.unwrap();
+    assert_eq!(
+        vector_status(&writer, "doc_emb"),
+        Some(SearchLsmStatus::Active)
+    );
+    assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Active));
+    namidb_storage::search_lsm::validate_search_lsm(&writer.snapshot().manifest().manifest)
+        .unwrap();
+    {
+        use namidb_storage::search_progress::{index_state, IndexState, IndexStateCounts};
+        let snapshot = writer.snapshot();
+        let manifest = &snapshot.manifest().manifest;
+        assert_eq!(
+            index_state(manifest, SearchLsmKind::Vector, "doc_emb"),
+            (IndexState::Online, 100.0)
+        );
+        let counts = IndexStateCounts::of(manifest);
+        assert_eq!((counts.vector_building, counts.vector_online), (0, 1));
+        assert_eq!((counts.text_building, counts.text_online), (0, 1));
+    }
+
+    // Every bare list of the declared dimension is indexed, the rest is not.
+    let target = 5usize;
+    let CoreValue::List(items) = bare_list(target as u64, DIM) else {
+        unreachable!()
+    };
+    let query = items
+        .iter()
+        .map(|item| match item {
+            CoreValue::F64(value) => *value as f32,
+            CoreValue::I64(value) => *value as f32,
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let hits = writer
+        .snapshot()
+        .try_vector_search("doc_emb", &query, 100, 200)
+        .await
+        .unwrap()
+        .expect("the activated index serves natively");
+    assert_eq!(hits.len(), 36, "{hits:?}");
+    assert_eq!(hits[0].0, ids[target]);
+    assert!(hits.iter().all(|(id, _)| !ids[36..].contains(id)));
+    assert_eq!(native_hits(&writer, "title_ft", "common").await, Some(40));
+
+    // A later write and a reopen keep it serving.
+    let mut record = doc(40);
+    record
+        .properties
+        .insert("embedding".into(), bare_list(40, DIM));
+    writer.upsert_node("Doc", NodeId::new(), &record).unwrap();
+    writer.flush(schema(false)).await.unwrap();
+    drop(writer);
+    let reopened = WriterSession::open(store, paths).await.unwrap();
+    let hits = reopened
+        .snapshot()
+        .try_vector_search("doc_emb", &query, 100, 200)
+        .await
+        .unwrap()
+        .expect("still native after a reopen");
+    assert_eq!(hits.len(), 37);
+}

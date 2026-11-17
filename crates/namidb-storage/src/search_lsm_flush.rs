@@ -228,6 +228,109 @@ impl SearchFlushManifestUpdate {
     }
 }
 
+/// Building generations for search indexes that were created over existing
+/// nodes and have seen no write since.
+///
+/// A generation is normally started by the first flush after its index is
+/// created, which also gives it the event its activation base will own. An
+/// index created after the data was loaded, with no write afterwards, got
+/// neither: no flush ran, nothing could activate it, and every search fell
+/// back to a scan for as long as the namespace stayed idle. This starts such
+/// a generation with one event (`0..1`) proven empty: the activation base then
+/// owns that event and covers every Nodes SST it scans.
+///
+/// The barrier objects are uploaded here; the caller commits the returned
+/// states and descriptors (an upload whose commit fails is an orphan the
+/// janitor reclaims).
+pub(crate) async fn idle_building_generations(
+    store: &Arc<dyn ObjectStore>,
+    paths: &crate::paths::NamespacePaths,
+    manifest: &Manifest,
+) -> Result<(Vec<SearchLsmState>, Vec<SstDescriptor>)> {
+    let mut states = Vec::new();
+    let mut descriptors = Vec::new();
+    if !manifest
+        .ssts
+        .iter()
+        .any(|descriptor| descriptor.kind == SstKind::Nodes && descriptor.row_count > 0)
+    {
+        return Ok((states, descriptors));
+    }
+    let mut pending: Vec<(SearchLsmKind, String)> = Vec::new();
+    #[cfg(feature = "vector-index")]
+    pending.extend(
+        manifest
+            .vector_indexes
+            .iter()
+            .map(|descriptor| (SearchLsmKind::Vector, descriptor.name.clone())),
+    );
+    #[cfg(feature = "text-index")]
+    pending.extend(
+        manifest
+            .text_indexes
+            .iter()
+            .map(|descriptor| (SearchLsmKind::Text, descriptor.name.clone())),
+    );
+    for (kind, index_name) in pending {
+        let has_state = manifest
+            .search_lsm
+            .iter()
+            .any(|state| state.kind == kind && state.index_name == index_name);
+        // A legacy body is adopted by the next flush instead.
+        let has_body = manifest
+            .ssts
+            .iter()
+            .any(|descriptor| descriptor.kind == kind.sst_kind() && descriptor.scope == index_name);
+        if has_state || has_body {
+            continue;
+        }
+        let Some(signature) = catalog_signature(manifest, kind, &index_name) else {
+            continue;
+        };
+        let barrier_id = Uuid::now_v7();
+        let state = SearchLsmState {
+            index_name: index_name.clone(),
+            kind,
+            catalog_signature: signature,
+            generation_id: Uuid::now_v7(),
+            status: SearchLsmStatus::Building,
+            next_event_seq: 1,
+            proven_empty_event_ranges: vec![SearchEventRange::new(0, 1)],
+            compat_barrier_sst_id: Some(barrier_id),
+            ..Default::default()
+        };
+        let body = encode_search_barrier(&state)
+            .map_err(|error| Error::invariant(format!("search barrier encode failed: {error}")))?;
+        let file_name = format!(
+            "{}-{}-{}.slb",
+            barrier_id.simple(),
+            kind.sst_kind().path_tag(),
+            index_name
+        );
+        let size_bytes = body.len() as u64;
+        store
+            .put(
+                &paths.sst_object(SstLevel::L0.as_u32(), &file_name),
+                body.into(),
+            )
+            .await?;
+        descriptors.push(search_barrier_descriptor(
+            &state,
+            barrier_id,
+            SstLevel::L0,
+            relative_sst_path(SstLevel::L0.as_u32(), &file_name),
+            size_bytes,
+        ));
+        tracing::info!(
+            index = %index_name,
+            kind = ?kind,
+            "search index created over existing nodes starts Building; its activation is scheduled"
+        );
+        states.push(state);
+    }
+    Ok((states, descriptors))
+}
+
 /// Upload rebased barrier objects (small, in memory) before the manifest CAS
 /// that references them.
 pub(crate) async fn upload_rebased_barriers(
@@ -759,13 +862,10 @@ fn vector_payload(
     if !carries_label {
         return None;
     }
-    let vector = match properties.get(&descriptor.property)? {
-        Value::Vec(vector) => vector.clone(),
-        Value::VecI8 { codes, scale } => {
-            codes.iter().map(|code| f32::from(*code) * *scale).collect()
-        }
-        _ => return None,
-    };
+    let vector = properties
+        .get(&descriptor.property)?
+        .embedding_f32(descriptor.dim as usize)?
+        .into_owned();
     if vector.len() != descriptor.dim as usize || vector.iter().any(|value| !value.is_finite()) {
         return None;
     }

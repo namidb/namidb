@@ -15,8 +15,37 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **`SHOW INDEXES` reports each index's state.** Two new columns: `state`
+  (`ONLINE`, or `BUILDING` while a vector or full-text index cannot serve
+  searches natively yet) and `populationPercent` (100 when online, otherwise
+  the progress of the build that activates it). `/metrics` adds
+  `namidb_search_indexes{kind,state}` and
+  `namidb_search_index_builds_in_flight`.
+
 ### Fixed
 
+- **A vector index created after its embeddings were loaded activates and
+  indexes them.** Embeddings written while no vector index covered the
+  property are stored as plain numeric lists. When the index was created
+  afterwards, the build skipped those lists, the generation stayed
+  `Building`, and every background compaction of the namespace was abandoned
+  ("Building Search-LSM ... has partial coverage for the selected Nodes
+  inputs"). A k=1 vector search then scanned the whole label and could fail
+  its memory budget (413). The activation build now reads a numeric list of
+  the index's declared dimension as an embedding (other lengths are still
+  skipped), a Building generation is activated by a physical base build, and
+  an index created on an idle namespace starts building at the next flush
+  tick instead of waiting for a write. Nothing has to be reloaded: the index
+  activates on its own after the upgrade.
+- **A vector search while its index is building stays bounded.** The exact
+  scan a search falls back to keeps only the best `k` candidates and streams
+  just the embedding column (or reconciles the label in batches while node
+  versions overlap), so its memory no longer grows with the label. When that
+  scan exceeds the query timeout the error says the index is building and how
+  far it is (HTTP 503 `index_building`, a transient error for drivers),
+  instead of a timeout or a 413.
 - **Full-text compaction merges postings instead of rebuilding them.** A
   Search-LSM compaction of FT4 segments read every node it covered back from
   the node tables and re-tokenized it, so its time and scratch space grew with
@@ -40,6 +69,28 @@ crates.io release will establish and document that API explicitly.
   meanwhile. In 3.4.1 it stayed `Building`, gained one segment per flush up to
   the ceiling and then held flushes back. A schema change that makes one
   index stale now restarts only that index, not every one.
+- **A delta consolidation survives a base build installing first.** The
+  delta runs that consolidate segments past a base build in flight (or past
+  the activation of a `Building` index) were abandoned when that base
+  installed before them ("did not advance append-only from the captured
+  prefix"). They now rebase after the new base, where their segments still
+  are. A `Building` index's per-flush deltas are merged while it waits for
+  its activation.
+- **Schema changes no longer abandon unrelated compactions.** Any schema or
+  index-catalog change since a compaction's prepare abandoned it, including
+  a new label or property first written by a data write. A search-segment
+  consolidation now depends only on its own index's generation, and a Nodes
+  or edge merge only on what its outputs carry (the rewritten labels' and
+  edge types' definitions, indexed-property sidecars, composite indexes,
+  constraints) and on the indexes it rebuilt; an index created meanwhile
+  does not invalidate it.
+- **Writes no longer wait behind a long flush build.** When the memtable
+  reached the stall threshold during an off-lock flush, the flush took the
+  writer lock and held it until its build and upload finished, so on a slow
+  store every write queued for minutes (a 175 s write was measured) and
+  failed at the 30 s write timeout. The memtable's hard bound now holds
+  writes back instead, without the writer lock. A flush superseded by DDL is
+  retried off-lock before it falls back to flushing under the lock.
 - **Embedding-only writes do no full-text work.** A write that changes only
   non-indexed properties (`MATCH (a:Doc {id: r.id}) SET a.embedding = r.v`)
   is no longer tokenized, writes no full-text segment and triggers no

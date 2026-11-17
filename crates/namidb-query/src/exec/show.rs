@@ -20,6 +20,16 @@ pub fn show_schema_columns() -> Vec<String> {
         .collect()
 }
 
+/// Column order for `SHOW INDEXES`: the schema columns plus `state`
+/// (`ONLINE`, or `BUILDING` while a vector or full-text index cannot serve a
+/// search natively yet) and `populationPercent` (100 when online, otherwise
+/// the progress of the build that will activate it; 0 until one starts).
+pub fn show_indexes_columns() -> Vec<String> {
+    let mut columns = show_schema_columns();
+    columns.extend(["state", "populationPercent"].map(String::from));
+    columns
+}
+
 fn str_list(items: &[String]) -> RuntimeValue {
     RuntimeValue::List(items.iter().cloned().map(RuntimeValue::String).collect())
 }
@@ -72,6 +82,8 @@ pub fn show_constraints_rows(schema: &Schema) -> Vec<Row> {
 /// indexes from the schema, plus the named vector and full-text descriptors.
 /// Sorted by name for a stable result order.
 pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
+    use namidb_storage::search_lsm::SearchLsmKind;
+    use namidb_storage::search_progress::index_state;
     let mut entries: Vec<(String, &'static str, String, Vec<String>)> = Vec::new();
     for (label, def) in &manifest.schema.labels {
         for p in &def.properties {
@@ -129,6 +141,18 @@ pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
     entries.sort();
     entries
         .into_iter()
-        .map(|(name, kind, label, props)| schema_row(name, kind, label, &props))
+        .map(|(name, kind, label, props)| {
+            let (state, percent) = match kind {
+                "VECTOR" => index_state(manifest, SearchLsmKind::Vector, &name),
+                "FULLTEXT" => index_state(manifest, SearchLsmKind::Text, &name),
+                _ => (namidb_storage::search_progress::IndexState::Online, 100.0),
+            };
+            schema_row(name, kind, label, &props)
+                .with("state", RuntimeValue::String(state.as_str().into()))
+                .with(
+                    "populationPercent",
+                    RuntimeValue::Float((percent * 10.0).round() / 10.0),
+                )
+        })
         .collect()
 }

@@ -755,7 +755,13 @@ impl ServerBackend {
             return RunObservation {
                 kind: Some(QueryKind::Read),
                 elapsed: started.elapsed(),
-                result: Ok(show_run_outcome(rows)),
+                result: Ok(show_run_outcome(
+                    rows,
+                    match c.kind {
+                        ShowKind::Constraints => namidb_query::show_schema_columns(),
+                        ShowKind::Indexes => namidb_query::show_indexes_columns(),
+                    },
+                )),
             };
         }
 
@@ -1776,9 +1782,9 @@ fn read_run_outcome(plan: &namidb_query::LogicalPlan, rows: Vec<Row>) -> RunOutc
 /// The session emits each row's values by looking them up by field name, so the
 /// canonical SHOW column order is used as the field list (and is surfaced even
 /// when there are no rows).
-fn show_run_outcome(rows: Vec<Row>) -> RunOutcome {
+fn show_run_outcome(rows: Vec<Row>, fields: Vec<String>) -> RunOutcome {
     RunOutcome {
-        fields: namidb_query::show_schema_columns(),
+        fields,
         rows,
         statement_type: StatementType::Read,
         counters: Default::default(),
@@ -1827,6 +1833,8 @@ fn map_exec_err_ref(e: &ExecError) -> BackendError {
         // query is malformed" without string-matching the message, and must
         // NOT auto-retry either (a re-run exceeds the same budget again).
         ExecError::Timeout => BackendError::Timeout("query exceeded the configured timeout".into()),
+        // Transient: drivers retry, and the index serves once online.
+        ExecError::IndexBuilding(message) => BackendError::Storage(message.clone()),
         ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
             BackendError::Cancelled("query cancelled by administrator".into())
         }

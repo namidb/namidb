@@ -1476,6 +1476,7 @@ fn delta_run_position(
 struct SearchNodeSourcePlan {
     min_key: [u8; 16],
     size_bytes: u64,
+    row_count: u64,
     label_def: LabelDef,
     scope: String,
 }
@@ -2168,6 +2169,7 @@ pub(super) async fn prepare_search_compactions(
             plan.push(SearchNodeSourcePlan {
                 min_key: descriptor.min_key,
                 size_bytes: descriptor.size_bytes,
+                row_count: descriptor.row_count,
                 label_def,
                 scope: descriptor.scope.clone(),
             });
@@ -2365,13 +2367,11 @@ fn vector_payload_from_node(
     if !node.labels.contains(&descriptor.label) {
         return None;
     }
-    let vector = match node.properties.get(&descriptor.property)? {
-        Value::Vec(vector) => vector.clone(),
-        Value::VecI8 { codes, scale } => {
-            codes.iter().map(|code| f32::from(*code) * *scale).collect()
-        }
-        _ => return None,
-    };
+    let vector = node
+        .properties
+        .get(&descriptor.property)?
+        .embedding_f32(descriptor.dim as usize)?
+        .into_owned();
     if vector.len() != descriptor.dim as usize
         || vector.iter().any(|component| !component.is_finite())
     {
@@ -2409,6 +2409,21 @@ fn reconcile_vector_payload(
         (SearchVersionOperation::Suppress, None)
             if record.payload_fingerprint
                 == crate::sst::search_delta::search_suppress_fingerprint() =>
+        {
+            Ok(None)
+        }
+        // Up to 3.4.1 a flush recorded a bare numeric list as no embedding
+        // (a suppression); it reads as one now. The delta keeps what it
+        // recorded, and the next base build indexes the list.
+        (SearchVersionOperation::Suppress, Some(_))
+            if record.payload_fingerprint
+                == crate::sst::search_delta::search_suppress_fingerprint()
+                && node.is_some_and(|node| {
+                    matches!(
+                        node.properties.get(&descriptor.property),
+                        Some(Value::List(_))
+                    )
+                }) =>
         {
             Ok(None)
         }
@@ -3251,21 +3266,11 @@ impl VectorBaseWork {
             update_winner_digest(&mut self.digest, node_id, lsn, true, None);
             return Ok(());
         };
-        let decoded;
-        let vector: &[f32] = match value {
-            Value::Vec(vector) => vector,
-            Value::VecI8 { codes, scale } => {
-                decoded = codes
-                    .iter()
-                    .map(|code| f32::from(*code) * *scale)
-                    .collect::<Vec<_>>();
-                &decoded
-            }
-            _ => {
-                update_winner_digest(&mut self.digest, node_id, lsn, true, None);
-                return Ok(());
-            }
+        let Some(vector) = value.embedding_f32(self.descriptor.dim as usize) else {
+            update_winner_digest(&mut self.digest, node_id, lsn, true, None);
+            return Ok(());
         };
+        let vector: &[f32] = &vector;
         if vector.len() != self.descriptor.dim as usize
             || vector.iter().any(|component| !component.is_finite())
         {
@@ -3654,6 +3659,14 @@ fn build_search_compactions_blocking(
 ) -> Result<Vec<BuiltSearchCompaction>> {
     let per_builder_memory = super::per_collector_index_build_memory_bytes(selections.len())?
         .ok_or_else(|| Error::invariant("Search-LSM compaction has no build memory share"))?;
+    // `SHOW INDEXES` reports a Building generation's progress from this.
+    let progress = crate::search_progress::begin_build(
+        selections
+            .iter()
+            .map(|selection| selection.captured_state.generation_id),
+        plan.iter()
+            .fold(0u64, |total, entry| total.saturating_add(entry.row_count)),
+    );
     let mut works = Vec::with_capacity(selections.len());
     for selection in selections {
         match selection.captured_state.kind {
@@ -3813,6 +3826,7 @@ fn build_search_compactions_blocking(
         let Some(Reverse(entry)) = heap.pop() else {
             break;
         };
+        progress.scanned(1);
         let exhausted = {
             let source = cursors[entry.src]
                 .as_mut()
@@ -3848,6 +3862,7 @@ fn build_search_compactions_blocking(
         }
     }
 
+    progress.scan_finished();
     let mut finished = works
         .into_iter()
         .filter_map(|work| work.finish(input_bytes, started).transpose())

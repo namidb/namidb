@@ -77,6 +77,37 @@ impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
+
+    /// This value as an f32 embedding of dimension `dim`, the one reading
+    /// every vector index build, delta and scan share.
+    ///
+    /// A dense [`Value::Vec`] is returned as is and an int8 [`Value::VecI8`]
+    /// dequantized (`code * scale`), whatever their length: the callers apply
+    /// their own dimension and finiteness checks to those. A [`Value::List`]
+    /// whose elements are all numbers (`F64` or `I64`) and whose length is
+    /// exactly `dim` is converted element-wise: that is how a bare JSON array
+    /// is stored when no vector index covered the property at write time, and
+    /// the write path coerces the same shape once an index exists. Anything
+    /// else is `None`.
+    pub fn embedding_f32(&self, dim: usize) -> Option<std::borrow::Cow<'_, [f32]>> {
+        use std::borrow::Cow;
+        match self {
+            Value::Vec(vector) => Some(Cow::Borrowed(vector.as_slice())),
+            Value::VecI8 { codes, scale } => Some(Cow::Owned(
+                codes.iter().map(|code| f32::from(*code) * *scale).collect(),
+            )),
+            Value::List(items) if items.len() == dim && dim != 0 => items
+                .iter()
+                .map(|item| match item {
+                    Value::F64(value) => Some(*value as f32),
+                    Value::I64(value) => Some(*value as f32),
+                    _ => None,
+                })
+                .collect::<Option<Vec<f32>>>()
+                .map(Cow::Owned),
+            _ => None,
+        }
+    }
 }
 
 impl From<bool> for Value {
@@ -298,6 +329,39 @@ impl<'de> Deserialize<'de> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedding_f32_reads_dense_quantized_and_numeric_lists_of_the_dimension() {
+        assert_eq!(
+            Value::Vec(vec![1.0, 2.0]).embedding_f32(3).as_deref(),
+            Some(&[1.0, 2.0][..])
+        );
+        assert_eq!(
+            Value::VecI8 {
+                codes: vec![2, -4],
+                scale: 0.5
+            }
+            .embedding_f32(2)
+            .as_deref(),
+            Some(&[1.0, -2.0][..])
+        );
+        let list = Value::List(vec![Value::F64(0.25), Value::I64(-1), Value::F64(2.0)]);
+        assert_eq!(
+            list.embedding_f32(3).as_deref(),
+            Some(&[0.25, -1.0, 2.0][..])
+        );
+        assert_eq!(
+            list.embedding_f32(4),
+            None,
+            "a wrong-dimension list is skipped"
+        );
+        assert_eq!(
+            Value::List(vec![Value::F64(1.0), Value::Str("x".into())]).embedding_f32(2),
+            None
+        );
+        assert_eq!(Value::List(Vec::new()).embedding_f32(0), None);
+        assert_eq!(Value::Str("x".into()).embedding_f32(1), None);
+    }
 
     #[test]
     fn value_from_primitives() {
