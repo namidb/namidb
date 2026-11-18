@@ -87,7 +87,10 @@ pub use ingest::{
     clear_shared_caches, prune_shared_caches, BackgroundFlush, BackgroundFlushInstall,
     BuiltBackgroundFlush, CommitOutcome, SessionCaches, StageMark, StagedValue, WriterSession,
 };
-pub use janitor::{sweep_orphans, JanitorReport};
+pub use janitor::{
+    descriptor_object_paths, manifest_object_paths, sweep_orphans, sweep_orphans_with,
+    JanitorReport, SweepOptions, DEFAULT_SUPERSEDED_MIN_AGE,
+};
 pub use local::LocalFileObjectStore;
 pub use manifest::{
     KindSpecificStats, Manifest, ManifestStore, NodePropertyPagesDescriptor, SstDescriptor,

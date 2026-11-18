@@ -36,8 +36,8 @@ use namidb_core::quantize::quantize_i8;
 use namidb_core::Value;
 
 use super::{
-    encode_vector_filter_value, metric_name, metric_score, VectorFilterPostings,
-    VectorGraphBuildStats,
+    decode_vector_filter_value, encode_vector_filter_value, metric_name, metric_score,
+    VectorFilterPostings, VectorGraphBuildStats,
 };
 use crate::error::Error;
 use crate::manifest::{VectorIndexDescriptor, VectorMetric};
@@ -211,6 +211,15 @@ struct BuildRow {
 struct BuildTree {
     nodes: Vec<CentroidNode>,
     leaves: Vec<Vec<usize>>,
+}
+
+/// One row of a V5 page as it was built: NodeId, full-precision vector, and
+/// its native-filter values in property order (absent properties omitted).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct VectorV5StoredRow {
+    pub(crate) id: [u8; 16],
+    pub(crate) vector: Vec<f32>,
+    pub(crate) filters: Vec<(String, Value)>,
 }
 
 /// Metadata-only reader. It never stores document IDs, quantized rows, or f32
@@ -548,6 +557,101 @@ impl VectorV5Reader {
     /// Byte length of the object this reader was opened over.
     pub fn file_len(&self) -> u64 {
         self.file_len
+    }
+
+    /// Native-filter properties this body advertises as complete.
+    pub(crate) fn filter_properties(&self) -> &[String] {
+        &self.footer.filter_properties
+    }
+
+    /// Decode every row of page `page` (in page order, not NodeId order):
+    /// the f32 vectors from its exact block and the filter values from its
+    /// navigation bitmaps. One page is resident at a time.
+    pub(crate) async fn read_page_rows(
+        &self,
+        page: usize,
+    ) -> Result<Vec<VectorV5StoredRow>, Error> {
+        let page_ref = self
+            .footer
+            .pages
+            .get(page)
+            .ok_or_else(|| Error::invariant("vector v5 page ordinal is out of range"))?;
+        let wires = self
+            .source
+            .read_ranges(&[page_ref.nav.range()?, page_ref.exact.range()?])
+            .await?;
+        let [nav_wire, exact_wire] = wires.as_slice() else {
+            return Err(Error::invariant(
+                "vector v5 range source returned the wrong page block count",
+            ));
+        };
+        let nav = decode_nav_page(nav_wire, &page_ref.nav, page_ref.row_count, self.footer.dim)?;
+        let raw = decode_block(exact_wire, &page_ref.exact, "exact page")?;
+        let dim = self.footer.dim as usize;
+        let row_bytes = dim
+            .checked_mul(4)
+            .ok_or_else(|| Error::invariant("vector v5 row byte size overflows"))?;
+        if raw.len()
+            != row_bytes
+                .checked_mul(nav.ids.len())
+                .ok_or_else(|| Error::invariant("vector v5 exact page size overflows"))?
+        {
+            return Err(Error::invariant(
+                "vector v5 exact page length disagrees with its navigation page",
+            ));
+        }
+        let mut rows = Vec::with_capacity(nav.ids.len());
+        for (id, exact) in nav.ids.iter().zip(raw.chunks_exact(row_bytes.max(1))) {
+            let mut vector = Vec::with_capacity(dim);
+            for bytes in exact.chunks_exact(4) {
+                let component = f32::from_le_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| Error::invariant("vector v5 invalid f32 bytes"))?,
+                );
+                if !component.is_finite() {
+                    return Err(Error::invariant(
+                        "vector v5 exact page contains a non-finite component",
+                    ));
+                }
+                vector.push(component);
+            }
+            rows.push(VectorV5StoredRow {
+                id: *id,
+                vector,
+                filters: Vec::new(),
+            });
+        }
+        for (property, values) in nav.filters {
+            if !self.supports_filter_property(&property) {
+                return Err(Error::invariant(
+                    "vector v5 navigation page carries an unadvertised filter",
+                ));
+            }
+            for (key, bitmap) in values {
+                let value = decode_vector_filter_value(&key)
+                    .ok_or_else(|| Error::invariant("vector v5 filter key is not decodable"))?;
+                for (word_index, mut word) in bitmap.into_iter().enumerate() {
+                    while word != 0 {
+                        let row = word_index * 64 + word.trailing_zeros() as usize;
+                        word &= word - 1;
+                        let filters = &mut rows
+                            .get_mut(row)
+                            .ok_or_else(|| {
+                                Error::invariant("vector v5 filter bitmap leaves its page")
+                            })?
+                            .filters;
+                        if filters.last().is_some_and(|(last, _)| *last == property) {
+                            return Err(Error::invariant(
+                                "vector v5 row holds two values of one filter property",
+                            ));
+                        }
+                        filters.push((property.clone(), value.clone()));
+                    }
+                }
+            }
+        }
+        Ok(rows)
     }
 
     pub async fn search_filter_groups(

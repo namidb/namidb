@@ -711,3 +711,82 @@ async fn a_vector_index_created_after_bare_list_embeddings_activates_while_idle(
         .expect("still native after a reopen");
     assert_eq!(hits.len(), 37);
 }
+
+/// A DDL that retires a search generation while a compaction of it is being
+/// prepared (DROP INDEX, DROP + CREATE under the same name, or a catalog
+/// change that restarts the index) makes that one compaction obsolete. Up to
+/// 3.4.2 the install abandoned the whole pass ("generation ... disappeared",
+/// or a drifted working state), throwing away every other index's finished
+/// base build as well. Now only the obsolete compaction is dropped: the pass
+/// installs, the retired generation's output is referenced by nothing, and
+/// the restarted generation builds on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_generation_retired_during_prepare_drops_only_its_own_compaction() {
+    for recreate in [false, true] {
+        let name = format!("retired-during-prepare-{recreate}");
+        let (mut writer, store, paths) = writer_with_corpus(&name, 30).await;
+        writer
+            .register_text_index(
+                TextIndexDescriptor::new("title_ft".into(), "Doc".into(), vec!["title".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+        writer.upsert_node("Doc", NodeId::new(), &doc(30)).unwrap();
+        writer.flush(schema(false)).await.unwrap();
+        assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Building));
+        assert!(writer.search_compaction_due());
+
+        let basis = writer.compaction_basis();
+        let prepared = basis.prepare_search_only(&schema(false)).await.unwrap();
+        assert!(!prepared.is_noop());
+
+        writer.drop_text_index("title_ft", false).await.unwrap();
+        if recreate {
+            writer
+                .register_text_index(
+                    TextIndexDescriptor::new("title_ft".into(), "Doc".into(), vec!["title".into()]),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        writer.upsert_node("Doc", NodeId::new(), &doc(31)).unwrap();
+        writer.flush(schema(false)).await.unwrap();
+
+        writer
+            .install_prepared_compaction(prepared)
+            .await
+            .expect("a retired generation must not abandon the pass");
+        let manifest = writer.snapshot().manifest().manifest.clone();
+        namidb_storage::search_lsm::validate_search_lsm(&manifest).unwrap();
+        assert_eq!(status(&writer, "body_ft"), Some(SearchLsmStatus::Active));
+        if recreate {
+            assert_eq!(
+                status(&writer, "title_ft"),
+                Some(SearchLsmStatus::Building),
+                "the recreated index builds its own generation"
+            );
+            // And it activates on its own next pass.
+            let prepared = writer
+                .compaction_basis()
+                .prepare_search_only(&schema(false))
+                .await
+                .unwrap();
+            writer.install_prepared_compaction(prepared).await.unwrap();
+            assert_eq!(status(&writer, "title_ft"), Some(SearchLsmStatus::Active));
+            assert_eq!(native_hits(&writer, "title_ft", "common").await, Some(32));
+        } else {
+            assert_eq!(status(&writer, "title_ft"), None);
+            assert!(
+                manifest
+                    .ssts
+                    .iter()
+                    .all(|descriptor| descriptor.scope != "title_ft"),
+                "the dropped index's output is referenced by nothing"
+            );
+        }
+        assert_eq!(native_hits(&writer, "body_ft", "common").await, Some(32));
+        drop((store, paths));
+    }
+}

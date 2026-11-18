@@ -762,6 +762,115 @@ mod tests {
         );
     }
 
+    /// Objects no manifest version references, written inside the window: an
+    /// SST body and side-car a failed upload or abandoned compaction left at
+    /// two levels, and a WAL segment whose commit never landed.
+    async fn plant_window_orphans(
+        store: &Arc<dyn ObjectStore>,
+        paths: &NamespacePaths,
+    ) -> Vec<object_store::path::Path> {
+        let orphans = vec![
+            paths.sst_object(0, "planted-orphan-Person.parquet"),
+            paths.sst_object(1, "planted-orphan-Person.bloom"),
+            paths.wal_segment(0x00ff_ffff_0000_0000),
+        ];
+        for path in &orphans {
+            store
+                .put(path, PutPayload::from_static(b"never referenced"))
+                .await
+                .unwrap();
+        }
+        orphans
+    }
+
+    fn exact_sweep_options() -> crate::SweepOptions {
+        crate::SweepOptions {
+            retention_horizon: u64::MAX,
+            min_age: Duration::ZERO,
+            superseded_min_age: Duration::ZERO,
+            max_level: 4,
+            delete: true,
+            exact_window: true,
+        }
+    }
+
+    /// Exact window mode: the live set is every manifest version in the
+    /// window, not "everything written since the window opened", so orphans
+    /// written inside an active window are reclaimed while every point in the
+    /// window still restores row for row.
+    #[tokio::test]
+    async fn janitor_exact_window_reclaims_orphans_inside_the_window() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("pitr-exact");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let floor = ms.load_current().await.unwrap().manifest.version;
+        plant_window(&ms, floor, chrono::Utc::now().timestamp() + 3600).await;
+        let (_session, history) = churn(&store, &paths).await;
+        let orphans = plant_window_orphans(&store, &paths).await;
+
+        // The write-time window keeps them: it cannot tell them apart from
+        // objects a version in the window references.
+        let kept = sweep(&ms).await;
+        assert!(kept.restore_window_retained > 0, "{kept:?}");
+        for path in &orphans {
+            assert!(store.head(path).await.is_ok(), "{path} kept by write time");
+        }
+
+        let exact = crate::sweep_orphans_with(&ms, exact_sweep_options())
+            .await
+            .unwrap();
+        for path in &orphans {
+            assert!(
+                store.head(path).await.is_err(),
+                "exact window mode must reclaim {path}: {exact:?}"
+            );
+        }
+        //STAGE-B-EXACT-ASSERTIONS
+        for (version, expected) in &history {
+            let got = restored_state(&store, &paths, *version)
+                .await
+                .unwrap_or_else(|e| panic!("restore point v{version} broke: {e}"));
+            assert_eq!(&got, expected, "v{version} must restore row for row");
+        }
+    }
+
+    /// Exact window mode with the floor in the middle of history: versions
+    /// below the floor are retired (with the objects only they referenced),
+    /// every version from the floor up restores row for row, and orphans
+    /// written inside the window are reclaimed.
+    #[tokio::test]
+    async fn janitor_exact_window_with_a_mid_history_floor_keeps_the_window() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = paths("pitr-exact-mid");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let (_session, history) = churn(&store, &paths).await;
+        let floor = history[history.len() / 2].0;
+        plant_window(&ms, floor, chrono::Utc::now().timestamp() + 3600).await;
+        let orphans = plant_window_orphans(&store, &paths).await;
+
+        let report = crate::sweep_orphans_with(&ms, exact_sweep_options())
+            .await
+            .unwrap();
+        assert!(report.manifest_snapshots_reclaimed > 0, "{report:?}");
+        for path in &orphans {
+            assert!(store.head(path).await.is_err(), "{path}: {report:?}");
+        }
+        for (version, expected) in &history {
+            let restored = restored_state(&store, &paths, *version).await;
+            if *version >= floor {
+                assert_eq!(
+                    &restored.unwrap_or_else(|e| panic!("v{version} broke: {e}")),
+                    expected
+                );
+            } else {
+                assert!(restored.is_err(), "v{version} is below the floor");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn an_expired_window_releases_its_history() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

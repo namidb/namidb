@@ -120,6 +120,7 @@ impl SharedAppState {
         writer_lock_timeout: Duration,
         default_namespace: String,
     ) -> Self {
+        registry.set_memtable_hard_bytes(crate::memtable_hard_bytes(memtable_stall_bytes));
         Self {
             registry,
             auth,

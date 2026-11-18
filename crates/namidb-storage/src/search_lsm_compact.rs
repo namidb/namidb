@@ -113,8 +113,9 @@ pub(super) struct SearchCompactionPolicy {
     pub(super) force_base: bool,
     /// Flat vector delta rows that schedule a clustered base rebuild.
     pub(super) vector_base_delta_rows: u64,
-    /// Largest Nodes corpus (descriptor bytes) the opportunistic vector base
-    /// rebuild may read; a rebuild holds a large share of it in memory.
+    /// Largest input (descriptor bytes) the opportunistic vector base rebuild
+    /// may read: the generation's segments when it folds them, else the Nodes
+    /// corpus, a large share of which a node scan holds in memory.
     pub(super) vector_base_max_input_bytes: u64,
 }
 
@@ -248,10 +249,12 @@ fn trailing_delta_len(state: &SearchLsmState) -> usize {
         .count()
 }
 
-/// Half of the process's cgroup memory limit, or unbounded without one. A base
-/// rebuild streams the namespace's Nodes bodies through a k-way merge whose
-/// resident inputs were measured at ~45% of their total bytes; within half the
-/// limit that stays under a quarter of the process.
+/// Half of the process's cgroup memory limit, or unbounded without one. A
+/// node-scan base rebuild streams the namespace's Nodes bodies through a k-way
+/// merge whose resident inputs were measured at ~45% of their total bytes;
+/// within half the limit that stays under a quarter of the process. A segment
+/// merge streams its inputs, so the same cap on its (much smaller) segment
+/// bytes is conservative.
 fn default_vector_base_max_input_bytes() -> u64 {
     cgroup_memory_limit_bytes().map_or(u64::MAX, |limit| limit / 2)
 }
@@ -283,14 +286,18 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
 }
 
 /// Flat vector rows held in deltas: every query scans them exactly.
+///
+/// `input_bytes` is what the rebuild would read: the generation's own
+/// segments when they can be merged ([`vector_segments_mergeable`]), the
+/// namespace's Nodes corpus otherwise.
 fn vector_base_rebuild_due(
     state: &SearchLsmState,
     descriptors: &[SstDescriptor],
     policy: SearchCompactionPolicy,
     now: chrono::DateTime<Utc>,
-    nodes_bytes: u64,
+    input_bytes: u64,
 ) -> Result<bool> {
-    if state.kind != SearchLsmKind::Vector || nodes_bytes > policy.vector_base_max_input_bytes {
+    if state.kind != SearchLsmKind::Vector || input_bytes > policy.vector_base_max_input_bytes {
         return Ok(false);
     }
     let mut delta_rows = 0u64;
@@ -684,8 +691,26 @@ pub(super) fn select_search_compactions(
             && delta_run_output_len
                 .map(|len| len >= policy.hard_segment_cap)
                 .unwrap_or(true);
+        // A vector base folded from the generation's own segments reads only
+        // them; otherwise the rebuild scans the whole Nodes corpus.
+        let vector_rebuild_input_bytes = if state.kind == SearchLsmKind::Vector
+            && vector_generation_filters(manifest, state)
+                .is_some_and(|filters| vector_segments_mergeable(state, &filters))
+        {
+            descriptors.iter().fold(0u64, |total, descriptor| {
+                total.saturating_add(descriptor.size_bytes)
+            })
+        } else {
+            nodes_bytes
+        };
         let rebuild_base = base_rebuild_needed(state, &descriptors, policy)?
-            || vector_base_rebuild_due(state, &descriptors, policy, now, nodes_bytes)?
+            || vector_base_rebuild_due(
+                state,
+                &descriptors,
+                policy,
+                now,
+                vector_rebuild_input_bytes,
+            )?
             || cap_requires_base;
         let (mode, selected_segment_start) = if rebuild_base {
             (SearchCompactionMode::BasePrefix, 0)
@@ -1512,16 +1537,15 @@ impl SearchVersionRangeSource for CompactionSearchRangeSource {
 
 /// A whole segment body fetched to the local spool (file-backed), read by
 /// range without further object-store requests.
-#[cfg(feature = "text-index")]
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
 #[derive(Debug)]
 struct LocalSegmentSource {
     body: Bytes,
 }
 
-#[cfg(feature = "text-index")]
-#[async_trait::async_trait]
-impl SearchVersionRangeSource for LocalSegmentSource {
-    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
+impl LocalSegmentSource {
+    fn slice(&self, range: Range<u64>) -> Result<Bytes> {
         let start = usize::try_from(range.start)
             .map_err(|_| Error::invariant("local segment range start exceeds usize"))?;
         let end = usize::try_from(range.end)
@@ -1534,6 +1558,81 @@ impl SearchVersionRangeSource for LocalSegmentSource {
         }
         Ok(self.body.slice(start..end))
     }
+}
+
+#[cfg(any(feature = "vector-index", feature = "text-index"))]
+#[async_trait::async_trait]
+impl SearchVersionRangeSource for LocalSegmentSource {
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        self.slice(range)
+    }
+}
+
+#[cfg(feature = "vector-index")]
+#[async_trait::async_trait]
+impl crate::sst::vector::v5::VectorV5RangeSource for LocalSegmentSource {
+    async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
+        self.slice(range)
+    }
+}
+
+/// An Active vector generation whose segments alone hold its whole indexed
+/// corpus at full precision: an optional complete clustered base followed by
+/// complete VG6 deltas, each advertising every native filter of the
+/// generation. A generation is Active only once its segments (plus proven-empty
+/// events) describe every node — it starts Active only over an empty
+/// namespace, and otherwise is activated by a base over the node corpus — so
+/// such a generation needs no node scan to rebuild its base, with or without
+/// an existing base.
+fn vector_segments_mergeable(state: &SearchLsmState, filters: &[String]) -> bool {
+    state.kind == SearchLsmKind::Vector
+        && state.status == SearchLsmStatus::Active
+        && !state.segments.is_empty()
+        && state
+            .segments
+            .iter()
+            .enumerate()
+            .all(|(position, segment)| {
+                segment.payload == SearchSegmentPayload::Complete
+                    && match (segment.role, segment.format) {
+                        (SearchSegmentRole::Base, SearchSegmentFormat::VectorV5Base) => {
+                            position == 0
+                        }
+                        (SearchSegmentRole::Delta, SearchSegmentFormat::VectorV6) => true,
+                        _ => false,
+                    }
+                    && filters
+                        .iter()
+                        .all(|property| segment.complete_filter_properties.contains(property))
+            })
+}
+
+/// The generation's native-filter properties, when its catalog entry exists.
+fn vector_generation_filters(manifest: &Manifest, state: &SearchLsmState) -> Option<Vec<String>> {
+    let matches = manifest
+        .vector_indexes
+        .iter()
+        .filter(|descriptor| descriptor.name == state.index_name)
+        .collect::<Vec<_>>();
+    let [descriptor] = matches.as_slice() else {
+        return None;
+    };
+    Some(crate::search_lsm::vector_native_filter_properties(
+        manifest, descriptor,
+    ))
+}
+
+/// A vector BasePrefix that [`build_vector_segment_merge`] can fold from the
+/// generation's segments instead of scanning the node corpus.
+fn vector_segment_merge_supported(
+    manifest: &Manifest,
+    selection: &SearchCompactionSelection,
+) -> bool {
+    selection.mode == SearchCompactionMode::BasePrefix
+        && selection.selected_segment_start == 0
+        && selection.selected_descriptors.len() == selection.captured_state.segments.len()
+        && vector_generation_filters(manifest, &selection.captured_state)
+            .is_some_and(|filters| vector_segments_mergeable(&selection.captured_state, &filters))
 }
 
 #[cfg(feature = "text-index")]
@@ -1770,6 +1869,156 @@ async fn build_text_segment_merge(
         },
         file: Some(artifact.file),
     })
+}
+
+/// Rebuild a vector generation's clustered base from its own segments (see
+/// `sst/vector/base_merge.rs`): the base rows and the deltas' winners, at full
+/// precision, stream into the same V5 collector a node scan feeds, so the
+/// result is that scan's base without reading the node corpus. The work is
+/// linear in the selected segments' bytes. `Ok(None)` abandons the rebuild
+/// exactly where a node scan would (a single live row).
+#[cfg(feature = "vector-index")]
+async fn build_vector_segment_merge(
+    store: Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    base: &LoadedManifest,
+    selection: SearchCompactionSelection,
+) -> Result<Option<BuiltSearchCompaction>> {
+    let started = Instant::now();
+    let manifest = &base.manifest;
+    if !vector_segment_merge_supported(manifest, &selection) {
+        return Err(Error::precondition(
+            "vector segment merge selected a generation its segments cannot rebuild",
+        ));
+    }
+    let matches = manifest
+        .vector_indexes
+        .iter()
+        .filter(|descriptor| descriptor.name == selection.captured_state.index_name)
+        .collect::<Vec<_>>();
+    let [descriptor] = matches.as_slice() else {
+        return Err(Error::precondition(
+            "vector segment merge catalog entry is missing or ambiguous",
+        ));
+    };
+    let descriptor = (*descriptor).clone();
+    let filters = crate::search_lsm::vector_native_filter_properties(manifest, &descriptor);
+    let segments = selection.captured_state.segments.clone();
+
+    // One sequential GET per source to the file-backed spool, fetched
+    // concurrently: the merge then reads ranges locally.
+    let fetches = selection
+        .selected_descriptors
+        .iter()
+        .map(|source| {
+            let store = store.clone();
+            async move { super::get_sst_body(store.as_ref(), paths, source).await }
+        })
+        .collect::<Vec<_>>();
+    let bodies = futures::future::try_join_all(fetches).await?;
+    let mut base_reader = None;
+    let mut deltas = Vec::with_capacity(bodies.len());
+    let mut input_bytes = 0u64;
+    for ((body, segment), source_descriptor) in bodies
+        .into_iter()
+        .zip(&segments)
+        .zip(&selection.selected_descriptors)
+    {
+        if source_descriptor.id != segment.sst_id {
+            return Err(Error::invariant(
+                "vector segment merge descriptor/segment order differs",
+            ));
+        }
+        input_bytes = input_bytes.saturating_add(source_descriptor.size_bytes);
+        let len = body.len() as u64;
+        let local = Arc::new(LocalSegmentSource { body });
+        let corrupted = |error: Error| Error::Corrupted {
+            path: source_descriptor.path.clone(),
+            detail: error.to_string(),
+        };
+        match segment.role {
+            SearchSegmentRole::Base => {
+                let source: Arc<dyn crate::sst::vector::v5::VectorV5RangeSource> = local;
+                let reader = crate::sst::vector::v5::VectorV5Reader::open(source, len)
+                    .await
+                    .map_err(corrupted)?;
+                let (min_key, max_key) = reader.node_id_bounds();
+                if reader.point_count() != segment.live_payload_count
+                    || reader.point_count() != source_descriptor.row_count
+                    || min_key != source_descriptor.min_key
+                    || max_key != source_descriptor.max_key
+                    || !matches!(
+                        segment.stats,
+                        SearchSegmentStats::Vector {
+                            live_count: SearchStatValue::Absolute(count)
+                        } if count == reader.point_count()
+                    )
+                {
+                    return Err(corrupted(Error::invariant(
+                        "vector base body disagrees with its descriptor and segment",
+                    )));
+                }
+                base_reader = Some(reader);
+            }
+            SearchSegmentRole::Delta => {
+                let source: Arc<dyn SearchVersionRangeSource> = local;
+                let reader = crate::sst::vector::v6::VectorV6Reader::open(
+                    source,
+                    len,
+                    &selection.captured_state,
+                    segment,
+                    &descriptor,
+                )
+                .await
+                .map_err(corrupted)?;
+                if reader.version_reader().reference().record_count != source_descriptor.row_count {
+                    return Err(corrupted(Error::invariant(
+                        "vector delta version count disagrees with its descriptor",
+                    )));
+                }
+                deltas.push(reader);
+            }
+        }
+    }
+
+    let mut collector = crate::sst::vector::v5::external::VectorV5ExternalBuildConfig::from_env()?;
+    collector.memory_budget_bytes = super::per_collector_index_build_memory_bytes(1)?
+        .ok_or_else(|| Error::invariant("vector segment merge has no build memory share"))?;
+    let options = super::vector_v5_build_options();
+    let merge_descriptor = descriptor.clone();
+    let merge_filters = filters.clone();
+    let merged = tokio::task::spawn_blocking(move || {
+        crate::sst::vector::base_merge::merge_vector_base(
+            crate::sst::vector::base_merge::VectorBaseMergeInput {
+                descriptor: &merge_descriptor,
+                filter_properties: &merge_filters,
+                base: base_reader.as_ref(),
+                deltas: &deltas,
+                collector,
+                options,
+            },
+        )
+    })
+    .await
+    .map_err(|error| Error::invariant(format!("vector segment merge panicked: {error}")))??;
+
+    let mut digest = winner_hasher(&selection);
+    digest.update(&merged.winner_digest.to_le_bytes());
+    finish_vector_base(
+        selection,
+        descriptor,
+        filters,
+        merged.artifact,
+        VectorBaseCounts {
+            input_bytes,
+            input_rows: merged.input_rows,
+            touched_rows: merged.touched_rows,
+            live_rows: merged.live_rows,
+            empty_proof_digest: digest.digest().max(1),
+            merge_workspace_bytes: merged.peak_merge_workspace_bytes as u64,
+        },
+        started,
+    )
 }
 
 #[cfg(any(feature = "vector-index", feature = "text-index"))]
@@ -2105,6 +2354,18 @@ pub(super) async fn prepare_search_compactions(
     base: &LoadedManifest,
     selections: Vec<SearchCompactionSelection>,
 ) -> Result<Vec<PreparedSearchCompaction>> {
+    prepare_search_compactions_with(store, paths, base, selections, true).await
+}
+
+/// [`prepare_search_compactions`]; `vector_segment_merge: false` forces every
+/// vector base through the node scan (tests compare the two builds).
+async fn prepare_search_compactions_with(
+    store: Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    base: &LoadedManifest,
+    selections: Vec<SearchCompactionSelection>,
+    vector_segment_merge: bool,
+) -> Result<Vec<PreparedSearchCompaction>> {
     if selections.is_empty() {
         return Ok(Vec::new());
     }
@@ -2112,12 +2373,38 @@ pub(super) async fn prepare_search_compactions(
     let (base_selections, delta_selections): (Vec<_>, Vec<_>) = selections
         .into_iter()
         .partition(|selection| selection.mode == SearchCompactionMode::BasePrefix);
-    // A full-text base over FT4 segments folds by merging postings; only the
-    // rest (vector bases, legacy or shadow bases, Building generations) scan
-    // the node corpus.
+    // A full-text base over FT4 segments folds by merging postings and a
+    // vector base over VG5/VG6 segments by merging their rows; only the rest
+    // (legacy or shadow bases, Building generations) scan the node corpus.
     let mut built = Vec::with_capacity(base_selections.len() + delta_selections.len());
     // A merge that fails falls back to the node scan, so one unexpected
     // segment never holds back every base of the pass.
+    #[cfg(feature = "vector-index")]
+    let base_selections = if vector_segment_merge {
+        let (merged, mut scanned): (Vec<_>, Vec<_>) = base_selections
+            .into_iter()
+            .partition(|selection| vector_segment_merge_supported(manifest, selection));
+        for selection in merged {
+            match build_vector_segment_merge(store.clone(), paths, base, selection.clone()).await {
+                Ok(Some(merged)) => built.push(merged),
+                // Abandoned like a node scan would be (a single live row).
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        index = %selection.captured_state.index_name,
+                        %error,
+                        "vector segment merge failed; rebuilding the base from node documents"
+                    );
+                    scanned.push(selection);
+                }
+            }
+        }
+        scanned
+    } else {
+        base_selections
+    };
+    #[cfg(not(feature = "vector-index"))]
+    let _ = vector_segment_merge;
     #[cfg(feature = "text-index")]
     let base_selections = {
         let (merged, mut scanned): (Vec<_>, Vec<_>) = base_selections
@@ -3327,138 +3614,185 @@ impl VectorBaseWork {
         } = self;
         let input_rows = builder.input_rows();
         let artifact = builder.finish(&descriptor, super::vector_v5_build_options())?;
-        let elapsed = elapsed_millis(started);
-        let Some(artifact) = artifact else {
-            if input_rows != 0 {
-                tracing::warn!(
-                    index = %descriptor.name,
-                    kind = "vector",
-                    live_rows = input_rows,
-                    prepare_millis = elapsed,
-                    abort_reason = "vector_v5_requires_at_least_two_points",
-                    "abandoning physical Search-LSM compaction without changing its generation"
-                );
-                return Ok(None);
-            }
-            return Ok(Some(BuiltSearchCompaction {
-                prepared: PreparedSearchCompaction {
-                    selection,
-                    output: None,
-                    empty_proof_digest: Some(digest.digest().max(1)),
-                    metrics: SearchCompactionBuildMetrics {
-                        input_bytes,
-                        prepare_millis: elapsed,
-                        ..Default::default()
-                    },
-                },
-                file: None,
-            }));
-        };
-        let crate::sst::vector::v5::external::VectorV5ExternalArtifact {
-            file,
-            len,
-            stats,
-            metrics,
-        } = artifact;
-        if stats.point_count != input_rows || metrics.input_rows != input_rows {
-            return Err(Error::invariant(
-                "V5 Search-LSM base counts disagree with its winner stream",
-            ));
+        finish_vector_base(
+            selection,
+            descriptor,
+            filters,
+            artifact,
+            VectorBaseCounts {
+                input_bytes,
+                input_rows,
+                touched_rows: input_rows,
+                live_rows: input_rows,
+                empty_proof_digest: digest.digest().max(1),
+                merge_workspace_bytes: 0,
+            },
+            started,
+        )
+    }
+}
+
+/// Winner-stream counters of one vector base build, node scan or segment
+/// merge.
+#[cfg(feature = "vector-index")]
+struct VectorBaseCounts {
+    input_bytes: u64,
+    input_rows: u64,
+    touched_rows: u64,
+    /// Live winners pushed into the V5 collector.
+    live_rows: u64,
+    /// Non-zero digest binding the winners, used when none is live.
+    empty_proof_digest: u64,
+    /// Merge-side workspace held before the collector's own build.
+    merge_workspace_bytes: u64,
+}
+
+/// Turn a finished V5 collector into the prepared base (or empty proof).
+#[cfg(feature = "vector-index")]
+fn finish_vector_base(
+    selection: SearchCompactionSelection,
+    descriptor: crate::manifest::VectorIndexDescriptor,
+    filters: Vec<String>,
+    artifact: Option<crate::sst::vector::v5::external::VectorV5ExternalArtifact>,
+    counts: VectorBaseCounts,
+    started: Instant,
+) -> Result<Option<BuiltSearchCompaction>> {
+    let elapsed = elapsed_millis(started);
+    let Some(artifact) = artifact else {
+        if counts.live_rows != 0 {
+            tracing::warn!(
+                index = %descriptor.name,
+                kind = "vector",
+                live_rows = counts.live_rows,
+                prepare_millis = elapsed,
+                abort_reason = "vector_v5_requires_at_least_two_points",
+                "abandoning physical Search-LSM compaction without changing its generation"
+            );
+            return Ok(None);
         }
-        let id = Uuid::now_v7();
-        let file_name = format!(
-            "{}-{}-{}.vg",
-            id.simple(),
-            SstKind::VectorGraph.path_tag(),
-            descriptor.name
-        );
-        let corpus_max_lsn = selection
-            .captured_state
-            .coverage
-            .iter()
-            .map(|coverage| coverage.node_sst_max_lsn)
-            .max()
-            .unwrap_or(0);
-        let output_descriptor = SstDescriptor {
-            id,
-            kind: SstKind::VectorGraph,
-            scope: descriptor.name.clone(),
-            level: SstLevel(1),
-            path: super::relative_sst_path(1, &file_name),
-            size_bytes: len,
-            row_count: stats.point_count,
-            created_at: Utc::now(),
-            min_key: stats.min_node_id,
-            max_key: stats.max_node_id,
-            min_lsn: 0,
-            max_lsn: corpus_max_lsn,
-            schema_version_min: 0,
-            schema_version_max: 0,
-            property_stats: Vec::new(),
-            kind_specific: KindSpecificStats::VectorGraph {
-                dim: stats.dim,
-                metric: stats.metric,
-                point_count: stats.point_count,
-                r: stats.r,
-                l_build: stats.l_build,
-                alpha: stats.alpha,
-                entry_medoid: stats.entry_medoid,
-            },
-            bloom: None,
-            unique_property_indices: Vec::new(),
-            equality_property_indices: Vec::new(),
-            composite_equality_indices: Vec::new(),
-            label_index: None,
-            node_locator: None,
-            per_label_property_stats: Vec::new(),
-        };
-        let segment = SearchSegmentRef {
-            sst_id: id,
-            role: SearchSegmentRole::Base,
-            format: SearchSegmentFormat::VectorV5Base,
-            payload: SearchSegmentPayload::Complete,
-            event_ranges: selection.selected_event_ranges.clone(),
-            min_lsn: output_descriptor.min_lsn,
-            max_lsn: output_descriptor.max_lsn,
-            mutation_count: stats.point_count,
-            live_payload_count: stats.point_count,
-            suppress_count: 0,
-            content_xxh3: legacy_base_content_fingerprint(
-                &output_descriptor,
-                SearchSegmentFormat::VectorV5Base,
-                &filters,
-            ),
-            complete_filter_properties: filters,
-            stats: SearchSegmentStats::Vector {
-                live_count: SearchStatValue::Absolute(stats.point_count),
-            },
-            equal_lsn_conflict_count: 0,
-        };
-        Ok(Some(BuiltSearchCompaction {
+        return Ok(Some(BuiltSearchCompaction {
             prepared: PreparedSearchCompaction {
                 selection,
-                output: Some(PreparedSearchPayload {
-                    descriptor: output_descriptor,
-                    segment,
-                }),
-                empty_proof_digest: None,
+                output: None,
+                empty_proof_digest: Some(counts.empty_proof_digest.max(1)),
                 metrics: SearchCompactionBuildMetrics {
-                    input_bytes,
-                    output_bytes: len,
-                    input_rows,
-                    touched_rows: input_rows,
-                    live_rows: input_rows,
-                    peak_workspace_bytes: metrics.peak_logical_memory_bytes as u64,
-                    scratch_bytes: metrics.scratch_bytes_written,
-                    spill_bytes: metrics.scratch_bytes_written,
+                    input_bytes: counts.input_bytes,
+                    input_rows: counts.input_rows,
+                    touched_rows: counts.touched_rows,
                     prepare_millis: elapsed,
-                    // Stamped centrally once the whole merge's peak is known.
-                    peak_resident_input_bytes: 0,
+                    ..Default::default()
                 },
             },
-            file: Some(file),
-        }))
+            file: None,
+        }));
+    };
+    let input_rows = counts.live_rows;
+    let crate::sst::vector::v5::external::VectorV5ExternalArtifact {
+        file,
+        len,
+        stats,
+        metrics,
+    } = artifact;
+    if stats.point_count != input_rows || metrics.input_rows != input_rows {
+        return Err(Error::invariant(
+            "V5 Search-LSM base counts disagree with its winner stream",
+        ));
     }
+    let id = Uuid::now_v7();
+    let file_name = format!(
+        "{}-{}-{}.vg",
+        id.simple(),
+        SstKind::VectorGraph.path_tag(),
+        descriptor.name
+    );
+    let corpus_max_lsn = selection
+        .captured_state
+        .coverage
+        .iter()
+        .map(|coverage| coverage.node_sst_max_lsn)
+        .max()
+        .unwrap_or(0);
+    let output_descriptor = SstDescriptor {
+        id,
+        kind: SstKind::VectorGraph,
+        scope: descriptor.name.clone(),
+        level: SstLevel(1),
+        path: super::relative_sst_path(1, &file_name),
+        size_bytes: len,
+        row_count: stats.point_count,
+        created_at: Utc::now(),
+        min_key: stats.min_node_id,
+        max_key: stats.max_node_id,
+        min_lsn: 0,
+        max_lsn: corpus_max_lsn,
+        schema_version_min: 0,
+        schema_version_max: 0,
+        property_stats: Vec::new(),
+        kind_specific: KindSpecificStats::VectorGraph {
+            dim: stats.dim,
+            metric: stats.metric,
+            point_count: stats.point_count,
+            r: stats.r,
+            l_build: stats.l_build,
+            alpha: stats.alpha,
+            entry_medoid: stats.entry_medoid,
+        },
+        bloom: None,
+        unique_property_indices: Vec::new(),
+        equality_property_indices: Vec::new(),
+        composite_equality_indices: Vec::new(),
+        label_index: None,
+        node_locator: None,
+        per_label_property_stats: Vec::new(),
+    };
+    let segment = SearchSegmentRef {
+        sst_id: id,
+        role: SearchSegmentRole::Base,
+        format: SearchSegmentFormat::VectorV5Base,
+        payload: SearchSegmentPayload::Complete,
+        event_ranges: selection.selected_event_ranges.clone(),
+        min_lsn: output_descriptor.min_lsn,
+        max_lsn: output_descriptor.max_lsn,
+        mutation_count: stats.point_count,
+        live_payload_count: stats.point_count,
+        suppress_count: 0,
+        content_xxh3: legacy_base_content_fingerprint(
+            &output_descriptor,
+            SearchSegmentFormat::VectorV5Base,
+            &filters,
+        ),
+        complete_filter_properties: filters,
+        stats: SearchSegmentStats::Vector {
+            live_count: SearchStatValue::Absolute(stats.point_count),
+        },
+        equal_lsn_conflict_count: 0,
+    };
+    Ok(Some(BuiltSearchCompaction {
+        prepared: PreparedSearchCompaction {
+            selection,
+            output: Some(PreparedSearchPayload {
+                descriptor: output_descriptor,
+                segment,
+            }),
+            empty_proof_digest: None,
+            metrics: SearchCompactionBuildMetrics {
+                input_bytes: counts.input_bytes,
+                output_bytes: len,
+                input_rows: counts.input_rows,
+                touched_rows: counts.touched_rows,
+                live_rows: input_rows,
+                peak_workspace_bytes: (metrics.peak_logical_memory_bytes as u64)
+                    .max(counts.merge_workspace_bytes),
+                scratch_bytes: metrics.scratch_bytes_written,
+                spill_bytes: metrics.scratch_bytes_written,
+                prepare_millis: elapsed,
+                // A node scan stamps its Nodes residency centrally once the
+                // whole merge's peak is known; a segment merge reads none.
+                peak_resident_input_bytes: 0,
+            },
+        },
+        file: Some(file),
+    }))
 }
 
 #[cfg(feature = "text-index")]
@@ -5106,3 +5440,7 @@ mod tests {
         assert!(rebased.segments.len() < current.search_lsm[0].segments.len());
     }
 }
+
+#[cfg(all(test, feature = "vector-index"))]
+#[path = "search_lsm_compact_vector_merge_tests.rs"]
+mod vector_merge_tests;

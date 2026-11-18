@@ -226,13 +226,59 @@ struct VectorPageInput<'a> {
     vector: &'a [f32],
 }
 
+/// One live payload row of a VG6 segment. Rows are stored in live-ordinal
+/// order, which is also NodeId order.
 #[derive(Debug)]
-struct VectorPageRow {
-    ordinal: u64,
-    node_id: [u8; 16],
-    lsn: u64,
-    payload_fingerprint: u64,
-    vector: Vec<f32>,
+pub(crate) struct VectorPageRow {
+    pub(crate) ordinal: u64,
+    pub(crate) node_id: [u8; 16],
+    pub(crate) lsn: u64,
+    pub(crate) payload_fingerprint: u64,
+    pub(crate) vector: Vec<f32>,
+}
+
+/// One complete native-filter property of a VG6 segment, by live ordinal.
+#[derive(Debug, Default)]
+pub(crate) struct VectorV6FilterColumn {
+    /// Distinct values of the property, in posting order.
+    pub(crate) values: Vec<SearchFilterValue>,
+    /// Index into `values` per live ordinal; [`Self::ABSENT`] when the row
+    /// has no value.
+    pub(crate) rows: Vec<u32>,
+}
+
+impl VectorV6FilterColumn {
+    pub(crate) const ABSENT: u32 = u32::MAX;
+
+    pub(crate) fn value(&self, ordinal: u64) -> Result<Option<&SearchFilterValue>> {
+        let index = usize::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| self.rows.get(ordinal))
+            .copied()
+            .ok_or_else(|| Error::invariant("vector v6 filter column ordinal is out of range"))?;
+        if index == Self::ABSENT {
+            return Ok(None);
+        }
+        self.values
+            .get(index as usize)
+            .map(Some)
+            .ok_or_else(|| Error::invariant("vector v6 filter column value is out of range"))
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.rows
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                self.values
+                    .iter()
+                    .map(|value| {
+                        std::mem::size_of::<SearchFilterValue>()
+                            + filter_value_resident_bytes(value)
+                    })
+                    .sum::<usize>(),
+            )
+    }
 }
 
 #[derive(Debug)]
@@ -753,6 +799,86 @@ impl VectorV6Reader {
                     .sum::<usize>(),
             )
             .saturating_add(self.version_reader.resident_metadata_bytes())
+    }
+
+    /// Decode live payload page `page` (rows in live-ordinal order).
+    pub(crate) async fn read_live_page(&self, page: usize) -> Result<Vec<VectorPageRow>> {
+        let reference = self
+            .footer
+            .pages
+            .get(page)
+            .ok_or_else(|| Error::invariant("vector v6 page ordinal is out of range"))?;
+        let compressed = self.source.read_range(reference.wire.range()?).await?;
+        let raw = decode_block(&compressed, &reference.wire, "vector page")?;
+        drop(compressed);
+        decode_vector_page(&raw, reference, self.footer.dim)
+    }
+
+    /// The complete column of native-filter `property` over this segment's
+    /// live ordinals, or `None` when the segment does not advertise it.
+    pub(crate) async fn live_filter_column(
+        &self,
+        property: &str,
+    ) -> Result<Option<VectorV6FilterColumn>> {
+        let Ok(index) = self
+            .footer
+            .filters
+            .binary_search_by(|candidate| candidate.property.as_str().cmp(property))
+        else {
+            return Ok(None);
+        };
+        let reference = &self.footer.filters[index];
+        let row_count = self.footer.binding.segment.live_payload_count;
+        validate_filter_directory(reference, row_count)?;
+        let rows = usize::try_from(row_count)
+            .map_err(|_| Error::invariant("vector v6 live row count exceeds usize"))?;
+        if reference.values.len() >= VectorV6FilterColumn::ABSENT as usize {
+            return Err(Error::invariant(
+                "vector v6 filter property has too many distinct values",
+            ));
+        }
+        let mut column = VectorV6FilterColumn {
+            values: Vec::with_capacity(reference.values.len()),
+            rows: vec![VectorV6FilterColumn::ABSENT; rows],
+        };
+        for (value_index, value) in reference.values.iter().enumerate() {
+            let compressed = self.source.read_range(value.wire.range()?).await?;
+            let raw = decode_block(&compressed, &value.wire, "filter posting block")?;
+            let mut assign = |ordinal: u64| -> Result<()> {
+                let slot = usize::try_from(ordinal)
+                    .ok()
+                    .and_then(|ordinal| column.rows.get_mut(ordinal))
+                    .ok_or_else(|| {
+                        Error::invariant("vector v6 filter ordinal leaves vector rows")
+                    })?;
+                if *slot != VectorV6FilterColumn::ABSENT {
+                    return Err(Error::invariant(
+                        "vector v6 row holds two values of one filter property",
+                    ));
+                }
+                *slot = value_index as u32;
+                Ok(())
+            };
+            match decode_filter_query_mask(raw, value, row_count)? {
+                QueryFilterMask::Sparse(ordinals) => {
+                    for ordinal in ordinals {
+                        assign(ordinal)?;
+                    }
+                }
+                QueryFilterMask::Dense(bitmap) => {
+                    for (byte_index, byte) in bitmap.into_iter().enumerate() {
+                        let mut bits = byte;
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as u64;
+                            bits &= bits - 1;
+                            assign(byte_index as u64 * 8 + bit)?;
+                        }
+                    }
+                }
+            }
+            column.values.push(value.value.clone());
+        }
+        Ok(Some(column))
     }
 
     /// Exhaustive exact search of this delta's live payload pages.

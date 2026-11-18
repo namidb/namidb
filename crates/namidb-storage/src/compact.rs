@@ -243,6 +243,58 @@ impl PreparedCompaction {
     pub fn base_version(&self) -> u64 {
         self.base_version
     }
+
+    /// Every namespace-relative object path this prepare uploaded (sorted,
+    /// deduplicated): each new descriptor's body, bloom and side-cars, every
+    /// rebuilt index body, every Search-LSM consolidation output and every
+    /// activation barrier it wrote. Objects it carried over from its inputs
+    /// (a side-car-only migration keeps the source body, bloom and index
+    /// side-cars) and barriers that were already present are excluded: they
+    /// belong to manifest history, not to this prepare.
+    ///
+    /// A caller whose install did not reference some of these (the install
+    /// lost a precondition, or dropped part of the plan) can delete those
+    /// right away instead of leaving them for the janitor's `min_age`.
+    pub fn uploaded_object_paths(&self) -> Vec<String> {
+        use crate::janitor::descriptor_object_paths;
+        let outputs = self
+            .new_descs
+            .iter()
+            .chain(self.node_rewrites.iter().filter_map(|r| r.output.as_ref()))
+            .chain(
+                self.search_compactions
+                    .iter()
+                    .filter_map(|search| search.output_descriptor()),
+            )
+            .chain(
+                self.search_lsm_activations
+                    .iter()
+                    .filter(|activation| !activation.barrier_already_present)
+                    .map(|activation| &activation.barrier),
+            );
+        let mut uploaded: HashSet<String> = outputs.flat_map(descriptor_object_paths).collect();
+        let carried = self
+            .node_rewrites
+            .iter()
+            .flat_map(|r| r.inputs.iter())
+            .chain(
+                self.search_compactions
+                    .iter()
+                    .flat_map(|search| search.selection.selected_descriptors.iter()),
+            )
+            .chain(
+                self.search_lsm_activations
+                    .iter()
+                    .filter(|activation| activation.barrier_already_present)
+                    .map(|activation| &activation.barrier),
+            );
+        for path in carried.flat_map(descriptor_object_paths) {
+            uploaded.remove(&path);
+        }
+        let mut uploaded: Vec<String> = uploaded.into_iter().collect();
+        uploaded.sort();
+        uploaded
+    }
 }
 
 /// Snapshot of everything the expensive compaction prepare phase needs,
@@ -320,6 +372,11 @@ impl CompactionBasis {
     /// Manifest version this basis was captured at.
     pub fn manifest_version(&self) -> u64 {
         self.base.manifest.version
+    }
+
+    /// The manifest this basis was captured at.
+    pub fn base_manifest(&self) -> &crate::manifest::Manifest {
+        &self.base.manifest
     }
 
     /// Schema committed in the basis manifest — what the maintenance loops
@@ -2825,6 +2882,66 @@ fn catalog_drift(
     drift
 }
 
+/// Drop every physical Search-LSM compaction whose generation is no longer
+/// in `current`: a DROP INDEX, or a DDL that restarted the index (a changed
+/// native-filter catalog retires the generation and a new one starts), landed
+/// while it was being prepared. Its output belongs to a generation no
+/// manifest will reference again, so installing it is impossible and
+/// retrying it pointless; abandoning the whole pass for it would also throw
+/// away every other index's finished work. The rest of the plan installs as
+/// usual, and the caller discards the dropped upload. Returns `true` when
+/// anything was dropped.
+fn drop_retired_search_compactions(
+    prepared: &mut PreparedCompaction,
+    current: &crate::manifest::Manifest,
+) -> bool {
+    let before = prepared.search_compactions.len();
+    let mut retired = Vec::new();
+    prepared.search_compactions.retain(|search| {
+        let captured = &search.selection.captured_state;
+        let alive = current.search_lsm.iter().any(|state| {
+            state.kind == captured.kind
+                && state.index_name == captured.index_name
+                && state.generation_id == captured.generation_id
+        });
+        if !alive {
+            retired.push((
+                captured.kind,
+                captured.index_name.clone(),
+                captured.generation_id,
+                search.output_descriptor().map(|output| output.id),
+                search.selection.selected_ids().collect::<HashSet<_>>(),
+            ));
+        }
+        alive
+    });
+    for (kind, name, generation_id, output, selected) in &retired {
+        if let Some(output) = output {
+            prepared
+                .new_descs
+                .retain(|descriptor| descriptor.id != *output);
+        }
+        prepared.removed_ids.retain(|id| !selected.contains(id));
+        let sst_kind = kind.sst_kind();
+        prepared
+            .consolidated_base_markers
+            .retain(|marker| !(marker.kind == sst_kind && marker.name == *name));
+        prepared.search_lsm_activations.retain(|activation| {
+            !(activation.state.kind == *kind
+                && activation.state.index_name == *name
+                && activation.state.generation_id == *generation_id)
+        });
+        tracing::info!(
+            index = %name,
+            ?kind,
+            %generation_id,
+            "dropping a prepared Search-LSM compaction: its generation was retired by DDL \
+             while it was being built"
+        );
+    }
+    prepared.search_compactions.len() != before
+}
+
 fn drop_conflicting_search_replacements(
     prepared: &mut PreparedCompaction,
     current: &crate::manifest::Manifest,
@@ -3024,6 +3141,14 @@ pub async fn install_prepared(
 
     let mut prepared = prepared;
     drop_conflicting_search_replacements(&mut prepared, &current.manifest);
+    if drop_retired_search_compactions(&mut prepared, &current.manifest) && prepared.is_noop() {
+        return Ok(CompactionOutcome {
+            committed: current.clone(),
+            source_ssts_removed: 0,
+            new_ssts_written: 0,
+            bloom_sidecars_written: 0,
+        });
+    }
     verify_search_replacement_inputs(
         &prepared.base_search_lsm,
         &current.manifest.search_lsm,
@@ -6331,14 +6456,16 @@ mod tests {
             .unwrap();
         assert_eq!(prepared.search_compactions.len(), 1);
         let physical = &prepared.search_compactions[0];
-        assert!(physical.metrics.peak_resident_input_bytes > 0);
-        assert!(
-            physical.metrics.peak_resident_input_bytes < physical.metrics.input_bytes,
-            "disjoint-range Nodes SSTs must stream through the base build, \
-             not co-reside: peak {} vs total {}",
-            physical.metrics.peak_resident_input_bytes,
-            physical.metrics.input_bytes
-        );
+        // An Active generation's base is folded from its own segments: no
+        // Nodes table is read or held resident.
+        assert_eq!(physical.metrics.peak_resident_input_bytes, 0);
+        let segment_bytes = physical
+            .selection
+            .selected_descriptors
+            .iter()
+            .map(|descriptor| descriptor.size_bytes)
+            .sum::<u64>();
+        assert_eq!(physical.metrics.input_bytes, segment_bytes);
         let selected_ids = physical.selection.selected_ids().collect::<Vec<_>>();
         let output = physical.output.as_ref().expect("non-empty V5 base");
         assert_eq!(

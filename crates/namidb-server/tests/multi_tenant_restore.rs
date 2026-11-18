@@ -60,6 +60,7 @@ fn config(
         flush_interval: Duration::ZERO,
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::ZERO,
+        sweep_superseded_min_age: Duration::ZERO,
         sweep_delete: false,
         restore_point_retention: Duration::ZERO,
         bolt_listen: None,
