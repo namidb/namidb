@@ -8887,11 +8887,15 @@ mod tests {
         corrupt_barrier[0] ^= 1;
         let barrier_absolute = format!("{}/{}", p.namespace_prefix().as_ref(), barrier.path);
         s.put(
-            &Path::from(barrier_absolute),
+            &Path::from(barrier_absolute.as_str()),
             PutPayload::from(Bytes::from(corrupt_barrier)),
         )
         .await
         .unwrap();
+        // Search objects are create-only; this test rewrites one in place, so
+        // drop the process's cached stat of it as a real replacement would
+        // never need to.
+        crate::range_cache::forget_create_only_head(&s, &Path::from(barrier_absolute.as_str()));
         let snap = Snapshot::new(out.committed.clone(), &empty_view, s.clone(), p.clone());
         assert!(
             snap.text_search("note_ft", "Note", &crate::text::parse_query("fox"), Some(5),)
@@ -9289,11 +9293,13 @@ mod tests {
         // search reports "index absent" instead of erroring the query.
         let absolute = format!("{}/{}", p.namespace_prefix().as_ref(), ft.path);
         s.put(
-            &Path::from(absolute),
+            &Path::from(absolute.as_str()),
             PutPayload::from_static(b"NAMIFT01legacy-postings"),
         )
         .await
         .unwrap();
+        // Create-only objects are never rewritten; forget the cached stat.
+        crate::range_cache::forget_create_only_head(&s, &Path::from(absolute.as_str()));
         let got = snap
             .text_search("note_ft", "Note", &q, Some(5))
             .await

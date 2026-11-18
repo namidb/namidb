@@ -519,7 +519,7 @@ impl WriterSession {
             Ok(loaded) => {
                 crate::format::check_upgrade(&store, &paths, &loaded.manifest, upgrade).await?;
                 manifest_store
-                    .claim_writer_unless_newer(yield_above)
+                    .claim_writer_from(yield_above, Some(loaded))
                     .await?
             }
             Err(Error::ObjectStore(object_store::Error::NotFound { .. })) => {
@@ -618,14 +618,15 @@ impl WriterSession {
         Ok(session)
     }
 
-    /// Seed, in the background, the node count and property-presence ledger
-    /// of every vector-indexed label (with the presence of its vector-indexed
-    /// properties), so `count(n)` and `count(n) WHERE
-    /// n.embedding IS NOT NULL` are O(1) from the first query after a restart
-    /// instead of waiting for a seed then. `NAMIDB_COUNT_SEED_ON_OPEN=0`
-    /// disables it; the first such count then seeds on demand.
+    /// With `NAMIDB_COUNT_SEED_ON_OPEN=1`, seed in the background the node
+    /// count and property-presence ledger of every vector-indexed label (with
+    /// the presence of its vector-indexed properties) as soon as the
+    /// namespace opens. Off by default: the seed reads every page of those
+    /// properties, which after a start or wake competed with the first
+    /// queries for the object store. The first count that needs the ledger
+    /// seeds it on demand instead.
     fn start_indexed_count_seed(&self) {
-        if std::env::var("NAMIDB_COUNT_SEED_ON_OPEN").is_ok_and(|value| value == "0") {
+        if !std::env::var("NAMIDB_COUNT_SEED_ON_OPEN").is_ok_and(|value| value == "1") {
             return;
         }
         let manifest = &self.current.manifest;

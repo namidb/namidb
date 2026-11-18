@@ -1507,6 +1507,15 @@ pub async fn run_with_memory_limits(
         }
         let app = build_multi_tenant_router(shared.clone());
 
+        // Open the shared object-range cache now rather than on the first
+        // query: with a persistent tier, its recovery then overlaps the
+        // first namespace open instead of delaying the first answer.
+        tokio::spawn(async {
+            if let Err(error) = namidb_storage::range_cache::shared_range_cache().await {
+                tracing::warn!(%error, "object-range cache did not open at start");
+            }
+        });
+
         // TLS on the serving path.
         let tls_config: Option<Arc<rustls::ServerConfig>> =
             match (&config.tls_cert, &config.tls_key) {

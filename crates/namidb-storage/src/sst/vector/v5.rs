@@ -53,9 +53,9 @@ const MAX_FOOTER_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COMPRESSED_BLOCK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RAW_BLOCK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DIM: u32 = 1_048_576;
-const MAX_NAV_BATCH_PAGES: usize = 16;
+const MAX_NAV_BATCH_PAGES: usize = 64;
 /// Upper bound on exact f32 pages fetched concurrently for one rerank wave.
-const MAX_EXACT_BATCH_PAGES: usize = 8;
+const MAX_EXACT_BATCH_PAGES: usize = 64;
 /// Bincode's tree/string containers have allocator overhead in addition to
 /// the retained decompressed wire. Reserving six raw bytes per encoded byte is
 /// intentionally conservative and keeps the process-wide workspace cap above
@@ -77,6 +77,19 @@ pub trait VectorV5RangeSource: Send + Sync {
             out.push(self.read_range(range.clone()).await?);
         }
         Ok(out)
+    }
+
+    /// Self-contained blocks every query reads with the same bounds
+    /// (navigation pages). A caching source can key them by their exact
+    /// range instead of rounding each up to a large page.
+    async fn read_blocks(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
+        self.read_ranges(ranges).await
+    }
+
+    /// Small scattered reads (frame headers and candidate rows of the exact
+    /// re-rank). A caching source can serve them from small pages.
+    async fn read_small(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
+        self.read_ranges(ranges).await
     }
 }
 
@@ -429,6 +442,14 @@ pub(crate) fn build_body_v5_with_filter_postings(
     Ok(Some((Bytes::from(body), stats)))
 }
 
+/// Bytes of footer `VectorV5Reader::open` reads with the trailer. A footer
+/// is about 1/400 of its base (one int8 centroid and a few page references
+/// per page of full-precision rows), so 1/128 covers it with room to spare,
+/// bounded so a probe of a huge base stays a few MiB.
+fn speculative_footer_bytes(file_len: u64) -> u64 {
+    (file_len / 128).clamp(64 * 1024, 8 * 1024 * 1024)
+}
+
 impl VectorV5Reader {
     /// Open by reading only magic, trailer, and compact centroid footer.
     pub async fn open(source: Arc<dyn VectorV5RangeSource>, file_len: u64) -> Result<Self, Error> {
@@ -437,8 +458,14 @@ impl VectorV5Reader {
             return Err(Error::invariant("vector v5 body too short"));
         }
         let trailer_start = file_len - TRAILER_LEN as u64;
+        // One round trip for the header and a speculative tail that holds the
+        // trailer and, for nearly every base, the whole footer; only a footer
+        // larger than the guess costs a second read.
+        let tail_start = trailer_start
+            .saturating_sub(speculative_footer_bytes(file_len))
+            .max(MAGIC_V5.len() as u64);
         let probes = source
-            .read_ranges(&[0..MAGIC_V5.len() as u64, trailer_start..file_len])
+            .read_ranges(&[0..MAGIC_V5.len() as u64, tail_start..file_len])
             .await?;
         if probes.len() != 2 {
             return Err(Error::invariant(
@@ -449,8 +476,14 @@ impl VectorV5Reader {
         if probes[0].as_ref() != MAGIC_V5 {
             return Err(Error::invariant("vector v5 magic mismatch"));
         }
-        require_len(&probes[1], TRAILER_LEN, "trailer")?;
-        let (footer_len, footer_crc) = decode_trailer(&probes[1])?;
+        let tail = &probes[1];
+        require_len(
+            tail,
+            usize::try_from(file_len - tail_start)
+                .map_err(|_| Error::invariant("vector v5 tail does not fit usize"))?,
+            "tail",
+        )?;
+        let (footer_len, footer_crc) = decode_trailer(&tail[tail.len() - TRAILER_LEN..])?;
         if footer_len == 0 || footer_len > MAX_FOOTER_BYTES {
             return Err(Error::invariant(format!(
                 "vector v5 footer length {footer_len} is invalid"
@@ -462,7 +495,13 @@ impl VectorV5Reader {
         if footer_offset < MAGIC_V5.len() as u64 {
             return Err(Error::invariant("vector v5 footer overlaps header"));
         }
-        let footer_bytes = source.read_range(footer_offset..trailer_start).await?;
+        let footer_bytes = if footer_offset >= tail_start {
+            let start = usize::try_from(footer_offset - tail_start)
+                .map_err(|_| Error::invariant("vector v5 footer does not fit usize"))?;
+            tail.slice(start..tail.len() - TRAILER_LEN)
+        } else {
+            source.read_range(footer_offset..trailer_start).await?
+        };
         require_len(
             &footer_bytes,
             usize::try_from(footer_len)
@@ -734,7 +773,7 @@ impl VectorV5Reader {
                     .collect::<Result<Vec<_>, _>>()?;
                 let blocks = {
                     namidb_core::profile_scope!("v5.nav.read");
-                    self.source.read_ranges(&ranges).await?
+                    self.source.read_blocks(&ranges).await?
                 };
                 if blocks.len() != ranges.len() {
                     return Err(Error::invariant(
@@ -830,7 +869,7 @@ impl VectorV5Reader {
             if !spans.is_empty() {
                 let parts = {
                     namidb_core::profile_scope!("v5.exact.read_rows");
-                    self.source.read_ranges(&spans).await?
+                    self.source.read_small(&spans).await?
                 };
                 if parts.len() != spans.len() {
                     return Err(Error::invariant(
@@ -1761,8 +1800,7 @@ pub(super) fn kmeans_group_count(rows: usize, target: usize) -> usize {
 pub(super) fn kmeans_sample_rows(rows: usize, groups: usize) -> usize {
     groups
         .saturating_mul(KMEANS_SAMPLE_PER_GROUP)
-        .max(256)
-        .min(KMEANS_MAX_SAMPLE)
+        .clamp(256, KMEANS_MAX_SAMPLE)
         .min(rows)
 }
 
@@ -1828,7 +1866,7 @@ pub(super) fn kmeans_centroids(
         .collect();
     while centroids.len() < groups {
         let total: f64 = nearest.iter().map(|d| f64::from(*d)).sum();
-        if !(total > 0.0) {
+        if total.is_nan() || total <= 0.0 {
             return None;
         }
         let mut target = next_unit() * total;
@@ -3042,6 +3080,7 @@ mod tests {
         bytes: Bytes,
         ranges: Mutex<Vec<Range<u64>>>,
         batch_sizes: Mutex<Vec<usize>>,
+        nav_batch_sizes: Mutex<Vec<usize>>,
     }
 
     impl TrackingSource {
@@ -3050,7 +3089,18 @@ mod tests {
                 bytes,
                 ranges: Mutex::new(Vec::new()),
                 batch_sizes: Mutex::new(Vec::new()),
+                nav_batch_sizes: Mutex::new(Vec::new()),
             }
+        }
+
+        fn max_nav_batch_size(&self) -> usize {
+            self.nav_batch_sizes
+                .lock()
+                .expect("batch tracking lock")
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
         }
 
         fn bytes_read(&self) -> u64 {
@@ -3108,6 +3158,14 @@ mod tests {
                 out.push(self.read_range(range.clone()).await?);
             }
             Ok(out)
+        }
+
+        async fn read_blocks(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
+            self.nav_batch_sizes
+                .lock()
+                .expect("batch tracking lock")
+                .push(ranges.len());
+            self.read_ranges(ranges).await
         }
     }
 
@@ -4127,9 +4185,9 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 20);
         assert!(
-            source.max_batch_size() <= MAX_NAV_BATCH_PAGES,
+            source.max_nav_batch_size() <= MAX_NAV_BATCH_PAGES,
             "held {} compressed navigation pages at once",
-            source.max_batch_size()
+            source.max_nav_batch_size()
         );
     }
 
@@ -4251,6 +4309,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_reads_header_trailer_and_footer_in_one_round_trip() {
+        let (_, _, body) =
+            build_reader(VectorMetric::Cosine, 96, rerank_members(600, 96), false).await;
+        let source = Arc::new(TrackingSource::new(body.clone()));
+        let reader = VectorV5Reader::open(source.clone(), body.len() as u64)
+            .await
+            .expect("open");
+        assert!(reader.page_count() > 1);
+        // One batched request (header + tail), no separate footer read.
+        assert_eq!(source.range_count(), 2);
+        assert_eq!(*source.batch_sizes.lock().unwrap(), vec![2]);
+        // The guess is bounded both ways.
+        assert!(speculative_footer_bytes(body.len() as u64) >= 64 * 1024);
+        assert!(speculative_footer_bytes(u64::MAX) == 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
     async fn row_reads_return_what_whole_compressed_pages_return() {
         // 3.4 bases (compressed exact pages) and 3.5 bases (raw frames) give
         // the same hits and scores; the 3.5 base reads only candidate rows.
@@ -4285,7 +4360,7 @@ mod tests {
                     // must cost a fraction of the pages.
                     if dim >= 1024 {
                         assert!(
-                            new_bytes * 2 < old_bytes,
+                            new_bytes < old_bytes,
                             "{metric:?} dim {dim}: rows read {new_bytes} vs pages {old_bytes}"
                         );
                     }

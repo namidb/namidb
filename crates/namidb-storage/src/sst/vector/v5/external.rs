@@ -1186,7 +1186,7 @@ fn partition_multiway(
 
 /// Split by nearest centroid of a k-means model trained on a bounded hash
 /// sample of the partition (see [`super::kmeans_centroids`]). The sample is
-/// at most `KMEANS_MAX_SAMPLE` rows and is shrunk to fit a quarter of the
+/// at most `KMEANS_MAX_SAMPLE` rows and is shrunk to fit an eighth of the
 /// memory budget; the assignment streams the spool once. `None` when the
 /// sample cannot train a split or the split makes no progress, leaving the
 /// partition to the direction split.
@@ -1202,7 +1202,8 @@ fn partition_kmeans(
     let groups = super::kmeans_group_count(rows, context.effective_target);
     // The sample is held twice (as read and as training rows).
     let row_bytes = dim.saturating_mul(std::mem::size_of::<f32>() * 2).max(1);
-    let by_budget = (context.config.memory_budget_bytes / 4) / row_bytes;
+    // Leave the rest of the budget to the tree metadata and leaf emission.
+    let by_budget = (context.config.memory_budget_bytes / 8) / row_bytes;
     let limit = super::kmeans_sample_rows(rows, groups).min(by_budget);
     if limit < groups.saturating_mul(2) {
         return Ok(None);

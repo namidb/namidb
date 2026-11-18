@@ -457,6 +457,7 @@ impl NamespaceRegistry {
         // read-amplification-bounded as a single-tenant process. The tasks
         // hold their own Arc clones and run until eviction cancels them.
         self.spawn_maintenance(Arc::clone(&state), paths);
+        spawn_metadata_prefetch(&state);
 
         tracing::info!("opened namespace: {}", namespace);
         Ok(state)
@@ -1129,6 +1130,61 @@ impl IntoResponse for RegistryError {
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
+}
+
+/// `NAMIDB_PREFETCH=0|false|off` disables the metadata prefetch a namespace
+/// runs when it opens.
+fn metadata_prefetch_enabled() -> bool {
+    !matches!(
+        std::env::var("NAMIDB_PREFETCH")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    )
+}
+
+/// Warm a freshly opened namespace in the background: node SST footers and
+/// every search index's segment metadata (vector centroid/routing levels,
+/// text dictionaries, object stats), so the first queries after an engine
+/// start or wake do not pay those round trips one at a time. Reads metadata
+/// only and stops on eviction.
+fn spawn_metadata_prefetch(state: &Arc<NamespaceState>) {
+    if !metadata_prefetch_enabled() {
+        return;
+    }
+    let snapshot = state.snapshot.load();
+    let namespace = state.namespace.clone();
+    let mut cancel = state.cancel_tx.subscribe();
+    // Not a maintenance task: it holds no namespace state, only a pinned
+    // snapshot, and it ends on its own or as soon as eviction cancels it.
+    tokio::spawn(async move {
+        let owned = snapshot.arc();
+        let work = async {
+            let snapshot = owned.borrow();
+            snapshot.prefetch_read_metadata().await
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => {}
+            result = work => match result {
+                Ok(summary) => tracing::info!(
+                    namespace = %namespace,
+                    node_ssts = summary.node_ssts,
+                    node_record_pages = summary.node_record_pages,
+                    vector_indexes = summary.vector_indexes,
+                    text_indexes = summary.text_indexes,
+                    elapsed_ms = summary.elapsed.as_millis() as u64,
+                    "prefetched namespace read metadata"
+                ),
+                Err(error) => tracing::warn!(
+                    namespace = %namespace,
+                    error = %error,
+                    "namespace metadata prefetch stopped"
+                ),
+            },
+        }
+        drop(snapshot);
+    });
 }
 
 #[cfg(test)]

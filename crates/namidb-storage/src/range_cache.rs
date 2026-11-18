@@ -19,8 +19,10 @@
 //! divided between Foyer's resident memory cache and its bounded disk write
 //! buffers and a conservative bound for its persistent hash index.
 //! `NAMIDB_NVME_CACHE_MAX_BYTES` is an independent on-disk device ceiling.
-//! Hybrid admission accepts canonical page-sized entries so a large device
-//! cannot create an unbounded in-memory index from millions of tiny ranges.
+//! A hybrid cache writes to its device only entries of at least
+//! [`DISK_MIN_ENTRY_BYTES`] (or the page size, if smaller), so a large device
+//! cannot create an unbounded in-memory index from millions of tiny ranges;
+//! smaller entries stay in its memory tier.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -54,6 +56,33 @@ const MEMORY_CACHE_SHARDS: usize = 8;
 /// Maximum number of authoritative range GETs issued concurrently by one
 /// pinned source, including cache misses from overlapping batch reads.
 pub const MAX_PINNED_OBJECT_RANGE_READS: usize = 16;
+
+/// Concurrent authoritative GETs one pinned source issues for small reads
+/// ([`ReadGranularity::Block`] and [`ReadGranularity::Fine`]), on a gate of
+/// their own: each moves at most a block, so a query's scattered row and
+/// navigation reads cost one round trip instead of several waves of 16.
+pub const MAX_PINNED_OBJECT_SMALL_READS: usize = 128;
+
+/// Page of [`ReadGranularity::Fine`] reads.
+pub const FINE_RANGE_PAGE_BYTES: u64 = 16 * 1024;
+
+/// How a range read maps onto cache entries and authoritative GETs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadGranularity {
+    /// Aligned pages of the configured size (`NAMIDB_RANGE_CACHE_PAGE_BYTES`).
+    Pages,
+    /// The range itself is the entry: for self-contained blocks every reader
+    /// requests with exactly the same bounds (a vector navigation page, a
+    /// frame header). One GET of exactly those bytes on a miss. Ranges larger
+    /// than a small-read entry fall back to [`Self::Pages`].
+    Block,
+    /// Aligned [`FINE_RANGE_PAGE_BYTES`] pages: scattered small reads such as
+    /// individual vector rows, which a large page would amplify many times.
+    Fine,
+}
+
+/// Largest range [`ReadGranularity::Block`] caches as one entry.
+const MAX_BLOCK_READ_BYTES: u64 = 1024 * 1024;
 const FOYER_INDEXER_SHARDS: usize = 16;
 /// Conservative `HashMap<u64, Index>` capacity, control-byte, allocator and
 /// lock overhead per persistent entry.
@@ -79,6 +108,11 @@ pub const DEFAULT_RANGE_CACHE_PAGE_BYTES: usize = 256 * 1024;
 /// Default Foyer block size. A block is the disk eviction unit and bounds the
 /// largest serialized entry.
 pub const DEFAULT_NVME_CACHE_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Smallest entry a hybrid cache writes to its device. Smaller entries (index
+/// pages, re-rank rows) are cached in its memory tier only; the persistent
+/// index is sized for a device full of entries of this size.
+pub const DISK_MIN_ENTRY_BYTES: usize = 64 * 1024;
 /// Maximum default size of each Foyer write buffer carved from the effective
 /// RAM assignment.
 pub const DEFAULT_NVME_CACHE_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
@@ -432,9 +466,15 @@ impl RangeCacheConfig {
             return 0;
         }
         self.disk_capacity_bytes
-            .div_ceil(self.page_size_bytes)
+            .div_ceil(self.disk_min_entry_bytes())
             .saturating_mul(FOYER_INDEX_BYTES_PER_ENTRY)
             .saturating_add(FOYER_INDEXER_SHARDS.saturating_mul(FOYER_INDEX_SHARD_OVERHEAD_BYTES))
+    }
+
+    /// Smallest entry written to the device: [`DISK_MIN_ENTRY_BYTES`], or the
+    /// page size when pages are smaller.
+    pub fn disk_min_entry_bytes(&self) -> usize {
+        DISK_MIN_ENTRY_BYTES.min(self.page_size_bytes).max(1)
     }
 
     pub fn write_buffer_reservation_bytes(&self) -> usize {
@@ -750,10 +790,14 @@ impl RangeCacheBackend {
         }
     }
 
-    fn insert(&self, key: String, value: Bytes) {
+    /// `memory_only` keeps a hybrid cache's entry off its device.
+    fn insert(&self, key: String, value: Bytes, memory_only: bool) {
         match self {
             Self::Memory(cache) => {
                 cache.insert(key, value);
+            }
+            Self::Hybrid(cache) if memory_only => {
+                cache.memory().insert(key, value);
             }
             Self::Hybrid(cache) => {
                 cache.insert(key, value);
@@ -789,6 +833,7 @@ impl RangeCacheBackend {
         &self,
         key: &str,
         fetch: F,
+        memory_only: bool,
     ) -> Result<(Bytes, Source), RangeCacheError>
     where
         F: FnOnce() -> FU,
@@ -797,6 +842,10 @@ impl RangeCacheBackend {
         match self {
             Self::Memory(cache) => {
                 let entry = cache.get_or_fetch(key, fetch).await?;
+                Ok((entry.value().clone(), entry.source()))
+            }
+            Self::Hybrid(cache) if memory_only => {
+                let entry = cache.memory().get_or_fetch(key, fetch).await?;
                 Ok((entry.value().clone(), entry.source()))
             }
             Self::Hybrid(cache) => {
@@ -934,10 +983,13 @@ impl ImmutableRangeCache {
                 .with_reclaimers(1)
                 .with_buffer_pool_size(config.write_buffer_bytes)
                 .with_submit_queue_size_threshold(config.write_buffer_bytes)
-                // Removes/clear are rare for immutable generations, but a
-                // tombstone log prevents deleted cache entries reappearing
-                // after an otherwise clean restart.
-                .with_tombstone_log(true);
+                // No tombstone log: opening one reads it a page at a time,
+                // which took 1.4 s for an 8 GiB device before the first
+                // query after a start could use the cache. Keys name
+                // immutable generations, so the only removals are of entries
+                // that failed validation; one that reappears after a restart
+                // fails validation again and is removed again.
+                .with_tombstone_log(false);
             builder = builder
                 .with_recover_mode(RecoverMode::Quiet)
                 .with_engine_config(engine);
@@ -1058,8 +1110,17 @@ impl ImmutableRangeCache {
         object_size: u64,
         range: Range<u64>,
     ) -> Result<Bytes, RangeCacheError> {
-        self.read_object_range_limited(store, location, generation, object_size, range, None, None)
-            .await
+        self.read_object_range_limited(
+            store,
+            location,
+            generation,
+            object_size,
+            range,
+            None,
+            None,
+            ReadGranularity::Pages,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1072,6 +1133,7 @@ impl ImmutableRangeCache {
         range: Range<u64>,
         remote_limit: Option<Arc<Semaphore>>,
         source_counters: Option<Arc<PinnedObjectRangeCounters>>,
+        granularity: ReadGranularity,
     ) -> Result<Bytes, RangeCacheError> {
         if range.start > range.end || range.end > object_size {
             return Err(RangeCacheError::InvalidKey(format!(
@@ -1088,22 +1150,35 @@ impl ImmutableRangeCache {
                 range.end - range.start
             ))
         })?;
-        let page_size = u64::try_from(self.config.page_size_bytes).map_err(|_| {
+        let configured_page = u64::try_from(self.config.page_size_bytes).map_err(|_| {
             RangeCacheError::Configuration(
                 "configured range-cache page size does not fit u64".into(),
             )
         })?;
-        let first_page = range.start / page_size * page_size;
+        let block_len = range.end - range.start;
+        let page_size = match granularity {
+            ReadGranularity::Block if block_len <= MAX_BLOCK_READ_BYTES => block_len,
+            ReadGranularity::Fine => FINE_RANGE_PAGE_BYTES.min(configured_page),
+            _ => configured_page,
+        };
+        // A block is its own page, whatever its alignment.
+        let first_page = if page_size == block_len && granularity == ReadGranularity::Block {
+            range.start
+        } else {
+            range.start / page_size * page_size
+        };
         let path_string = location.to_string();
-        // Scope every key to the store INSTANCE. Backend generations are only
-        // unique within one store: `InMemory` e_tags are per-instance
-        // counters, and two buckets can hold different objects at one path
-        // with colliding tokens. Readers sharing one `Arc<dyn ObjectStore>`
-        // — the production shape, one store per process — still share pages.
-        let store_token = store_instance_token(&store);
-        let generation_token = format!("{}@st{store_token:x}", generation.cache_token()?);
+        // Scope every key to the store. Backend generations are only unique
+        // within one store: two buckets can hold different objects at one
+        // path with colliding tokens. See `cache_store_token` for why the
+        // scope is the store's identity rather than the process's instance.
+        let store_token = cache_store_token(&store);
+        let generation_token = format!("{}@{store_token}", generation.cache_token()?);
+        let step = usize::try_from(page_size).map_err(|_| {
+            RangeCacheError::Configuration("range-cache page size does not fit usize".into())
+        })?;
         let pages = (first_page..range.end)
-            .step_by(self.config.page_size_bytes)
+            .step_by(step)
             .map(|start| start..start.saturating_add(page_size).min(object_size));
 
         let fetched: Vec<(Range<u64>, Bytes)> = stream::iter(pages)
@@ -1187,7 +1262,10 @@ impl ImmutableRangeCache {
                     Ok::<_, RangeCacheError>((page, value))
                 }
             })
-            .buffered(MAX_PARALLEL_PAGE_FETCHES)
+            .buffered(match granularity {
+                ReadGranularity::Pages => MAX_PARALLEL_PAGE_FETCHES,
+                ReadGranularity::Block | ReadGranularity::Fine => MAX_PINNED_OBJECT_SMALL_READS,
+            })
             .try_collect()
             .await?;
 
@@ -1285,7 +1363,8 @@ impl ImmutableRangeCache {
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
-        self.cache.insert(self.storage_key(key), value);
+        let memory_only = self.memory_only(value.len());
+        self.cache.insert(self.storage_key(key), value, memory_only);
         self.counters.inserts.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }
@@ -1342,18 +1421,22 @@ impl ImmutableRangeCache {
         let counters = self.counters.clone();
         let (value, source) = self
             .cache
-            .get_or_fetch(&storage_key, move || async move {
-                counters.outer_fetches.fetch_add(1, Ordering::Relaxed);
-                let value = fetch().await.map_err(Into::into)?;
-                if value.len() != expected {
-                    return Err(anyhow::anyhow!(
-                        "authoritative range length mismatch for {path} {start}..{end}: \
+            .get_or_fetch(
+                &storage_key,
+                move || async move {
+                    counters.outer_fetches.fetch_add(1, Ordering::Relaxed);
+                    let value = fetch().await.map_err(Into::into)?;
+                    if value.len() != expected {
+                        return Err(anyhow::anyhow!(
+                            "authoritative range length mismatch for {path} {start}..{end}: \
                          expected {expected}, found {}",
-                        value.len()
-                    ));
-                }
-                Ok::<Bytes, anyhow::Error>(value)
-            })
+                            value.len()
+                        ));
+                    }
+                    Ok::<Bytes, anyhow::Error>(value)
+                },
+                self.memory_only(expected),
+            )
             .await?;
         self.record_source(source);
         if let Err(error) = self.validate_value(key, &value) {
@@ -1403,14 +1486,18 @@ impl ImmutableRangeCache {
         if len == 0 || len > self.config.max_entry_bytes {
             return false;
         }
-        // The persistent index itself lives in RAM. Admitting arbitrary tiny
-        // values would make its entry count proportional to device bytes
-        // rather than canonical pages and invalidate the configured cap.
-        if self.is_hybrid() && len < self.config.page_size_bytes {
-            return false;
+        if self.is_hybrid() && !self.memory_only(len) {
+            return true;
         }
-        self.is_hybrid()
-            || self.storage_key(key).len().saturating_add(len) <= self.memory_capacity_bytes()
+        self.storage_key(key).len().saturating_add(len) <= self.memory_capacity_bytes()
+    }
+
+    /// Whether an entry of `len` bytes stays in memory. The persistent index
+    /// itself lives in RAM: writing arbitrary tiny values to the device would
+    /// make its entry count proportional to device bytes and invalidate the
+    /// configured bound, so a hybrid cache keeps them in its memory tier.
+    fn memory_only(&self, len: usize) -> bool {
+        self.is_hybrid() && len < self.config.disk_min_entry_bytes()
     }
 
     fn validate_value(
@@ -1489,6 +1576,56 @@ pub struct PinnedObjectRangeStats {
     pub remote_bytes: u64,
 }
 
+tokio::task_local! {
+    static BACKGROUND_READ: ();
+}
+
+/// Reads a background task may have in flight across the whole process.
+const BACKGROUND_READ_PERMITS: usize = 2;
+
+/// Queries currently waiting on background work; while any is, background
+/// reads run at full speed.
+static BACKGROUND_READ_AWAITED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Held by a query that waits for background work (a count waiting for the
+/// seed it needs): background reads stop yielding until it is dropped.
+#[derive(Debug)]
+pub struct AwaitingBackground(());
+
+impl AwaitingBackground {
+    pub fn new() -> Self {
+        BACKGROUND_READ_AWAITED.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Default for AwaitingBackground {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for AwaitingBackground {
+    fn drop(&mut self) {
+        BACKGROUND_READ_AWAITED.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn background_read_gate() -> &'static Semaphore {
+    static GATE: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| Semaphore::new(BACKGROUND_READ_PERMITS))
+}
+
+/// Run `work` as background maintenance: every pinned range read it issues
+/// (cache hits included) waits for one of [`BACKGROUND_READ_PERMITS`]
+/// process-wide permits, so a corpus-sized background pass (a node-count
+/// seed) trickles instead of taking the object-store bandwidth queries need,
+/// unless a query is waiting for it (see [`AwaitingBackground`]).
+pub async fn background_reads<F: std::future::Future>(work: F) -> F::Output {
+    BACKGROUND_READ.scope((), work).await
+}
+
 #[derive(Clone)]
 pub struct PinnedObjectRangeSource {
     store: Arc<dyn ObjectStore>,
@@ -1496,6 +1633,7 @@ pub struct PinnedObjectRangeSource {
     generation: PinnedObjectGeneration,
     range_cache: Option<ImmutableRangeCache>,
     remote_limit: Arc<Semaphore>,
+    small_remote_limit: Arc<Semaphore>,
     counters: Arc<PinnedObjectRangeCounters>,
 }
 
@@ -1640,6 +1778,7 @@ impl PinnedObjectRangeSource {
             generation,
             range_cache,
             remote_limit: Arc::new(Semaphore::new(MAX_PINNED_OBJECT_RANGE_READS)),
+            small_remote_limit: Arc::new(Semaphore::new(MAX_PINNED_OBJECT_SMALL_READS)),
             counters: Arc::new(PinnedObjectRangeCounters::default()),
         })
     }
@@ -1679,7 +1818,25 @@ impl PinnedObjectRangeSource {
 
     /// Read one exact half-open range from the frozen object generation.
     pub async fn read_range(&self, range: Range<u64>) -> crate::error::Result<Bytes> {
-        let result = self.read_range_inner(range).await;
+        self.read_range_as(range, ReadGranularity::Pages).await
+    }
+
+    /// [`Self::read_range`] with an explicit cache granularity.
+    pub async fn read_range_as(
+        &self,
+        range: Range<u64>,
+        granularity: ReadGranularity,
+    ) -> crate::error::Result<Bytes> {
+        let _background = match BACKGROUND_READ.try_with(|_| ()) {
+            Ok(()) if BACKGROUND_READ_AWAITED.load(Ordering::Relaxed) == 0 => Some(
+                background_read_gate()
+                    .acquire()
+                    .await
+                    .expect("background read gate is never closed"),
+            ),
+            _ => None,
+        };
+        let result = self.read_range_inner(range, granularity).await;
         if result.is_err() {
             // The metadata this source pins may have come from the
             // process-wide HEAD cache. Whatever failed, never let a cached
@@ -1689,7 +1846,11 @@ impl PinnedObjectRangeSource {
         result
     }
 
-    async fn read_range_inner(&self, range: Range<u64>) -> crate::error::Result<Bytes> {
+    async fn read_range_inner(
+        &self,
+        range: Range<u64>,
+        granularity: ReadGranularity,
+    ) -> crate::error::Result<Bytes> {
         self.validate_range(&range)?;
         self.counters
             .logical_requests
@@ -1706,8 +1867,14 @@ impl PinnedObjectRangeSource {
                     &self.generation,
                     self.meta.size,
                     range.clone(),
-                    Some(self.remote_limit.clone()),
+                    Some(match granularity {
+                        ReadGranularity::Pages => self.remote_limit.clone(),
+                        ReadGranularity::Block | ReadGranularity::Fine => {
+                            self.small_remote_limit.clone()
+                        }
+                    }),
                     Some(self.counters.clone()),
+                    granularity,
                 )
                 .await
             {
@@ -1739,9 +1906,23 @@ impl PinnedObjectRangeSource {
     /// complete source are additionally guarded by the shared 16-permit
     /// semaphore, including page-normalized cache misses.
     pub async fn read_ranges(&self, ranges: &[Range<u64>]) -> crate::error::Result<Vec<Bytes>> {
+        self.read_ranges_as(ranges, ReadGranularity::Pages).await
+    }
+
+    /// [`Self::read_ranges`] with an explicit cache granularity. Small-read
+    /// granularities run up to [`MAX_PINNED_OBJECT_SMALL_READS`] at once.
+    pub async fn read_ranges_as(
+        &self,
+        ranges: &[Range<u64>],
+        granularity: ReadGranularity,
+    ) -> crate::error::Result<Vec<Bytes>> {
+        let concurrency = match granularity {
+            ReadGranularity::Pages => MAX_PINNED_OBJECT_RANGE_READS,
+            ReadGranularity::Block | ReadGranularity::Fine => MAX_PINNED_OBJECT_SMALL_READS,
+        };
         stream::iter(ranges.iter().cloned())
-            .map(|range| self.read_range(range))
-            .buffered(MAX_PINNED_OBJECT_RANGE_READS)
+            .map(|range| self.read_range_as(range, granularity))
+            .buffered(concurrency)
             .try_collect()
             .await
     }
@@ -1845,6 +2026,32 @@ fn pinned_range_cache_error(location: &ObjectPath, error: RangeCacheError) -> cr
 /// recycled allocation address gets a fresh id because the stored `Weak` no
 /// longer upgrades to the same instance. One store per process (production)
 /// resolves to one id forever, so page sharing is unaffected.
+/// The store scope of a range-cache key. A persisted disk tier is only
+/// useful after a restart if the next process computes the same keys, so a
+/// store backed by durable storage is identified by what it addresses (its
+/// `Display`: backend, bucket or root, and any wrapper around them), never by
+/// a per-process counter. Any other store (`InMemory`, whose e_tags are
+/// per-instance counters, or a wrapper that does not show its backend) keeps
+/// a per-instance scope.
+fn cache_store_token(store: &Arc<dyn ObjectStore>) -> String {
+    const DURABLE_BACKENDS: [&str; 5] = [
+        "AmazonS3",
+        "LocalFileSystem",
+        "GoogleCloudStorage",
+        "MicrosoftAzure",
+        "HttpStore",
+    ];
+    let identity = store.to_string();
+    if identity.contains("InMemory")
+        || !DURABLE_BACKENDS
+            .iter()
+            .any(|backend| identity.contains(backend))
+    {
+        return format!("st{:x}", store_instance_token(store));
+    }
+    format!("sd{:016x}", xxhash_rust::xxh3::xxh3_64(identity.as_bytes()))
+}
+
 fn store_instance_token(store: &Arc<dyn ObjectStore>) -> u64 {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1892,6 +2099,13 @@ fn create_only_heads() -> std::sync::MutexGuard<'static, CreateOnlyHeads> {
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether [`head_create_only`] holds a stat of `location` for `store`.
+#[cfg(all(test, any(feature = "vector-index", feature = "text-index")))]
+pub(crate) fn create_only_head_cached(store: &Arc<dyn ObjectStore>, location: &ObjectPath) -> bool {
+    let key: HeadKey = (store_instance_token(store), location.as_ref().to_string());
+    create_only_heads().entries.contains_key(&key)
 }
 
 fn create_only_head_cache_max_entries() -> usize {
@@ -2356,6 +2570,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cache_keys_survive_a_restart_but_not_a_different_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let open = |path: &std::path::Path| -> Arc<dyn ObjectStore> {
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(path).unwrap())
+        };
+        // A new process opens a new store instance over the same data.
+        assert_eq!(
+            cache_store_token(&open(dir.path())),
+            cache_store_token(&open(dir.path()))
+        );
+        assert_ne!(
+            cache_store_token(&open(dir.path())),
+            cache_store_token(&open(other.path()))
+        );
+        // In-memory stores number their e_tags per instance.
+        let a: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let b: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        assert_ne!(cache_store_token(&a), cache_store_token(&b));
+    }
+
+    #[tokio::test]
+    async fn block_and_fine_reads_fetch_only_what_they_need() {
+        let mut config = memory_config(8 * 1024 * 1024);
+        config.page_size_bytes = DEFAULT_RANGE_CACHE_PAGE_BYTES;
+        let cache = ImmutableRangeCache::open(config).await.unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = ObjectPath::from("objects/granularity");
+        let body = Bytes::from(
+            (0..1024 * 1024u32)
+                .map(|value| (value % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        store
+            .put(&location, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        let meta = store.head(&location).await.unwrap();
+        let generation = PinnedObjectGeneration::from_meta(&meta).unwrap();
+        let counters = Arc::new(PinnedObjectRangeCounters::default());
+        let read = |range: Range<u64>, granularity| {
+            let cache = cache.clone();
+            let store = store.clone();
+            let location = location.clone();
+            let generation = generation.clone();
+            let counters = counters.clone();
+            async move {
+                cache
+                    .read_object_range_limited(
+                        store,
+                        &location,
+                        &generation,
+                        meta.size,
+                        range,
+                        None,
+                        Some(counters),
+                        granularity,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let remote = || {
+            (
+                counters.remote_requests.load(Ordering::Relaxed),
+                counters.remote_bytes.load(Ordering::Relaxed),
+            )
+        };
+
+        // An unaligned block is one GET of exactly its bytes, then a hit.
+        let block = 300_001..380_017;
+        assert_eq!(
+            read(block.clone(), ReadGranularity::Block).await,
+            body.slice(300_001..380_017)
+        );
+        assert_eq!(remote(), (1, 80_016));
+        read(block, ReadGranularity::Block).await;
+        assert_eq!(remote(), (1, 80_016));
+
+        // A 4 KiB row costs one fine page, not a configured page.
+        let row = 600_000..604_096;
+        assert_eq!(
+            read(row.clone(), ReadGranularity::Fine).await,
+            body.slice(600_000..604_096)
+        );
+        assert_eq!(remote(), (2, 80_016 + FINE_RANGE_PAGE_BYTES));
+        // Another row in the same fine page is a hit.
+        read(601_000..602_000, ReadGranularity::Fine).await;
+        assert_eq!(remote().0, 2);
+
+        // Pages keep the configured size.
+        read(900_000..900_100, ReadGranularity::Pages).await;
+        assert_eq!(
+            remote(),
+            (
+                3,
+                80_016 + FINE_RANGE_PAGE_BYTES + DEFAULT_RANGE_CACHE_PAGE_BYTES as u64
+            )
+        );
+    }
+
     #[tokio::test]
     async fn create_only_source_supports_backends_without_generation_metadata() {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -2606,16 +2922,23 @@ mod tests {
                 + cache.disk_index_estimate_bytes(),
             cache.ram_budget_bytes()
         );
-        assert!(
-            !cache
-                .insert(
-                    "objects/tiny",
-                    "etag-tiny",
-                    0..1024,
-                    Bytes::from(vec![1; 1024])
-                )
-                .unwrap(),
-            "tiny persistent entries would invalidate the disk-index RAM bound"
+        // Entries below the device floor are cached in memory only: tiny
+        // persistent entries would invalidate the disk-index RAM bound.
+        assert!(cache
+            .insert(
+                "objects/tiny",
+                "etag-tiny",
+                0..1024,
+                Bytes::from(vec![1; 1024])
+            )
+            .unwrap());
+        assert_eq!(
+            cache
+                .get("objects/tiny", "etag-tiny", 0..1024)
+                .await
+                .unwrap()
+                .map(|bytes| bytes.len()),
+            Some(1024)
         );
         assert!(cache
             .insert(
@@ -2635,6 +2958,14 @@ mod tests {
             .unwrap();
         assert_eq!(got, Some(value));
         assert_eq!(reopened.stats().disk_hits, 1);
+        assert_eq!(
+            reopened
+                .get("objects/tiny", "etag-tiny", 0..1024)
+                .await
+                .unwrap(),
+            None,
+            "a memory-only entry never reached the device"
+        );
         assert!(reopened.memory_usage_bytes() <= reopened.memory_capacity_bytes());
         reopened.close().await.unwrap();
     }
