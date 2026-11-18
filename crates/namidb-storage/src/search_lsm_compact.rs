@@ -290,6 +290,31 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
 /// `input_bytes` is what the rebuild would read: the generation's own
 /// segments when they can be merged ([`vector_segments_mergeable`]), the
 /// namespace's Nodes corpus otherwise.
+/// Whether the generation's vector base predates k-means splits: a cosine
+/// or Euclidean base whose descriptor lacks the layout tag.
+#[cfg(feature = "vector-index")]
+fn vector_base_layout_stale(state: &SearchLsmState, descriptors: &[SstDescriptor]) -> bool {
+    state
+        .segments
+        .iter()
+        .zip(descriptors)
+        .any(|(segment, descriptor)| {
+            segment.role == SearchSegmentRole::Base
+                && segment.payload == SearchSegmentPayload::Complete
+                && matches!(
+                    &descriptor.kind_specific,
+                    KindSpecificStats::VectorGraph { metric, entry_medoid, .. }
+                        if metric != "dot"
+                            && *entry_medoid != crate::sst::vector::v5::VECTOR_V5_KMEANS_LAYOUT
+                )
+        })
+}
+
+#[cfg(not(feature = "vector-index"))]
+fn vector_base_layout_stale(_: &SearchLsmState, _: &[SstDescriptor]) -> bool {
+    false
+}
+
 fn vector_base_rebuild_due(
     state: &SearchLsmState,
     descriptors: &[SstDescriptor],
@@ -313,6 +338,11 @@ fn vector_base_rebuild_due(
             }
             SearchSegmentRole::Base => base_rows = segment.live_payload_count,
         }
+    }
+    // A base written before k-means splits is rebuilt once, from its own
+    // segments when they fold, within the same input bound as any rebuild.
+    if vector_base_layout_stale(state, descriptors) {
+        return Ok(true);
     }
     let Some(newest_delta) = newest_delta else {
         return Ok(false);
@@ -4282,7 +4312,7 @@ mod tests {
                     r: 8,
                     l_build: 16,
                     alpha: 1.2,
-                    entry_medoid: 0,
+                    entry_medoid: crate::sst::vector::v5::VECTOR_V5_KMEANS_LAYOUT,
                 },
                 _ => unreachable!(),
             },
@@ -4712,6 +4742,50 @@ mod tests {
         // ...but not a few stray rows.
         let trickle = sized_delta_fixture(&[(100, 3), (100, 3)], VECTOR_BASE_IDLE_SECS + 5);
         assert!(select_search_compactions(&trickle, policy)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_base_built_before_kmeans_splits_is_rebuilt_once() {
+        let policy = delta_policy(6, 8);
+        let mut manifest = compacted_single_base_fixture();
+        assert!(select_search_compactions(&manifest, policy)
+            .unwrap()
+            .is_empty());
+        let base = manifest.search_lsm[0].segments[0].sst_id;
+        let untag = |manifest: &mut Manifest, metric: &str| {
+            let descriptor = manifest
+                .ssts
+                .iter_mut()
+                .find(|descriptor| descriptor.id == base)
+                .unwrap();
+            descriptor.kind_specific = KindSpecificStats::VectorGraph {
+                dim: 2,
+                metric: metric.into(),
+                point_count: descriptor.row_count,
+                r: 8,
+                l_build: 16,
+                alpha: 1.2,
+                entry_medoid: 0,
+            };
+        };
+        untag(&mut manifest, "cosine");
+        let selection = select_search_compactions(&manifest, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(selection.mode, SearchCompactionMode::BasePrefix);
+        // Within the same input bound as any vector rebuild.
+        let tight = SearchCompactionPolicy {
+            vector_base_max_input_bytes: 1,
+            ..policy
+        };
+        assert!(select_search_compactions(&manifest, tight)
+            .unwrap()
+            .is_empty());
+        // Dot-product bases keep direction splits and are left alone.
+        untag(&mut manifest, "dot");
+        assert!(select_search_compactions(&manifest, policy)
             .unwrap()
             .is_empty());
     }

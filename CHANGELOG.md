@@ -41,6 +41,27 @@ crates.io release will establish and document that API explicitly.
 
 ### Changed
 
+- **Vector bases are partitioned by k-means.** The clustered vector base split
+  every node into equal-count slabs along one principal direction. In 1024
+  dimensions such slabs scatter a query's true neighbours over many leaves,
+  so ranking leaf centroids could not find them and a wider `ef` helped only
+  slowly. Cosine and Euclidean bases now split each node by nearest centroid
+  of a k-means model (k-means++ seeding, spherical for cosine) trained on a
+  bounded hash sample of at most 8192 rows, with up to 64 children per node;
+  the rows are assigned in one streaming pass, within the same build memory
+  budget. Dot-product bases keep direction splits. The file format is
+  unchanged, so earlier releases read the new bases.
+
+  Every cosine or Euclidean base written before this release is rebuilt once
+  by the background compactor, from its own segments and within the same
+  input bound as any vector rebuild; queries are served from the old base
+  until the new one is installed. Measured on 386k 1024-dimension
+  embeddings at 6 GiB / 2 CPU: recall@10 against exact search of new query
+  vectors went from 0.70 to 0.975 at the default `ef` and from 0.86 to 0.981
+  at `ef: 400`; a warm top-10 took 97 ms at p50. The one-time rebuild took
+  4.4 minutes, peaked at 2.5 GB resident and 4.8 GB of spool, and all 98
+  queries issued during it succeeded.
+
 - **Vector queries probe at least 64 leaves.** The clustered vector base
   probed `ef / 4` leaves with a floor of 24, which found a document's own
   embedding in about 86% of self-queries on real text embeddings at the
