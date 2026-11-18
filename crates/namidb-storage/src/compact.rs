@@ -6456,14 +6456,16 @@ mod tests {
             .unwrap();
         assert_eq!(prepared.search_compactions.len(), 1);
         let physical = &prepared.search_compactions[0];
-        assert!(physical.metrics.peak_resident_input_bytes > 0);
-        assert!(
-            physical.metrics.peak_resident_input_bytes < physical.metrics.input_bytes,
-            "disjoint-range Nodes SSTs must stream through the base build, \
-             not co-reside: peak {} vs total {}",
-            physical.metrics.peak_resident_input_bytes,
-            physical.metrics.input_bytes
-        );
+        // An Active generation's base is folded from its own segments: no
+        // Nodes table is read or held resident.
+        assert_eq!(physical.metrics.peak_resident_input_bytes, 0);
+        let segment_bytes = physical
+            .selection
+            .selected_descriptors
+            .iter()
+            .map(|descriptor| descriptor.size_bytes)
+            .sum::<u64>();
+        assert_eq!(physical.metrics.input_bytes, segment_bytes);
         let selected_ids = physical.selection.selected_ids().collect::<Vec<_>>();
         let output = physical.output.as_ref().expect("non-empty V5 base");
         assert_eq!(
