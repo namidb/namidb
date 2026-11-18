@@ -1781,10 +1781,13 @@ pub(super) static KMEANS_OFF: std::sync::atomic::AtomicBool =
 
 pub(super) fn kmeans_enabled() -> bool {
     #[cfg(test)]
-    if KMEANS_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
+    {
+        !KMEANS_OFF.load(std::sync::atomic::Ordering::Relaxed)
     }
-    true
+    #[cfg(not(test))]
+    {
+        true
+    }
 }
 /// Training rows per child and in all for one k-means split.
 pub(super) const KMEANS_SAMPLE_PER_GROUP: usize = 48;
