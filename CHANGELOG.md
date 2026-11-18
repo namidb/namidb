@@ -22,8 +22,8 @@ crates.io release will establish and document that API explicitly.
   count(n)` and `MATCH (n:L) RETURN count(n.p)` read an exact per-label,
   per-property presence ledger kept by the writer instead of decoding the
   label. The ledger is seeded in the background when a namespace opens (for
-  labels with a vector index, and their vector and full-text indexed
-  properties) or on the first such count, rolled forward over the commits
+  labels with a vector index, and their vector properties) or on the first
+  such count, rolled forward over the commits
   that land while it is seeded, and kept exact at every commit and flush.
   Other predicates still take the exact path, and a count the ledger cannot
   prove exact never comes from it.
@@ -34,10 +34,20 @@ crates.io release will establish and document that API explicitly.
   it no longer decodes the whole unflushed tail, nor asks the index for
   `k + tail` candidates. Flushed vector deltas get the same treatment: an
   int8 code of each row is kept resident (64 MiB per process by default,
-  `NAMIDB_VECTOR_CODE_CACHE_BYTES`, cleared under memory pressure), and only
-  the pages holding rows that can reach the top-k are read and scored. Hits
-  and scores are unchanged: every returned score is still the exact f32
-  score, and the same rows win.
+  `NAMIDB_VECTOR_CODE_CACHE_BYTES`, cleared under memory pressure; codes in
+  use are never evicted to admit others, and the first query of a delta
+  builds its codes during the exact scan it runs anyway), and only the pages
+  holding rows that can reach the top-k are read and scored. Hits and scores
+  are unchanged: every returned score is still the exact f32 score, and the
+  same rows win.
+- **Vector search with a selective metadata filter reads only what the
+  filter admits.** When a filter (`search.vector({… filter: {ley: $ley}})`
+  or a `WHERE` on node properties) is not one the index can apply and admits
+  few nodes, the filter is evaluated on its own columns first and only the
+  admitted nodes (up to 4,096) are read whole and scored exactly. It used to
+  widen the index search through rounds that each read their whole
+  over-fetch, then scan every node of the label in full. Results are the
+  same exact top-k.
 - **Full-text search stays on its index while unflushed writes leave the
   indexed text alone.** Any unflushed write to a label, even an
   embedding-only `SET`, used to send `search.bm25` on that label to the exact

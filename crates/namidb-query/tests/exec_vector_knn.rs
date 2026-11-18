@@ -442,6 +442,116 @@ async fn flat_vector_search_reads_only_embeddings_until_it_has_the_top_k() {
     );
 }
 
+/// `search.vector` with a selective metadata filter and no index to serve
+/// it: the filter is evaluated on its own column first, and only the nodes it
+/// admits are read whole. Same hits as evaluating it on whole nodes,
+/// including a node without the property (null never passes).
+#[tokio::test]
+async fn flat_vector_search_with_a_selective_filter_reads_only_admitted_nodes() {
+    let counting = Arc::new(ByteCountingStore {
+        inner: store(),
+        bytes: Default::default(),
+    });
+    let shared: Arc<dyn ObjectStore> = counting.clone();
+    let mut writer = WriterSession::open(shared.clone(), paths("knn-flat-filtered"))
+        .await
+        .unwrap();
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut text = |len: usize| {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'a' + (state % 26) as u8)
+            })
+            .collect::<String>()
+    };
+    const DOCS: usize = 400;
+    const BODY: usize = 32 * 1024;
+    let put = |writer: &mut WriterSession, properties: BTreeMap<String, CoreValue>| {
+        writer
+            .upsert_node(
+                "Doc",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    };
+    for i in 0..DOCS {
+        put(
+            &mut writer,
+            BTreeMap::from([
+                ("title".into(), CoreValue::Str(format!("doc-{i}"))),
+                ("kind".into(), CoreValue::Str(format!("k{}", i % 50))),
+                ("body".into(), CoreValue::Str(text(BODY))),
+                ("embedding".into(), CoreValue::Vec(vec![1.0, i as f32, 0.0])),
+            ]),
+        );
+    }
+    // The best match of all, without a `kind`.
+    put(
+        &mut writer,
+        BTreeMap::from([
+            ("title".into(), CoreValue::Str("no-kind".into())),
+            ("embedding".into(), CoreValue::Vec(vec![1.0, 0.0, 0.0])),
+        ]),
+    );
+    writer.commit_batch().await.unwrap();
+    writer
+        .flush(namidb_core::schema::Schema::default())
+        .await
+        .unwrap();
+    drop(writer);
+    let reader = WriterSession::open(shared, paths("knn-flat-filtered"))
+        .await
+        .unwrap();
+
+    let mut params = Params::new();
+    params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0]));
+    let run = |filter: &str| {
+        let cypher = format!(
+            "CALL search.vector({{label: 'Doc', property: 'embedding', query: $q, k: 3, \
+             filter: {filter}}}) YIELD node, score RETURN node.title AS title, \
+             size(node.body) AS body"
+        );
+        let plan = lower(&parse(&cypher).unwrap()).unwrap();
+        let snapshot = reader.snapshot();
+        let params = params.clone();
+        let counting = counting.clone();
+        async move {
+            let before = counting.bytes.load(std::sync::atomic::Ordering::SeqCst);
+            let rows = execute(&plan, &snapshot, &params).await.unwrap();
+            let read = counting.bytes.load(std::sync::atomic::Ordering::SeqCst) - before;
+            for row in &rows {
+                // Winners are whole nodes.
+                assert_eq!(row.get("body"), Some(&RuntimeValue::Integer(BODY as i64)));
+            }
+            (titles(&rows), read)
+        }
+    };
+    let all_bodies = (DOCS * BODY) as u64;
+
+    let (hits, read) = run("{kind: 'k7'}").await;
+    assert_eq!(hits, ["doc-7", "doc-57", "doc-107"]);
+    // Point reads of 8 nodes fetch the pages around them, never the label.
+    assert!(
+        read < all_bodies / 2,
+        "read {read} bytes for 8 admitted nodes, the bodies alone are {all_bodies}"
+    );
+    let (hits, _) = run("{kind: ['k3', 'k4']}").await;
+    assert_eq!(hits, ["doc-3", "doc-4", "doc-53"]);
+    // `no-kind` scores best, but a missing property is null and fails `<>`.
+    let (hits, _) = run("{kind: {ne: 'k0'}}").await;
+    assert_eq!(hits, ["doc-1", "doc-2", "doc-3"]);
+    let (hits, _) = run("{kind: 'missing'}").await;
+    assert!(hits.is_empty());
+}
+
 // ── RFC-030 indexed path: freshness (delta-union) + filtered ANN ──────────
 // These exercise the Vamana index + the optimizer's VectorSearch rewrite, so
 // they run the full `optimize` pass with a catalog and require the feature.

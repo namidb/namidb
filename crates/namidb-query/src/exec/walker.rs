@@ -6499,6 +6499,12 @@ async fn vector_search_rows(
         }
     }
 
+    // The flat path's selective-filter eligibility, once computed (by the
+    // index path when its first round under-fills): `Some(None)` means the
+    // filter is not property-only or admits too many nodes.
+    #[cfg_attr(not(feature = "vector-index"), allow(unused_mut))]
+    let mut flat_eligible: Option<Option<Vec<NodeId>>> = None;
+
     // RFC-030 (`vector-index`): serve from the Vamana index when one exists for
     // (label, property, metric). Falls through to the flat scan otherwise (and
     // also when a residual filter is too selective for the index to satisfy).
@@ -6518,6 +6524,7 @@ async fn vector_search_rows(
             span,
             ef_search,
             params,
+            &mut flat_eligible,
         )
         .await?
         {
@@ -6573,6 +6580,29 @@ async fn vector_search_rows(
         Ok(())
     };
     let scan: Result<(), ExecError> = async {
+        // A source filter that reads only properties of the node is first
+        // evaluated on those columns alone. When it admits few nodes, only
+        // they are read whole and scored; a selective filter no longer reads
+        // every node of the label in full.
+        if let (Some(label_name), Some(filter)) = (label, source_filter) {
+            let eligible = match flat_eligible.take() {
+                Some(known) => known,
+                None => {
+                    filtered_flat_eligible(snapshot, label_name, alias, property, filter, params)
+                        .await?
+                }
+            };
+            if let Some(eligible) = eligible {
+                for chunk in eligible.chunks(VECTOR_FLAT_SCAN_BATCH) {
+                    let views = snapshot.batch_lookup_nodes(label_name, chunk).await?;
+                    for view in views.into_iter().flatten() {
+                        consider(view)?;
+                    }
+                    crate::exec::memory::release_storage_rows();
+                }
+                return Ok(());
+            }
+        }
         match label {
             Some(label_name) if score_only && snapshot.node_scan_is_disjoint() => {
                 // Compacted layout: stream only the embedding column, one row
@@ -6690,6 +6720,96 @@ fn building_vector_index_message(
 /// Nodes reconciled per batch by the flat vector scan's cursor.
 const VECTOR_FLAT_SCAN_BATCH: usize = 256;
 
+/// At most this many nodes admitted by a property-only source filter are
+/// read whole by the flat vector scan; a less selective filter scans whole
+/// nodes as before.
+const FILTERED_FLAT_ELIGIBLE_CAP: usize = 4096;
+
+/// The properties of `alias` that `filter` reads, when it reads nothing else
+/// of the node: property accesses `alias.p`, literals and parameters combined
+/// by operators, `IN`, string tests and null tests. `None` for anything else
+/// (the bare node, a function call, another variable, a subquery), so a
+/// filter evaluated on just these properties is the same filter.
+fn filter_property_projection(filter: &Expression, alias: &str) -> Option<BTreeSet<String>> {
+    fn visit(expr: &Expression, alias: &str, out: &mut BTreeSet<String>) -> bool {
+        match &expr.kind {
+            ExpressionKind::Literal(_) | ExpressionKind::Parameter(_) => true,
+            ExpressionKind::Property(access) => match &access.target.kind {
+                ExpressionKind::Variable(id) if id.name == alias => {
+                    out.insert(access.key.name.clone());
+                    true
+                }
+                _ => false,
+            },
+            ExpressionKind::Unary { expr, .. } | ExpressionKind::IsNull { expr, .. } => {
+                visit(expr, alias, out)
+            }
+            ExpressionKind::Binary { left, right, .. } => {
+                visit(left, alias, out) && visit(right, alias, out)
+            }
+            ExpressionKind::In { item, list } => visit(item, alias, out) && visit(list, alias, out),
+            ExpressionKind::StringTest {
+                target, pattern, ..
+            } => visit(target, alias, out) && visit(pattern, alias, out),
+            ExpressionKind::List(items) => items.iter().all(|item| visit(item, alias, out)),
+            _ => false,
+        }
+    }
+    let mut out = BTreeSet::new();
+    (visit(filter, alias, &mut out) && !out.is_empty()).then_some(out)
+}
+
+/// Ids of the `label` nodes admitted by a property-only `filter`, read from
+/// the filter's columns alone, in id order. `None` when the filter reads more
+/// than node properties (or the embedding), or admits more than
+/// [`FILTERED_FLAT_ELIGIBLE_CAP`] nodes; the caller then scans whole nodes.
+async fn filtered_flat_eligible(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    alias: &str,
+    vector_property: &str,
+    filter: &Expression,
+    params: &Params,
+) -> Result<Option<Vec<NodeId>>, ExecError> {
+    // A filter on the embedding itself would read every embedding twice.
+    let Some(properties) = filter_property_projection(filter, alias)
+        .filter(|properties| !properties.contains(vector_property))
+    else {
+        return Ok(None);
+    };
+    let projection: Vec<String> = properties.into_iter().collect();
+    let mut eligible: Vec<NodeId> = Vec::new();
+    let mut overflow = false;
+    snapshot
+        .visit_label_with_projection::<_, ExecError>(label, &projection, |view| {
+            crate::exec::limits::check_deadline()?;
+            if overflow {
+                return Ok(());
+            }
+            let id = view.id;
+            let mut row = Row::new();
+            row.set(
+                alias.to_string(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            if evaluate(filter, &row, params)?.as_bool() == Some(true) {
+                if eligible.len() == FILTERED_FLAT_ELIGIBLE_CAP {
+                    overflow = true;
+                } else {
+                    eligible.push(id);
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    if overflow {
+        return Ok(None);
+    }
+    eligible.sort_unstable();
+    eligible.dedup();
+    Ok(Some(eligible))
+}
+
 /// The `limit` best flat-scan candidates, ranked like the index path:
 /// ascending sort key ("lower is better"), then `NodeId`.
 struct VectorTopK {
@@ -6793,6 +6913,7 @@ async fn try_index_search(
     span: SourceSpan,
     ef_search: Option<usize>,
     params: &Params,
+    flat_eligible: &mut Option<Option<Vec<NodeId>>>,
 ) -> Result<Option<Vec<Row>>, ExecError> {
     use crate::exec::expr::vector_score;
     use crate::plan::logical::VectorDistance;
@@ -7242,6 +7363,22 @@ async fn try_index_search(
         // needs the flat ground truth. Widening cannot improve a drained beam.
         if index_exhausted {
             break;
+        }
+        // A filter that under-fills the first round may be selective. When it
+        // reads only node properties and admits few nodes, scoring exactly
+        // those (the flat path) is cheaper than widening: every widened round
+        // hydrates its whole over-fetch to evaluate the filter.
+        if let Some(filter) = source_filter {
+            if flat_eligible.is_none() {
+                let eligible =
+                    filtered_flat_eligible(snapshot, label, alias, property, filter, params)
+                        .await?;
+                let selective = eligible.is_some();
+                *flat_eligible = Some(eligible);
+                if selective {
+                    return Ok(None);
+                }
+            }
         }
         mult = mult.saturating_mul(WIDEN_GROWTH);
         rounds_left -= 1;
