@@ -15,6 +15,84 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.4.3] - 2026-11-18
+
+### Added
+
+- **`POST /v0/admin/sweep`** runs the orphan sweep now and returns its
+  report, including what the store holds (`store_sst_bytes`,
+  `store_wal_bytes`, `store_manifest_bytes`) and how much of it is live
+  (`live_sst_bytes`, `live_wal_bytes`). With `"exact_window": true` it reads
+  every manifest version in the restore point window and reclaims the garbage
+  written inside it (failed uploads, abandoned compaction outputs), which the
+  periodic sweep keeps until the window moves past it. `min_age_secs` (never
+  below 600) and `dry_run` are optional. Multi-tenant:
+  `/:namespace/v0/admin/sweep`. `/metrics` adds `namidb_store_bytes{kind}`
+  and `namidb_store_live_bytes`, updated by every sweep.
+- **`NAMIDB_SWEEP_SUPERSEDED_MIN_AGE`** (`--sweep-superseded-min-age`,
+  default `1h`, capped at `NAMIDB_SWEEP_MIN_AGE`). See below.
+
+### Fixed
+
+- **Superseded data is reclaimed after an hour, not a day.** Compaction
+  inputs merged away, replaced search segments, flushed WAL segments and the
+  manifest versions that referenced them waited out `NAMIDB_SWEEP_MIN_AGE`
+  (24 h) like any unreferenced object, so a namespace that rebuilt large
+  search indexes held a day of rewrites. The sweep now reads each manifest
+  version it retires: what that version references and no retained version
+  does was installed once (it cannot be an upload whose commit is in flight),
+  so it is deleted once the version has been superseded for
+  `NAMIDB_SWEEP_SUPERSEDED_MIN_AGE`, objects first and the manifest version
+  last. Objects that no version ever referenced still wait
+  `NAMIDB_SWEEP_MIN_AGE`.
+- **A compaction pass that loses its install deletes its uploads.** A pass
+  abandoned on a precondition, or the part of a plan an install dropped, left
+  its finished outputs (often GBs of rebuilt search segments) for the sweep;
+  inside a restore point window the periodic sweep kept them until the window
+  moved past. The pass now deletes them right away. Any other install error
+  is ambiguous, so its uploads are still left to the sweep.
+- **Full-text builds write their scratch data once.** The external sort
+  behind a full-text base build and a full-text compaction merged its spilled
+  runs pairwise, level by level, so every spilled byte was rewritten once per
+  level: a build that spilled 18 runs wrote about 5x its data to the spool
+  disk, and large rebuilds wrote tens of GB. The runs are now merged once, by
+  a bounded k-way merge (up to 64 runs at a time, with read buffers inside the
+  build's memory budget) that streams straight into the index, so scratch
+  stays about 1x the data and the build reads it once. Only builds with more
+  runs than the fan-in fold their smallest runs first. The index bytes are
+  unchanged.
+- **Vector bases are rebuilt from their segments.** A vector index's
+  clustered base was rebuilt by scanning every node table of the namespace.
+  When the node tables exceeded `NAMIDB_SEARCH_LSM_VECTOR_BASE_MAX_INPUT_BYTES`
+  (half the memory limit), for example a few hundred thousand documents with
+  a few KB of text each, the base was never rebuilt and every query scanned
+  the flat deltas in full; when it did run it held hundreds of MB of node
+  tables. Base and delta segments keep every vector at full precision with
+  its version record, so the base is now assembled from them alone: version
+  tables merged by node id, no node read, and the rebuild reads roughly the
+  index's own size instead of the namespace's. The output is byte-for-byte the
+  node-scan build. The input cap now applies to the index's segments, so the
+  delta-row trigger works whatever the size of the node tables. Indexes still
+  being built over existing nodes, and any segment that cannot be merged,
+  keep the node scan.
+- **An index DDL during a compaction no longer throws the compaction away.**
+  When a DDL retired a search index's generation while a compaction pass was
+  building it (`DROP INDEX`, a drop and re-create under the same name, or a
+  property index that changes a full-text index's native filters), the
+  install abandoned the whole pass ("generation ... disappeared"), including
+  the finished builds of every other index in it, which then had to be
+  redone. Only the retired generation's compaction is dropped now; the rest
+  installs, and its upload is discarded.
+- **A superseded flush no longer holds every write for minutes.** After two
+  consecutive off-lock flushes were superseded (for example an index
+  activation landing during one build and an index DDL during the next), the
+  flush loop flushed the whole memtable under the writer lock, whatever its
+  size, and every write waited for the full-text and vector deltas to build:
+  writes timed out after 30 s. The locked flush now runs only once the
+  memtable is at its hard bound, when writes are held back anyway, or after
+  eight consecutive supersedes as the progress guarantee; until then a
+  superseded flush is retried off the lock.
+
 ## [3.4.2] - 2026-11-17
 
 ### Added
@@ -5032,7 +5110,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.4.2...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.4.3...HEAD
+[3.4.3]: https://github.com/namidb/namidb/compare/v3.4.2...v3.4.3
 [3.4.2]: https://github.com/namidb/namidb/compare/v3.4.1...v3.4.2
 [3.4.1]: https://github.com/namidb/namidb/compare/v3.4.0...v3.4.1
 [3.4.0]: https://github.com/namidb/namidb/compare/v3.3.3...v3.4.0
