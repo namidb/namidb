@@ -128,6 +128,12 @@ pub struct NamespaceRegistry {
     /// Without this, a multi-tenant namespace never flushed or compacted — a
     /// durability and read-amplification gap vs the single-tenant path.
     maintenance: MaintenanceConfig,
+    /// The memtable size past which foreground writes wait for a flush
+    /// (`crate::memtable_hard_bytes`; `0` = no bound), set by the shared
+    /// state that serves this registry. The flush loop flushes under the
+    /// writer lock after repeated superseded attempts only once writes are
+    /// held back anyway (`crate::flush_under_lock`).
+    memtable_hard_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl NamespaceRegistry {
@@ -152,6 +158,7 @@ impl NamespaceRegistry {
             anchor: Instant::now(),
             metrics,
             maintenance,
+            memtable_hard_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -168,6 +175,12 @@ impl NamespaceRegistry {
 
     /// The sweep settings every namespace's maintenance loop (and the admin
     /// sweep) runs with.
+    /// Record the memtable hard bound the shared state enforces on writes.
+    pub(crate) fn set_memtable_hard_bytes(&self, bytes: usize) {
+        self.memtable_hard_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn sweep_settings(&self) -> crate::maintenance::SweepSettings {
         crate::maintenance::SweepSettings {
             min_age: self.maintenance.sweep_min_age,
@@ -491,6 +504,9 @@ impl NamespaceRegistry {
             let interval = maint.flush_interval;
             let l0_trigger = maint.compaction_l0_trigger;
             let ns = state.namespace.clone();
+            let memtable_hard_bytes = self
+                .memtable_hard_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
             let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -552,8 +568,11 @@ impl NamespaceRegistry {
                         }
                         // SST build and upload with the writer lock released;
                         // see the single-tenant loop.
-                        let flushed = if flush_superseded >= crate::SUPERSEDED_FLUSHES_BEFORE_LOCKED
-                        {
+                        let flushed = if crate::flush_under_lock(
+                            flush_superseded,
+                            w.memtable_bytes(),
+                            memtable_hard_bytes,
+                        ) {
                             flush_superseded = 0;
                             let schema = w.snapshot().manifest().manifest.schema.clone();
                             w.try_flush(schema).await.map(|_| None)

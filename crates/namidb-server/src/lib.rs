@@ -1128,15 +1128,33 @@ pub async fn run_with_memory_max_bytes(
     run_with_memory_limits(config, memory_max_bytes, query_memory_max_bytes).await
 }
 
-/// Consecutive superseded off-lock flushes after which the flush loop
-/// flushes under the writer lock, so a stream of DDL can never starve flushes.
+/// Consecutive superseded off-lock flushes after which the flush loop may
+/// flush under the writer lock, so a stream of DDL can never starve flushes.
 ///
 /// A flush under the lock builds and uploads the whole memtable while every
 /// write waits: with a large memtable and a busy store that is minutes, past
-/// the write timeout. A superseded flush is therefore first retried off-lock;
-/// compactions do not supersede a flush (it rebases over them), so a second
-/// consecutive supersede means DDL kept landing.
+/// the write timeout. A superseded flush is therefore retried off-lock, and
+/// even past this count the locked flush runs only once writes are held back
+/// anyway (the memtable is at its hard bound, see [`flush_under_lock`]). A
+/// DDL and an index activation landing during two consecutive off-lock
+/// builds used to flip the next flush under the lock with the memtable far
+/// from full, stalling every write for ~90 s.
 pub(crate) const SUPERSEDED_FLUSHES_BEFORE_LOCKED: u32 = 2;
+
+/// Consecutive superseded off-lock flushes after which the flush loop
+/// flushes under the writer lock whatever the memtable size: the progress
+/// guarantee when no hard bound is configured or the bound is never reached.
+pub(crate) const SUPERSEDED_FLUSHES_FORCE_LOCKED: u32 = 8;
+
+/// Whether the flush loop should flush under the writer lock now, after
+/// `superseded` consecutive superseded off-lock flushes, with the memtable at
+/// `memtable_bytes` and writes held back from `hard_bytes` (`0` = no bound).
+pub(crate) fn flush_under_lock(superseded: u32, memtable_bytes: usize, hard_bytes: usize) -> bool {
+    superseded >= SUPERSEDED_FLUSHES_FORCE_LOCKED
+        || (superseded >= SUPERSEDED_FLUSHES_BEFORE_LOCKED
+            && hard_bytes > 0
+            && memtable_bytes >= hard_bytes)
+}
 
 /// Fraction of the process memory limit the memtable may reach before a
 /// committed write triggers a flush (1/16) or is stalled (1/8).
@@ -1654,9 +1672,14 @@ pub async fn run_with_memory_limits(
                     // released (`WriterSession::begin_background_flush`):
                     // writes keep committing while a large memtable is
                     // encoded and uploaded, instead of queueing behind it.
-                    // After repeated superseded attempts the next one
-                    // flushes under the lock, so DDL can never starve flushes.
-                    let flushed = if flush_superseded >= SUPERSEDED_FLUSHES_BEFORE_LOCKED {
+                    // After repeated superseded attempts, and only once the
+                    // memtable holds writes back anyway, the next one flushes
+                    // under the lock, so DDL can never starve flushes.
+                    let flushed = if flush_under_lock(
+                        flush_superseded,
+                        w.memtable_bytes(),
+                        memtable_hard_bytes(state_for_flush.memtable_stall_bytes),
+                    ) {
                         flush_superseded = 0;
                         let schema = w.snapshot().manifest().manifest.schema.clone();
                         w.try_flush(schema).await.map(|_| None)
@@ -7060,6 +7083,36 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// 3.4.2 flushed under the writer lock after two consecutive superseded
+    /// off-lock flushes whatever the memtable size. An index activation and a
+    /// DDL landing during two builds were enough: the locked flush then built
+    /// the whole memtable while every write waited (a 102 s write, three 30 s
+    /// timeouts, in the live-workload bench). The fallback now runs only once
+    /// writes are held back by the memtable's hard bound anyway, or after
+    /// eight consecutive supersedes as the progress guarantee.
+    #[test]
+    fn a_superseded_flush_takes_the_writer_lock_only_when_writes_wait_anyway() {
+        const GIB: usize = 1 << 30;
+        // The 3.4.2 trigger: two supersedes, a memtable far from full.
+        assert!(!flush_under_lock(2, 64 << 20, GIB));
+        assert!(!flush_under_lock(
+            SUPERSEDED_FLUSHES_FORCE_LOCKED - 1,
+            64 << 20,
+            GIB
+        ));
+        // Writes are already held back: a locked flush costs them nothing.
+        assert!(flush_under_lock(2, GIB, GIB));
+        assert!(!flush_under_lock(1, GIB, GIB));
+        // The progress guarantee, bounded or not.
+        assert!(flush_under_lock(SUPERSEDED_FLUSHES_FORCE_LOCKED, 0, GIB));
+        assert!(!flush_under_lock(
+            SUPERSEDED_FLUSHES_FORCE_LOCKED - 1,
+            GIB,
+            0
+        ));
+        assert!(flush_under_lock(SUPERSEDED_FLUSHES_FORCE_LOCKED, GIB, 0));
     }
 
     #[test]
