@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.4.2] - 2026-11-17
+
 ### Added
 
 - **`SHOW INDEXES` reports each index's state.** Two new columns: `state`
@@ -5030,7 +5032,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.4.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.4.2...HEAD
+[3.4.2]: https://github.com/namidb/namidb/compare/v3.4.1...v3.4.2
 [3.4.1]: https://github.com/namidb/namidb/compare/v3.4.0...v3.4.1
 [3.4.0]: https://github.com/namidb/namidb/compare/v3.3.3...v3.4.0
 [3.3.3]: https://github.com/namidb/namidb/compare/v3.3.2...v3.3.3
