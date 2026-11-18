@@ -6305,6 +6305,167 @@ impl<'mt> Snapshot<'mt> {
         Some(live)
     }
 
+    /// Exact number of live `label` nodes whose `property` is present and not
+    /// null: `MATCH (n:label) WHERE n.property IS NOT NULL RETURN count(n)`
+    /// and `count(n.property)`.
+    ///
+    /// Served from the writer's node-count ledger when it tracks the pair
+    /// (O(1)). Otherwise a background seed scans the label once, outside the
+    /// query's deadline, and is rolled forward over the commits that land
+    /// meanwhile; this call waits for it (still honouring the deadline) and
+    /// then every later call is O(1). The value a seed installs belongs to
+    /// the newest committed generation, which is never older than this
+    /// snapshot. Without a ledger (writer-private overlays, unattached
+    /// snapshots) the count streams the label in bounded batches.
+    pub async fn count_nodes_with_property(&self, label: &str, property: &str) -> Result<u64> {
+        if self.overlay.is_none() {
+            if let Some(count) = self
+                .exact_node_counts
+                .as_ref()
+                .and_then(|counts| counts.presence(label, property))
+            {
+                namidb_core::profile::record("Snapshot::count_nodes_with_property.ledger", 0);
+                return Ok(count);
+            }
+            if let Some(count) = self.await_count_seed(label, Some(property)).await? {
+                namidb_core::profile::record("Snapshot::count_nodes_with_property.seed", 0);
+                return Ok(count);
+            }
+        }
+        namidb_core::profile_scope!("Snapshot::count_nodes_with_property.scan");
+        let mut cursor = self.label_scan_cursor(label).await?;
+        let mut count = 0_u64;
+        loop {
+            crate::cancel::check()?;
+            let batch = cursor.next_batch(self, COUNT_SCAN_BATCH).await?;
+            if batch.is_empty() {
+                return Ok(count);
+            }
+            count += batch
+                .iter()
+                .filter(|view| property_present(view, property))
+                .count() as u64;
+        }
+    }
+
+    /// Start (or join) a background seed of `label` and, with `property`,
+    /// its presence, then wait for the count. `None` when no seed can serve it
+    /// (no ledger attached, or the seed failed): the caller scans.
+    async fn await_count_seed(&self, label: &str, property: Option<&str>) -> Result<Option<u64>> {
+        if self.overlay.is_some() {
+            return Ok(None);
+        }
+        let Some(cache) = self.property_index_cache.clone() else {
+            return Ok(None);
+        };
+        let labels: BTreeSet<String> = [label.to_string()].into_iter().collect();
+        let pairs = count_seed_pairs(&self.manifest.manifest, label, property);
+        let read = |cache: &crate::property_index::PropertyIndexCache| match property {
+            Some(property) => cache.current_presence(label, property),
+            None => cache.current_label_count(label),
+        };
+        let waiting_since = std::time::Instant::now();
+        let mut starts = 0_u32;
+        loop {
+            if let Some(count) = read(&cache) {
+                return Ok(Some(count));
+            }
+            if !cache.count_seed_running() {
+                if cache.count_seed_requested() {
+                    // A commit already moved past this snapshot; the writer
+                    // starts the seed after its next node commit.
+                    if waiting_since.elapsed() >= COUNT_SEED_REQUEST_PATIENCE {
+                        return Ok(None);
+                    }
+                } else {
+                    if starts >= COUNT_SEED_MAX_STARTS {
+                        return Ok(None);
+                    }
+                    starts += 1;
+                    let started = self.owned_for_count_seed().is_some_and(|owned| {
+                        spawn_count_seed(owned, labels.clone(), pairs.clone())
+                    });
+                    if !started && !cache.count_seed_running() {
+                        cache.request_count_seed(labels.clone(), pairs.clone());
+                    }
+                }
+            }
+            crate::cancel::check()?;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An owned copy of this published snapshot for a background seed. The
+    /// memtable is a persistent map, so the copy is O(1).
+    fn owned_for_count_seed(&self) -> Option<Arc<OwnedSnapshot>> {
+        if self.overlay.is_some() {
+            return None;
+        }
+        Some(Arc::new(OwnedSnapshot {
+            manifest: self.manifest.clone(),
+            memtable: Arc::new(self.memtable.clone()),
+            store: self.store.clone(),
+            paths: self.paths.clone(),
+            cache: self.cache.clone(),
+            ranged_mode: self.ranged_mode,
+            ranged_threshold_bytes: self.ranged_threshold_bytes,
+            adjacency_cache: self.adjacency_cache.clone(),
+            shared_node_cache: self.shared_node_cache.clone(),
+            property_index_cache: Some(self.property_index_cache.clone()?),
+            property_index_generation: Some(self.property_index_generation?),
+            exact_node_counts: self.exact_node_counts.clone(),
+            memtable_claimant_cell: self.memtable_claimant_cell.clone(),
+        }))
+    }
+
+    /// Exact label and presence counts for a seed, streaming each label in
+    /// bounded batches.
+    pub(crate) async fn scan_count_seed(
+        &self,
+        labels: &BTreeSet<String>,
+        pairs: &BTreeSet<(String, String)>,
+    ) -> Result<crate::property_index::CountSeedResult> {
+        let mut result = crate::property_index::CountSeedResult::default();
+        for label in labels {
+            let properties: Vec<&str> = pairs
+                .iter()
+                .filter(|(pair_label, _)| pair_label == label)
+                .map(|(_, property)| property.as_str())
+                .collect();
+            let mut present = vec![0_u64; properties.len()];
+            let mut count = 0_u64;
+            let mut cursor = self.label_scan_cursor(label).await?;
+            if properties.is_empty() {
+                result
+                    .by_label
+                    .insert(label.clone(), cursor.count_rest(self).await?);
+                continue;
+            }
+            loop {
+                let batch = cursor.next_batch(self, COUNT_SCAN_BATCH).await?;
+                if batch.is_empty() {
+                    break;
+                }
+                for view in &batch {
+                    count += 1;
+                    for (slot, property) in present.iter_mut().zip(&properties) {
+                        if property_present(view, property) {
+                            *slot += 1;
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            result.by_label.insert(label.clone(), count);
+            for (property, present) in properties.into_iter().zip(present) {
+                result
+                    .presence
+                    .insert((label.clone(), property.to_string()), present);
+            }
+        }
+        Ok(result)
+    }
+
     /// Count live nodes exactly, using manifest metadata in the compacted /
     /// disjoint case and the ordinary last-write-wins reconciliation
     /// otherwise. A writer-attached snapshot caches the reconciled total and
@@ -6364,6 +6525,15 @@ impl<'mt> Snapshot<'mt> {
                 }
             }
             return Ok(count);
+        }
+        // Seed this label in the background so later counts survive commits
+        // that land during the exact reconciliation below.
+        if let Some(label) = label {
+            if let Some(owned) = self.owned_for_count_seed() {
+                let labels = [label.to_string()].into_iter().collect();
+                let pairs = count_seed_pairs(&self.manifest.manifest, label, None);
+                spawn_count_seed(owned, labels, pairs);
+            }
         }
         namidb_core::profile_scope!("Snapshot::count_nodes.reconcile");
         if let Some((cache, generation)) = cache_generation {
@@ -9811,6 +9981,105 @@ impl<'mt> Snapshot<'mt> {
         Ok(latest.into_iter().map(|(id, (_, v))| (id, v)).collect())
     }
 
+    /// (`vector-index`) The committed-memtable delta of a vector index for a
+    /// top-`k` query, without decoding the memtable: the ids the memtable
+    /// supersedes (live or suppressed) plus the exact embeddings of the only
+    /// live rows that can reach the delta's own top-`k` (see
+    /// [`crate::vector_tail`]). Equal to [`Self::vector_fresh_delta`] for every
+    /// purpose of an unfiltered top-`k` merge.
+    ///
+    /// `None` when the snapshot carries a writer-private overlay or the index
+    /// is not registered: callers use [`Self::vector_fresh_delta`].
+    #[cfg(feature = "vector-index")]
+    pub fn vector_fresh_candidates(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Option<FreshVectorDelta>> {
+        if self.overlay.is_some() {
+            return Ok(None);
+        }
+        let Some(descriptor) = self
+            .manifest
+            .manifest
+            .vector_indexes
+            .iter()
+            .find(|descriptor| descriptor.label == label && descriptor.property == property)
+        else {
+            return Ok(None);
+        };
+        let metric = descriptor.metric;
+        let dim = descriptor.dim as usize;
+        let tail = match self
+            .memtable_claimant_cell
+            .as_ref()
+            .and_then(|cell| cell.vector_tail(label, property, metric, dim))
+        {
+            Some(tail) => tail,
+            None => {
+                namidb_core::profile_scope!("Snapshot::vector_tail.build");
+                let dict = &self.manifest.manifest.label_dict;
+                let mut tail = crate::vector_tail::VectorTail::new();
+                for (key, entry) in self.memtable.iter_nodes() {
+                    let MemKey::Node { id } = key else {
+                        continue;
+                    };
+                    if tail.get(id).is_some_and(|(lsn, _)| *lsn >= entry.lsn) {
+                        continue;
+                    }
+                    let record = match &entry.op {
+                        MemOp::Tombstone => None,
+                        MemOp::Upsert(payload) => Some(NodeWriteRecord::decode(payload)?),
+                    };
+                    tail.insert(
+                        *id,
+                        (
+                            entry.lsn,
+                            vector_tail_entry(record.as_ref(), label, property, metric, dim, dict),
+                        ),
+                    );
+                }
+                let built = Arc::new(crate::property_index::VectorTailIndex { metric, dim, tail });
+                match &self.memtable_claimant_cell {
+                    Some(cell) => cell.install_vector_tail(label, property, built),
+                    None => built,
+                }
+            }
+        };
+        let ids = crate::vector_tail::candidates(&tail.tail, query, metric, k);
+        let mut candidates = Vec::with_capacity(ids.len());
+        let dict = &self.manifest.manifest.label_dict;
+        for id in ids {
+            let Some(entry) = self.memtable.get(&MemKey::Node { id }) else {
+                // The pinned tail and memtable disagree; never serve from it.
+                tracing::warn!(%id, "vector tail row is missing from its memtable; decoding the memtable");
+                return Ok(None);
+            };
+            let MemOp::Upsert(payload) = &entry.op else {
+                continue;
+            };
+            let record = NodeWriteRecord::decode(payload)?;
+            if !record_carries_label(&record, label, dict) {
+                continue;
+            }
+            if let Some(embedding) = record
+                .properties
+                .get(property)
+                .and_then(|value| value.embedding_f32(dim))
+            {
+                candidates.push((id, embedding.into_owned()));
+            }
+        }
+        tracing::trace!(
+            candidates = candidates.len(),
+            tail = tail.tail.len(),
+            "vector tail candidates"
+        );
+        Ok(Some(FreshVectorDelta { tail, candidates }))
+    }
+
     /// (`text-index`): full BM25 top-k over the `TextIndex` SST(s) registered for
     /// `index_name`, **only when the index is authoritative for `label`**.
     ///
@@ -9871,8 +10140,12 @@ impl<'mt> Snapshot<'mt> {
         //   - a tombstone, or an upsert NOT carrying `label` (a possible
         //     relabel), affects the corpus only if its id is an indexed
         //     document — probed against the decoded index below.
+        //   - except an upsert whose label membership and indexed text equal
+        //     its persisted version (an embedding-only `SET`, say): the index
+        //     already holds exactly that document (see `text_changed_rows`).
         let dict = &self.manifest.manifest.label_dict;
         let mut dirty: Vec<[u8; 16]> = Vec::new();
+        let mut carrying: Vec<NodeId> = Vec::new();
         for (mk, entry) in self.node_entries() {
             let MemKey::Node { id } = mk else {
                 continue;
@@ -9882,10 +10155,19 @@ impl<'mt> Snapshot<'mt> {
                 MemOp::Upsert(payload) => {
                     let rec = NodeWriteRecord::decode(payload)?;
                     if record_carries_label(&rec, label, dict) {
-                        return Ok(None);
+                        carrying.push(*id);
+                        continue;
                     }
                     dirty.push(*id.0.as_bytes());
                 }
+            }
+        }
+        if !carrying.is_empty() {
+            let Some(changed) = self.text_changed_rows(index_name, label).await? else {
+                return Ok(None);
+            };
+            if carrying.iter().any(|id| changed.changed.contains(id)) {
+                return Ok(None);
             }
         }
 
@@ -9971,6 +10253,85 @@ impl<'mt> Snapshot<'mt> {
             all.truncate(k);
         }
         Ok(Some(all))
+    }
+
+    /// The committed memtable rows whose label membership or indexed text
+    /// differs from the persisted version that full-text index `index_name`
+    /// covers. Computed once per memtable (one batched point read of the
+    /// memtable rows carrying `label`), then kept by every commit. `None`
+    /// when it cannot be computed here (an overlay, no pinned memtable cell).
+    #[cfg(feature = "text-index")]
+    async fn text_changed_rows(
+        &self,
+        index_name: &str,
+        label: &str,
+    ) -> Result<Option<Arc<crate::property_index::TextChangedIndex>>> {
+        if self.overlay.is_some() {
+            return Ok(None);
+        }
+        let Some(cell) = self.memtable_claimant_cell.as_ref() else {
+            return Ok(None);
+        };
+        let Some(descriptor) = self
+            .manifest
+            .manifest
+            .text_indexes
+            .iter()
+            .find(|descriptor| descriptor.name == index_name && descriptor.label == label)
+        else {
+            return Ok(None);
+        };
+        let properties: BTreeSet<String> = descriptor.properties.iter().cloned().collect();
+        if let Some(tracked) = cell.text_changed(index_name, label, &properties) {
+            return Ok(Some(tracked));
+        }
+        namidb_core::profile_scope!("Snapshot::text_changed.build");
+        let dict = &self.manifest.manifest.label_dict;
+        let mut ids = Vec::new();
+        let mut records = Vec::new();
+        for (key, entry) in self.memtable.iter_nodes() {
+            let MemKey::Node { id } = key else {
+                continue;
+            };
+            if let MemOp::Upsert(payload) = &entry.op {
+                let record = NodeWriteRecord::decode(payload)?;
+                if record_carries_label(&record, label, dict) {
+                    ids.push(*id);
+                    records.push(record);
+                }
+            }
+        }
+        // The versions the index covers: the same manifest without the
+        // memtable.
+        let empty = crate::memtable::MemtableSnapshot::default();
+        let mut persisted = Snapshot::new(
+            self.manifest.clone(),
+            &empty,
+            self.store.clone(),
+            self.paths.clone(),
+        );
+        if let Some(cache) = &self.cache {
+            persisted = persisted.with_cache(cache.clone());
+        }
+        let old = persisted.batch_lookup_nodes("", &ids).await?;
+        let mut changed = imbl::OrdSet::new();
+        for ((id, record), old) in ids.iter().zip(&records).zip(&old) {
+            let same = old.as_ref().is_some_and(|view| {
+                view.labels.contains(label)
+                    && properties.iter().all(|property| {
+                        record.properties.get(property) == view.properties.get(property)
+                    })
+            });
+            if !same {
+                changed.insert(*id);
+            }
+        }
+        let built = Arc::new(crate::property_index::TextChangedIndex {
+            label: label.to_string(),
+            properties,
+            changed,
+        });
+        Ok(Some(cell.install_text_changed(index_name, built)))
     }
 
     /// Exact Search-LSM BM25 with native equality prefilters.
@@ -11580,7 +11941,11 @@ fn node_view_from_payload(
 
 /// Whether a decoded record carries `label`, resolving the name via `dict`.
 /// Used to label-filter memtable rows now that the label left the key.
-fn record_carries_label(rec: &NodeWriteRecord, label: &str, dict: &LabelDictionary) -> bool {
+pub(crate) fn record_carries_label(
+    rec: &NodeWriteRecord,
+    label: &str,
+    dict: &LabelDictionary,
+) -> bool {
     dict.id(label)
         .map(|lid| rec.labels.contains(&lid.get()))
         .unwrap_or(false)
@@ -12253,6 +12618,178 @@ pub(crate) fn arrow_value_to_value(
         }
     };
     Ok(Some(value))
+}
+
+/// The winning memtable version of one node, as an entry of the tail of the
+/// `(label, property)` vector index: the same membership rules as
+/// [`Snapshot::vector_fresh_delta`] (a version without the label or without
+/// a usable embedding suppresses the persisted row).
+pub(crate) fn vector_tail_entry(
+    record: Option<&NodeWriteRecord>,
+    label: &str,
+    property: &str,
+    metric: crate::manifest::VectorMetric,
+    dim: usize,
+    dict: &LabelDictionary,
+) -> crate::vector_tail::TailEntry {
+    let Some(record) = record else {
+        return crate::vector_tail::TailEntry::Suppress;
+    };
+    if !record_carries_label(record, label, dict) {
+        return crate::vector_tail::TailEntry::Suppress;
+    }
+    match record
+        .properties
+        .get(property)
+        .and_then(|value| value.embedding_f32(dim))
+    {
+        Some(embedding) => crate::vector_tail::encode(&embedding, metric),
+        None => crate::vector_tail::TailEntry::Suppress,
+    }
+}
+
+/// The committed-memtable delta of a vector index for one top-`k` query (see
+/// [`Snapshot::vector_fresh_candidates`]).
+#[derive(Debug)]
+pub struct FreshVectorDelta {
+    tail: Arc<crate::property_index::VectorTailIndex>,
+    /// Exact embeddings of the live rows that can reach the delta's top-`k`.
+    pub candidates: Vec<(NodeId, Vec<f32>)>,
+}
+
+impl FreshVectorDelta {
+    /// `true` when the memtable supersedes `id`'s persisted index row.
+    pub fn contains(&self, id: &NodeId) -> bool {
+        self.tail.tail.contains_key(id)
+    }
+
+    /// Ids the memtable supersedes.
+    pub fn len(&self) -> usize {
+        self.tail.tail.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tail.tail.is_empty()
+    }
+}
+
+/// Nodes per batch when a count streams a label.
+const COUNT_SCAN_BATCH: usize = 512;
+/// Times one count call may (re)start a seed after another seed finished
+/// without serving it.
+const COUNT_SEED_MAX_STARTS: u32 = 3;
+/// How long a count waits for the writer to start a seed it requested before
+/// it scans on its own.
+const COUNT_SEED_REQUEST_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `true` when the node carries `property` with a non-null value (Cypher
+/// `IS NOT NULL`).
+fn property_present(view: &NodeView, property: &str) -> bool {
+    view.properties
+        .get(property)
+        .is_some_and(|value| !matches!(value, Value::Null))
+}
+
+/// Presence pairs a seed of `label` counts: the requested property plus the
+/// label's vector-indexed properties, the ones "how many have an embedding"
+/// asks about. Full-text properties are left out: counting their presence
+/// means decoding every document body, which is most of the scan.
+fn count_seed_pairs(
+    manifest: &crate::manifest::Manifest,
+    label: &str,
+    property: Option<&str>,
+) -> BTreeSet<(String, String)> {
+    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    if let Some(property) = property {
+        pairs.insert((label.to_string(), property.to_string()));
+    }
+    for index in &manifest.vector_indexes {
+        if index.label == label {
+            pairs.insert((label.to_string(), index.property.clone()));
+        }
+    }
+    pairs
+}
+
+/// The runtime count seeds run on: one worker of its own, for the life of the
+/// process. A seed is a detached reader. Spawned on the caller's runtime it
+/// could still be mid-read when that runtime shuts down (every
+/// `#[tokio::test]`, or an embedder that opens a runtime per call, does), and
+/// a read issued by a task of a closing runtime can wedge process-wide
+/// caches that every later reader shares.
+fn count_seed_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("namidb-count-seed")
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    tracing::warn!(%error, "could not start the node-count seed runtime");
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Start a background node-count seed of `labels` / `pairs` from `owned`,
+/// unless one is running or a commit already moved past `owned`'s
+/// generation. The seed runs on [`count_seed_runtime`], without the
+/// caller's deadline; a seed that is dropped unfinished unregisters itself.
+pub(crate) fn spawn_count_seed(
+    owned: Arc<OwnedSnapshot>,
+    labels: BTreeSet<String>,
+    pairs: BTreeSet<(String, String)>,
+) -> bool {
+    let (Some(cache), Some(generation)) = (
+        owned.property_index_cache.clone(),
+        owned.property_index_generation,
+    ) else {
+        return false;
+    };
+    let Some(runtime) = count_seed_runtime() else {
+        return false;
+    };
+    let Some(id) = cache.begin_count_seed(generation, labels.clone(), pairs.clone()) else {
+        return false;
+    };
+    struct Unregister {
+        cache: Arc<crate::property_index::PropertyIndexCache>,
+        id: u64,
+    }
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            self.cache.abort_count_seed(self.id);
+        }
+    }
+    let unregister = Unregister {
+        cache: cache.clone(),
+        id,
+    };
+    runtime.spawn(async move {
+        let _unregister = unregister;
+        let started = std::time::Instant::now();
+        let snapshot = owned.borrow();
+        match snapshot.scan_count_seed(&labels, &pairs).await {
+            Ok(result) => {
+                let installed = cache.finish_count_seed(id, result);
+                tracing::info!(
+                    labels = ?labels,
+                    pairs = pairs.len(),
+                    installed,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "node-count seed finished"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, labels = ?labels, "node-count seed failed");
+            }
+        }
+    });
+    true
 }
 
 /// Owned, lifetime-free read snapshot of a namespace.

@@ -32,6 +32,9 @@ use crate::sst::search_delta::{
     SearchVersionTableReader, SearchVersionTableRef, SearchVersionTableWriter,
 };
 
+#[path = "v6_codes.rs"]
+mod codes;
+pub(crate) use codes::clear_resident_codes;
 #[path = "v6_external.rs"]
 mod external;
 
@@ -2303,6 +2306,102 @@ mod tests {
         assert_eq!(result.eligible_rows_seen, 1);
         assert_eq!(result.hits[0].node_id, node(5_000));
         assert!(result.peak_live_bytes < 512 * 1024);
+    }
+
+    #[tokio::test]
+    async fn coded_search_returns_the_exact_hits_and_reads_fewer_pages() {
+        let dim = 32_usize;
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        let rows = 4_000_u64;
+        for (metric, sst) in [
+            (VectorMetric::Cosine, 11_u128),
+            (VectorMetric::Dot, 12),
+            (VectorMetric::Euclidean, 13),
+        ] {
+            let mut descriptor = descriptor(metric);
+            descriptor.dim = dim as u32;
+            let context = VectorV6BuildContext {
+                sst_id: Uuid::from_u128(sst),
+                event_ranges: vec![SearchEventRange::new(1, rows + 1)],
+                complete_filter_properties: vec!["ley".into()],
+            };
+            let mutations = (1..=rows)
+                .map(|value| VectorV6Mutation {
+                    node_id: node(value),
+                    lsn: value,
+                    before: None,
+                    after: Some(VectorV6Payload {
+                        vector: (0..dim).map(|_| next()).collect(),
+                        filters: BTreeMap::from([(
+                            "ley".into(),
+                            SearchFilterValue::String(format!("ley-{}", value % 7)),
+                        )]),
+                    }),
+                })
+                .collect();
+            let artifact = build_delta_v6(
+                &state(),
+                &descriptor,
+                context,
+                mutations,
+                VectorV6BuildOptions {
+                    rows_per_page: 64,
+                    compression_level: 1,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            let source = Arc::new(MemorySource {
+                body: artifact.body.clone(),
+                ranges: Mutex::new(Vec::new()),
+            });
+            let reader = VectorV6Reader::open(
+                source.clone(),
+                artifact.body.len() as u64,
+                &state(),
+                &artifact.output.segment,
+                &descriptor,
+            )
+            .await
+            .unwrap();
+            let groups = [(
+                "ley".to_owned(),
+                vec![SearchFilterValue::String("ley-3".into())],
+            )];
+            // Warm the codes once.
+            reader.search_coded(&vec![0.5; dim], 10, &[]).await.unwrap();
+            for round in 0..20 {
+                let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+                let filter: &[(String, Vec<SearchFilterValue>)] =
+                    if round % 2 == 0 { &[] } else { &groups };
+                for k in [1, 10, 100] {
+                    let exact = reader.search_exact(&query, k, filter).await.unwrap();
+                    source.ranges.lock().unwrap().clear();
+                    let coded = reader
+                        .search_coded(&query, k, filter)
+                        .await
+                        .unwrap()
+                        .expect("codes fit the default budget");
+                    let coded_pages = source.ranges.lock().unwrap().len();
+                    assert_eq!(coded.hits, exact.hits, "{metric:?} k={k} round={round}");
+                    assert_eq!(coded.eligible_rows_seen, exact.eligible_rows_seen);
+                    assert_eq!(coded.applied_filter_groups, exact.applied_filter_groups);
+                    if k <= 10 && filter.is_empty() {
+                        assert!(
+                            coded_pages * 2 < reader.page_count(),
+                            "{metric:?} k={k}: coded search read {coded_pages} of {} pages",
+                            reader.page_count()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

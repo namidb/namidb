@@ -678,6 +678,41 @@ impl NodeScanCursor {
         batch
     }
 
+    /// Count the nodes this cursor has not returned yet, reading only the
+    /// structural columns (no property is decoded). Consumes the cursor.
+    pub async fn count_rest(mut self, snap: &Snapshot<'_>) -> Result<u64> {
+        if self.failed {
+            return Err(Error::precondition(
+                "an earlier batch of this label scan failed; open a new cursor",
+            ));
+        }
+        if let Some(rest) = self.fallback {
+            return Ok(rest.count() as u64);
+        }
+        if let Some(merge) = &mut self.merge {
+            let mut count = 0_u64;
+            loop {
+                match merge.next_live(snap).await? {
+                    Merged::Live(_) => {
+                        count += 1;
+                        if count % 4096 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    Merged::End => return Ok(count),
+                    Merged::Unordered => break,
+                }
+            }
+            if self.last.is_some() {
+                return Err(Error::invariant(format!(
+                    "a node SST is not in id order, so the count of `{}` cannot go on",
+                    self.label
+                )));
+            }
+        }
+        Ok(snap.scan_label(&self.label).await?.len() as u64)
+    }
+
     async fn read_batch(&mut self, snap: &Snapshot<'_>, max: usize) -> Result<Vec<NodeView>> {
         loop {
             if let Some(rest) = &mut self.fallback {

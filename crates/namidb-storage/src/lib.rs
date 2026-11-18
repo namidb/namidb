@@ -50,7 +50,10 @@ pub mod sst;
 pub(crate) mod test_support;
 pub mod text;
 pub mod unique_index;
+// Commits maintain the tail in every build; only vector search reads it.
 pub mod uri;
+#[cfg_attr(not(feature = "vector-index"), allow(dead_code))]
+pub(crate) mod vector_tail;
 pub mod wal;
 
 pub use adjacency::{

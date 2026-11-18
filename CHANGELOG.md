@@ -15,6 +15,43 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Changed
+
+- **Label and presence counts are answered from metadata.**
+  `MATCH (n:L) RETURN count(n)`, `MATCH (n:L) WHERE n.p IS NOT NULL RETURN
+  count(n)` and `MATCH (n:L) RETURN count(n.p)` read an exact per-label,
+  per-property presence ledger kept by the writer instead of decoding the
+  label. The ledger is seeded in the background when a namespace opens (for
+  labels with a vector index, and their vector and full-text indexed
+  properties) or on the first such count, rolled forward over the commits
+  that land while it is seeded, and kept exact at every commit and flush.
+  Other predicates still take the exact path, and a count the ledger cannot
+  prove exact never comes from it.
+- **Unindexed writes are searched without scanning them.** Vector search
+  keeps an int8 code of every unflushed embedding of an indexed property,
+  maintained at commit. A query bounds each one's exact score from its code
+  and decodes and scores in f32 only those that can still reach the top-k;
+  it no longer decodes the whole unflushed tail, nor asks the index for
+  `k + tail` candidates. Flushed vector deltas get the same treatment: an
+  int8 code of each row is kept resident (64 MiB per process by default,
+  `NAMIDB_VECTOR_CODE_CACHE_BYTES`, cleared under memory pressure), and only
+  the pages holding rows that can reach the top-k are read and scored. Hits
+  and scores are unchanged: every returned score is still the exact f32
+  score, and the same rows win.
+- **Full-text search stays on its index while unflushed writes leave the
+  indexed text alone.** Any unflushed write to a label, even an
+  embedding-only `SET`, used to send `search.bm25` on that label to the exact
+  scan of every document until the next flush. The writer now tracks, per
+  full-text index, the unflushed rows whose label membership or indexed
+  values differ from the version the index covers; rows outside that set are
+  served from the index. A write that does change indexed text still takes
+  the exact path until it is flushed.
+- Count seeds run on a dedicated background runtime, so a seed still in
+  flight when a caller's runtime shuts down cannot wedge the shared
+  object-range cache.
+- No on-disk format changes. A store written by this release opens with
+  3.4.x and back.
+
 ## [3.4.2] - 2026-11-17
 
 ### Added

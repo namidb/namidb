@@ -632,6 +632,98 @@ mod indexed {
         assert!(!got.contains(&"a".to_string()), "deleted node excluded");
     }
 
+    /// A write burst far larger than `k` sits unindexed in the memtable
+    /// (inserts, re-embeddings of indexed rows, deletes) across several
+    /// commits. The index route takes only the fresh rows whose quantised
+    /// bounds can reach the top-k, so it must still equal exact KNN over the
+    /// live set after every commit, with and without a property filter.
+    #[tokio::test]
+    async fn index_knn_over_a_large_fresh_burst_equals_exact_knn() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        let mut vector = || (0..DIM).map(|_| next()).collect::<Vec<f32>>();
+        let base: Vec<(String, String, Vec<f32>)> = (0..240)
+            .map(|i| {
+                let kind = if i % 3 == 0 { "Y" } else { "X" };
+                (format!("base{i}"), kind.to_string(), vector())
+            })
+            .collect();
+        let docs: Vec<(&str, &str, Vec<f32>)> = base
+            .iter()
+            .map(|(t, k, e)| (t.as_str(), k.as_str(), e.clone()))
+            .collect();
+        let (mut w, ids) = build_index("idx-burst", &docs).await;
+        let mut live: BTreeMap<String, (String, Vec<f32>)> = base
+            .iter()
+            .map(|(t, k, e)| (t.clone(), (k.clone(), e.clone())))
+            .collect();
+        let mut fresh_ids: BTreeMap<String, NodeId> = BTreeMap::new();
+        const KNN10: &str = "MATCH (d:Doc) WHERE d.embedding IS NOT NULL \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 10";
+        const KNN10_Y: &str = "MATCH (d:Doc) WHERE d.embedding IS NOT NULL AND d.kind = 'Y' \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 10";
+        for round in 0..4 {
+            for i in 0..150 {
+                let title = format!("fresh{round}-{i}");
+                let kind = if i % 3 == 0 { "Y" } else { "X" };
+                let id = NodeId::new();
+                let embedding = vector();
+                w.upsert_node("Doc", id, &rec(&title, kind, embedding.clone()))
+                    .unwrap();
+                fresh_ids.insert(title.clone(), id);
+                live.insert(title, (kind.to_string(), embedding));
+            }
+            for i in (round * 20)..(round * 20 + 20) {
+                let title = format!("base{i}");
+                let kind = live[&title].0.clone();
+                let embedding = vector();
+                w.upsert_node("Doc", ids[&title], &rec(&title, &kind, embedding.clone()))
+                    .unwrap();
+                live.insert(title, (kind, embedding));
+            }
+            for i in (round * 10)..(round * 10 + 10) {
+                let title = format!("base{}", 120 + i);
+                w.tombstone_node("Doc", ids[&title]).unwrap();
+                live.remove(&title);
+            }
+            if round > 0 {
+                let title = format!("fresh{}-{}", round - 1, 7);
+                w.tombstone_node("Doc", fresh_ids[&title]).unwrap();
+                live.remove(&title);
+            }
+            w.commit_batch().await.unwrap();
+            for _ in 0..8 {
+                let q = vector();
+                let all: Vec<(String, Vec<f32>)> = live
+                    .iter()
+                    .map(|(t, (_, e))| (t.clone(), e.clone()))
+                    .collect();
+                assert_eq!(
+                    titles(&run(&w, KNN10, q.clone()).await),
+                    exact_topk(&all, &q, 10),
+                    "round {round}: unfiltered"
+                );
+                let ys: Vec<(String, Vec<f32>)> = live
+                    .iter()
+                    .filter(|(_, (k, _))| k == "Y")
+                    .map(|(t, (_, e))| (t.clone(), e.clone()))
+                    .collect();
+                assert_eq!(
+                    titles(&run(&w, KNN10_Y, q.clone()).await),
+                    exact_topk(&ys, &q, 10),
+                    "round {round}: filtered"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn undecodable_vector_index_with_full_delta_falls_back_to_flat() {
         // Regression: storage used to collapse "the .vg failed to decode" into

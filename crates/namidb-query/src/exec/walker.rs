@@ -6873,10 +6873,30 @@ async fn try_index_search(
     // live embedding to merge in, `None` suppresses a now-stale id (tombstoned,
     // label removed, or embedding dropped) so the merge stays equal to the flat
     // scan (RFC-030 freshness).
-    let delta = snapshot
-        .vector_fresh_delta(label, property)
-        .map_err(ExecError::Storage)?;
-    let delta_ids: BTreeSet<NodeId> = delta.iter().map(|(id, _)| *id).collect();
+    //
+    // Unfiltered, the memtable's own top-k is enough: storage keeps an int8
+    // tail of the memtable per index and hands back the exact embeddings of
+    // only the rows that can reach it, plus the set of superseded ids.
+    let fresh = if source_filter.is_none() {
+        snapshot
+            .vector_fresh_candidates(label, property, &qv, k)
+            .map_err(ExecError::Storage)?
+    } else {
+        None
+    };
+    let delta: Vec<(NodeId, Option<Vec<f32>>)> = if fresh.is_some() {
+        Vec::new()
+    } else {
+        snapshot
+            .vector_fresh_delta(label, property)
+            .map_err(ExecError::Storage)?
+    };
+    let delta_set: BTreeSet<NodeId> = delta.iter().map(|(id, _)| *id).collect();
+    let delta_contains = |id: &NodeId| match &fresh {
+        Some(fresh) => fresh.contains(id),
+        None => delta_set.contains(id),
+    };
+    let delta_len = fresh.as_ref().map_or(delta_set.len(), |fresh| fresh.len());
 
     // Pre-score the freshness delta ONCE: a delta's score is independent of the
     // fetch width, so the widening loop below only re-queries the index — it never
@@ -6923,7 +6943,15 @@ async fn try_index_search(
             }
         }
     } else {
-        for (id, emb) in delta {
+        let live: Box<dyn Iterator<Item = (NodeId, Vec<f32>)>> = match fresh.as_ref() {
+            Some(fresh) => Box::new(fresh.candidates.iter().cloned()),
+            None => Box::new(
+                delta
+                    .into_iter()
+                    .filter_map(|(id, embedding)| embedding.map(|embedding| (id, embedding))),
+            ),
+        };
+        for (id, emb) in live.map(|(id, v)| (id, Some(v))) {
             if let Some(v) = emb {
                 let emb_rv = RuntimeValue::Vector(v);
                 if let Some((score, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
@@ -6962,10 +6990,22 @@ async fn try_index_search(
     let mut capped_eligibility_resolved = false;
     let mut capped_eligibility: Option<BTreeSet<NodeId>> = None;
 
-    for _ in 0..max_rounds {
+    // A fresh write supersedes its persisted version, so persisted hits for
+    // delta ids are dropped below. Over-fetching by the whole delta keeps
+    // `k * mult` survivors in the worst case, but under a write burst the
+    // delta holds thousands of ids that are mostly NOT among the persisted
+    // hits (a backfill gives nodes their first embedding), and asking the
+    // index for `k + |delta|` hits with a beam that wide made every query
+    // cost O(memtable). Ask for `k * mult` first and redo the round with the
+    // full over-fetch only when superseded hits actually left fewer than
+    // `k * mult` survivors; an accepted round therefore carries exactly the
+    // guarantee the full over-fetch gave.
+    let mut delta_overfetch = 0_usize;
+    let mut rounds_left = max_rounds;
+    while rounds_left > 0 {
         let kprime = k
             .saturating_mul(mult)
-            .saturating_add(delta_ids.len())
+            .saturating_add(delta_overfetch)
             .max(k);
         // Beam width ≥ the fetch count so the beam can actually surface `kprime`
         // candidates. A user `$__vector_ef` is clamped only to `≥ kprime`, so for a
@@ -7061,6 +7101,16 @@ async fn try_index_search(
                 let exhausted = persisted_complete || hits.len() < kprime;
                 (hits, exhausted, persisted_complete)
             };
+        if delta_overfetch == 0 && delta_len > 0 && !index_exhausted {
+            let survivors = raw_hits
+                .iter()
+                .filter(|(id, _)| !delta_contains(id))
+                .count();
+            if survivors < k.saturating_mul(mult) {
+                delta_overfetch = delta_len;
+                continue;
+            }
+        }
 
         // int8 rescore (RFC-030): the index returned the QUANTIZED cosine, so
         // rescore every candidate with the true f32 metric from its stored
@@ -7083,7 +7133,7 @@ async fn try_index_search(
                     // A fresh upsert/tombstone deliberately supersedes this
                     // persisted hit. Its current embedding (or suppression) is
                     // already represented by `delta_scored`/`delta_ids`.
-                    if delta_ids.contains(id) {
+                    if delta_contains(id) {
                         continue;
                     }
                     let Some(view) = view else {
@@ -7113,10 +7163,10 @@ async fn try_index_search(
         // superseded hit is dropped. The set also remains a defensive dedup
         // boundary for malformed index bodies; storage rejects manifests with
         // multiple full-corpus vector generations.
-        let mut seen: BTreeSet<NodeId> = delta_ids.clone();
+        let mut seen: BTreeSet<NodeId> = BTreeSet::new();
         let mut scored: Vec<(f64, NodeId)> = Vec::with_capacity(hits.len() + delta_scored.len());
         for (id, score) in hits {
-            if seen.insert(id) {
+            if !delta_contains(&id) && seen.insert(id) {
                 scored.push((score, id));
             }
         }
@@ -7168,7 +7218,7 @@ async fn try_index_search(
                 // check after hydration (native postings may cover only part of
                 // the expression).
                 if let Some(filter) = source_filter {
-                    if !delta_ids.contains(&id)
+                    if !delta_contains(&id)
                         && evaluate(filter, &row, params)?.as_bool() != Some(true)
                     {
                         continue;
@@ -7194,6 +7244,7 @@ async fn try_index_search(
             break;
         }
         mult = mult.saturating_mul(WIDEN_GROWTH);
+        rounds_left -= 1;
     }
 
     // Fewer than k survivors even after widening (a selective source filter, or
@@ -8474,9 +8525,13 @@ fn fingerprint_into(out: &mut String, v: &RuntimeValue) {
 // ───────────────────────── Aggregate ─────────────────────────────────
 
 /// Fast path for a global `count(*)` / `count(n)` directly over an
-/// unfiltered node scan. Storage serves a compacted/disjoint corpus from
-/// manifest label counts and falls back to exact LSM reconciliation whenever
-/// additive metadata could double-count overlapping versions.
+/// unfiltered node scan, and for the presence counts
+/// `MATCH (n:L) WHERE n.p IS NOT NULL RETURN count(n)` and
+/// `MATCH (n:L) RETURN count(n.p)`. Storage serves a compacted/disjoint
+/// corpus from manifest label counts, and every other case from the writer's
+/// exact node-count ledger (seeded once in the background, then kept exact by
+/// every commit), falling back to exact LSM reconciliation whenever neither
+/// can prove the answer.
 async fn try_metadata_node_count(
     input: &LogicalPlan,
     group_by: &[(Expression, String)],
@@ -8495,18 +8550,41 @@ async fn try_metadata_node_count(
     else {
         return Ok(None);
     };
-    if !predicates.is_empty() {
-        return Ok(None);
-    }
-    let (output, AggregateExpr::Count { arg, .. }) = &aggregations[0] else {
+    let (output, AggregateExpr::Count { arg, distinct }) = &aggregations[0] else {
         return Ok(None);
     };
-    if let Some(arg) = arg {
-        if !matches!(&arg.kind, ExpressionKind::Variable(id) if id.name == *alias) {
-            return Ok(None);
+    // `count(n)` / `count(*)` count rows; `count(n.p)` counts rows whose `p`
+    // is not null. DISTINCT is a no-op for `n` (one row per node) but not
+    // for `n.p` (equal values collapse).
+    let counted_property = match arg.as_ref().map(|arg| &arg.kind) {
+        None => None,
+        Some(ExpressionKind::Variable(id)) if id.name == *alias => None,
+        Some(ExpressionKind::Property(property)) if !*distinct => match &property.target.kind {
+            ExpressionKind::Variable(id) if id.name == *alias => Some(property.key.name.clone()),
+            _ => return Ok(None),
+        },
+        Some(_) => return Ok(None),
+    };
+    let filtered_property = match predicates.as_slice() {
+        [] => None,
+        [namidb_storage::sst::predicates::ScanPredicate::IsNotNull { column }] => {
+            Some(column.clone())
         }
-    }
-    let count = snapshot.count_nodes(label.as_deref()).await?;
+        _ => return Ok(None),
+    };
+    let present = match (counted_property, filtered_property) {
+        (None, None) => None,
+        (Some(property), None) | (None, Some(property)) => Some(property),
+        (Some(counted), Some(filtered)) if counted == filtered => Some(counted),
+        (Some(_), Some(_)) => return Ok(None),
+    };
+    let count = match (label.as_deref(), present) {
+        (label, None) => snapshot.count_nodes(label).await?,
+        (Some(label), Some(property)) => {
+            snapshot.count_nodes_with_property(label, &property).await?
+        }
+        (None, Some(_)) => return Ok(None),
+    };
     let count = i64::try_from(count)
         .map_err(|_| ExecError::Runtime("node count exceeds Cypher INTEGER range".into()))?;
     Ok(Some(vec![
