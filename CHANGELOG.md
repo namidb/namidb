@@ -40,17 +40,18 @@ crates.io release will establish and document that API explicitly.
   holding rows that can reach the top-k are read and scored. Hits and scores
   are unchanged: every returned score is still the exact f32 score, and the
   same rows win.
-- **Vector search re-ranks by reading single rows.** The exact f32 pages of
-  a vector base are now written uncompressed inside standard zstd frames
-  (raw blocks), so a query reads just the candidate rows it re-ranks
-  instead of decompressing every probed page whole: a cold top-10 fetches
-  about a third of the bytes it did, and a warm one spends a fraction of
-  the CPU. Each row read this way must agree with the checksummed int8 code
+- **Vector search re-ranks by reading single rows.** The exact f32 pages
+  and the navigation pages of a vector base are now written uncompressed
+  inside standard zstd frames (raw blocks), so a query reads just the
+  candidate rows it re-ranks instead of decompressing every probed page
+  whole. Each row read this way must agree with the checksummed int8 code
   it was ranked by, or its page is read whole under the page checksum.
-  Navigation pages decode with one bulk call and a direct decoder instead
-  of a per-element visit, and approximate scores run in fixed lanes the
-  compiler vectorises. Bases written by earlier releases are read as before
-  until compaction rewrites them; hits and exact scores are unchanged.
+  Navigation pages decode with one bulk call and a direct decoder, and
+  approximate scores run in fixed lanes the compiler vectorises. On a
+  60k-vector, 1024-dimension index a warm top-10 went from 360 ms to 43 ms
+  and a cold one from 475 ms to 294 ms. Bases written by earlier releases
+  are read as before (with the faster decode) until compaction rewrites
+  them; hits and exact scores are unchanged.
 - **Vector search with a selective metadata filter reads only what the
   filter admits.** When a filter (`search.vector({… filter: {ley: $ley}})`
   or a `WHERE` on node properties) is not one the index can apply and admits
