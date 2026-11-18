@@ -6729,6 +6729,7 @@ const VECTOR_FLAT_SCAN_BATCH: usize = 256;
 const FILTERED_FLAT_ELIGIBLE_CAP: usize = 4096;
 /// Indexed equality filters the vector index cannot apply natively that admit
 /// at most this many nodes skip the index search entirely.
+#[cfg(feature = "vector-index")]
 const FILTERED_FLAT_FIRST_CAP: usize = 1024;
 
 /// The properties of `alias` that `filter` reads, when it reads nothing else
@@ -6780,6 +6781,7 @@ async fn selective_filter_eligible(
     params: &Params,
 ) -> Result<Option<Vec<NodeId>>, ExecError> {
     if !groups.is_empty() {
+        #[cfg(feature = "vector-index")]
         if let Some(ids) = resolve_capped_filter_eligibility(snapshot, label, groups).await? {
             if ids.len() <= FILTERED_FLAT_ELIGIBLE_CAP {
                 return Ok(Some(ids.into_iter().collect()));

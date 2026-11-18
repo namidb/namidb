@@ -22,9 +22,9 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::{
     encode_vector_filter_value, metric_name, validate_build_options, BlockRef, CentroidNode,
-    Footer, NavPage, PageRef, VectorGraphBuildStats, VectorIndexDescriptor, VectorMetric,
-    VectorV5BuildOptions, FORMAT_VERSION, MAGIC_V5, MAX_COMPRESSED_BLOCK_BYTES, MAX_FOOTER_BYTES,
-    MAX_RAW_BLOCK_BYTES, RawFrameEncoder, TRAILER_MAGIC,
+    Footer, NavPage, PageRef, RawFrameEncoder, VectorGraphBuildStats, VectorIndexDescriptor,
+    VectorMetric, VectorV5BuildOptions, FORMAT_VERSION, MAGIC_V5, MAX_COMPRESSED_BLOCK_BYTES,
+    MAX_FOOTER_BYTES, MAX_RAW_BLOCK_BYTES, TRAILER_MAGIC,
 };
 use crate::error::Error;
 
@@ -1494,10 +1494,8 @@ fn write_exact_block(
     validate_block_lengths(raw_len, "exact page")?;
     let offset = output.stream_position()?;
     let writer = CrcCountingWriter::new(output);
-    let mut encoder = std::io::BufWriter::with_capacity(
-        64 * 1024,
-        RawFrameEncoder::new(writer, raw_len)?,
-    );
+    let mut encoder =
+        std::io::BufWriter::with_capacity(64 * 1024, RawFrameEncoder::new(writer, raw_len)?);
     partition.rewind(dim)?;
     let mut rows = 0u64;
     while let Some(record) = read_record(partition.spool.as_file_mut(), dim, memory_budget)? {

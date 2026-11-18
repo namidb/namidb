@@ -20,10 +20,10 @@ pub mod external;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
-use std::io::{Cursor, Write};
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+use std::io::Write;
 use std::mem::size_of;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -833,10 +833,8 @@ impl VectorV5Reader {
                     let exact = &self.footer.pages[page as usize].exact;
                     if let Some(header) = header {
                         let raw = parts[header].as_ref() == raw_frame_header(exact.raw_len);
-                        self.raw_pages[page as usize].store(
-                            if raw { RAW_YES } else { RAW_NO },
-                            AtomicOrdering::Relaxed,
-                        );
+                        self.raw_pages[page as usize]
+                            .store(if raw { RAW_YES } else { RAW_NO }, AtomicOrdering::Relaxed);
                         if !raw {
                             whole.push((page, candidate_start, candidate_end));
                             continue;
@@ -1072,8 +1070,13 @@ impl VectorV5Reader {
                         page,
                         quality(
                             self.metric,
-                            approximate_score(self.metric, query, query_norm, &node.codes, node.scale)
-                                as f64,
+                            approximate_score(
+                                self.metric,
+                                query,
+                                query_norm,
+                                &node.codes,
+                                node.scale,
+                            ) as f64,
                         ),
                     )
                 })
@@ -2042,7 +2045,7 @@ fn append_compressed_block(
             raw.len()
         )));
     }
-    let wire = zstd::stream::encode_all(Cursor::new(raw), compression_level)
+    let wire = zstd::stream::encode_all(std::io::Cursor::new(raw), compression_level)
         .map_err(|error| Error::invariant(format!("vector v5 zstd encode failed: {error}")))?;
     if wire.len() as u64 > MAX_COMPRESSED_BLOCK_BYTES {
         return Err(Error::invariant(format!(
@@ -2136,7 +2139,10 @@ fn decode_nav_raw(raw: &[u8]) -> Result<NavPage, Error> {
             // A length whose elements cannot fit in what is left is truncated
             // input, checked before any allocation.
             let len = usize::try_from(len).map_err(|_| short())?;
-            if len.checked_mul(element_bytes).is_none_or(|n| n > self.bytes.len()) {
+            if len
+                .checked_mul(element_bytes)
+                .is_none_or(|n| n > self.bytes.len())
+            {
                 return Err(short());
             }
             Ok(len)
@@ -2277,7 +2283,9 @@ impl<W: Write> Write for RawFrameEncoder<W> {
             return Ok(0);
         }
         if self.written >= self.raw_len {
-            return Err(std::io::Error::other("raw frame content exceeds its length"));
+            return Err(std::io::Error::other(
+                "raw frame content exceeds its length",
+            ));
         }
         let offset_in_block = self.written % RAW_FRAME_BLOCK_BYTES;
         if offset_in_block == 0 {
@@ -2413,7 +2421,11 @@ impl QueryNorms {
     fn of(query: &[f32]) -> Self {
         Self {
             l1: query.iter().map(|v| (*v as f64).abs()).sum(),
-            l2: query.iter().map(|v| *v as f64 * *v as f64).sum::<f64>().sqrt(),
+            l2: query
+                .iter()
+                .map(|v| *v as f64 * *v as f64)
+                .sum::<f64>()
+                .sqrt(),
         }
     }
 }
@@ -2437,7 +2449,11 @@ fn exact_row_consistent(
     }
     let half_step = candidate.scale as f64 * 0.5 * (1.0 + 1e-3) + 1e-9;
     let error_l2 = half_step * (row.len() as f64).sqrt();
-    let row_norm = row.iter().map(|v| *v as f64 * *v as f64).sum::<f64>().sqrt();
+    let row_norm = row
+        .iter()
+        .map(|v| *v as f64 * *v as f64)
+        .sum::<f64>()
+        .sqrt();
     let approx = candidate.score as f64;
     let (bound, slack) = match metric {
         VectorMetric::Dot => (half_step * norms.l1, 1e-3 * norms.l2 * row_norm + 1e-6),
@@ -3721,7 +3737,12 @@ mod tests {
     #[test]
     fn fast_nav_decoder_matches_bincode_and_rejects_what_it_rejects() {
         let mut rng = ChaCha8Rng::seed_from_u64(11);
-        for (rows, dim, filter_props) in [(0usize, 4usize, 0usize), (1, 3, 0), (37, 8, 2), (512, 16, 1)] {
+        for (rows, dim, filter_props) in [
+            (0usize, 4usize, 0usize),
+            (1, 3, 0),
+            (37, 8, 2),
+            (512, 16, 1),
+        ] {
             let words = rows.div_ceil(64);
             let mut filters = BTreeMap::new();
             for p in 0..filter_props {
@@ -3778,7 +3799,7 @@ mod tests {
             assert_eq!(decode_block(wire, &block, "t").unwrap(), raw);
             // The streaming decoder earlier releases use.
             let mut streamed = Vec::new();
-            zstd::stream::read::Decoder::new(Cursor::new(wire))
+            zstd::stream::read::Decoder::new(std::io::Cursor::new(wire))
                 .unwrap()
                 .read_to_end(&mut streamed)
                 .unwrap();
@@ -3836,9 +3857,14 @@ mod tests {
         // the same hits and scores; the 3.5 base reads only candidate rows.
         // dim 96 makes rows straddle the 128 KiB block boundaries.
         for dim in [96usize, 1024] {
-            for metric in [VectorMetric::Cosine, VectorMetric::Dot, VectorMetric::Euclidean] {
+            for metric in [
+                VectorMetric::Cosine,
+                VectorMetric::Dot,
+                VectorMetric::Euclidean,
+            ] {
                 let members = rerank_members(if dim >= 1024 { 2_000 } else { 600 }, dim);
-                let queries: Vec<Vec<f32>> = members.iter().step_by(97).map(|m| m.1.clone()).collect();
+                let queries: Vec<Vec<f32>> =
+                    members.iter().step_by(97).map(|m| m.1.clone()).collect();
                 let (old, old_source, _) = build_reader(metric, dim, members.clone(), true).await;
                 let (new, new_source, _) = build_reader(metric, dim, members, false).await;
                 let options = VectorV5SearchOptions {
@@ -3898,7 +3924,10 @@ mod tests {
             .await
             .expect("open");
         let result = reader.search(&query, 5, options).await;
-        assert!(result.is_err(), "damaged row must fail the page checksum: {result:?}");
+        assert!(
+            result.is_err(),
+            "damaged row must fail the page checksum: {result:?}"
+        );
     }
 
     /// Warm-cache CPU cost of one serving query on a realistic base:
@@ -3907,7 +3936,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn v5_warm_query_cost() {
-        let rows: u32 = std::env::var("V5_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(60_000);
+        let rows: u32 = std::env::var("V5_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60_000);
         let dim = 1024usize;
         let mut rng = ChaCha8Rng::seed_from_u64(7);
         let members: Vec<_> = (0..rows)
@@ -3927,7 +3959,9 @@ mod tests {
         .expect("body");
         eprintln!("built {} bytes in {:?}", body.len(), started.elapsed());
         let source = Arc::new(TrackingSource::new(body.clone()));
-        let reader = VectorV5Reader::open(source, body.len() as u64).await.expect("open");
+        let reader = VectorV5Reader::open(source, body.len() as u64)
+            .await
+            .expect("open");
         let pages = reader.page_count();
         let options = VectorV5SearchOptions {
             nprobe: 24.min(pages),
