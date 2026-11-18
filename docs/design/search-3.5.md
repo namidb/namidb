@@ -32,12 +32,21 @@ single rows (a step towards the row-addressable exact tier of §5.2.3). A
 
 Measured on the live-workload bench (M shape, 120k documents, 100k
 embeddings, then 80k more embedding writes), 3.4.2 → 3.5.0, p50: presence
-count settled 7.2 s → 7 ms; filtered vector top-10 settled 21.5 s (3/10
-timeouts) → 3.0 s; BM25 under embedding writes 23.6 s (10/15 timeouts) →
-1.5 s; a fresh embedding found by top-1 18.9 s → 3.5 s; unfiltered vector
-top-10 settled 948 → 801 ms. Under sustained re-embedding writes, vector top-k latency stays dominated
-by the V5 base and its maintenance competing for the same two CPUs and the
-bandwidth cap; that is what S4/S5 address.
+count settled 7.2 s → 6 ms; filtered vector top-10 settled 21.5 s (3/10
+timeouts) → 2.7 s; BM25 under embedding writes 23.6 s (10/15 timeouts) →
+1.3 s; a fresh embedding found by top-1 18.9 s → 2.6 s; unfiltered vector
+top-10 settled 948 → 448 ms, under embedding writes 11.0 s → 1.2 s.
+
+Warm and cold are reported separately on a 60k × 1,024 base (same harness,
+range cache 365 MB): cold top-10 475 → 294 ms; the same vectors again
+360 → 43 ms; new vectors after the cache filled 424 → 172 ms (92 ms once the
+index fits the range cache); in process, without HTTP, 223 → 23 ms per warm
+query. A filter on a range-indexed property (the equality shape customers
+use) answers in 203 ms repeated, 508 ms first. Warm top-k for new vectors on
+an index larger than the cache still pays object reads, and under sustained
+re-embedding writes vector top-k stays dominated by the V5 base and its
+maintenance competing for the same two CPUs and the bandwidth cap; that is
+what S4/S5 address.
 
 ## 1. Summary
 
