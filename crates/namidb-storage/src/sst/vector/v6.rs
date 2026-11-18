@@ -2374,8 +2374,16 @@ mod tests {
                 "ley".to_owned(),
                 vec![SearchFilterValue::String("ley-3".into())],
             )];
-            // Warm the codes once.
-            reader.search_coded(&vec![0.5; dim], 10, &[]).await.unwrap();
+            // The first query is the exact scan that also builds the codes.
+            let warm_query = vec![0.5; dim];
+            let warm = reader
+                .search_coded(&warm_query, 10, &groups)
+                .await
+                .unwrap()
+                .expect("codes fit the default budget");
+            let exact = reader.search_exact(&warm_query, 10, &groups).await.unwrap();
+            assert_eq!(warm.hits, exact.hits, "{metric:?}: building pass");
+            assert_eq!(warm.eligible_rows_seen, exact.eligible_rows_seen);
             for round in 0..20 {
                 let query: Vec<f32> = (0..dim).map(|_| next()).collect();
                 let filter: &[(String, Vec<SearchFilterValue>)] =

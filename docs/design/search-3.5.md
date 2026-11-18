@@ -1,6 +1,6 @@
 # Design: Search 3.5 — fresh, incremental, quantized search on object storage
 
-**Status:** draft
+**Status:** in progress (S1 and part of S2 shipped in 3.5.0; see "Implementation status")
 **Author(s):** NamiDB team
 **Created:** 2026-11-17
 **Targets:** NamiDB 3.5.x (branches from the 3.4.3 release)
@@ -10,6 +10,25 @@ RFC-030 (vector index), RFC-035 (incremental `.vg` maintenance)
 vector and text segment formats, manifest, range cache), `namidb-query`
 (count rewrite, vector / BM25 / hybrid execution), `namidb-server`
 (maintenance scheduling, prewarm), `namidb-bench` (measurement)
+
+## Implementation status (3.5.0)
+
+3.5.0 ships the parts of S1 and S2 that need no format change. Everything
+below is in memory and rebuilt after a restart, so a 3.5.0 store opens with
+3.4.x and back.
+
+| Step | Shipped in 3.5.0 | Not yet |
+|---|---|---|
+| S1 counts | Exact per-label and per-`(label, property)` presence ledger, maintained by every commit and flush; seeded in the background (at open for vector-indexed labels, otherwise on the first count) and rolled forward over the commits that land during the seed; `count(n)`, `count(n) WHERE n.p IS NOT NULL`, `count(n.p)` answered from it | Persisting the ledger in the manifest (§5.7.1); after a restart the first count of an untracked property waits for a seed |
+| S2 vector freshness | Per-index int8 memtable tail with exact score bounds (§5.2.6 with int8 instead of RaBitQ codes); only rows that can reach the top-k are decoded; adaptive over-fetch instead of `k + \|tail\|`; resident int8 codes for VG6 deltas so only pages that can hold the top-k are read | Recovery-time tail rebuild is lazy (first query after open or flush), not at replay |
+| S2 BM25 freshness | Rows whose label membership and indexed text equal the persisted version no longer force the flat scan (the embedding-only `SET` case of G6) | A text tail for rows whose indexed text did change (§5.5.1): those still take the exact path until flushed |
+| S3–S9 | — | Streaming backfill, VG7 partitioned RaBitQ index with SPFresh maintenance, cold path, FT5 blocked postings, hybrid, storage bounds |
+
+Measured on the live-workload bench (M shape) with 120k documents and 100k
+embeddings — numbers in the release notes of 3.5.0 and in the PR that shipped
+it. Under sustained re-embedding writes, vector top-k latency stays dominated
+by the V5 base and its maintenance competing for the same two CPUs and the
+bandwidth cap; that is what S4/S5 address.
 
 ## 1. Summary
 
