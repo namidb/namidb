@@ -19,6 +19,7 @@
 //! `euclidean` navigates with an L2 space (cosine would mis-rank whenever
 //! magnitudes vary).
 
+pub mod base_merge;
 pub mod v5;
 pub mod v6;
 
@@ -170,6 +171,17 @@ fn encode_vector_filter_value(value: &Value) -> Option<Cow<'_, str>> {
         Value::Bool(false) => Some(Cow::Borrowed("b:0")),
         Value::Str(value) => Some(Cow::Owned(format!("s:{value}"))),
         _ => None,
+    }
+}
+
+/// Inverse of [`encode_vector_filter_value`] for the keys a V5 body stores.
+fn decode_vector_filter_value(key: &str) -> Option<Value> {
+    match key {
+        "b:1" => Some(Value::Bool(true)),
+        "b:0" => Some(Value::Bool(false)),
+        _ => key
+            .strip_prefix("s:")
+            .map(|value| Value::Str(value.to_owned())),
     }
 }
 
