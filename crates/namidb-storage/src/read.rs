@@ -6333,19 +6333,33 @@ impl<'mt> Snapshot<'mt> {
             }
         }
         namidb_core::profile_scope!("Snapshot::count_nodes_with_property.scan");
-        let mut cursor = self.label_scan_cursor(label).await?;
-        let mut count = 0_u64;
-        loop {
-            crate::cancel::check()?;
-            let batch = cursor.next_batch(self, COUNT_SCAN_BATCH).await?;
-            if batch.is_empty() {
-                return Ok(count);
-            }
-            count += batch
-                .iter()
-                .filter(|view| property_present(view, property))
-                .count() as u64;
+        self.scan_presence_count(label, property).await
+    }
+
+    /// Exact count of the live `label` nodes whose `property` is present and
+    /// not null, reading only that property: column by column, a row group at
+    /// a time, in the compacted layout; otherwise through the predicate scan
+    /// with an empty projection (ids only, the same path a general
+    /// `WHERE n.p IS NOT NULL` takes).
+    async fn scan_presence_count(&self, label: &str, property: &str) -> Result<u64> {
+        if self.node_scan_is_disjoint() {
+            let mut count = 0_u64;
+            self.visit_label_with_projection::<_, Error>(label, &[property.to_string()], |view| {
+                if property_present(&view, property) {
+                    count += 1;
+                }
+                Ok(())
+            })
+            .await?;
+            return Ok(count);
         }
+        let predicates = [ScanPredicate::IsNotNull {
+            column: property.to_string(),
+        }];
+        Ok(self
+            .scan_label_with_predicates_and_projection(label, &predicates, Some(&[]))
+            .await?
+            .len() as u64)
     }
 
     /// Start (or join) a background seed of `label` and, with `property`,
@@ -6432,32 +6446,14 @@ impl<'mt> Snapshot<'mt> {
                 .filter(|(pair_label, _)| pair_label == label)
                 .map(|(_, property)| property.as_str())
                 .collect();
-            let mut present = vec![0_u64; properties.len()];
-            let mut count = 0_u64;
-            let mut cursor = self.label_scan_cursor(label).await?;
-            if properties.is_empty() {
-                result
-                    .by_label
-                    .insert(label.clone(), cursor.count_rest(self).await?);
-                continue;
-            }
-            loop {
-                let batch = cursor.next_batch(self, COUNT_SCAN_BATCH).await?;
-                if batch.is_empty() {
-                    break;
-                }
-                for view in &batch {
-                    count += 1;
-                    for (slot, property) in present.iter_mut().zip(&properties) {
-                        if property_present(view, property) {
-                            *slot += 1;
-                        }
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-            result.by_label.insert(label.clone(), count);
-            for (property, present) in properties.into_iter().zip(present) {
+            // The label count reads structural columns only, and each
+            // presence count only its property; neither decodes whole nodes.
+            let cursor = self.label_scan_cursor(label).await?;
+            result
+                .by_label
+                .insert(label.clone(), cursor.count_rest(self).await?);
+            for property in properties {
+                let present = self.scan_presence_count(label, property).await?;
                 result
                     .presence
                     .insert((label.clone(), property.to_string()), present);
@@ -12673,8 +12669,6 @@ impl FreshVectorDelta {
     }
 }
 
-/// Nodes per batch when a count streams a label.
-const COUNT_SCAN_BATCH: usize = 512;
 /// Times one count call may (re)start a seed after another seed finished
 /// without serving it.
 const COUNT_SEED_MAX_STARTS: u32 = 3;
