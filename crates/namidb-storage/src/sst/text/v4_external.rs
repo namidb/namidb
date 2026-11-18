@@ -1,9 +1,10 @@
 //! Bounded-memory external builder for `NAMIFT04` deltas.
 //!
 //! The caller streams NodeId-sorted before/after images. Token occurrences and
-//! signed df events are folded into checksummed external-sort runs. The final
-//! run is consumed one term at a time, so neither the corpus postings nor all
-//! term entries coexist in RAM. Complete native filters travel through the same
+//! signed df events are spilled into checksummed external-sort runs. A bounded
+//! fan-in k-way merge streams the runs into the assembler one term at a time,
+//! so neither the corpus postings nor all term entries coexist in RAM, and
+//! each spilled byte is normally written once. Complete native filters travel through the same
 //! external sort and are emitted as independently range-readable adaptive
 //! postings: delta-varint ordinals while sparse, bitmaps only when dense.
 
@@ -32,6 +33,9 @@ use super::{
 use crate::error::{Error, Result};
 use crate::search_lsm::SearchSegmentFormat;
 use crate::sst::search_delta::SearchSegmentWireBinding;
+use crate::sst::text::run_merge::{
+    take_smallest, KWayMerge, MergeBudget, MergeMessages, MergeRecord, SortedRunSource,
+};
 
 const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const MIN_MEMORY_BUDGET_BYTES: usize = 256 * 1024;
@@ -130,6 +134,14 @@ impl TextV4ExternalBuildConfig {
     fn directory_budget(&self) -> usize {
         self.memory_budget_bytes / 8
     }
+
+    /// Read buffers of the run merges. Merges run with the sort buffer
+    /// drained, and the final one alongside the assembler's block and
+    /// directory workspace (at most five eighths of the budget), so a quarter
+    /// keeps both within the budget.
+    fn merge_budget(&self) -> MergeBudget {
+        MergeBudget::new(self.memory_budget_bytes / 4)
+    }
 }
 
 /// Conservative logical allocation/I/O counters from one completed build.
@@ -143,7 +155,13 @@ pub struct TextV4ExternalBuildMetrics {
     pub max_directory_bytes: usize,
     pub peak_logical_memory_bytes: usize,
     pub initial_run_count: u64,
+    /// Bytes of the sorted runs spilled from the sort buffer, before merging.
+    pub initial_run_bytes: u64,
+    /// Merge passes that wrote an intermediate run (the final merge streams
+    /// into the artifact and is not counted).
     pub run_merge_count: u64,
+    /// Every byte written to scratch files: runs, merge rewrites, and the
+    /// dictionary and filter staging spools.
     pub spool_bytes_written: u64,
     pub filter_spool_bytes: u64,
     pub filter_value_count: u64,
@@ -213,7 +231,8 @@ pub struct TextV4ExternalBuilder {
     records: Vec<TermRecord>,
     record_term_bytes: usize,
     sort_buffer_bytes: usize,
-    levels: Vec<Option<RunFile>>,
+    /// Spilled runs awaiting the final merge.
+    runs: Vec<RunFile>,
     last_node_id: Option<[u8; 16]>,
     effective_count: u64,
     live_count: u64,
@@ -242,7 +261,7 @@ impl std::fmt::Debug for TextV4ExternalBuilder {
             .field("live_count", &self.live_count)
             .field("suppress_count", &self.suppress_count)
             .field("sort_buffer_bytes", &self.sort_buffer_bytes)
-            .field("live_run_levels", &self.levels.len())
+            .field("pending_runs", &self.runs.len())
             .field("metrics", &self.metrics)
             .field("poisoned", &self.poisoned)
             .finish()
@@ -364,7 +383,7 @@ impl TextV4ExternalBuilder {
             records: Vec::new(),
             record_term_bytes: 0,
             sort_buffer_bytes: 0,
-            levels: Vec::new(),
+            runs: Vec::new(),
             last_node_id: None,
             effective_count: 0,
             live_count: 0,
@@ -1159,45 +1178,65 @@ impl TextV4ExternalBuilder {
         for record in &records {
             writer.push(record)?;
         }
+        drop(records);
         let run = writer.finish()?;
         self.metrics.initial_run_count = self.metrics.initial_run_count.saturating_add(1);
+        self.metrics.initial_run_bytes = self.metrics.initial_run_bytes.saturating_add(run.len);
         self.metrics.spool_bytes_written = self.metrics.spool_bytes_written.saturating_add(run.len);
-        self.insert_run(0, run)
+        self.push_run(run)
     }
 
-    fn insert_run(&mut self, mut level: usize, mut run: RunFile) -> Result<()> {
-        loop {
-            if self.levels.len() <= level {
-                self.levels.resize_with(level + 1, || None);
-            }
-            let Some(existing) = self.levels[level].take() else {
-                self.levels[level] = Some(run);
-                return Ok(());
-            };
-            run = merge_runs(existing, run, &self.spool, self.config.block_budget())?;
-            self.metrics.run_merge_count = self.metrics.run_merge_count.saturating_add(1);
-            self.metrics.spool_bytes_written =
-                self.metrics.spool_bytes_written.saturating_add(run.len);
-            level += 1;
+    /// Queue a spilled run for the final merge. Only when the pending runs
+    /// reach a multiple of the fan-in are the smallest folded right away, which
+    /// bounds the spool files held open while ingesting.
+    fn push_run(&mut self, run: RunFile) -> Result<()> {
+        self.runs.push(run);
+        if self.runs.len() >= self.config.merge_budget().max_pending_runs() {
+            self.merge_smallest_runs()?;
         }
+        Ok(())
     }
 
-    fn collapse_runs(&mut self) -> Result<Option<RunFile>> {
-        let mut final_run = None;
-        for run in std::mem::take(&mut self.levels).into_iter().flatten() {
-            final_run = Some(match final_run {
-                None => run,
-                Some(previous) => {
-                    let merged =
-                        merge_runs(previous, run, &self.spool, self.config.block_budget())?;
-                    self.metrics.run_merge_count = self.metrics.run_merge_count.saturating_add(1);
-                    self.metrics.spool_bytes_written =
-                        self.metrics.spool_bytes_written.saturating_add(merged.len);
-                    merged
-                }
-            });
+    /// Fold the smallest runs into intermediate runs until the rest fit one
+    /// final merge. Runs within the fan-in are left untouched.
+    fn reduce_runs(&mut self) -> Result<()> {
+        while self.merge_smallest_runs()? {}
+        Ok(())
+    }
+
+    /// One intermediate merge pass, when the pending runs exceed the fan-in.
+    fn merge_smallest_runs(&mut self) -> Result<bool> {
+        let budget = self.config.merge_budget();
+        let Some(group) = budget.next_group(self.runs.len()) else {
+            return Ok(false);
+        };
+        let runs = take_smallest(&mut self.runs, group, |run| run.len);
+        self.metrics
+            .observe_finish(merge_reader_bytes(budget, runs.len()).saturating_add(IO_BUFFER_BYTES));
+        let mut merge = open_run_merge(runs, self.config.block_budget(), budget)?;
+        let mut output = RunWriter::new(&self.spool)?;
+        while let Some(record) = merge.next()? {
+            output.push(record)?;
         }
-        Ok(final_run)
+        drop(merge);
+        let run = output.finish()?;
+        self.metrics.run_merge_count = self.metrics.run_merge_count.saturating_add(1);
+        self.metrics.spool_bytes_written = self.metrics.spool_bytes_written.saturating_add(run.len);
+        self.runs.push(run);
+        Ok(true)
+    }
+
+    /// Open the final merge over every pending run, with its reader bytes.
+    fn open_final_merge(&mut self) -> Result<Option<(KWayMerge<RunReader>, usize)>> {
+        self.reduce_runs()?;
+        if self.runs.is_empty() {
+            return Ok(None);
+        }
+        let budget = self.config.merge_budget();
+        let runs = std::mem::take(&mut self.runs);
+        let reader_bytes = merge_reader_bytes(budget, runs.len());
+        let merge = open_run_merge(runs, self.config.block_budget(), budget)?;
+        Ok(Some((merge, reader_bytes)))
     }
 
     fn validate_reconciled_stats(&self) -> Result<()> {
@@ -1262,7 +1301,8 @@ impl TextV4ExternalBuilder {
         }
         self.validate_reconciled_stats()?;
         self.flush_records()?;
-        let final_run = self.collapse_runs()?;
+        let mut final_merge = self.open_final_merge()?;
+        let final_merge_bytes = final_merge.as_ref().map_or(0, |(_, bytes)| *bytes);
 
         let version_writer = self
             .version_writer
@@ -1323,9 +1363,10 @@ impl TextV4ExternalBuilder {
         )?;
         assembler.df_from_postings =
             self.presorted && matches!(self.mode, ExternalBuildMode::Derived);
-        if let Some(run) = final_run {
-            assembler.consume(run, self.config.block_budget())?;
+        if let Some((merge, _)) = final_merge.as_mut() {
+            assembler.consume(merge)?;
         }
+        drop(final_merge);
         if let Some(feed) = feed {
             feed(&mut MergeSink {
                 assembler: &mut assembler,
@@ -1356,7 +1397,8 @@ impl TextV4ExternalBuilder {
             assembly
                 .filter_directory_bytes
                 .saturating_add(assembly.max_posting_block_bytes.saturating_mul(3))
-                .saturating_add(self.config.block_budget()),
+                .saturating_add(self.config.block_budget())
+                .saturating_add(final_merge_bytes),
         );
         let postings_end = output.stream_position()?;
         if postings_start != assembly.postings_start || postings_end != assembly.postings_end {
@@ -1628,7 +1670,9 @@ impl TermRecord {
             },
         }
     }
+}
 
+impl MergeRecord for TermRecord {
     fn same_key(&self, other: &Self) -> bool {
         self == other
     }
@@ -1861,7 +1905,7 @@ struct RunReader {
 }
 
 impl RunReader {
-    fn open(mut run: RunFile, record_budget: usize) -> Result<Self> {
+    fn open(mut run: RunFile, record_budget: usize, buffer_bytes: usize) -> Result<Self> {
         run.file.rewind()?;
         let mut magic = [0u8; 8];
         run.file.read_exact(&mut magic)?;
@@ -1878,7 +1922,7 @@ impl RunReader {
             return Err(Error::invariant("text v4 run header length mismatch"));
         }
         Ok(Self {
-            reader: BufReader::with_capacity(IO_BUFFER_BYTES, run.file),
+            reader: BufReader::with_capacity(buffer_bytes, run.file),
             expected_count,
             expected_payload_len,
             expected_crc,
@@ -1995,57 +2039,42 @@ impl RunReader {
     }
 }
 
-fn merge_runs(
-    left: RunFile,
-    right: RunFile,
-    spool: &SpoolFactory,
-    record_budget: usize,
-) -> Result<RunFile> {
-    let mut left = RunReader::open(left, record_budget)?;
-    let mut right = RunReader::open(right, record_budget)?;
-    let mut output = RunWriter::new(spool)?;
-    let mut a = left.next()?;
-    let mut b = right.next()?;
-    let mut previous: Option<TermRecord> = None;
-    while a.is_some() || b.is_some() {
-        let next = match (&a, &b) {
-            (Some(left_record), Some(right_record)) => {
-                if left_record.same_key(right_record) {
-                    return Err(Error::invariant(
-                        "duplicate text v4 record encountered while merging",
-                    ));
-                }
-                if left_record <= right_record {
-                    let value = a.take().expect("left record present");
-                    a = left.next()?;
-                    value
-                } else {
-                    let value = b.take().expect("right record present");
-                    b = right.next()?;
-                    value
-                }
-            }
-            (Some(_), None) => {
-                let value = a.take().expect("left record present");
-                a = left.next()?;
-                value
-            }
-            (None, Some(_)) => {
-                let value = b.take().expect("right record present");
-                b = right.next()?;
-                value
-            }
-            (None, None) => break,
-        };
-        if previous.as_ref().is_some_and(|record| record >= &next) {
-            return Err(Error::invariant(
-                "text v4 run merge produced non-increasing records",
-            ));
-        }
-        output.push(&next)?;
-        previous = Some(next);
+impl SortedRunSource for RunReader {
+    type Record = TermRecord;
+
+    fn next_record(&mut self) -> Result<Option<TermRecord>> {
+        self.next()
     }
-    output.finish()
+
+    fn verified(&self) -> bool {
+        self.verified
+    }
+}
+
+static RUN_MERGE_MESSAGES: MergeMessages = MergeMessages {
+    duplicate: "duplicate text v4 record encountered while merging",
+    non_increasing: "text v4 run merge produced non-increasing records",
+    unverified: "text v4 run merge ended before verifying every run",
+};
+
+/// Read-buffer bytes of a merge over `readers` runs.
+fn merge_reader_bytes(budget: MergeBudget, readers: usize) -> usize {
+    budget.reader_buffer_bytes(readers).saturating_mul(readers)
+}
+
+/// A k-way merge over `runs`; the caller keeps `runs.len()` within the
+/// budget's fan-in.
+fn open_run_merge(
+    runs: Vec<RunFile>,
+    record_budget: usize,
+    budget: MergeBudget,
+) -> Result<KWayMerge<RunReader>> {
+    let buffer_bytes = budget.reader_buffer_bytes(runs.len());
+    let readers = runs
+        .into_iter()
+        .map(|run| RunReader::open(run, record_budget, buffer_bytes))
+        .collect::<Result<Vec<_>>>()?;
+    KWayMerge::new(readers, &RUN_MERGE_MESSAGES)
 }
 
 /// The callback a presorted merge drives a [`MergeSink`] with.
@@ -2325,15 +2354,11 @@ impl<'a> ExternalAssembler<'a> {
         })
     }
 
-    fn consume(&mut self, run: RunFile, record_budget: usize) -> Result<()> {
-        let mut reader = RunReader::open(run, record_budget)?;
-        let mut previous = None;
-        while let Some(record) = reader.next()? {
-            if previous.as_ref().is_some_and(|prior| prior >= &record) {
-                return Err(Error::invariant("final text v4 run is not strictly sorted"));
-            }
-            self.accept(&record)?;
-            previous = Some(record);
+    /// Consume the final merge. It yields strictly increasing records and
+    /// fails on a repeated key, so no copy of the previous record is kept.
+    fn consume(&mut self, merge: &mut KWayMerge<RunReader>) -> Result<()> {
+        while let Some(record) = merge.next()? {
+            self.accept(record)?;
         }
         self.finish_filter()?;
         self.finish_term()
@@ -3175,6 +3200,7 @@ mod tests {
     use super::*;
     use crate::search_lsm::{SearchEventRange, SearchLsmKind, SearchLsmStatus};
     use crate::sst::search_delta::SearchVersionRangeSource;
+    use crate::sst::text::run_merge::MERGE_FAN_IN;
     use async_trait::async_trait;
     use bytes::Bytes;
     use uuid::Uuid;
@@ -3302,7 +3328,6 @@ mod tests {
         }
         let artifact = builder.finish().unwrap().unwrap();
         assert!(artifact.metrics.initial_run_count > 1);
-        assert!(artifact.metrics.run_merge_count > 0);
         assert!(
             artifact.metrics.peak_logical_memory_bytes <= config.memory_budget_bytes,
             "{:?}",
@@ -3629,7 +3654,6 @@ mod tests {
         }
         let artifact = builder.finish().unwrap().unwrap();
         assert!(artifact.metrics.initial_run_count > 1);
-        assert!(artifact.metrics.run_merge_count > 0);
         assert!(artifact.metrics.peak_logical_memory_bytes <= config.memory_budget_bytes);
         let reader = open_artifact(artifact).await;
         let mut seen = 0usize;
@@ -3845,5 +3869,121 @@ mod tests {
         let reader = open_artifact(artifact).await;
         assert!(reader.supports_filter_property("estado"));
         assert!(!reader.supports_filter_property("id"));
+    }
+
+    fn generic_corpus_config(budget: usize, directory: &Path) -> TextV4ExternalBuildConfig {
+        TextV4ExternalBuildConfig {
+            memory_budget_bytes: budget,
+            spool_directory: Some(directory.into()),
+            max_filter_distinct_per_property: 8,
+            wire: TextV4BuildOptions {
+                postings_per_block: 8,
+                terms_per_dictionary_block: 4,
+                compression_level: 1,
+            },
+        }
+    }
+
+    /// Build a synthetic corpus of `documents` rows over a small vocabulary
+    /// and return the artifact bytes with the build metrics.
+    fn build_generic_corpus(
+        budget: usize,
+        documents: u64,
+    ) -> (Vec<u8>, TextV4ExternalBuildMetrics) {
+        const VOCABULARY: u64 = 400;
+        let directory = tempfile::tempdir().unwrap();
+        let context = TextV4BuildContext {
+            sst_id: Uuid::from_u128(502),
+            event_ranges: vec![SearchEventRange::new(1, documents)],
+            complete_filter_properties: vec!["flag".into()],
+        };
+        let mut builder = TextV4ExternalBuilder::with_config(
+            &state(),
+            context,
+            generic_corpus_config(budget, directory.path()),
+        )
+        .unwrap();
+        for value in 1..=documents {
+            let text = (0..8u64)
+                .map(|slot| format!("w{}", (value * 7 + slot * 13) % VOCABULARY))
+                .collect::<Vec<_>>()
+                .join(" ");
+            builder
+                .push(TextV4Mutation {
+                    node_id: node(value),
+                    lsn: value,
+                    before: None,
+                    after: Some(super::super::TextV4Payload {
+                        text,
+                        filters: BTreeMap::from([(
+                            "flag".into(),
+                            SearchFilterValue::Bool(value % 3 == 0),
+                        )]),
+                    }),
+                })
+                .unwrap();
+        }
+        let mut artifact = builder.finish().unwrap().unwrap();
+        let mut body = Vec::new();
+        artifact.file.read_to_end(&mut body).unwrap();
+        assert_eq!(body.len() as u64, artifact.len);
+        (body, artifact.metrics)
+    }
+
+    #[test]
+    fn many_tiny_runs_merge_to_the_single_run_artifact() {
+        const DOCUMENTS: u64 = 10_000;
+        let (expected, single) = build_generic_corpus(256 * 1024 * 1024, DOCUMENTS);
+        assert_eq!(single.initial_run_count, 1, "{single:?}");
+        assert_eq!(single.run_merge_count, 0, "{single:?}");
+
+        let (actual, metrics) = build_generic_corpus(MIN_MEMORY_BUDGET_BYTES, DOCUMENTS);
+        assert!(
+            metrics.initial_run_count > MERGE_FAN_IN as u64,
+            "the corpus must spill more runs than the merge fan-in: {metrics:?}"
+        );
+        assert!(metrics.run_merge_count > 0, "{metrics:?}");
+        assert!(
+            metrics.peak_logical_memory_bytes <= MIN_MEMORY_BUDGET_BYTES,
+            "{metrics:?}"
+        );
+        assert!(actual == expected, "multi-pass merge changed the artifact");
+    }
+
+    #[test]
+    fn runs_within_fan_in_are_written_once() {
+        // Regression: the binary-counter run levels rewrote every spilled byte
+        // once per level, so a build that spilled 18 runs wrote ~5x its data
+        // to scratch. Runs within the fan-in are now read once by the final
+        // merge, which streams into the artifact: scratch stays ~1x the data.
+        const DOCUMENTS: u64 = 10_000;
+        // 1 MiB leaves the merge readers enough memory for the full fan-in.
+        const BUDGET: usize = 1024 * 1024;
+        let (expected, reference) = build_generic_corpus(256 * 1024 * 1024, DOCUMENTS);
+        assert_eq!(reference.initial_run_count, 1, "{reference:?}");
+        let (actual, metrics) = build_generic_corpus(BUDGET, DOCUMENTS);
+        eprintln!(
+            "initial_runs={} run_merges={} scratch_bytes={} single_run_scratch_bytes={}",
+            metrics.initial_run_count,
+            metrics.run_merge_count,
+            metrics.spool_bytes_written,
+            reference.spool_bytes_written
+        );
+        assert!(metrics.initial_run_count > 8, "{metrics:?}");
+        assert!(
+            metrics.initial_run_count <= MERGE_FAN_IN as u64,
+            "{metrics:?}"
+        );
+        assert_eq!(metrics.run_merge_count, 0, "{metrics:?}");
+        // The single-run build writes every record once plus the dictionary
+        // and filter staging spools; many runs add only per-run framing.
+        assert!(
+            metrics.spool_bytes_written * 4 <= reference.spool_bytes_written * 5,
+            "scratch {} exceeds 1.25x the single-run build's {} bytes",
+            metrics.spool_bytes_written,
+            reference.spool_bytes_written
+        );
+        assert!(metrics.peak_logical_memory_bytes <= BUDGET, "{metrics:?}");
+        assert!(actual == expected, "the k-way merge changed the artifact");
     }
 }

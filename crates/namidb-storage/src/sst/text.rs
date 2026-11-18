@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::text::{avg_len, bm25_idf, bm25_term_score, TextQuery, PREFIX_EXPANSION_LIMIT};
 
+mod run_merge;
 mod v3;
 pub mod v4;
 

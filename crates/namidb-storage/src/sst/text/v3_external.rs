@@ -2,11 +2,11 @@
 //!
 //! Documents are already NodeId-sorted when they reach this builder. The fixed
 //! document table is written directly to the final artifact, while token
-//! occurrences are sorted in bounded in-memory runs. Runs are folded like a
-//! binary counter, so the number of live spool files is logarithmic rather
-//! than proportional to the corpus. The final run is consumed term-by-term to
-//! emit the exact posting/dictionary block layout used by the in-memory v3
-//! builder.
+//! occurrences are sorted in bounded in-memory runs. A bounded fan-in k-way
+//! merge streams the runs term-by-term into the exact posting/dictionary block
+//! layout used by the in-memory v3 builder, so each spilled byte is normally
+//! written once. Only a corpus with more runs than the fan-in folds groups of
+//! runs into intermediate runs first, which also bounds the live spool files.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -25,6 +25,9 @@ use super::{
     TERMS_PER_DICTIONARY_BLOCK, TRAILER_MAGIC, ZSTD_LEVEL,
 };
 use crate::error::{Error, Result};
+use crate::sst::text::run_merge::{
+    take_smallest, KWayMerge, MergeBudget, MergeMessages, MergeRecord, SortedRunSource,
+};
 use crate::sst::text::TextIndexBuildStats;
 
 const DEFAULT_INDEX_BUILD_MEMORY_BYTES: usize = 64 * 1024 * 1024;
@@ -118,7 +121,10 @@ pub struct ExternalTextIndexBuildMetrics {
     pub max_buffer_bytes: usize,
     /// Initial sorted runs produced from the bounded buffer.
     pub initial_run_count: u64,
-    /// Streaming two-way merges performed while folding runs.
+    /// Bytes of the initial sorted runs, before any merge.
+    pub initial_run_bytes: u64,
+    /// Merge passes that wrote an intermediate run. The final merge streams
+    /// into the artifact and is not counted.
     pub run_merge_count: u64,
     /// Bytes written to occurrence and sparse-directory spool files, including
     /// merge rewrites. This is diagnostic I/O, not final artifact size.
@@ -182,7 +188,8 @@ pub struct TextIndexExternalBuilder {
     occurrences: Vec<Occurrence>,
     occurrence_term_bytes: usize,
     occurrence_buffer_bytes: usize,
-    levels: Vec<Option<RunFile>>,
+    /// Spilled runs awaiting the final merge.
+    runs: Vec<RunFile>,
     doc_count: u32,
     total_len: u64,
     min_node_id: Option<[u8; 16]>,
@@ -200,7 +207,7 @@ impl std::fmt::Debug for TextIndexExternalBuilder {
             .field("total_len", &self.total_len)
             .field("buffered_occurrences", &self.occurrences.len())
             .field("occurrence_buffer_bytes", &self.occurrence_buffer_bytes)
-            .field("live_run_levels", &self.levels.len())
+            .field("pending_runs", &self.runs.len())
             .field("metrics", &self.metrics)
             .field("poisoned", &self.poisoned)
             .finish()
@@ -239,7 +246,7 @@ impl TextIndexExternalBuilder {
             occurrences: Vec::new(),
             occurrence_term_bytes: 0,
             occurrence_buffer_bytes: 0,
-            levels: Vec::new(),
+            runs: Vec::new(),
             doc_count: 0,
             total_len: 0,
             min_node_id: None,
@@ -278,7 +285,7 @@ impl TextIndexExternalBuilder {
             return Ok(None);
         }
         self.flush_occurrence_buffer()?;
-        let final_run = self.collapse_runs()?;
+        let mut final_merge = self.open_final_merge()?;
 
         let doc_table_offset = MAGIC_V3.len() as u64;
         let doc_table_len = u64::from(self.doc_count)
@@ -294,9 +301,10 @@ impl TextIndexExternalBuilder {
         }
 
         let mut assembler = OutputAssembler::new(&mut self.output, &self.spool)?;
-        if let Some(run) = final_run {
-            assembler.consume(run, self.options.memory_budget_bytes)?;
+        if let Some(merge) = final_merge.as_mut() {
+            assembler.consume(merge)?;
         }
+        drop(final_merge);
         let term_count = assembler.term_count;
         let assembled = assembler.finish()?;
         let directory = assembled.directory;
@@ -504,43 +512,60 @@ impl TextIndexExternalBuilder {
         drop(records);
         let run = writer.finish()?;
         self.metrics.initial_run_count += 1;
+        self.metrics.initial_run_bytes = self
+            .metrics
+            .initial_run_bytes
+            .checked_add(run.len)
+            .ok_or_else(|| Error::invariant("text run byte counter overflows u64"))?;
         self.add_spool_bytes(run.len)?;
-        self.insert_run(0, run)?;
+        self.push_run(run)
+    }
+
+    /// Merge readers run once the occurrence buffer is drained, so they may
+    /// share the whole budget.
+    fn merge_budget(&self) -> MergeBudget {
+        MergeBudget::new(self.options.memory_budget_bytes)
+    }
+
+    /// Queue a spilled run for the final merge. Only when the pending runs
+    /// reach a multiple of the fan-in are the smallest folded right away, which
+    /// bounds the spool files held open while ingesting.
+    fn push_run(&mut self, run: RunFile) -> Result<()> {
+        self.runs.push(run);
+        if self.runs.len() >= self.merge_budget().max_pending_runs() {
+            self.merge_smallest_runs()?;
+        }
         Ok(())
     }
 
-    fn insert_run(&mut self, mut level: usize, mut run: RunFile) -> Result<()> {
-        loop {
-            if self.levels.len() <= level {
-                self.levels.resize_with(level + 1, || None);
-            }
-            let Some(existing) = self.levels[level].take() else {
-                self.levels[level] = Some(run);
-                return Ok(());
-            };
-            run = merge_runs(existing, run, &self.spool, self.options.memory_budget_bytes)?;
-            self.metrics.run_merge_count += 1;
-            self.add_spool_bytes(run.len)?;
-            level += 1;
+    /// One intermediate merge pass, when the pending runs exceed the fan-in.
+    fn merge_smallest_runs(&mut self) -> Result<bool> {
+        let budget = self.merge_budget();
+        let Some(group) = budget.next_group(self.runs.len()) else {
+            return Ok(false);
+        };
+        let runs = take_smallest(&mut self.runs, group, |run| run.len);
+        let mut merge = open_run_merge(runs, self.options.memory_budget_bytes, budget)?;
+        let mut writer = RunWriter::new(&self.spool)?;
+        while let Some(occurrence) = merge.next()? {
+            writer.write_occurrence(occurrence)?;
         }
+        drop(merge);
+        let run = writer.finish()?;
+        self.metrics.run_merge_count += 1;
+        self.add_spool_bytes(run.len)?;
+        self.runs.push(run);
+        Ok(true)
     }
 
-    fn collapse_runs(&mut self) -> Result<Option<RunFile>> {
-        let mut merged: Option<RunFile> = None;
-        let levels = std::mem::take(&mut self.levels);
-        for run in levels.into_iter().flatten() {
-            merged = Some(match merged {
-                None => run,
-                Some(previous) => {
-                    let run =
-                        merge_runs(previous, run, &self.spool, self.options.memory_budget_bytes)?;
-                    self.metrics.run_merge_count += 1;
-                    self.add_spool_bytes(run.len)?;
-                    run
-                }
-            });
+    /// Fold the smallest runs until the rest fit one merge, then open it.
+    fn open_final_merge(&mut self) -> Result<Option<KWayMerge<RunReader>>> {
+        while self.merge_smallest_runs()? {}
+        if self.runs.is_empty() {
+            return Ok(None);
         }
-        Ok(merged)
+        let runs = std::mem::take(&mut self.runs);
+        open_run_merge(runs, self.options.memory_budget_bytes, self.merge_budget()).map(Some)
     }
 
     fn add_spool_bytes(&mut self, bytes: u64) -> Result<()> {
@@ -561,7 +586,7 @@ struct Occurrence {
     doc_len: u32,
 }
 
-impl Occurrence {
+impl MergeRecord for Occurrence {
     fn same_key(&self, other: &Self) -> bool {
         self.term == other.term && self.doc == other.doc && self.position == other.position
     }
@@ -715,7 +740,7 @@ struct RunReader {
 }
 
 impl RunReader {
-    fn open(mut run: RunFile, max_record_bytes: usize) -> Result<Self> {
+    fn open(mut run: RunFile, max_record_bytes: usize, buffer_bytes: usize) -> Result<Self> {
         run.file.rewind()?;
         let mut magic = [0u8; 8];
         run.file.read_exact(&mut magic)?;
@@ -734,7 +759,7 @@ impl RunReader {
             ));
         }
         Ok(Self {
-            reader: BufReader::with_capacity(IO_BUFFER_BYTES, run.file),
+            reader: BufReader::with_capacity(buffer_bytes, run.file),
             expected_count,
             expected_payload_len,
             expected_crc,
@@ -823,57 +848,37 @@ impl RunReader {
     }
 }
 
-fn merge_runs(
-    left: RunFile,
-    right: RunFile,
-    spool: &SpoolFactory,
-    max_record_bytes: usize,
-) -> Result<RunFile> {
-    let mut left = RunReader::open(left, max_record_bytes)?;
-    let mut right = RunReader::open(right, max_record_bytes)?;
-    let mut writer = RunWriter::new(spool)?;
-    let mut a = left.next_occurrence()?;
-    let mut b = right.next_occurrence()?;
-    let mut previous: Option<Occurrence> = None;
-    while a.is_some() || b.is_some() {
-        let next = match (&a, &b) {
-            (Some(a_value), Some(b_value)) => {
-                if a_value.same_key(b_value) {
-                    return Err(Error::invariant(
-                        "duplicate text occurrence encountered while merging runs",
-                    ));
-                }
-                if a_value <= b_value {
-                    let value = a.take().expect("left occurrence present");
-                    a = left.next_occurrence()?;
-                    value
-                } else {
-                    let value = b.take().expect("right occurrence present");
-                    b = right.next_occurrence()?;
-                    value
-                }
-            }
-            (Some(_), None) => {
-                let value = a.take().expect("left occurrence present");
-                a = left.next_occurrence()?;
-                value
-            }
-            (None, Some(_)) => {
-                let value = b.take().expect("right occurrence present");
-                b = right.next_occurrence()?;
-                value
-            }
-            (None, None) => break,
-        };
-        if previous.as_ref().is_some_and(|prior| prior >= &next) {
-            return Err(Error::invariant(
-                "text occurrence merge produced non-increasing records",
-            ));
-        }
-        writer.write_occurrence(&next)?;
-        previous = Some(next);
+impl SortedRunSource for RunReader {
+    type Record = Occurrence;
+
+    fn next_record(&mut self) -> Result<Option<Occurrence>> {
+        self.next_occurrence()
     }
-    writer.finish()
+
+    fn verified(&self) -> bool {
+        self.verified
+    }
+}
+
+static RUN_MERGE_MESSAGES: MergeMessages = MergeMessages {
+    duplicate: "duplicate text occurrence encountered while merging runs",
+    non_increasing: "text occurrence merge produced non-increasing records",
+    unverified: "text occurrence merge ended before verifying every run",
+};
+
+/// A k-way merge over `runs`; the caller keeps `runs.len()` within the
+/// budget's fan-in.
+fn open_run_merge(
+    runs: Vec<RunFile>,
+    max_record_bytes: usize,
+    budget: MergeBudget,
+) -> Result<KWayMerge<RunReader>> {
+    let buffer_bytes = budget.reader_buffer_bytes(runs.len());
+    let readers = runs
+        .into_iter()
+        .map(|run| RunReader::open(run, max_record_bytes, buffer_bytes))
+        .collect::<Result<Vec<_>>>()?;
+    KWayMerge::new(readers, &RUN_MERGE_MESSAGES)
 }
 
 struct OutputAssembler<'a> {
@@ -923,17 +928,11 @@ impl<'a> OutputAssembler<'a> {
         })
     }
 
-    fn consume(&mut self, run: RunFile, max_record_bytes: usize) -> Result<()> {
-        let mut reader = RunReader::open(run, max_record_bytes)?;
-        let mut previous: Option<Occurrence> = None;
-        while let Some(occurrence) = reader.next_occurrence()? {
-            if previous.as_ref().is_some_and(|prior| prior >= &occurrence) {
-                return Err(Error::invariant(
-                    "final text occurrence run is not strictly sorted",
-                ));
-            }
-            self.accept(&occurrence)?;
-            previous = Some(occurrence);
+    /// Consume the final merge. It yields strictly increasing occurrences
+    /// and fails on a repeated key, so no copy of the previous one is kept.
+    fn consume(&mut self, merge: &mut KWayMerge<RunReader>) -> Result<()> {
+        while let Some(occurrence) = merge.next()? {
+            self.accept(occurrence)?;
         }
         self.finish_term()?;
         Ok(())
@@ -1718,6 +1717,7 @@ fn is_cjk(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sst::text::run_merge::MERGE_FAN_IN;
     use crate::sst::text::{build_body, TextIndex};
     use crate::text::{parse_query, tokenize};
 
@@ -1894,7 +1894,7 @@ mod tests {
         run.file.seek(SeekFrom::Start(RUN_HEADER_LEN + 4)).unwrap();
         run.file.write_all(b"z").unwrap();
         run.file.flush().unwrap();
-        let mut reader = RunReader::open(run, 1024).unwrap();
+        let mut reader = RunReader::open(run, 1024, IO_BUFFER_BYTES).unwrap();
         assert!(reader.next_occurrence().is_ok());
         let error = reader.next_occurrence().unwrap_err().to_string();
         assert!(error.contains("checksum"), "{error}");
@@ -1904,6 +1904,61 @@ mod tests {
             std::fs::read_dir(directory.path()).unwrap().count(),
             0,
             "anonymous spool files must be removed on close"
+        );
+    }
+
+    fn generic_corpus(documents: u16) -> Vec<([u8; 16], String)> {
+        (0..documents)
+            .map(|value| {
+                let text = (0..5u32)
+                    .map(|slot| format!("w{}", (u32::from(value) * 7 + slot * 13) % 300))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (id(value), text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn more_runs_than_fan_in_merge_to_the_in_memory_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let docs = generic_corpus(2_000);
+        let expected = build_body(docs.clone()).unwrap().unwrap().0;
+        let (actual, metrics) = build_external(docs, 4 * 1024, directory.path());
+        assert!(
+            metrics.initial_run_count > MERGE_FAN_IN as u64,
+            "{metrics:?}"
+        );
+        assert!(metrics.run_merge_count > 0, "{metrics:?}");
+        assert!(actual.as_slice() == expected.as_ref());
+    }
+
+    #[test]
+    fn runs_within_fan_in_are_written_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let docs = generic_corpus(20_000);
+        let expected = build_body(docs.clone()).unwrap().unwrap().0;
+        let (actual, metrics) = build_external(docs, 256 * 1024, directory.path());
+        eprintln!(
+            "initial_runs={} initial_run_bytes={} run_merges={} scratch_bytes={}",
+            metrics.initial_run_count,
+            metrics.initial_run_bytes,
+            metrics.run_merge_count,
+            metrics.spool_bytes_written
+        );
+        assert!(actual.as_slice() == expected.as_ref());
+        assert!(metrics.initial_run_count > 8, "{metrics:?}");
+        assert!(
+            metrics.initial_run_count <= MERGE_FAN_IN as u64,
+            "{metrics:?}"
+        );
+        // Scratch also holds the dictionary staging spools, which are small
+        // next to the occurrence runs of this corpus.
+        assert!(
+            metrics.spool_bytes_written * 10 <= metrics.initial_run_bytes * 11,
+            "scratch {} exceeds 1.1x the initial runs' {} bytes",
+            metrics.spool_bytes_written,
+            metrics.initial_run_bytes
         );
     }
 }
