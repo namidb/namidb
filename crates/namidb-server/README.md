@@ -144,6 +144,21 @@ reclaims versions below the live-reader horizon after
 object-count growth observed during the first hours of a bulk load is bounded
 history under the default maintenance settings.
 
+Objects the sweep can prove were installed once wait only
+`--sweep-superseded-min-age` / `NAMIDB_SWEEP_SUPERSEDED_MIN_AGE` (default
+`1h`, capped at `NAMIDB_SWEEP_MIN_AGE`). These are compaction inputs merged
+away, replaced search segments, flushed WAL segments, and the retired
+manifest versions that referenced them. Before the sweep retires a manifest
+version below the horizon, it reads that version. Every object the version
+references and no retained version references is deleted once the version
+has been superseded for that long, and before the manifest version itself
+is deleted. `NAMIDB_SWEEP_MIN_AGE` still guards objects that no manifest
+version ever referenced, since one of those may be an upload whose commit
+has not landed yet. A compaction pass that loses its install deletes its
+own uploads right away. Each sweep publishes `namidb_store_bytes{kind}` and
+`namidb_store_live_bytes` on `/v0/metrics`. `POST /v0/admin/sweep` runs a
+sweep on demand.
+
 `--restore-point-retention` / `NAMIDB_RESTORE_POINT_RETENTION` (default `0`,
 off; e.g. `24h`, `7d`) keeps that history on purpose: every committed version
 of the last `retention` stays restorable, so `POST /v0/admin/backup` with
@@ -159,7 +174,11 @@ superseded — roughly `retention × ingest rate × compaction write
 amplification`, plus `commits × manifest size`, on top of the live data. The
 sweep's and a cold open's LISTs of `manifest/` and `wal/` grow with the
 number of commits kept. Each sweep logs `restore_window_retained` /
-`restore_window_bytes`, the objects kept only for the window. Setting the
+`restore_window_bytes`, the objects kept only for the window. The periodic
+sweep keeps window history by write time, so it also keeps orphans written
+inside the window (failed uploads, abandoned compaction outputs). `POST
+/v0/admin/sweep` with `"exact_window": true` reclaims them by reading every
+version in the window. Setting the
 retention back to `0` releases the window when the maintenance loop next
 starts (multi-tenant: when each namespace next opens); a server that stops
 refreshing it (stopped, or the namespace evicted) leaves a lease that expires
@@ -216,6 +235,7 @@ byte-identical to static-token-only). Build the server with, e.g.,
 | `POST` | `/v0/cypher`       | bearer  | Run a Cypher query (read or write) |
 | `POST` | `/v0/admin/flush`  | bearer  | Force a memtable -> L0 SST flush; remains available and globally serialized under RSS pressure |
 | `POST` | `/v0/admin/compact` | bearer | Drain L0 completely and block until done; outside the request timeout, single-flighted on its own permit. Run it after a bulk load |
+| `POST` | `/v0/admin/sweep` | bearer (read-write) | Run the orphan sweep now and return its report; `exact_window` also reclaims garbage inside the restore point window (multi-tenant: `/:namespace/v0/admin/sweep`). See [below](#post-v0adminsweep) |
 | `POST` | `/v0/admin/backup` | bearer (read-write) | Copy a point-in-time snapshot of the namespace to an allowlisted destination (disabled unless `--backup-target-uri` is set; multi-tenant: `/:namespace/v0/admin/backup`) |
 | `GET` | `/v0/admin/restore-points` | bearer (read-write) | The restore point window and a page of its points, newest first (multi-tenant: `/:namespace/v0/admin/restore-points`) |
 | `POST` | `/:namespace/v0/admin/restore` | bearer (read-write) | `--multi-tenant` only: copy an allowlisted backup into a namespace that does not exist yet (disabled unless `--backup-target-uri` is set; unprefixed `/v0/admin/restore` resolves the namespace like the other routes) |
@@ -373,6 +393,48 @@ a mismatch; 503 when another backup or restore holds the permit for more
 than 30 s; 507/500 for other failures, including an object the backup's
 manifest names but the backup lacks. On a single-tenant server the route
 does not exist (404).
+
+### `POST /v0/admin/sweep`
+
+Runs the orphan sweep for the namespace now, waiting for an in-flight
+compaction pass to install first (it takes the same guard as the periodic
+sweep), and returns the sweep's report as JSON. Outside the request
+timeout, like the other maintenance routes. Multi-tenant:
+`/:namespace/v0/admin/sweep`, or the unprefixed route with the
+`X-NamiDB-Namespace` header.
+
+```json
+{ "exact_window": true, "min_age_secs": 3600, "dry_run": false }
+```
+
+Every field is optional, and an empty body means all defaults.
+
+- `exact_window` (default `false`): build the live set from every manifest
+  version in the restore point window instead of keeping every object
+  written since the window opened. This reclaims orphans written inside the
+  window, such as failed uploads and abandoned compaction outputs, while
+  every point in the window stays restorable. It costs one manifest read
+  per version in the window. If a version inside the window is missing, the
+  sweep cannot prove the window's closure and keeps window history by write
+  time for that run (the report's `exact_window` is then `false`).
+- `min_age_secs` (default `--sweep-min-age`): the age guard for objects no
+  manifest version ever referenced. It is always at least 600 s.
+- `dry_run` (default: the opposite of `--sweep-delete`): report what would
+  be reclaimed without deleting anything.
+
+The report counts what was reclaimed: `orphans_found` and `bytes_freed`
+for SST objects, of which `superseded_reclaimed` and
+`superseded_bytes_freed` came through the superseded fast path (see
+`NAMIDB_SWEEP_SUPERSEDED_MIN_AGE` above). It also counts manifest
+snapshots, pointers, WAL segments, and objects kept for the restore point
+window. The store totals the sweep listed are reported as
+`store_sst_bytes`, `store_wal_bytes`, `store_manifest_bytes`,
+`live_sst_bytes` and `live_wal_bytes`. `aborted_by_pin: true` means a
+backup pinned an older version mid-sweep, so nothing was deleted; retry.
+
+Status codes: 403 for a read-only token; 400 for a malformed body; 503
+under memory pressure when a multi-tenant namespace is not open; 500 when
+the sweep fails.
 
 ### `POST /v0/cypher`
 

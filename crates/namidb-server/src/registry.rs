@@ -19,9 +19,7 @@ use axum::response::Response;
 use axum::{response::IntoResponse, Json};
 use namidb_core::NamespaceId;
 use namidb_query::StatsCatalog;
-use namidb_storage::{
-    sweep_orphans, Manifest, ManifestStore, NamespacePaths, SnapshotCell, WriterSession,
-};
+use namidb_storage::{Manifest, ManifestStore, NamespacePaths, SnapshotCell, WriterSession};
 use object_store::ObjectStore;
 use tokio::sync::{watch, Mutex, OnceCell, RwLock};
 use tokio::task::JoinHandle;
@@ -49,6 +47,8 @@ pub struct MaintenanceConfig {
     pub flush_interval: Duration,
     pub compaction_interval: Duration,
     pub sweep_min_age: Duration,
+    /// See `Config::sweep_superseded_min_age`.
+    pub sweep_superseded_min_age: Duration,
     pub sweep_delete: bool,
     /// Restore point window kept by each open namespace's maintenance loop
     /// (see `Config::restore_point_retention`). Zero turns it off.
@@ -72,6 +72,7 @@ impl Default for MaintenanceConfig {
             flush_interval: Duration::ZERO,
             compaction_interval: Duration::ZERO,
             sweep_min_age: Duration::ZERO,
+            sweep_superseded_min_age: Duration::ZERO,
             sweep_delete: false,
             restore_point_retention: Duration::ZERO,
             compaction_l0_trigger: 0,
@@ -163,6 +164,16 @@ impl NamespaceRegistry {
     /// `true` if the cap is configured and reached.
     fn at_capacity(&self, len: usize) -> bool {
         self.max_namespaces != 0 && len >= self.max_namespaces
+    }
+
+    /// The sweep settings every namespace's maintenance loop (and the admin
+    /// sweep) runs with.
+    pub(crate) fn sweep_settings(&self) -> crate::maintenance::SweepSettings {
+        crate::maintenance::SweepSettings {
+            min_age: self.maintenance.sweep_min_age,
+            superseded_min_age: self.maintenance.sweep_superseded_min_age,
+            delete: self.maintenance.sweep_delete,
+        }
     }
 
     /// The shared store handle plus this namespace's paths, for a
@@ -712,8 +723,7 @@ impl NamespaceRegistry {
             let mut cancel = state.cancel_tx.subscribe();
             let ms = Arc::clone(&maint_store);
             let interval = maint.compaction_interval;
-            let sweep_min_age = maint.sweep_min_age;
-            let sweep_delete = maint.sweep_delete;
+            let sweep = self.sweep_settings();
             let restore_point_retention = maint.restore_point_retention;
             let ns = state.namespace.clone();
             let handle = tokio::spawn(async move {
@@ -778,7 +788,8 @@ impl NamespaceRegistry {
                     }
                     let horizon = s.snapshot.retention_horizon();
                     if let Err(e) =
-                        sweep_orphans(&ms, horizon, sweep_min_age, 1, sweep_delete).await
+                        crate::maintenance::run_sweep(&ms, sweep.options(horizon), &ns, &metrics)
+                            .await
                     {
                         error!(namespace = %ns, error = %e, "orphan sweep failed");
                     }

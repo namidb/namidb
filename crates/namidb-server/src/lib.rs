@@ -48,7 +48,7 @@ use namidb_query::{
     execute_with_limits, execute_write_checked_with_deadline, execute_write_staged_with_deadline,
     parse as cypher_parse, plan as build_plan, Params, RuntimeValue, StatsCatalog, WriteOutcome,
 };
-use namidb_storage::{sweep_orphans, Manifest, ManifestStore, SnapshotCell, WriterSession};
+use namidb_storage::{Manifest, ManifestStore, SnapshotCell, SweepOptions, WriterSession};
 
 use crate::auth::{AuthConfig, Principal};
 use crate::maintenance::{request_compaction, CompactionScheduler};
@@ -168,6 +168,13 @@ pub struct Config {
     /// object. Live readers are protected independently by the exact retention
     /// horizon; this age guards the upload-before-manifest/pointer-CAS window.
     pub sweep_min_age: Duration,
+    /// Age guard for an object the sweep proves was installed once: it is
+    /// referenced by a manifest version the sweep retires (a compaction input
+    /// merged away, a replaced search segment, a flushed WAL segment) and by
+    /// no retained version. It cannot be an in-flight upload, so it does not
+    /// wait out `sweep_min_age`; this short grace covers readers in other
+    /// processes that hold no retention pin. Capped at `sweep_min_age`.
+    pub sweep_superseded_min_age: Duration,
     /// When `true` (the default) the orphan sweep deletes unreachable
     /// immutable bodies, WALs, manifests, and pointers; the retention horizon
     /// (RFC-027) makes that safe by construction. Set `false` for a dry-run
@@ -379,6 +386,9 @@ pub struct AppState {
     /// lock by `GET /v0/admin/restore-points` and to resolve a backup's
     /// `as_of`.
     pub(crate) history: ManifestStore,
+    /// Sweep settings for `POST /v0/admin/sweep` (the periodic sweep reads
+    /// the same values from [`Config`]).
+    pub(crate) sweep: maintenance::SweepSettings,
 }
 
 /// See [`AppState::backup`].
@@ -434,6 +444,7 @@ impl AppState {
             // One namespace: the process-wide gate already caps it.
             query_gate: None,
             history,
+            sweep: maintenance::SweepSettings::default(),
         }
     }
 
@@ -511,7 +522,14 @@ impl AppState {
             group_commit: ns.group_commit.clone(),
             backup: None,
             query_gate: ns.query_gate.clone(),
+            sweep: shared.registry.sweep_settings(),
         }
+    }
+
+    /// Sweep settings used by `POST /v0/admin/sweep` (builder style).
+    pub(crate) fn with_sweep_settings(mut self, sweep: maintenance::SweepSettings) -> Self {
+        self.sweep = sweep;
+        self
     }
 
     /// Enable the admin backup endpoint (builder style): the namespace's
@@ -805,6 +823,7 @@ pub fn build_router(state: AppState) -> Router {
     let maintenance = Router::new()
         .route("/v0/admin/flush", post(admin_flush))
         .route("/v0/admin/compact", post(admin_compact))
+        .route("/v0/admin/sweep", post(admin_sweep))
         .route("/v0/admin/backup", post(admin_backup))
         .route("/v0/admin/restore-points", get(admin_restore_points))
         .route("/v0/admin/queries", get(admin_queries))
@@ -951,6 +970,7 @@ where
 /// - `/:namespace/v0/cypher` - execute Cypher queries
 /// - `/:namespace/v0/admin/flush` - manual flush
 /// - `/:namespace/v0/admin/compact` - drain L0 and block until done
+/// - `/:namespace/v0/admin/sweep` - run the orphan sweep now
 /// - `/:namespace/v0/admin/backup` - copy a snapshot to an allowlisted URI
 /// - `/:namespace/v0/admin/restore-points` - list the restore point window
 /// - `/:namespace/v0/admin/restore` - copy an allowlisted backup into a new
@@ -990,6 +1010,8 @@ pub fn build_multi_tenant_router(shared: SharedAppState) -> Router {
         .route("/v0/admin/flush", post(admin_flush_multi_unprefixed))
         .route("/:namespace/v0/admin/compact", post(admin_compact_multi))
         .route("/v0/admin/compact", post(admin_compact_multi_unprefixed))
+        .route("/:namespace/v0/admin/sweep", post(admin_sweep_multi))
+        .route("/v0/admin/sweep", post(admin_sweep_multi_unprefixed))
         .route("/:namespace/v0/admin/backup", post(admin_backup_multi))
         .route("/v0/admin/backup", post(admin_backup_multi_unprefixed))
         .route(
@@ -1427,6 +1449,7 @@ pub async fn run_with_memory_limits(
             flush_interval: config.flush_interval,
             compaction_interval: config.compaction_interval,
             sweep_min_age: config.sweep_min_age,
+            sweep_superseded_min_age: config.sweep_superseded_min_age,
             sweep_delete: config.sweep_delete,
             restore_point_retention: config.restore_point_retention,
             compaction_l0_trigger: config.compaction_l0_trigger,
@@ -1540,6 +1563,11 @@ pub async fn run_with_memory_limits(
         .with_http_body_limit(config.http_max_body_bytes)
         .with_slow_query_threshold(config.slow_query_threshold)
         .with_fence_policy(config.fence_policy)
+        .with_sweep_settings(maintenance::SweepSettings {
+            min_age: config.sweep_min_age,
+            superseded_min_age: config.sweep_superseded_min_age,
+            delete: config.sweep_delete,
+        })
         .with_group_commit(config.group_commit_window);
     if state.group_commit.is_some() {
         info!(
@@ -1805,8 +1833,7 @@ pub async fn run_with_memory_limits(
     if config.compaction_interval > Duration::ZERO {
         let state_for_maint = state.clone();
         let interval = config.compaction_interval;
-        let sweep_min_age = config.sweep_min_age;
-        let sweep_delete = config.sweep_delete;
+        let sweep = state.sweep;
         let restore_point_retention = config.restore_point_retention;
         tokio::spawn(async move {
             // Open (or release, when retention is off) the restore point
@@ -1874,43 +1901,15 @@ pub async fn run_with_memory_limits(
                     .await;
                 }
                 let horizon = state_for_maint.snapshot.retention_horizon();
-                match sweep_orphans(
+                if let Err(e) = maintenance::run_sweep(
                     &maint_manifest_store,
-                    horizon,
-                    sweep_min_age,
-                    1,
-                    sweep_delete,
+                    sweep.options(horizon),
+                    &state_for_maint.namespace,
+                    &state_for_maint.metrics,
                 )
                 .await
                 {
-                    Ok(report)
-                        if report.orphans_found > 0
-                            || report.manifest_snapshots_reclaimed > 0
-                            || report.pointer_files_reclaimed > 0
-                            || report.wal_segments_reclaimed > 0
-                            || report.memtable_snapshots_reclaimed > 0
-                            || report.restore_window_retained > 0 =>
-                    {
-                        info!(
-                            found = report.orphans_found,
-                            deleted = report.orphans_deleted,
-                            bytes_freed = report.bytes_freed,
-                            manifest_snapshots = report.manifest_snapshots_reclaimed,
-                            manifest_bytes_freed = report.manifest_bytes_freed,
-                            pointer_files = report.pointer_files_reclaimed,
-                            pointer_bytes_freed = report.pointer_bytes_freed,
-                            wal_segments = report.wal_segments_reclaimed,
-                            wal_bytes_freed = report.wal_bytes_freed,
-                            memtable_snapshots = report.memtable_snapshots_reclaimed,
-                            memtable_snapshot_bytes_freed = report.memtable_snapshot_bytes_freed,
-                            restore_window_retained = report.restore_window_retained,
-                            restore_window_bytes = report.restore_window_bytes,
-                            dry_run = !sweep_delete,
-                            "orphan sweep"
-                        )
-                    }
-                    Ok(_) => {}
-                    Err(e) => error!(error = %e, "orphan sweep failed"),
+                    error!(error = %e, "orphan sweep failed");
                 }
             }
         });
@@ -4921,6 +4920,204 @@ async fn dispatch_admin_compact_multi(
     }
 }
 
+/// Body of `POST /v0/admin/sweep`; every field is optional and an empty body
+/// means all defaults.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminSweepRequest {
+    /// Build the live set from every manifest version in the restore point
+    /// window, so orphans written inside the window are reclaimed too.
+    #[serde(default)]
+    exact_window: bool,
+    /// Age guard for objects no manifest version ever referenced. Defaults to
+    /// the server's `--sweep-min-age`; floored at
+    /// [`ADMIN_SWEEP_MIN_AGE_FLOOR`].
+    #[serde(default)]
+    min_age_secs: Option<u64>,
+    /// Report only. Defaults to the opposite of the server's
+    /// `--sweep-delete`.
+    #[serde(default)]
+    dry_run: Option<bool>,
+}
+
+/// Smallest `min_age` an admin sweep runs with, whatever the request asks
+/// for: an object younger than this may be an upload whose manifest CAS has
+/// not landed yet.
+const ADMIN_SWEEP_MIN_AGE_FLOOR: Duration = Duration::from_secs(600);
+
+impl AdminSweepRequest {
+    fn parse(body: &[u8]) -> Result<Self, Box<Response>> {
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self::default());
+        }
+        serde_json::from_slice(body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: format!("invalid sweep request: {e}"),
+                }),
+            )
+                .into_response()
+                .into()
+        })
+    }
+
+    fn options(&self, settings: maintenance::SweepSettings, horizon: u64) -> SweepOptions {
+        let min_age = self
+            .min_age_secs
+            .map(Duration::from_secs)
+            .unwrap_or(settings.min_age)
+            .max(ADMIN_SWEEP_MIN_AGE_FLOOR);
+        SweepOptions {
+            exact_window: self.exact_window,
+            min_age,
+            superseded_min_age: settings.superseded_min_age.min(min_age),
+            delete: self.dry_run.map_or(settings.delete, |dry_run| !dry_run),
+            ..settings.options(horizon)
+        }
+    }
+}
+
+/// Run one sweep for a namespace on behalf of `POST /v0/admin/sweep`. Takes
+/// the scheduler's sweep guard first, so no compaction prepare is between
+/// upload and install while the sweep classifies and deletes.
+async fn admin_sweep_run(
+    scheduler: &CompactionScheduler,
+    history: &ManifestStore,
+    snapshot: &SnapshotCell,
+    settings: maintenance::SweepSettings,
+    request: &AdminSweepRequest,
+    namespace: &str,
+    metrics: &Metrics,
+) -> Response {
+    let _sweep_guard = scheduler.sweep_guard().await;
+    let options = request.options(settings, snapshot.retention_horizon());
+    match maintenance::run_sweep(history, options, namespace, metrics).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: format!("sweep failed: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn admin_sweep_forbidden() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorBody {
+            error: "this token is read-only; admin sweep is forbidden".into(),
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /v0/admin/sweep` — run the orphan sweep now and return its report.
+///
+/// Optional JSON body `{ "exact_window": bool, "min_age_secs": u64,
+/// "dry_run": bool }`. `exact_window` reclaims garbage inside the restore
+/// point window (one manifest read per version in it). Outside the request
+/// timeout like the other maintenance routes: the sweep waits for an
+/// in-flight compaction pass to install first.
+async fn admin_sweep(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: axum::body::Bytes,
+) -> Response {
+    if !principal.allows_write() {
+        return admin_sweep_forbidden();
+    }
+    let request = match AdminSweepRequest::parse(&body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    admin_sweep_run(
+        &state.compaction_scheduler,
+        &state.history,
+        &state.snapshot,
+        state.sweep,
+        &request,
+        &state.namespace,
+        &state.metrics,
+    )
+    .await
+}
+
+async fn admin_sweep_multi(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    axum::extract::Path(namespace): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    dispatch_admin_sweep_multi(&shared, &namespace, &principal, &body).await
+}
+
+async fn admin_sweep_multi_unprefixed(
+    State(shared): State<SharedAppState>,
+    Extension(principal): Extension<Principal>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let namespace = namespace_from_header(&shared, &headers);
+    dispatch_admin_sweep_multi(&shared, &namespace, &principal, &body).await
+}
+
+async fn dispatch_admin_sweep_multi(
+    shared: &SharedAppState,
+    namespace: &str,
+    principal: &Principal,
+    body: &[u8],
+) -> Response {
+    if !principal.allows_write() {
+        return admin_sweep_forbidden();
+    }
+    let request = match AdminSweepRequest::parse(body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    // The sweep needs the namespace's in-process reader horizon and its
+    // compaction scheduler, so it runs on the open namespace. Like the admin
+    // compact, refuse to recover a cold writer under memory pressure.
+    let _ = shared.memory.sample();
+    let ns_state = if shared.memory.over_limit() {
+        match shared.registry.get_if_open(namespace).await {
+            Some(ns) => ns,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorBody {
+                        error: format!(
+                            "process memory pressure: namespace '{namespace}' is not open; \
+                             refusing to recover a cold writer for admin sweep"
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match shared.registry.get_or_open(namespace).await {
+            Ok(ns) => ns,
+            Err(e) => return namespace_open_error(e),
+        }
+    };
+    if ns_state.is_retired() {
+        return namespace_retired_response();
+    }
+    admin_sweep_run(
+        &ns_state.compaction_scheduler,
+        &ns_state.history,
+        &ns_state.snapshot,
+        shared.registry.sweep_settings(),
+        &request,
+        &ns_state.namespace,
+        &shared.metrics,
+    )
+    .await
+}
+
 async fn admin_flush(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -6890,6 +7087,7 @@ mod tests {
             flush_interval: Duration::ZERO,
             compaction_interval: Duration::ZERO,
             sweep_min_age: Duration::ZERO,
+            sweep_superseded_min_age: Duration::ZERO,
             sweep_delete: false,
             restore_point_retention: Duration::ZERO,
             bolt_listen: None,
@@ -9309,6 +9507,113 @@ mod tests {
             0,
             "the call must block until the drain it reports has actually landed"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_sweep_stays_authenticated_and_forbids_read_only_tokens() {
+        let app = fixture_with_tokens("authz-sweep", ROLE_TOKENS).await;
+        let sweep = |token: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().method("POST").uri("/v0/admin/sweep");
+                if let Some(token) = token {
+                    request = request.header("authorization", format!("Bearer {token}"));
+                }
+                app.oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(sweep(None).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(sweep(Some("rkey")).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(sweep(Some("wkey")).await.status(), StatusCode::OK);
+    }
+
+    /// `POST /v0/admin/sweep` runs the sweep with the requested options and
+    /// returns its report: an exact-window sweep that reports the store
+    /// accounting, floors `min_age` at 600 s (a just-written orphan
+    /// survives), and rejects a malformed body.
+    #[tokio::test]
+    async fn admin_sweep_runs_the_sweep_and_returns_its_report() {
+        use object_store::ObjectStoreExt;
+        let (store, paths) = namidb_storage::parse_uri("memory://http-admin-sweep").unwrap();
+        let writer = WriterSession::open(store.clone(), paths.clone())
+            .await
+            .unwrap();
+        let state = AppState::new(writer, None, "http-admin-sweep".into()).with_sweep_settings(
+            maintenance::SweepSettings {
+                min_age: Duration::ZERO,
+                superseded_min_age: Duration::ZERO,
+                delete: true,
+            },
+        );
+        {
+            let mut writer = state.writer.lock().await;
+            writer
+                .upsert_node(
+                    "Doc",
+                    namidb_core::id::NodeId::new(),
+                    &namidb_storage::NodeWriteRecord {
+                        properties: std::collections::BTreeMap::from([(
+                            "i".to_string(),
+                            namidb_core::value::Value::I64(1),
+                        )]),
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            writer.commit_batch().await.unwrap();
+            writer
+                .flush(namidb_core::schema::Schema::empty())
+                .await
+                .unwrap();
+            state.snapshot.store(writer.owned_snapshot());
+        }
+        let orphan = paths.sst_object(0, "planted-orphan.parquet");
+        store
+            .put(&orphan, object_store::PutPayload::from_static(b"orphan"))
+            .await
+            .unwrap();
+
+        let app = build_router(state.clone());
+        let resp = post_admin_json(
+            &app,
+            "/v0/admin/sweep",
+            "unused",
+            serde_json::json!({ "exact_window": true, "min_age_secs": 0 }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["exact_window"], true);
+        assert_eq!(body["aborted_by_pin"], false);
+        assert!(body["store_sst_bytes"].as_u64().unwrap() > 0, "{body}");
+        assert!(body["live_sst_bytes"].as_u64().unwrap() > 0, "{body}");
+        assert_eq!(body["orphans_found"], 0, "min_age is floored: {body}");
+        assert!(body["skipped_too_young"].as_u64().unwrap() >= 1, "{body}");
+        assert!(store.head(&orphan).await.is_ok());
+        assert!(state
+            .metrics
+            .render()
+            .contains("namidb_store_bytes{kind=\"sst\"}"));
+        assert!(!state
+            .metrics
+            .render()
+            .contains("namidb_store_live_bytes 0\n"));
+
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v0/admin/sweep")
+                    .body(Body::from("{\"exact_window\": \"yes\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     }
 
     /// POST a JSON body to an admin path with a bearer token.

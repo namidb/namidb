@@ -89,7 +89,7 @@ use crate::manifest::ManifestStore;
 /// behaviour requested by the caller — when `delete = false` (dry run),
 /// `orphans_deleted` is always zero and `bytes_freed` reports what *would*
 /// be freed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct JanitorReport {
     /// Distinct objects classified as orphan (not referenced by the
     /// current manifest, older than `min_age`).
@@ -166,6 +166,206 @@ pub struct JanitorReport {
     pub restore_window_retained: usize,
     /// Bytes held by the objects in `restore_window_retained`.
     pub restore_window_bytes: u64,
+    /// SST, side-car and WAL objects reclaimed through the superseded fast
+    /// path: referenced by a manifest version this sweep retires, so they were
+    /// once installed and cannot be an in-flight upload, and guarded only by
+    /// [`SweepOptions::superseded_min_age`]. A subset of `orphans_found` +
+    /// `wal_segments_reclaimed`. Populated in dry-run too.
+    pub superseded_reclaimed: usize,
+    /// Bytes held by the objects in `superseded_reclaimed`.
+    pub superseded_bytes_freed: u64,
+    /// Manifest versions retired by this sweep that it loaded to find the
+    /// objects they referenced (the superseded fast path).
+    pub retired_versions_loaded: usize,
+    /// Manifest versions loaded to build the live set (current included).
+    pub live_versions_loaded: usize,
+    /// `true` when the live set was built from every manifest version in the
+    /// restore point window instead of keeping window history by write time
+    /// ([`SweepOptions::exact_window`]).
+    pub exact_window: bool,
+    /// Total bytes of every object listed under `sst/` (bodies and side-cars),
+    /// before this sweep deleted anything.
+    pub store_sst_bytes: u64,
+    /// Total bytes of every object listed under `wal/`, before deletion.
+    pub store_wal_bytes: u64,
+    /// Total bytes of every object listed under `manifest/` (bodies, pointers
+    /// and pin leases), before deletion.
+    pub store_manifest_bytes: u64,
+    /// Bytes of the listed `sst/` objects in the live set (referenced by a
+    /// retained manifest version).
+    pub live_sst_bytes: u64,
+    /// Bytes of the listed WAL segments in the live set.
+    pub live_wal_bytes: u64,
+}
+
+impl JanitorReport {
+    /// Bytes of the SST and WAL objects in the live set.
+    pub fn live_bytes(&self) -> u64 {
+        self.live_sst_bytes.saturating_add(self.live_wal_bytes)
+    }
+
+    /// `true` when the sweep found anything worth an info log line.
+    pub fn has_activity(&self) -> bool {
+        self.orphans_found > 0
+            || self.manifest_snapshots_reclaimed > 0
+            || self.pointer_files_reclaimed > 0
+            || self.wal_segments_reclaimed > 0
+            || self.memtable_snapshots_reclaimed > 0
+            || self.restore_window_retained > 0
+    }
+}
+
+/// Default for [`SweepOptions::superseded_min_age`].
+pub const DEFAULT_SUPERSEDED_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How many manifest bodies a sweep reads at once while building its live
+/// set or loading the versions it retires. Bounds memory to a few bodies.
+const MANIFEST_LOAD_CONCURRENCY: usize = 8;
+
+/// Parameters of [`sweep_orphans_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepOptions {
+    /// Oldest manifest version any in-process reader is pinned to (RFC-027).
+    pub retention_horizon: u64,
+    /// Age an unreferenced object must reach before deletion when the sweep
+    /// cannot prove it was ever installed: it may be an upload whose manifest
+    /// CAS has not landed yet.
+    pub min_age: std::time::Duration,
+    /// Age guard for an object referenced by a manifest version this sweep
+    /// retires (and by no retained one). Such an object was installed once,
+    /// so it is not an in-flight upload; the guard is only a margin for
+    /// readers outside this process that hold no retention pin. A retired
+    /// version must also have been superseded (its successor committed) at
+    /// least this long ago. Never longer than `min_age`.
+    pub superseded_min_age: std::time::Duration,
+    /// Expected deepest SST level (a diagnostics hint, not a bound).
+    pub max_level: u32,
+    /// `false` runs a dry run that only reports.
+    pub delete: bool,
+    /// Build the live set from EVERY manifest version in the restore point
+    /// window (one body at a time) instead of keeping every object written
+    /// since the window opened. Exact, so it also reclaims orphans written
+    /// inside the window (failed uploads, abandoned compaction outputs);
+    /// costs one manifest read per version in the window.
+    pub exact_window: bool,
+}
+
+impl SweepOptions {
+    /// The options [`sweep_orphans`] uses: superseded objects wait
+    /// `min(min_age, DEFAULT_SUPERSEDED_MIN_AGE)`, window history is kept by
+    /// write time.
+    pub fn new(
+        retention_horizon: u64,
+        min_age: std::time::Duration,
+        max_level: u32,
+        delete: bool,
+    ) -> Self {
+        Self {
+            retention_horizon,
+            min_age,
+            superseded_min_age: min_age.min(DEFAULT_SUPERSEDED_MIN_AGE),
+            max_level,
+            delete,
+            exact_window: false,
+        }
+    }
+}
+
+/// Every namespace-relative object path one SST descriptor references: the
+/// body plus its bloom and every side-car. This is the per-descriptor half of
+/// the sweep's live set, shared with callers that need to know what a
+/// manifest (or a prepared compaction) points at.
+pub fn descriptor_object_paths(desc: &crate::manifest::SstDescriptor) -> Vec<String> {
+    let mut out = Vec::with_capacity(4);
+    out.push(desc.path.clone());
+    if let Some(b) = &desc.bloom {
+        out.push(b.path.clone());
+    }
+    // Side-car bodies live in the same `sst/level{N}/` prefix the sweep
+    // scans, so they must be marked live too — otherwise the sweep deletes
+    // unique/equality/label-index side-cars a retained manifest still
+    // references, breaking point lookups and (with the typed-column layout)
+    // label scans.
+    for u in &desc.unique_property_indices {
+        out.push(u.path.clone());
+        if let Some(paged) = &u.paged {
+            out.push(paged.path.clone());
+        }
+    }
+    for e in &desc.equality_property_indices {
+        out.push(e.path.clone());
+        if let Some(paged) = &e.paged {
+            out.push(paged.path.clone());
+        }
+    }
+    for c in &desc.composite_equality_indices {
+        out.push(c.path.clone());
+        if let Some(paged) = &c.paged {
+            out.push(paged.path.clone());
+        }
+    }
+    if let Some(li) = &desc.label_index {
+        out.push(li.path.clone());
+    }
+    if let Some(locator) = &desc.node_locator {
+        out.push(locator.path.clone());
+        if let Some(properties) = &locator.property_pages {
+            out.push(properties.path.clone());
+        }
+    }
+    if let Some(point) = crate::manifest::edge_point_sidecar_path(desc) {
+        out.push(point);
+    }
+    out
+}
+
+/// Every namespace-relative `sst/` object path `manifest` references.
+pub fn manifest_object_paths(manifest: &crate::manifest::Manifest) -> HashSet<String> {
+    manifest
+        .ssts
+        .iter()
+        .flat_map(descriptor_object_paths)
+        .collect()
+}
+
+/// The objects a set of manifest versions references: `sst/` paths
+/// (namespace-relative) and WAL segment seqs.
+#[derive(Debug, Default)]
+struct ObjectSet {
+    paths: HashSet<String>,
+    wal: HashSet<u64>,
+    /// Deepest SST level any marked version occupies.
+    max_level: u32,
+}
+
+impl ObjectSet {
+    fn mark(&mut self, manifest: &crate::manifest::Manifest) {
+        for seg in &manifest.wal_segments {
+            self.wal.insert(seg.seq);
+        }
+        for desc in &manifest.ssts {
+            self.max_level = self.max_level.max(desc.level.as_u32());
+            for path in descriptor_object_paths(desc) {
+                self.paths.insert(path);
+            }
+        }
+    }
+
+    /// Mark what `manifest` references and `live` does not.
+    fn mark_outside(&mut self, manifest: &crate::manifest::Manifest, live: &ObjectSet) {
+        for seg in &manifest.wal_segments {
+            if !live.wal.contains(&seg.seq) {
+                self.wal.insert(seg.seq);
+            }
+        }
+        for desc in &manifest.ssts {
+            for path in descriptor_object_paths(desc) {
+                if !live.paths.contains(&path) {
+                    self.paths.insert(path);
+                }
+            }
+        }
+    }
 }
 
 /// The restore point window a sweep honours: the oldest window lease's floor
@@ -257,6 +457,92 @@ pub async fn sweep_orphans(
     max_level: u32,
     delete: bool,
 ) -> Result<JanitorReport> {
+    sweep_orphans_with(
+        manifest_store,
+        SweepOptions::new(retention_horizon, min_age, max_level, delete),
+    )
+    .await
+}
+
+/// Load manifest versions `versions` (at most [`MANIFEST_LOAD_CONCURRENCY`]
+/// bodies in flight) and hand each to `visit` in version order. A version
+/// that is gone is passed as `None`; any other error aborts.
+async fn for_each_manifest_version(
+    manifest_store: &ManifestStore,
+    versions: impl IntoIterator<Item = u64>,
+    mut visit: impl FnMut(u64, Option<&crate::manifest::Manifest>) -> Result<()>,
+) -> Result<()> {
+    use futures::StreamExt;
+    let mut loads = futures::stream::iter(versions)
+        .map(|version| async move {
+            match manifest_store.load_manifest_at(version).await {
+                Ok(manifest) => Ok((version, Some(manifest))),
+                Err(Error::ObjectStore(object_store::Error::NotFound { .. })) => {
+                    Ok((version, None))
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .buffered(MANIFEST_LOAD_CONCURRENCY);
+    while let Some(loaded) = loads.next().await {
+        let (version, manifest) = loaded?;
+        visit(version, manifest.as_ref())?;
+    }
+    Ok(())
+}
+
+/// Parse a `manifest/` object name: `v{16-hex}.json` bodies and
+/// `p{16-hex}.json` pointers, as `(is_pointer, version)`.
+fn parse_manifest_object(location: &object_store::path::Path) -> Option<(bool, u64)> {
+    let filename = location.filename()?;
+    filename
+        .strip_prefix('v')
+        .map(|rest| (false, rest))
+        .or_else(|| filename.strip_prefix('p').map(|rest| (true, rest)))
+        .and_then(|(is_pointer, rest)| rest.strip_suffix(".json").map(|h| (is_pointer, h)))
+        .and_then(|(is_pointer, hex)| u64::from_str_radix(hex, 16).ok().map(|v| (is_pointer, v)))
+}
+
+/// [`sweep_orphans`] with every knob exposed (see [`SweepOptions`]).
+///
+/// On top of the retention-horizon sweep this adds two things:
+///
+/// - **The superseded fast path.** Every manifest version below the retained
+///   floor whose successor committed at least `superseded_min_age` ago is
+///   loaded, and the objects it references that no retained version
+///   references are reclaimed after that short grace instead of `min_age`:
+///   they were installed once, so they cannot be an upload whose manifest
+///   CAS is still in flight. Objects go first, then the retired manifest
+///   bodies, so an interrupted sweep never forgets what a version held.
+/// - **The exact restore window** (`exact_window`). The live set is the union
+///   of every manifest version in the restore point window instead of "every
+///   object written since the window opened", so garbage written inside the
+///   window (failed uploads, abandoned compaction outputs) is reclaimed after
+///   `min_age`. If any version inside the window is missing the sweep cannot
+///   prove the window's closure and falls back to keeping by write time.
+#[instrument(
+ skip(manifest_store),
+ fields(
+ namespace = %manifest_store.paths().namespace(),
+ retention_horizon = opts.retention_horizon,
+ min_age_secs = opts.min_age.as_secs(),
+ superseded_min_age_secs = opts.superseded_min_age.as_secs(),
+ exact_window = opts.exact_window,
+ delete = opts.delete,
+ )
+)]
+pub async fn sweep_orphans_with(
+    manifest_store: &ManifestStore,
+    opts: SweepOptions,
+) -> Result<JanitorReport> {
+    let SweepOptions {
+        retention_horizon,
+        min_age,
+        max_level,
+        delete,
+        ..
+    } = opts;
+    let superseded_min_age = opts.superseded_min_age.min(min_age);
     let current = manifest_store.load_current().await?;
     let current_version = current.manifest.version;
 
@@ -264,6 +550,7 @@ pub async fn sweep_orphans(
     let paths = manifest_store.paths();
     let mut report = JanitorReport::default();
     let min_age_secs = min_age.as_secs() as i64;
+    let superseded_secs = superseded_min_age.as_secs() as i64;
     let now = Utc::now();
 
     // Retention pin leases (see `crate::pin`): cross-process readers — a
@@ -352,19 +639,32 @@ pub async fn sweep_orphans(
     // Manifest bodies at or above this version are kept: the dense horizon,
     // or the restore point window's floor when it reaches further back.
     let body_floor = window.map_or(horizon, |w| horizon.min(w.version));
-    // Objects written at or after this instant are kept for the window: a
-    // version inside it may reference them (see `PinScope::Window`).
-    let window_keep_since = window.map(|w| {
-        chrono::Duration::from_std(min_age)
-            .ok()
-            .and_then(|margin| w.since.checked_sub_signed(margin))
-            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
-    });
     // Versions at or above this floor are retained for in-process readers and
     // must load; versions below it are retained only because of a pin lease
     // and may already have been reclaimed before the lease existed (the pin
     // holder re-checks its own root and fails loudly in that case).
     let strict_floor = retention_horizon.min(current_version);
+
+    // List `manifest/` once: the store accounting, the retired bodies the
+    // superseded fast path loads, and their successors' commit times.
+    let mut manifest_objects: Vec<object_store::ObjectMeta> = Vec::new();
+    let mut body_modified: std::collections::BTreeMap<u64, chrono::DateTime<Utc>> =
+        Default::default();
+    let mut manifest_listing = store.list(Some(&paths.manifest_dir()));
+    while let Some(meta) = manifest_listing
+        .try_next()
+        .await
+        .map_err(Error::ObjectStore)?
+    {
+        report.store_manifest_bytes = report.store_manifest_bytes.saturating_add(meta.size);
+        if meta.location.as_ref().contains("/pins/") {
+            continue;
+        }
+        if let Some((false, version)) = parse_manifest_object(&meta.location) {
+            body_modified.insert(version, meta.last_modified);
+        }
+        manifest_objects.push(meta);
+    }
 
     // Build the live object set from the union of every retained manifest
     // version from the horizon to current (inclusive). A reader pinned at
@@ -372,96 +672,40 @@ pub async fn sweep_orphans(
     // them can be swept; an object only an older version referenced (a
     // compaction input merged away before the horizon, say) drops out of the
     // set and becomes reclaimable. This is what makes deletion safe by
-    // construction rather than by a wall-clock guess.
-    let mut referenced: HashSet<String> = HashSet::new();
-    // Deepest SST level occupied by ANY retained manifest version. Leveled-lite
-    // compaction cascades output to deeper levels (L2, L3, …) as buckets grow,
-    // and levels only ever increase, so the deepest level any retained manifest
-    // references predicts the normal scan depth. It is not a safe upper bound:
-    // compaction writes level N+1 before its manifest CAS, so a lost CAS can
-    // leave the only object at that deeper level absent from every manifest.
-    let mut max_seen_level: u32 = 0;
-    // WAL seqs referenced by ANY retained manifest version. Recovery replays
-    // exactly the `wal_segments` list of the manifest it is handed, so this
-    // union is the complete read surface of the `wal/` prefix (see the WAL
-    // sweep below for the full deletion rule).
-    let mut referenced_wal: HashSet<u64> = HashSet::new();
-    let mut mark_live = |manifest: &crate::manifest::Manifest| {
-        for seg in &manifest.wal_segments {
-            referenced_wal.insert(seg.seq);
-        }
-        for desc in &manifest.ssts {
-            max_seen_level = max_seen_level.max(desc.level.as_u32());
-            referenced.insert(desc.path.clone());
-            if let Some(b) = &desc.bloom {
-                referenced.insert(b.path.clone());
+    // construction rather than by a wall-clock guess. The set also unions the
+    // WAL seqs of those versions: recovery replays exactly the `wal_segments`
+    // list of the manifest it is handed, so that union is the complete read
+    // surface of the `wal/` prefix.
+    let mut live = ObjectSet::default();
+    live.mark(&current.manifest);
+    report.live_versions_loaded += 1;
+    for_each_manifest_version(
+        manifest_store,
+        horizon..current_version,
+        |version, manifest| match manifest {
+            Some(manifest) => {
+                live.mark(manifest);
+                report.live_versions_loaded += 1;
+                Ok(())
             }
-            // Side-car bodies live in the same `sst/level{N}/` prefix the
-            // sweep scans, so they must be marked live too — otherwise the
-            // sweep deletes unique/equality/label-index side-cars a retained
-            // manifest still references, breaking point lookups and (with the
-            // typed-column layout) label scans.
-            for u in &desc.unique_property_indices {
-                referenced.insert(u.path.clone());
-                if let Some(paged) = &u.paged {
-                    referenced.insert(paged.path.clone());
-                }
+            // A version retained only by a pin lease can predate the lease's
+            // own visibility and be gone already (the holder detects that
+            // itself). It references nothing we could keep alive, so skip
+            // it; a missing version at or above the strict floor is a real
+            // inconsistency and still aborts the sweep.
+            None if version < strict_floor => {
+                debug!(
+                    version,
+                    "pin-retained manifest version already reclaimed; skipping"
+                );
+                Ok(())
             }
-            for e in &desc.equality_property_indices {
-                referenced.insert(e.path.clone());
-                if let Some(paged) = &e.paged {
-                    referenced.insert(paged.path.clone());
-                }
-            }
-            for c in &desc.composite_equality_indices {
-                referenced.insert(c.path.clone());
-                if let Some(paged) = &c.paged {
-                    referenced.insert(paged.path.clone());
-                }
-            }
-            if let Some(li) = &desc.label_index {
-                referenced.insert(li.path.clone());
-            }
-            if let Some(locator) = &desc.node_locator {
-                referenced.insert(locator.path.clone());
-                if let Some(properties) = &locator.property_pages {
-                    referenced.insert(properties.path.clone());
-                }
-            }
-            if let Some(point) = crate::manifest::edge_point_sidecar_path(desc) {
-                referenced.insert(point);
-            }
-        }
-    };
-    for version in horizon..=current_version {
-        let loaded;
-        let manifest = if version == current_version {
-            &current.manifest
-        } else {
-            match manifest_store.load_manifest_at(version).await {
-                Ok(m) => {
-                    loaded = m;
-                    &loaded
-                }
-                // A version retained only by a pin lease can predate the
-                // lease's own visibility and be gone already (the holder
-                // detects that itself). It references nothing we could keep
-                // alive, so skip it; a missing version at or above the strict
-                // floor is a real inconsistency and still aborts the sweep.
-                Err(Error::ObjectStore(object_store::Error::NotFound { .. }))
-                    if version < strict_floor =>
-                {
-                    debug!(
-                        version,
-                        "pin-retained manifest version already reclaimed; skipping"
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        mark_live(manifest);
-    }
+            None => Err(Error::invariant(format!(
+                "retained manifest version {version} is missing"
+            ))),
+        },
+    )
+    .await?;
     // Versions kept on their own below the dense horizon: point leases (a
     // backup of an older restore point) and the restore point window's floor
     // version, whose closure holds every object older than the window that
@@ -473,23 +717,101 @@ pub async fn sweep_orphans(
         .chain(window.map(|w| w.version))
         .filter(|v| *v < horizon)
         .collect();
-    for version in &extra_versions {
-        match manifest_store.load_manifest_at(*version).await {
-            Ok(manifest) => mark_live(&manifest),
-            Err(Error::ObjectStore(object_store::Error::NotFound { .. })) => {
-                debug!(
+    for_each_manifest_version(
+        manifest_store,
+        extra_versions.iter().copied(),
+        |version, manifest| {
+            match manifest {
+                Some(manifest) => {
+                    live.mark(manifest);
+                    report.live_versions_loaded += 1;
+                }
+                None => debug!(
                     version,
                     "point/window-pinned manifest version already reclaimed; skipping"
-                );
+                ),
             }
-            Err(e) => return Err(e),
+            Ok(())
+        },
+    )
+    .await?;
+
+    // The exact window: every version strictly between the window's floor and
+    // the horizon joins the live set, so the window keeps exactly what its
+    // versions reference. One that is missing leaves the window's closure
+    // unproven; keep history by write time instead (the default mode).
+    let mut exact = opts.exact_window;
+    if let Some(w) = window.filter(|_| opts.exact_window) {
+        let mut missing = 0usize;
+        for_each_manifest_version(
+            manifest_store,
+            w.version.saturating_add(1)..horizon,
+            |_, manifest| {
+                match manifest {
+                    Some(manifest) => {
+                        live.mark(manifest);
+                        report.live_versions_loaded += 1;
+                    }
+                    None => missing += 1,
+                }
+                Ok(())
+            },
+        )
+        .await?;
+        if missing > 0 {
+            warn!(
+                missing,
+                window_floor = w.version,
+                horizon,
+                "restore point window has missing manifest versions; keeping window history by write time"
+            );
+            exact = false;
         }
     }
+    report.exact_window = exact;
+    // Objects written at or after this instant are kept for the window: a
+    // version inside it may reference them (see `PinScope::Window`).
+    let window_keep_since = window.filter(|_| !exact).map(|w| {
+        chrono::Duration::from_std(min_age)
+            .ok()
+            .and_then(|margin| w.since.checked_sub_signed(margin))
+            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC)
+    });
+
+    // The superseded fast path: retired versions (below every retained floor
+    // and not point-pinned) whose successor committed at least
+    // `superseded_min_age` ago. A successor that is already gone was itself
+    // retired, so it committed even earlier.
+    let superseded_cutoff = now - chrono::Duration::seconds(superseded_secs);
+    let fast_versions: Vec<u64> = body_modified
+        .keys()
+        .copied()
+        .filter(|version| *version < body_floor && !point_versions.contains(version))
+        .filter(|version| match body_modified.get(&(version + 1)) {
+            Some(successor) => *successor <= superseded_cutoff,
+            None => version + 1 < body_floor,
+        })
+        .collect();
+    let mut superseded = ObjectSet::default();
+    let mut fast_retired: HashSet<u64> = HashSet::new();
+    for_each_manifest_version(
+        manifest_store,
+        fast_versions.iter().copied(),
+        |version, manifest| {
+            if let Some(manifest) = manifest {
+                superseded.mark_outside(manifest, &live);
+                fast_retired.insert(version);
+                report.retired_versions_loaded += 1;
+            }
+            Ok(())
+        },
+    )
+    .await?;
 
     let ns_prefix = paths.namespace_prefix();
     let ns_prefix_str = ns_prefix.as_ref();
 
-    let expected_max_level = max_level.max(max_seen_level);
+    let expected_max_level = max_level.max(live.max_level);
     // Pre-delete pin re-check (defense in depth): a lease that landed while
     // the live set was being built pins a version this sweep's horizon does
     // not honour — deleting now would race the new holder's copy. Abort the
@@ -507,12 +829,33 @@ pub async fn sweep_orphans(
         return Ok(report);
     }
 
+    // How one unreferenced object is classified.
+    enum Verdict {
+        Retain,
+        TooYoung,
+        Reclaim { superseded: bool },
+    }
+    let classify = |last_modified: chrono::DateTime<Utc>, superseded: bool| {
+        if window_keep_since.is_some_and(|since| last_modified >= since) {
+            return Verdict::Retain;
+        }
+        let age_secs = (now - last_modified).num_seconds();
+        if superseded && age_secs >= superseded_secs {
+            return Verdict::Reclaim { superseded: true };
+        }
+        if age_secs < min_age_secs {
+            return Verdict::TooYoung;
+        }
+        Verdict::Reclaim { superseded }
+    };
+
     // One recursive LIST discovers numeric levels that no retained manifest
     // references. Listing `0..=expected_max_level` cannot see a level N+1
     // output stranded when compaction loses its install CAS.
     let sst_root = object_store::path::Path::from(format!("{ns_prefix_str}/sst"));
     let mut sst_objects = store.list(Some(&sst_root));
     while let Some(meta) = sst_objects.try_next().await.map_err(Error::ObjectStore)? {
+        report.store_sst_bytes = report.store_sst_bytes.saturating_add(meta.size);
         let absolute = meta.location.as_ref();
         // Convert to namespace-relative form so the comparison matches what's
         // stored in `SstDescriptor::path`.
@@ -548,19 +891,28 @@ pub async fn sweep_orphans(
                 "discovered SST level deeper than retained manifests/configuration"
             );
         }
-        if referenced.contains(relative) {
+        if live.paths.contains(relative) {
+            report.live_sst_bytes = report.live_sst_bytes.saturating_add(meta.size);
             continue;
         }
-        if window_keep_since.is_some_and(|since| meta.last_modified >= since) {
-            report.restore_window_retained += 1;
-            report.restore_window_bytes = report.restore_window_bytes.saturating_add(meta.size);
-            continue;
-        }
-        let age_secs = (now - meta.last_modified).num_seconds();
-        if age_secs < min_age_secs {
-            report.skipped_too_young += 1;
-            debug!(path = %absolute, age_secs, "orphan candidate too young, deferring");
-            continue;
+        match classify(meta.last_modified, superseded.paths.contains(relative)) {
+            Verdict::Retain => {
+                report.restore_window_retained += 1;
+                report.restore_window_bytes = report.restore_window_bytes.saturating_add(meta.size);
+                continue;
+            }
+            Verdict::TooYoung => {
+                report.skipped_too_young += 1;
+                debug!(path = %absolute, "orphan candidate too young, deferring");
+                continue;
+            }
+            Verdict::Reclaim { superseded } => {
+                if superseded {
+                    report.superseded_reclaimed += 1;
+                    report.superseded_bytes_freed =
+                        report.superseded_bytes_freed.saturating_add(meta.size);
+                }
+            }
         }
         report.orphans_found += 1;
         report.bytes_freed = report.bytes_freed.saturating_add(meta.size);
@@ -570,79 +922,6 @@ pub async fn sweep_orphans(
                 .await
                 .map_err(Error::ObjectStore)?;
             report.orphans_deleted += 1;
-        }
-    }
-
-    // Reclaim superseded manifest snapshots. Every commit / flush / compaction
-    // writes an immutable `manifest/v{N}.json` and nothing ever removed the old
-    // ones, so the `manifest/` prefix grew by one object per write forever —
-    // unbounded space amplification independent of logical data size. A
-    // snapshot at version N is reachable only through `load_manifest_at(N)`,
-    // which the engine calls for versions at or above the horizon (a reader
-    // pinned at `horizon` loads exactly `v{horizon}.json`, and `current.json`
-    // points at `current_version >= horizon`). Versions strictly below the
-    // horizon are reachable by no live reader, so they fall out of the live set
-    // and become reclaimable — the same retention-horizon argument that makes
-    // the SST sweep safe. `min_age` is the same secondary guard for the
-    // body-PUT-then-pointer-CAS race.
-    let manifest_dir = paths.manifest_dir();
-    let mut manifests = store.list(Some(&manifest_dir));
-    while let Some(meta) = manifests.try_next().await.map_err(Error::ObjectStore)? {
-        // Classify by filename. Manifest bodies are `v{16-hex}.json` directly
-        // under `manifest/`; pointer files (RFC-029) are `p{16-hex}.json` under
-        // `manifest/pointer/`, which this recursive LIST also returns. Pin
-        // leases (`manifest/pins/`) have their own lifecycle above. The legacy
-        // `current.json` and anything else fail both parses and are left
-        // untouched.
-        if meta.location.as_ref().contains("/pins/") {
-            continue;
-        }
-        let Some(filename) = meta.location.filename() else {
-            continue;
-        };
-        let Some((is_pointer, version)) = filename
-            .strip_prefix('v')
-            .map(|rest| (false, rest))
-            .or_else(|| filename.strip_prefix('p').map(|rest| (true, rest)))
-            .and_then(|(is_pointer, rest)| rest.strip_suffix(".json").map(|h| (is_pointer, h)))
-            .and_then(|(is_pointer, hex)| {
-                u64::from_str_radix(hex, 16).ok().map(|v| (is_pointer, v))
-            })
-        else {
-            continue;
-        };
-        // Keep current and every version a pinned reader could still load. For
-        // pointers this also keeps the family contiguous over [horizon,
-        // current], which load_current's forward HEAD probe relies on.
-        // Bodies also stay for the restore point window and point leases;
-        // history is read by `load_manifest_at`, which needs no pointer.
-        if version >= horizon {
-            continue;
-        }
-        if is_pointer && advisory_floor.is_some_and(|floor| version >= floor) {
-            continue;
-        }
-        if !is_pointer && (version >= body_floor || point_versions.contains(&version)) {
-            continue;
-        }
-        let age_secs = (now - meta.last_modified).num_seconds();
-        if age_secs < min_age_secs {
-            report.skipped_too_young += 1;
-            debug!(path = %meta.location, age_secs, "retired manifest/pointer object too young, deferring");
-            continue;
-        }
-        if is_pointer {
-            report.pointer_files_reclaimed += 1;
-            report.pointer_bytes_freed = report.pointer_bytes_freed.saturating_add(meta.size);
-        } else {
-            report.manifest_snapshots_reclaimed += 1;
-            report.manifest_bytes_freed = report.manifest_bytes_freed.saturating_add(meta.size);
-        }
-        if delete {
-            store
-                .delete(&meta.location)
-                .await
-                .map_err(Error::ObjectStore)?;
         }
     }
 
@@ -659,11 +938,13 @@ pub async fn sweep_orphans(
     //    commit that failed before the pointer CAS (its records were never
     //    acked) or a segment a flush already drained into SSTs that every
     //    retained version references (its records are durable elsewhere).
-    // 2. The object is older than `min_age`. A commit PUTs the segment BEFORE
-    //    the pointer CAS lands; in that window it is referenced by no version
-    //    yet, but the very next manifest will reference it and the client is
-    //    acked on the CAS — deleting it then would lose acked writes at the
-    //    next crash. Same guard as the SST body-PUT-then-CAS race above.
+    // 2. The object is older than `min_age` — or, when a retired version
+    //    referenced it, older than `superseded_min_age`. A commit PUTs the
+    //    segment BEFORE the pointer CAS lands; in that window it is referenced
+    //    by no version yet, but the very next manifest will reference it and
+    //    the client is acked on the CAS — deleting it then would lose acked
+    //    writes at the next crash. A segment a retired version references
+    //    already had its CAS land, so only the short grace applies.
     //
     // Deleting a segment cannot cause a later seq collision either: writers
     // pick the next seq strictly above every segment still VISIBLE, and once
@@ -673,6 +954,7 @@ pub async fn sweep_orphans(
     let wal_dir = paths.wal_dir();
     let mut wal_objects = store.list(Some(&wal_dir));
     while let Some(meta) = wal_objects.try_next().await.map_err(Error::ObjectStore)? {
+        report.store_wal_bytes = report.store_wal_bytes.saturating_add(meta.size);
         // Segments are `<16-hex-digits>.wal`; anything else under the prefix
         // is not ours to judge, so leave it alone.
         let Some(seq) = meta
@@ -683,19 +965,28 @@ pub async fn sweep_orphans(
         else {
             continue;
         };
-        if referenced_wal.contains(&seq) {
+        if live.wal.contains(&seq) {
+            report.live_wal_bytes = report.live_wal_bytes.saturating_add(meta.size);
             continue;
         }
-        if window_keep_since.is_some_and(|since| meta.last_modified >= since) {
-            report.restore_window_retained += 1;
-            report.restore_window_bytes = report.restore_window_bytes.saturating_add(meta.size);
-            continue;
-        }
-        let age_secs = (now - meta.last_modified).num_seconds();
-        if age_secs < min_age_secs {
-            report.skipped_too_young += 1;
-            debug!(path = %meta.location, age_secs, "dead WAL segment too young, deferring");
-            continue;
+        match classify(meta.last_modified, superseded.wal.contains(&seq)) {
+            Verdict::Retain => {
+                report.restore_window_retained += 1;
+                report.restore_window_bytes = report.restore_window_bytes.saturating_add(meta.size);
+                continue;
+            }
+            Verdict::TooYoung => {
+                report.skipped_too_young += 1;
+                debug!(path = %meta.location, "dead WAL segment too young, deferring");
+                continue;
+            }
+            Verdict::Reclaim { superseded } => {
+                if superseded {
+                    report.superseded_reclaimed += 1;
+                    report.superseded_bytes_freed =
+                        report.superseded_bytes_freed.saturating_add(meta.size);
+                }
+            }
         }
         report.wal_segments_reclaimed += 1;
         report.wal_bytes_freed = report.wal_bytes_freed.saturating_add(meta.size);
@@ -704,6 +995,63 @@ pub async fn sweep_orphans(
                 .delete(&meta.location)
                 .await
                 .map_err(Error::ObjectStore)?;
+        }
+    }
+
+    // Reclaim superseded manifest snapshots, after the objects they named.
+    // Every commit / flush / compaction writes an immutable
+    // `manifest/v{N}.json` and nothing else removes the old ones. A snapshot
+    // at version N is reachable only through `load_manifest_at(N)`, which the
+    // engine calls for versions at or above the horizon (a reader pinned at
+    // `horizon` loads exactly `v{horizon}.json`, and `current.json` points at
+    // `current_version >= horizon`). Versions strictly below the horizon are
+    // reachable by no live reader, so they become reclaimable — the same
+    // retention-horizon argument that makes the SST sweep safe. A retired body
+    // the fast path loaded goes now (its successor committed at least
+    // `superseded_min_age` ago); any other waits out `min_age`, the guard for
+    // the body-PUT-then-pointer-CAS race.
+    for meta in manifest_objects {
+        // Classify by filename. Manifest bodies are `v{16-hex}.json` directly
+        // under `manifest/`; pointer files (RFC-029) are `p{16-hex}.json` under
+        // `manifest/pointer/`, which the recursive LIST also returned. The
+        // legacy `current.json` and anything else fail both parses and are
+        // left untouched.
+        let Some((is_pointer, version)) = parse_manifest_object(&meta.location) else {
+            continue;
+        };
+        // Keep current and every version a pinned reader could still load. For
+        // pointers this also keeps the family contiguous over [horizon,
+        // current], which load_current's forward HEAD probe relies on.
+        // Bodies also stay for the restore point window and point leases;
+        // history is read by `load_manifest_at`, which needs no pointer.
+        if version >= horizon {
+            continue;
+        }
+        if is_pointer && advisory_floor.is_some_and(|floor| version >= floor) {
+            continue;
+        }
+        if !is_pointer && (version >= body_floor || point_versions.contains(&version)) {
+            continue;
+        }
+        let fast = !is_pointer && fast_retired.contains(&version);
+        let age_secs = (now - meta.last_modified).num_seconds();
+        if !fast && age_secs < min_age_secs {
+            report.skipped_too_young += 1;
+            debug!(path = %meta.location, age_secs, "retired manifest/pointer object too young, deferring");
+            continue;
+        }
+        if is_pointer {
+            report.pointer_files_reclaimed += 1;
+            report.pointer_bytes_freed = report.pointer_bytes_freed.saturating_add(meta.size);
+        } else {
+            report.manifest_snapshots_reclaimed += 1;
+            report.manifest_bytes_freed = report.manifest_bytes_freed.saturating_add(meta.size);
+        }
+        if delete {
+            match store.delete(&meta.location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(other) => return Err(Error::ObjectStore(other)),
+            }
         }
     }
 
@@ -1689,6 +2037,341 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.expired_pins_reclaimed, 0);
+    }
+
+    /// Reports every listed object as `age` older than it really is, so a
+    /// test can drive the sweep's age guards without waiting for them.
+    #[derive(Debug)]
+    struct AgedStore {
+        inner: Arc<dyn ObjectStore>,
+        age: chrono::Duration,
+    }
+
+    impl std::fmt::Display for AgedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "AgedStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for AgedStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            use futures::StreamExt;
+            let age = self.age;
+            self.inner
+                .list(prefix)
+                .map(move |meta| {
+                    meta.map(|mut meta| {
+                        meta.last_modified -= age;
+                        meta
+                    })
+                })
+                .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    /// The superseded fast path. Every object below is two hours old and the
+    /// sweep runs with the 24 h `min_age`: WAL segments a flush retired, L0
+    /// bodies a compaction merged away and the manifest versions that
+    /// referenced them were all installed once, so they are reclaimed under
+    /// the 1 h superseded grace, while an object no manifest version ever
+    /// referenced (it could be an upload whose CAS has not landed) still waits
+    /// out `min_age`. A version pinned by an in-process reader (the horizon)
+    /// or by a retention lease keeps its whole closure.
+    #[tokio::test]
+    async fn sweep_reclaims_superseded_objects_after_the_short_grace_while_orphans_wait() {
+        let store: Arc<dyn ObjectStore> = Arc::new(AgedStore {
+            inner: make_store(),
+            age: chrono::Duration::hours(2),
+        });
+        let paths = make_paths("janitor-superseded");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let abs = |rel: &str| {
+            object_store::path::Path::from(format!("{}/{}", paths.namespace_prefix().as_ref(), rel))
+        };
+
+        // Two commits (two WAL segments), a flush, one more commit + flush:
+        // two L0 bodies; then a compaction merges them into one L1 body.
+        let (mut session, commits) = session_with_commits(&store, &paths, &["A", "B"]).await;
+        session.flush(person_schema()).await.unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(3), &node_record("C"))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        session.flush(person_schema()).await.unwrap();
+        let pre_compaction = ms.load_current().await.unwrap().manifest;
+        let l0_objects: Vec<String> = pre_compaction
+            .ssts
+            .iter()
+            .flat_map(descriptor_object_paths)
+            .collect();
+        assert!(l0_objects.len() >= 2);
+        session.compact_l0(&person_schema()).await.unwrap();
+        let current = ms.load_current().await.unwrap().manifest;
+        let live_now = manifest_object_paths(&current);
+        assert!(
+            l0_objects.iter().all(|p| !live_now.contains(p)),
+            "the compaction must supersede every L0 object"
+        );
+        let wal_seqs: Vec<u64> = commits.iter().map(|(_, seq)| *seq).collect();
+
+        // An object no manifest version ever referenced.
+        let orphan = paths.sst_object(0, "planted-orphan.parquet");
+        store
+            .put(&orphan, PutPayload::from(Bytes::from_static(b"orphan")))
+            .await
+            .unwrap();
+
+        // 1. A reader pinned at the pre-compaction version (the horizon): the
+        // flushed WAL segments are superseded and go, the L0 closure stays.
+        let pinned = sweep_orphans(
+            &ms,
+            pre_compaction.version,
+            Duration::from_secs(86_400),
+            4,
+            true,
+        )
+        .await
+        .unwrap();
+        for seq in &wal_seqs {
+            assert!(
+                store.head(&paths.wal_segment(*seq)).await.is_err(),
+                "flushed WAL segment {seq} must be reclaimed under the short grace: {pinned:?}"
+            );
+        }
+        for rel in &l0_objects {
+            assert!(
+                store.head(&abs(rel)).await.is_ok(),
+                "the horizon-pinned version keeps {rel}"
+            );
+        }
+        assert!(store
+            .head(&paths.manifest_version(pre_compaction.version))
+            .await
+            .is_ok());
+
+        // 2. The same closure held by a retention lease instead.
+        let pin = RetentionPin::acquire(
+            store.clone(),
+            &paths,
+            pre_compaction.version,
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        sweep_orphans(&ms, u64::MAX, Duration::from_secs(86_400), 4, true)
+            .await
+            .unwrap();
+        for rel in &l0_objects {
+            assert!(
+                store.head(&abs(rel)).await.is_ok(),
+                "the lease-pinned version keeps {rel}"
+            );
+        }
+
+        // 3. Released: the merged-away L0 objects and every retired manifest
+        // version go; the never-referenced orphan still waits for min_age.
+        pin.release().await.unwrap();
+        let released = sweep_orphans(&ms, u64::MAX, Duration::from_secs(86_400), 4, true)
+            .await
+            .unwrap();
+        for rel in &l0_objects {
+            assert!(
+                store.head(&abs(rel)).await.is_err(),
+                "superseded {rel} must be reclaimed under the short grace: {released:?}"
+            );
+        }
+        for version in 0..current.version {
+            assert!(
+                store.head(&paths.manifest_version(version)).await.is_err(),
+                "retired manifest v{version} must be reclaimed: {released:?}"
+            );
+        }
+        assert!(
+            store.head(&orphan).await.is_ok(),
+            "a never-referenced object waits out min_age"
+        );
+        assert!(released.skipped_too_young >= 1, "{released:?}");
+        assert!(
+            released.superseded_reclaimed >= l0_objects.len(),
+            "{released:?}"
+        );
+        assert!(released.retired_versions_loaded > 0, "{released:?}");
+        assert!(!released.exact_window);
+        assert!(pinned.superseded_reclaimed >= wal_seqs.len(), "{pinned:?}");
+
+        // The current version still reads every row.
+        let rows = session.snapshot().scan_label("Person").await.unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// The restore point window by write time keeps every object written
+    /// since it opened, garbage included; the exact window keeps exactly
+    /// what its versions reference. A compaction input merged away inside
+    /// the window is still referenced by an in-window version and stays in
+    /// both modes; an upload no version ever referenced is reclaimed only by
+    /// the exact sweep. A missing version inside the window leaves its
+    /// closure unproven, so the sweep falls back to keeping by write time.
+    #[tokio::test]
+    async fn exact_window_reclaims_garbage_written_inside_the_window() {
+        let store: Arc<dyn ObjectStore> = Arc::new(AgedStore {
+            inner: make_store(),
+            age: chrono::Duration::hours(2),
+        });
+        let paths = make_paths("janitor-exact-window");
+        let ms = ManifestStore::new(store.clone(), paths.clone());
+        let abs = |rel: &str| {
+            object_store::path::Path::from(format!("{}/{}", paths.namespace_prefix().as_ref(), rel))
+        };
+        let (mut session, commits) = session_with_commits(&store, &paths, &["A", "B"]).await;
+        let window_floor = commits[0].0;
+        session.flush(person_schema()).await.unwrap();
+        session
+            .upsert_node("Person", sorted_node_id(3), &node_record("C"))
+            .unwrap();
+        session.commit_batch().await.unwrap();
+        session.flush(person_schema()).await.unwrap();
+        let l0_objects: Vec<String> = ms
+            .load_current()
+            .await
+            .unwrap()
+            .manifest
+            .ssts
+            .iter()
+            .flat_map(descriptor_object_paths)
+            .collect();
+        session.compact_l0(&person_schema()).await.unwrap();
+        let current = ms.load_current().await.unwrap().manifest.version;
+        assert!(current > window_floor + 2);
+
+        // The window opened three hours ago at the first commit.
+        let lease = PinLease {
+            version: window_floor,
+            expires_at_unix: chrono::Utc::now().timestamp() + 3600,
+            scope: PinScope::Window {
+                since: chrono::Utc::now() - chrono::Duration::hours(3),
+            },
+        };
+        store
+            .put(
+                &paths.pin_object("restore-points"),
+                PutPayload::from(serde_json::to_vec(&lease).unwrap()),
+            )
+            .await
+            .unwrap();
+        let orphan = paths.sst_object(0, "abandoned-output.parquet");
+        store
+            .put(&orphan, PutPayload::from(Bytes::from_static(b"abandoned")))
+            .await
+            .unwrap();
+        let options = |exact_window| SweepOptions {
+            exact_window,
+            ..SweepOptions::new(u64::MAX, Duration::from_secs(3600), 4, true)
+        };
+
+        // By write time the window keeps the abandoned upload.
+        let by_time = sweep_orphans_with(&ms, options(false)).await.unwrap();
+        assert!(!by_time.exact_window);
+        assert!(by_time.restore_window_retained >= 1, "{by_time:?}");
+        assert_eq!(by_time.orphans_found, 0, "{by_time:?}");
+        assert!(store.head(&orphan).await.is_ok());
+
+        // Exact: the abandoned upload goes, the in-window history stays.
+        let exact = sweep_orphans_with(&ms, options(true)).await.unwrap();
+        assert!(exact.exact_window, "{exact:?}");
+        assert_eq!(exact.restore_window_retained, 0, "{exact:?}");
+        assert_eq!(exact.orphans_found, 1, "{exact:?}");
+        assert!(
+            exact.live_versions_loaded as u64 >= current - window_floor,
+            "{exact:?}"
+        );
+        assert!(store.head(&orphan).await.is_err());
+        for rel in &l0_objects {
+            assert!(
+                store.head(&abs(rel)).await.is_ok(),
+                "an in-window version still references {rel}"
+            );
+        }
+        for version in window_floor..=current {
+            assert!(store.head(&paths.manifest_version(version)).await.is_ok());
+        }
+        assert!(exact.store_sst_bytes >= exact.live_sst_bytes);
+        assert!(exact.live_sst_bytes > 0);
+
+        // A version missing inside the window: back to keeping by write time.
+        store
+            .delete(&paths.manifest_version(window_floor + 1))
+            .await
+            .unwrap();
+        store
+            .put(&orphan, PutPayload::from(Bytes::from_static(b"abandoned")))
+            .await
+            .unwrap();
+        let fallback = sweep_orphans_with(&ms, options(true)).await.unwrap();
+        assert!(!fallback.exact_window, "{fallback:?}");
+        assert!(store.head(&orphan).await.is_ok());
+        for rel in &l0_objects {
+            assert!(store.head(&abs(rel)).await.is_ok());
+        }
+
+        let rows = session.snapshot().scan_label("Person").await.unwrap();
+        assert_eq!(rows.len(), 3);
     }
 
     /// Snapshot staleness follows the exact CURRENT WAL closure, not an SST

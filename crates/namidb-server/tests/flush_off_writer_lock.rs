@@ -142,6 +142,7 @@ async fn boot_with_memtable(store_uri: String, flush_bytes: usize, stall_bytes: 
         flush_interval: Duration::from_millis(200),
         compaction_interval: Duration::ZERO,
         sweep_min_age: Duration::from_secs(3600),
+        sweep_superseded_min_age: Duration::from_secs(3600),
         sweep_delete: false,
         restore_point_retention: Duration::ZERO,
         bolt_listen: None,
