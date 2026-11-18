@@ -5548,6 +5548,10 @@ fn hybrid_text_props(
 /// its index or falls back to its exact flat scan, so hybrid is
 /// freshness-equivalent to running the two separately and fusing. At least one
 /// leg must be configured.
+/// Fewest fused candidates `search.hybrid` hydrates per batch: a filter that
+/// rejects some of the first `k` then costs one more batch, not one per miss.
+const HYBRID_HYDRATE_MIN_BATCH: usize = 16;
+
 async fn hybrid_search_procedure(
     args: &[Expression],
     yield_items: &[(String, String)],
@@ -5738,23 +5742,37 @@ async fn hybrid_search_procedure(
     // Materialise the fused candidates in rank order. The residual filter is
     // checked again defensively after hydration; normal candidates have already
     // passed it in their respective retrieval leg.
+    //
+    // Hydrate in rank-order batches: one `batch_lookup_nodes` call resolves a
+    // whole window of sparse-leg ids together (the dense leg's nodes are
+    // already in the snapshot's node cache). Looking ids up one at a time made
+    // each sparse-only hit a separate cold walk over every node run, so a
+    // fused top-10 cost ten sequential object-store walks.
     let mut raw = Vec::with_capacity(k.min(fused.len()));
-    for (id, score) in fused.into_iter() {
-        if raw.len() >= k {
-            break;
-        }
+    let mut next = 0usize;
+    while raw.len() < k && next < fused.len() {
         crate::exec::limits::check_deadline()?;
-        if let Some(view) = snapshot.lookup_node(&label, id).await? {
+        let window = (k - raw.len()).max(HYBRID_HYDRATE_MIN_BATCH);
+        let end = next.saturating_add(window).min(fused.len());
+        let chunk = &fused[next..end];
+        next = end;
+        let ids: Vec<NodeId> = chunk.iter().map(|(id, _)| *id).collect();
+        let views = snapshot.batch_lookup_nodes(&label, &ids).await?;
+        for ((_, score), view) in chunk.iter().zip(views) {
+            if raw.len() >= k {
+                break;
+            }
+            let Some(view) = view else { continue };
             let node_rv = RuntimeValue::Node(Box::new(NodeValue::from(view)));
             if let Some(pf) = pf.as_ref() {
                 let mut row = Row::new();
                 row.set("node".to_string(), node_rv.clone());
-                row.set("score".to_string(), RuntimeValue::Float(score));
+                row.set("score".to_string(), RuntimeValue::Float(*score));
                 if evaluate(pf, &row, params)?.as_bool() != Some(true) {
                     continue;
                 }
             }
-            raw.push(vec![node_rv, RuntimeValue::Float(score)]);
+            raw.push(vec![node_rv, RuntimeValue::Float(*score)]);
         }
     }
     project_proc_rows("search.hybrid", &["node", "score"], raw, yield_items)
