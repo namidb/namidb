@@ -22,6 +22,30 @@ crates.io release will establish and document that API explicitly.
   cost a separate walk over the label's node runs; on a cold cache a top-10
   over a few hundred thousand documents exceeded the query timeout while
   each leg alone answered in seconds. The results are unchanged.
+- **Presence counts no longer read property values.** `count(n.p)` and
+  `WHERE n.p IS NOT NULL ... count(...)` on a label the count ledger had not
+  seeded yet scanned the label with the property projected. With overlapping
+  node SSTs that scan kept every matching row, vector included, until the
+  newest version of each node was known, and the background seed that ran it
+  had no memory budget: one count over a few hundred thousand embedded nodes
+  could hold gigabytes. The seed now merges the memtable and node SSTs by id
+  and keeps only (id, version, present) per row, read from the property
+  pages' row state, column validity, or a skipping walk of the schemaless
+  cells. Its working set is reserved from the search workspace; when it
+  cannot answer within it, the seed gives up and the count runs as a scan
+  under the query's own memory budget. A label count seeds only the label,
+  not every vector-indexed property on it. Measured on 386k nodes with
+  1024-dimension embeddings and overlapping SSTs: the first
+  `IS NOT NULL` count peaked at 0.6 GB resident instead of 2.5 GB, and later
+  counts answer in under 10 ms.
+
+### Changed
+
+- **Vector queries probe at least 64 leaves.** The clustered vector base
+  probed `ef / 4` leaves with a floor of 24, which found a document's own
+  embedding in about 86% of self-queries on real text embeddings at the
+  default `ef`. The floor is now 64, which found it in all of them. A warm
+  top-10 costs about 30 ms more on 386k 1024-dimension vectors.
 
 ## [3.5.0] - 2026-11-18
 

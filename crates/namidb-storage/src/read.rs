@@ -501,7 +501,7 @@ const PRESENCE_ROW_BYTES: usize = 48;
 
 #[cfg(feature = "vector-index")]
 /// Leaf pages every clustered-base vector query probes at least.
-const MIN_VECTOR_V5_NPROBE: usize = 24;
+const MIN_VECTOR_V5_NPROBE: usize = 64;
 
 #[cfg(feature = "vector-index")]
 fn vector_v5_search_options(
@@ -513,8 +513,11 @@ fn vector_v5_search_options(
     // spans many 512-row leaves once the corpus is large, and the true nearest
     // neighbours are spread across them. On 377k 1024-dimension rows in 1024
     // leaves (principal-direction splits) 16 leaves gave recall@10 0.94-0.97
-    // and 24 gave 0.995. Probe `ef / 4` leaves, at least 24; the pages are
-    // fetched concurrently, so this costs bandwidth, not round trips.
+    // and 24 gave 0.995 on synthetic clusters. On real text embeddings at the
+    // same scale 24 leaves found a document's own embedding in only 25 of
+    // 29 self-queries, and 64 found all 29. Probe `ef / 4` leaves, at least
+    // 64; the pages are fetched concurrently, so this costs bandwidth, not
+    // round trips.
     // Widening eventually reaches every page when `ef` approaches the corpus,
     // preserving the exact-fallback/exhaustion logic.
     let nprobe = ef.div_ceil(4).max(MIN_VECTOR_V5_NPROBE).min(page_count);
