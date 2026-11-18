@@ -614,7 +614,34 @@ impl WriterSession {
         session.prune_sst_cache();
         writer_local_cache_registry()
             .register(&session.property_index_cache, &session.unique_index);
+        session.start_indexed_count_seed();
         Ok(session)
+    }
+
+    /// Seed, in the background, the node count and property-presence ledger
+    /// of every vector-indexed label (with the presence of its vector-indexed
+    /// properties), so `count(n)` and `count(n) WHERE
+    /// n.embedding IS NOT NULL` are O(1) from the first query after a restart
+    /// instead of waiting for a seed then. `NAMIDB_COUNT_SEED_ON_OPEN=0`
+    /// disables it; the first such count then seeds on demand.
+    fn start_indexed_count_seed(&self) {
+        if std::env::var("NAMIDB_COUNT_SEED_ON_OPEN").is_ok_and(|value| value == "0") {
+            return;
+        }
+        let manifest = &self.current.manifest;
+        let labels: BTreeSet<String> = manifest
+            .vector_indexes
+            .iter()
+            .map(|index| index.label.clone())
+            .collect();
+        if labels.is_empty() {
+            return;
+        }
+        let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+        for index in &manifest.vector_indexes {
+            pairs.insert((index.label.clone(), index.property.clone()));
+        }
+        crate::read::spawn_count_seed(self.owned_snapshot(), labels, pairs);
     }
 
     /// Refresh [`Self::published_memtable`] from the current `memtable`.
@@ -951,23 +978,21 @@ impl WriterSession {
     /// expose speculative cardinalities.
     async fn pending_node_count_changes(
         &self,
-    ) -> Result<Option<Vec<(Option<BTreeSet<String>>, Option<BTreeSet<String>>)>>> {
+    ) -> Result<Option<crate::property_index::NodeCountChanges>> {
+        use crate::property_index::NodeCountState;
         let generation = self.property_index_cache.generation();
-        if !self
-            .property_index_cache
-            .node_counts_initialized_at(generation)
-        {
+        let Some(tracked) = self.property_index_cache.count_tracking_at(generation) else {
             return Ok(None);
-        }
+        };
 
         let mut ids = Vec::new();
-        let mut new_labels = Vec::new();
+        let mut new_states = Vec::new();
         for (key, entry) in self.staged_memtable.iter_nodes() {
             let MemKey::Node { id } = key else {
                 continue;
             };
             ids.push(*id);
-            let labels = match &entry.op {
+            let state = match &entry.op {
                 MemOp::Tombstone => None,
                 MemOp::Upsert(payload) => {
                     let record = NodeWriteRecord::decode(payload)?;
@@ -983,10 +1008,12 @@ impl WriterSession {
                             })?;
                         resolved.insert(name.to_string());
                     }
-                    Some(resolved)
+                    Some(NodeCountState::of(resolved, &tracked, |name| {
+                        record.properties.get(name)
+                    }))
                 }
             };
-            new_labels.push(labels);
+            new_states.push(state);
         }
 
         // This internal read computes a delta for the generation that is
@@ -1005,12 +1032,83 @@ impl WriterSession {
             committed = committed.with_cache(cache.clone());
         }
         let old = committed.batch_lookup_nodes("", &ids).await?;
-        Ok(Some(
-            old.into_iter()
-                .zip(new_labels)
-                .map(|(view, new)| (view.map(|view| view.labels), new))
-                .collect(),
-        ))
+        let changes = old
+            .into_iter()
+            .zip(new_states)
+            .map(|(view, new)| {
+                let old = view.map(|view| {
+                    let NodeView {
+                        labels, properties, ..
+                    } = view;
+                    NodeCountState::of(labels, &tracked, |name| properties.get(name))
+                });
+                (old, new)
+            })
+            .collect();
+        Ok(Some(crate::property_index::NodeCountChanges {
+            tracked,
+            changes,
+        }))
+    }
+
+    /// The staged rows whose label membership or indexed text differs from
+    /// the version before this commit, for every tracked full-text index
+    /// (see [`crate::property_index::TextChangedIndex`]).
+    async fn pending_text_changes(
+        &self,
+        specs: &[crate::property_index::TextChangedSpec],
+    ) -> Result<HashMap<String, (crate::property_index::TextChangedSpec, Vec<NodeId>)>> {
+        let mut out: HashMap<_, _> = specs
+            .iter()
+            .map(|spec| (spec.0.clone(), (spec.clone(), Vec::new())))
+            .collect();
+        if specs.is_empty() {
+            return Ok(out);
+        }
+        let mut ids = Vec::new();
+        let mut records = Vec::new();
+        for (key, entry) in self.staged_memtable.iter_nodes() {
+            let MemKey::Node { id } = key else {
+                continue;
+            };
+            ids.push(*id);
+            records.push(match &entry.op {
+                MemOp::Tombstone => None,
+                MemOp::Upsert(payload) => Some(NodeWriteRecord::decode(payload)?),
+            });
+        }
+        // Same isolated read as the node-count delta: the version each row
+        // had before this commit, without touching the shared node caches.
+        let mut committed = Snapshot::new(
+            self.current.clone(),
+            &self.published_memtable,
+            self.manifest_store.store().clone(),
+            self.manifest_store.paths().clone(),
+        );
+        if let Some(cache) = &self.sst_cache {
+            committed = committed.with_cache(cache.clone());
+        }
+        let old = committed.batch_lookup_nodes("", &ids).await?;
+        for ((id, record), old) in ids.iter().zip(&records).zip(&old) {
+            for ((_, label, properties), changed) in out.values_mut() {
+                let new_carries = record.as_ref().is_some_and(|record| {
+                    crate::read::record_carries_label(record, label, &self.label_dict)
+                });
+                let old_carries = old.as_ref().is_some_and(|view| view.labels.contains(label));
+                let differs = new_carries != old_carries
+                    || (new_carries
+                        && properties.iter().any(|property| {
+                            record
+                                .as_ref()
+                                .and_then(|record| record.properties.get(property))
+                                != old.as_ref().and_then(|view| view.properties.get(property))
+                        }));
+                if differs {
+                    changed.push(*id);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Build the exact delta for every lazily populated committed-memtable
@@ -1021,10 +1119,66 @@ impl WriterSession {
     /// Only scalar equality encodings are retained. In particular, embedding
     /// vectors are decoded as part of the node record but are not cloned into
     /// this transient delta.
+    /// The final staged version of every changed node, encoded for each
+    /// populated memtable vector tail (see [`crate::vector_tail`]). Each
+    /// staged record is decoded once, whatever the number of tails.
+    #[allow(clippy::type_complexity)]
+    fn pending_vector_tail_changes(
+        &self,
+        specs: &[((String, String), crate::manifest::VectorMetric, usize)],
+    ) -> Result<
+        HashMap<
+            (String, String),
+            (
+                crate::manifest::VectorMetric,
+                usize,
+                Vec<crate::property_index::VectorTailChange>,
+            ),
+        >,
+    > {
+        let mut out: HashMap<_, _> = specs
+            .iter()
+            .map(|(pair, metric, dim)| (pair.clone(), (*metric, *dim, Vec::new())))
+            .collect();
+        if specs.is_empty() {
+            return Ok(out);
+        }
+        for (key, entry) in self.staged_memtable.iter_nodes() {
+            let MemKey::Node { id } = key else {
+                continue;
+            };
+            let record = match &entry.op {
+                MemOp::Tombstone => None,
+                MemOp::Upsert(payload) => Some(NodeWriteRecord::decode(payload)?),
+            };
+            for ((label, property), (metric, dim, changes)) in out.iter_mut() {
+                let tail_entry = crate::read::vector_tail_entry(
+                    record.as_ref(),
+                    label,
+                    property,
+                    *metric,
+                    *dim,
+                    &self.label_dict,
+                );
+                changes.push((*id, entry.lsn, tail_entry));
+            }
+        }
+        Ok(out)
+    }
+
     fn pending_memtable_claimant_changes(
         &self,
         cached_pairs: &BTreeSet<(String, String)>,
     ) -> Result<crate::property_index::MemtableClaimantDelta> {
+        if cached_pairs.is_empty() {
+            return Ok(crate::property_index::MemtableClaimantDelta {
+                changes_by_pair: HashMap::new(),
+                captured_pairs: BTreeSet::new(),
+                rows: 0,
+                tail_changes: HashMap::new(),
+                text_changes: HashMap::new(),
+            });
+        }
         let indexed_properties: BTreeSet<String> = cached_pairs
             .iter()
             .map(|(_, property)| property.clone())
@@ -1148,6 +1302,8 @@ impl WriterSession {
             changes_by_pair,
             captured_pairs: cached_pairs.clone(),
             rows,
+            tail_changes: HashMap::new(),
+            text_changes: HashMap::new(),
         })
     }
 
@@ -1874,8 +2030,32 @@ impl WriterSession {
         } else {
             BTreeSet::new()
         };
-        let memtable_claimant_delta = if !memtable_claimant_pairs.is_empty() {
-            match self.pending_memtable_claimant_changes(&memtable_claimant_pairs) {
+        let memtable_tail_specs = if committed_node_mutations {
+            self.property_index_cache.memtable_vector_tail_specs()
+        } else {
+            Vec::new()
+        };
+        let memtable_text_specs = if committed_node_mutations {
+            self.property_index_cache.memtable_text_changed_specs()
+        } else {
+            Vec::new()
+        };
+        let text_changes = if memtable_text_specs.is_empty() {
+            Ok(HashMap::new())
+        } else {
+            self.pending_text_changes(&memtable_text_specs).await
+        };
+        let memtable_claimant_delta = if !memtable_claimant_pairs.is_empty()
+            || !memtable_tail_specs.is_empty()
+            || !memtable_text_specs.is_empty()
+        {
+            match self
+                .pending_memtable_claimant_changes(&memtable_claimant_pairs)
+                .and_then(|mut delta| {
+                    delta.tail_changes = self.pending_vector_tail_changes(&memtable_tail_specs)?;
+                    delta.text_changes = text_changes?;
+                    Ok(delta)
+                }) {
                 Ok(delta) => Some(delta),
                 Err(error) => {
                     // Claimant maps are accelerators. If an old buffered row
@@ -2032,7 +2212,7 @@ impl WriterSession {
         // not change those maps and should leave them hot.
         if committed_node_mutations {
             self.property_index_cache.advance_with_node_changes(
-                node_count_changes.as_deref(),
+                node_count_changes.as_ref(),
                 memtable_claimant_delta.as_ref(),
             );
         }
@@ -2040,6 +2220,13 @@ impl WriterSession {
         // Bolt, embedded) pick up the just-committed records without
         // taking the writer lock. See RFC-021.
         self.refresh_published();
+        // A reader asked for a node-count seed but its snapshot was already
+        // behind; start it from exactly the generation just published.
+        if committed_node_mutations {
+            if let Some((labels, pairs)) = self.property_index_cache.take_count_seed_request() {
+                crate::read::spawn_count_seed(self.owned_snapshot(), labels, pairs);
+            }
+        }
         // Every committed node mutation already passed through
         // apply_upsert/apply_tombstone while staged, so the maps now describe
         // committed state exactly. Forget only their rollback journal; keeping
@@ -3895,6 +4082,8 @@ pub fn clear_shared_caches() {
         cache.clear();
     }
     crate::range_cache::clear_shared_range_cache_memory();
+    #[cfg(feature = "vector-index")]
+    crate::sst::vector::v6::clear_resident_codes();
     writer_local_cache_registry().clear();
 }
 
@@ -4575,6 +4764,206 @@ mod tests {
             scans,
             "both generations must answer from their pinned exact cells"
         );
+    }
+
+    fn doc_record(embedding: Option<f32>, title: Option<&str>) -> NodeWriteRecord {
+        let mut props: BTreeMap<String, Value> = BTreeMap::new();
+        if let Some(seed) = embedding {
+            props.insert("embedding".into(), Value::Vec(vec![seed, 1.0, 2.0]));
+        }
+        if let Some(title) = title {
+            props.insert("title".into(), Value::Str(title.into()));
+        }
+        NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Model of the live graph for presence-count tests: id -> (labels, has
+    /// embedding).
+    type CountModel = BTreeMap<u8, (Vec<&'static str>, bool)>;
+
+    fn model_presence(model: &CountModel, label: &str) -> (u64, u64) {
+        let nodes = model
+            .values()
+            .filter(|(labels, _)| labels.contains(&label))
+            .count() as u64;
+        let present = model
+            .values()
+            .filter(|(labels, has)| *has && labels.contains(&label))
+            .count() as u64;
+        (nodes, present)
+    }
+
+    fn apply_doc(
+        session: &mut WriterSession,
+        model: &mut CountModel,
+        id: u8,
+        labels: Option<Vec<&'static str>>,
+        embedded: bool,
+    ) {
+        match labels {
+            None => {
+                session.tombstone_node("Doc", sorted_node_id(id)).unwrap();
+                model.remove(&id);
+            }
+            Some(labels) => {
+                session
+                    .upsert_node_with_labels(
+                        labels.iter().map(|l| l.to_string()),
+                        sorted_node_id(id),
+                        &doc_record(embedded.then_some(id as f32), Some("t")),
+                    )
+                    .unwrap();
+                model.insert(id, (labels, embedded));
+            }
+        }
+    }
+
+    async fn assert_presence(session: &WriterSession, model: &CountModel) {
+        let owned = session.owned_snapshot();
+        let snapshot = owned.borrow();
+        let (nodes, present) = model_presence(model, "Doc");
+        assert_eq!(
+            snapshot
+                .count_nodes_with_property("Doc", "embedding")
+                .await
+                .unwrap(),
+            present
+        );
+        assert_eq!(snapshot.count_nodes(Some("Doc")).await.unwrap(), nodes);
+        assert_eq!(
+            snapshot
+                .count_nodes_with_property("Doc", "missing")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn presence_counts_stay_exact_across_commits_flushes_and_overlapping_ssts() {
+        let mut session = WriterSession::open(make_store(), make_paths("ingest-presence-counts"))
+            .await
+            .unwrap();
+        let mut model = CountModel::new();
+        for id in 1..=40u8 {
+            apply_doc(&mut session, &mut model, id, Some(vec!["Doc"]), id % 3 != 0);
+        }
+        session.commit_batch().await.unwrap();
+        session.flush(Schema::empty()).await.unwrap();
+        // A second, overlapping SST: updates, deletes and relabels of flushed
+        // ids plus new ones.
+        for id in (2..=40u8).step_by(5) {
+            apply_doc(&mut session, &mut model, id, Some(vec!["Doc"]), id % 2 == 0);
+        }
+        apply_doc(&mut session, &mut model, 7, None, false);
+        apply_doc(&mut session, &mut model, 8, Some(vec!["Archived"]), true);
+        apply_doc(
+            &mut session,
+            &mut model,
+            50,
+            Some(vec!["Doc", "Archived"]),
+            true,
+        );
+        session.commit_batch().await.unwrap();
+        session.flush(Schema::empty()).await.unwrap();
+        // And a memtable tail.
+        apply_doc(&mut session, &mut model, 1, Some(vec!["Doc"]), false);
+        apply_doc(&mut session, &mut model, 60, Some(vec!["Doc"]), true);
+        session.commit_batch().await.unwrap();
+
+        let cache = session.property_index_cache().clone();
+        assert_eq!(cache.count_seeds_installed(), 0);
+        assert_presence(&session, &model).await;
+        let seeds = cache.count_seeds_installed();
+        assert!(seeds >= 1, "the first presence count seeds the ledger");
+
+        // Every later count is served by the ledger across commits, flushes
+        // and edits that add, remove and relabel embedded nodes.
+        for round in 0..4u8 {
+            apply_doc(
+                &mut session,
+                &mut model,
+                70 + round,
+                Some(vec!["Doc"]),
+                true,
+            );
+            apply_doc(
+                &mut session,
+                &mut model,
+                2 + round,
+                Some(vec!["Doc"]),
+                round % 2 == 0,
+            );
+            apply_doc(&mut session, &mut model, 20 + round, None, false);
+            apply_doc(
+                &mut session,
+                &mut model,
+                30 + round,
+                Some(vec!["Other"]),
+                true,
+            );
+            session.commit_batch().await.unwrap();
+            if round % 2 == 1 {
+                session.flush(Schema::empty()).await.unwrap();
+            }
+            let owned = session.owned_snapshot();
+            let (_, present) = model_presence(&model, "Doc");
+            assert_eq!(
+                owned
+                    .exact_node_counts
+                    .as_ref()
+                    .and_then(|cell| cell.presence("Doc", "embedding")),
+                Some(present),
+                "round {round}: the ledger itself is exact"
+            );
+            assert_presence(&session, &model).await;
+        }
+        assert_eq!(
+            cache.count_seeds_installed(),
+            seeds,
+            "every later count is served by the ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_presence_count_on_a_stale_snapshot_is_seeded_by_the_next_commit() {
+        let mut session = WriterSession::open(make_store(), make_paths("ingest-presence-stale"))
+            .await
+            .unwrap();
+        let mut model = CountModel::new();
+        for id in 1..=10u8 {
+            apply_doc(&mut session, &mut model, id, Some(vec!["Doc"]), id <= 6);
+        }
+        session.commit_batch().await.unwrap();
+        session.flush(Schema::empty()).await.unwrap();
+        let stale = session.owned_snapshot();
+        apply_doc(&mut session, &mut model, 11, Some(vec!["Doc"]), true);
+        session.commit_batch().await.unwrap();
+
+        // The stale snapshot cannot seed (it would miss doc 11), so it asks
+        // the writer; the writer's next commit starts the seed.
+        let count = async {
+            stale
+                .borrow()
+                .count_nodes_with_property("Doc", "embedding")
+                .await
+                .unwrap()
+        };
+        let mut next = model.clone();
+        let commit = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            apply_doc(&mut session, &mut next, 12, Some(vec!["Doc"]), true);
+            session.commit_batch().await.unwrap();
+        };
+        let (count, ()) = tokio::join!(count, commit);
+        // Never older than the snapshot: 7 at the stale snapshot's
+        // generation's successor, 8 once doc 12 committed.
+        assert!(count == 8, "got {count}");
+        assert_presence(&session, &next).await;
     }
 
     #[test]

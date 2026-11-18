@@ -442,6 +442,116 @@ async fn flat_vector_search_reads_only_embeddings_until_it_has_the_top_k() {
     );
 }
 
+/// `search.vector` with a selective metadata filter and no index to serve
+/// it: the filter is evaluated on its own column first, and only the nodes it
+/// admits are read whole. Same hits as evaluating it on whole nodes,
+/// including a node without the property (null never passes).
+#[tokio::test]
+async fn flat_vector_search_with_a_selective_filter_reads_only_admitted_nodes() {
+    let counting = Arc::new(ByteCountingStore {
+        inner: store(),
+        bytes: Default::default(),
+    });
+    let shared: Arc<dyn ObjectStore> = counting.clone();
+    let mut writer = WriterSession::open(shared.clone(), paths("knn-flat-filtered"))
+        .await
+        .unwrap();
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    let mut text = |len: usize| {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b'a' + (state % 26) as u8)
+            })
+            .collect::<String>()
+    };
+    const DOCS: usize = 400;
+    const BODY: usize = 32 * 1024;
+    let put = |writer: &mut WriterSession, properties: BTreeMap<String, CoreValue>| {
+        writer
+            .upsert_node(
+                "Doc",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    };
+    for i in 0..DOCS {
+        put(
+            &mut writer,
+            BTreeMap::from([
+                ("title".into(), CoreValue::Str(format!("doc-{i}"))),
+                ("kind".into(), CoreValue::Str(format!("k{}", i % 50))),
+                ("body".into(), CoreValue::Str(text(BODY))),
+                ("embedding".into(), CoreValue::Vec(vec![1.0, i as f32, 0.0])),
+            ]),
+        );
+    }
+    // The best match of all, without a `kind`.
+    put(
+        &mut writer,
+        BTreeMap::from([
+            ("title".into(), CoreValue::Str("no-kind".into())),
+            ("embedding".into(), CoreValue::Vec(vec![1.0, 0.0, 0.0])),
+        ]),
+    );
+    writer.commit_batch().await.unwrap();
+    writer
+        .flush(namidb_core::schema::Schema::default())
+        .await
+        .unwrap();
+    drop(writer);
+    let reader = WriterSession::open(shared, paths("knn-flat-filtered"))
+        .await
+        .unwrap();
+
+    let mut params = Params::new();
+    params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0]));
+    let run = |filter: &str| {
+        let cypher = format!(
+            "CALL search.vector({{label: 'Doc', property: 'embedding', query: $q, k: 3, \
+             filter: {filter}}}) YIELD node, score RETURN node.title AS title, \
+             size(node.body) AS body"
+        );
+        let plan = lower(&parse(&cypher).unwrap()).unwrap();
+        let snapshot = reader.snapshot();
+        let params = params.clone();
+        let counting = counting.clone();
+        async move {
+            let before = counting.bytes.load(std::sync::atomic::Ordering::SeqCst);
+            let rows = execute(&plan, &snapshot, &params).await.unwrap();
+            let read = counting.bytes.load(std::sync::atomic::Ordering::SeqCst) - before;
+            for row in &rows {
+                // Winners are whole nodes.
+                assert_eq!(row.get("body"), Some(&RuntimeValue::Integer(BODY as i64)));
+            }
+            (titles(&rows), read)
+        }
+    };
+    let all_bodies = (DOCS * BODY) as u64;
+
+    let (hits, read) = run("{kind: 'k7'}").await;
+    assert_eq!(hits, ["doc-7", "doc-57", "doc-107"]);
+    // Point reads of 8 nodes fetch the pages around them, never the label.
+    assert!(
+        read < all_bodies / 2,
+        "read {read} bytes for 8 admitted nodes, the bodies alone are {all_bodies}"
+    );
+    let (hits, _) = run("{kind: ['k3', 'k4']}").await;
+    assert_eq!(hits, ["doc-3", "doc-4", "doc-53"]);
+    // `no-kind` scores best, but a missing property is null and fails `<>`.
+    let (hits, _) = run("{kind: {ne: 'k0'}}").await;
+    assert_eq!(hits, ["doc-1", "doc-2", "doc-3"]);
+    let (hits, _) = run("{kind: 'missing'}").await;
+    assert!(hits.is_empty());
+}
+
 // ── RFC-030 indexed path: freshness (delta-union) + filtered ANN ──────────
 // These exercise the Vamana index + the optimizer's VectorSearch rewrite, so
 // they run the full `optimize` pass with a catalog and require the feature.
@@ -630,6 +740,98 @@ mod indexed {
             "fresh memtable node visible"
         );
         assert!(!got.contains(&"a".to_string()), "deleted node excluded");
+    }
+
+    /// A write burst far larger than `k` sits unindexed in the memtable
+    /// (inserts, re-embeddings of indexed rows, deletes) across several
+    /// commits. The index route takes only the fresh rows whose quantised
+    /// bounds can reach the top-k, so it must still equal exact KNN over the
+    /// live set after every commit, with and without a property filter.
+    #[tokio::test]
+    async fn index_knn_over_a_large_fresh_burst_equals_exact_knn() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+        };
+        let mut vector = || (0..DIM).map(|_| next()).collect::<Vec<f32>>();
+        let base: Vec<(String, String, Vec<f32>)> = (0..240)
+            .map(|i| {
+                let kind = if i % 3 == 0 { "Y" } else { "X" };
+                (format!("base{i}"), kind.to_string(), vector())
+            })
+            .collect();
+        let docs: Vec<(&str, &str, Vec<f32>)> = base
+            .iter()
+            .map(|(t, k, e)| (t.as_str(), k.as_str(), e.clone()))
+            .collect();
+        let (mut w, ids) = build_index("idx-burst", &docs).await;
+        let mut live: BTreeMap<String, (String, Vec<f32>)> = base
+            .iter()
+            .map(|(t, k, e)| (t.clone(), (k.clone(), e.clone())))
+            .collect();
+        let mut fresh_ids: BTreeMap<String, NodeId> = BTreeMap::new();
+        const KNN10: &str = "MATCH (d:Doc) WHERE d.embedding IS NOT NULL \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 10";
+        const KNN10_Y: &str = "MATCH (d:Doc) WHERE d.embedding IS NOT NULL AND d.kind = 'Y' \
+             RETURN d.title AS title, cosine_similarity(d.embedding, $q) AS score \
+             ORDER BY score DESC LIMIT 10";
+        for round in 0..4 {
+            for i in 0..150 {
+                let title = format!("fresh{round}-{i}");
+                let kind = if i % 3 == 0 { "Y" } else { "X" };
+                let id = NodeId::new();
+                let embedding = vector();
+                w.upsert_node("Doc", id, &rec(&title, kind, embedding.clone()))
+                    .unwrap();
+                fresh_ids.insert(title.clone(), id);
+                live.insert(title, (kind.to_string(), embedding));
+            }
+            for i in (round * 20)..(round * 20 + 20) {
+                let title = format!("base{i}");
+                let kind = live[&title].0.clone();
+                let embedding = vector();
+                w.upsert_node("Doc", ids[&title], &rec(&title, &kind, embedding.clone()))
+                    .unwrap();
+                live.insert(title, (kind, embedding));
+            }
+            for i in (round * 10)..(round * 10 + 10) {
+                let title = format!("base{}", 120 + i);
+                w.tombstone_node("Doc", ids[&title]).unwrap();
+                live.remove(&title);
+            }
+            if round > 0 {
+                let title = format!("fresh{}-{}", round - 1, 7);
+                w.tombstone_node("Doc", fresh_ids[&title]).unwrap();
+                live.remove(&title);
+            }
+            w.commit_batch().await.unwrap();
+            for _ in 0..8 {
+                let q = vector();
+                let all: Vec<(String, Vec<f32>)> = live
+                    .iter()
+                    .map(|(t, (_, e))| (t.clone(), e.clone()))
+                    .collect();
+                assert_eq!(
+                    titles(&run(&w, KNN10, q.clone()).await),
+                    exact_topk(&all, &q, 10),
+                    "round {round}: unfiltered"
+                );
+                let ys: Vec<(String, Vec<f32>)> = live
+                    .iter()
+                    .filter(|(_, (k, _))| k == "Y")
+                    .map(|(t, (_, e))| (t.clone(), e.clone()))
+                    .collect();
+                assert_eq!(
+                    titles(&run(&w, KNN10_Y, q.clone()).await),
+                    exact_topk(&ys, &q, 10),
+                    "round {round}: filtered"
+                );
+            }
+        }
     }
 
     #[tokio::test]

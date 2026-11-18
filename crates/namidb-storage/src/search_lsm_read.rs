@@ -961,7 +961,12 @@ async fn search_vector_segment(
             })
         }
         OpenedVectorSegment::V6 { reader, .. } => {
-            let result = reader.search_exact(query, limit, canonical_groups).await?;
+            // Resident int8 codes bound every row's score, so only the
+            // pages that can hold the exact top-`limit` are read in f32.
+            let result = match reader.search_coded(query, limit, canonical_groups).await? {
+                Some(result) => result,
+                None => reader.search_exact(query, limit, canonical_groups).await?,
+            };
             if result.applied_filter_groups != canonical_groups.len()
                 || result.scanned_pages != reader.page_count()
             {

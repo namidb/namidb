@@ -40,7 +40,6 @@ use namidb_core::id::NodeId;
 /// type-complexity threshold.
 type PropertyIndices = HashMap<(u64, String, String), Arc<HashMap<String, NodeId>>>;
 type GlobalPropertyIndices = HashMap<(u64, String), Arc<HashMap<String, Vec<NodeId>>>>;
-type NodeLabelChange = (Option<BTreeSet<String>>, Option<BTreeSet<String>>);
 
 /// One immutable-by-convention claimant posting map. Both levels are
 /// persistent: carrying a populated map across an auto-commit is O(1), while
@@ -60,7 +59,48 @@ type MemtableClaimantIndices = PersistentHashMap<(String, String), Arc<MemtableC
 #[derive(Debug, Default)]
 pub(crate) struct MemtableClaimantCell {
     indices: RwLock<MemtableClaimantIndices>,
+    /// Lazily built vector-index tails of the same committed memtable
+    /// (see [`crate::vector_tail`]), carried by commits like the claimants.
+    vector_tails: RwLock<PersistentHashMap<(String, String), Arc<VectorTailIndex>>>,
+    /// Per full-text index (by name), the memtable rows whose indexed text
+    /// differs from the version the index covers (see [`TextChangedIndex`]).
+    text_changed: RwLock<PersistentHashMap<String, Arc<TextChangedIndex>>>,
 }
+
+/// The memtable rows that change what one full-text index would see.
+///
+/// Every committed memtable row that carries `label` and is NOT in `changed`
+/// has the same label membership and the same values of every indexed
+/// property as its persisted version, so the persisted index is exact for it
+/// (an embedding-only `SET` is the common case). A row is added to `changed`
+/// when a commit makes its label membership or any indexed value differ from
+/// the version before the commit, and never leaves it while the memtable
+/// lives: by induction every row outside the set still equals its persisted
+/// version.
+#[derive(Debug, Clone)]
+pub(crate) struct TextChangedIndex {
+    pub(crate) label: String,
+    pub(crate) properties: BTreeSet<String>,
+    pub(crate) changed: OrdSet<NodeId>,
+}
+
+/// Labels and `(label, property)` presence pairs a count seed is asked for.
+pub(crate) type CountSeedRequest = (BTreeSet<String>, BTreeSet<(String, String)>);
+
+/// `(index name, label, indexed properties)` of a tracked full-text index.
+pub(crate) type TextChangedSpec = (String, String, BTreeSet<String>);
+
+/// The memtable tail of one vector index: the metric and dimension it was
+/// encoded for, and its rows.
+#[derive(Debug, Clone)]
+pub(crate) struct VectorTailIndex {
+    pub(crate) metric: crate::manifest::VectorMetric,
+    pub(crate) dim: usize,
+    pub(crate) tail: crate::vector_tail::VectorTail,
+}
+
+/// One commit's change to a tail: the id, its new winning LSN and entry.
+pub(crate) type VectorTailChange = (NodeId, u64, crate::vector_tail::TailEntry);
 
 /// The equality-indexable portion of one committed memtable node row.
 ///
@@ -89,6 +129,14 @@ pub(crate) struct MemtableClaimantDelta {
     pub(crate) changes_by_pair: HashMap<(String, String), Vec<MemtableClaimantPairChange>>,
     pub(crate) captured_pairs: BTreeSet<(String, String)>,
     pub(crate) rows: usize,
+    /// Changes for every vector tail populated when the delta was prepared,
+    /// keyed by `(label, property)` together with the metric and dimension
+    /// they were encoded for. A tail installed later is dropped, not carried.
+    pub(crate) tail_changes:
+        HashMap<(String, String), (crate::manifest::VectorMetric, usize, Vec<VectorTailChange>)>,
+    /// Rows whose indexed text changed in this commit, for every text index
+    /// tracked when the delta was prepared, with the spec it was computed for.
+    pub(crate) text_changes: HashMap<String, (TextChangedSpec, Vec<NodeId>)>,
 }
 
 impl MemtableClaimantNode {
@@ -109,7 +157,17 @@ impl MemtableClaimantCell {
             .read()
             .map(|indices| indices.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
-        if source.is_empty() {
+        let source_tails = self
+            .vector_tails
+            .read()
+            .map(|tails| tails.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+        let source_text = self
+            .text_changed
+            .read()
+            .map(|text| text.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+        if source.is_empty() && source_tails.is_empty() && source_text.is_empty() {
             return Arc::new(Self::default());
         }
 
@@ -145,9 +203,149 @@ impl MemtableClaimantCell {
             }
             carried.insert(pair, Arc::new(updated));
         }
+        let mut carried_tails = PersistentHashMap::new();
+        for (pair, tail) in source_tails.iter() {
+            // Only a tail whose changes were prepared with its own encoding
+            // can be carried; anything else is rebuilt on its next query.
+            let Some((metric, dim, changes)) = delta.tail_changes.get(pair) else {
+                continue;
+            };
+            if *metric != tail.metric || *dim != tail.dim {
+                continue;
+            }
+            let mut updated = tail.as_ref().clone();
+            for (id, lsn, entry) in changes {
+                updated.tail.insert(*id, (*lsn, entry.clone()));
+            }
+            carried_tails.insert(pair.clone(), Arc::new(updated));
+        }
+        let mut carried_text = PersistentHashMap::new();
+        for (name, tracked) in source_text.iter() {
+            // Same rule as the tails: only an index whose changes were
+            // prepared for the same label and properties is carried.
+            let Some(((_, label, properties), changed)) = delta.text_changes.get(name) else {
+                continue;
+            };
+            if *label != tracked.label || *properties != tracked.properties {
+                continue;
+            }
+            let mut updated = tracked.as_ref().clone();
+            for id in changed {
+                updated.changed.insert(*id);
+            }
+            carried_text.insert(name.clone(), Arc::new(updated));
+        }
         Arc::new(Self {
             indices: RwLock::new(carried),
+            vector_tails: RwLock::new(carried_tails),
+            text_changed: RwLock::new(carried_text),
         })
+    }
+
+    /// The changed rows of full-text index `name` when they were computed
+    /// for `label` and `properties`.
+    #[cfg_attr(not(feature = "text-index"), allow(dead_code))]
+    pub(crate) fn text_changed(
+        &self,
+        name: &str,
+        label: &str,
+        properties: &BTreeSet<String>,
+    ) -> Option<Arc<TextChangedIndex>> {
+        let text = self.text_changed.read().ok()?;
+        text.get(name)
+            .filter(|tracked| tracked.label == label && tracked.properties == *properties)
+            .cloned()
+    }
+
+    /// Install freshly computed changed rows unless some are already there.
+    #[cfg_attr(not(feature = "text-index"), allow(dead_code))]
+    pub(crate) fn install_text_changed(
+        &self,
+        name: &str,
+        tracked: Arc<TextChangedIndex>,
+    ) -> Arc<TextChangedIndex> {
+        let Ok(mut text) = self.text_changed.write() else {
+            return tracked;
+        };
+        if let Some(existing) = text.get(name).filter(|existing| {
+            existing.label == tracked.label && existing.properties == tracked.properties
+        }) {
+            return Arc::clone(existing);
+        }
+        text.insert(name.to_string(), Arc::clone(&tracked));
+        tracked
+    }
+
+    /// The spec of every tracked full-text index.
+    pub(crate) fn text_changed_specs(&self) -> Vec<TextChangedSpec> {
+        self.text_changed
+            .read()
+            .map(|text| {
+                text.iter()
+                    .map(|(name, tracked)| {
+                        (
+                            name.clone(),
+                            tracked.label.clone(),
+                            tracked.properties.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The tail of `(label, property)` when it was built for `metric` and
+    /// `dim`.
+    #[cfg_attr(not(feature = "vector-index"), allow(dead_code))]
+    pub(crate) fn vector_tail(
+        &self,
+        label: &str,
+        property: &str,
+        metric: crate::manifest::VectorMetric,
+        dim: usize,
+    ) -> Option<Arc<VectorTailIndex>> {
+        let tails = self.vector_tails.read().ok()?;
+        tails
+            .get(&(label.to_string(), property.to_string()))
+            .filter(|tail| tail.metric == metric && tail.dim == dim)
+            .cloned()
+    }
+
+    /// Install a freshly built tail unless one is already there.
+    #[cfg_attr(not(feature = "vector-index"), allow(dead_code))]
+    pub(crate) fn install_vector_tail(
+        &self,
+        label: &str,
+        property: &str,
+        tail: Arc<VectorTailIndex>,
+    ) -> Arc<VectorTailIndex> {
+        let Ok(mut tails) = self.vector_tails.write() else {
+            return tail;
+        };
+        let key = (label.to_string(), property.to_string());
+        if let Some(existing) = tails
+            .get(&key)
+            .filter(|existing| existing.metric == tail.metric && existing.dim == tail.dim)
+        {
+            return Arc::clone(existing);
+        }
+        tails.insert(key, Arc::clone(&tail));
+        tail
+    }
+
+    /// `(label, property, metric, dim)` of every tail built so far.
+    pub(crate) fn vector_tail_specs(
+        &self,
+    ) -> Vec<((String, String), crate::manifest::VectorMetric, usize)> {
+        self.vector_tails
+            .read()
+            .map(|tails| {
+                tails
+                    .iter()
+                    .map(|(pair, tail)| (pair.clone(), tail.metric, tail.dim))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -163,10 +361,91 @@ impl MemtableClaimantCell {
 /// only the current cell; older cells live only while an immutable snapshot is
 /// pinned, so memory is bounded by labels × live generations rather than nodes
 /// or lifetime commits.
+///
+/// Knowledge may be partial. A full reconciliation (or authoritative manifest
+/// metadata) seeds `total` and every label (`labels_complete`). A background
+/// label seed ([`PropertyIndexCache::begin_count_seed`]) seeds one label and the
+/// presence of some of its properties without knowing the rest of the graph.
+/// Every commit then applies its exact old/new deltas to whatever is known.
 #[derive(Clone, Debug, Default)]
 struct ExactNodeCounts {
-    total: u64,
+    /// Total live nodes, when known.
+    total: Option<u64>,
+    /// Exact live nodes per label. When `labels_complete`, a label missing
+    /// here has none; otherwise only the listed labels are known.
     by_label: HashMap<String, u64>,
+    labels_complete: bool,
+    /// Live nodes of `label` whose `property` is present and not null, for
+    /// the listed pairs. Every listed pair's label is known in `by_label`.
+    presence: HashMap<(String, String), u64>,
+}
+
+impl ExactNodeCounts {
+    fn label(&self, label: &str) -> Option<u64> {
+        match self.by_label.get(label) {
+            Some(count) => Some(*count),
+            None if self.labels_complete => Some(0),
+            None => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total.is_none() && self.by_label.is_empty() && !self.labels_complete
+    }
+
+    /// Exact: no impossible relation between the known counts.
+    fn consistent(&self) -> bool {
+        if let Some(total) = self.total {
+            if self.by_label.values().any(|count| *count > total) {
+                return false;
+            }
+        }
+        self.presence.iter().all(|((label, _), present)| {
+            self.label(label)
+                .is_some_and(|label_count| *present <= label_count)
+        })
+    }
+}
+
+/// Labels and tracked-property presence of one node version, as seen by the
+/// node-count ledger. `present` lists only properties the ledger tracks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NodeCountState {
+    pub(crate) labels: BTreeSet<String>,
+    pub(crate) present: BTreeSet<String>,
+}
+
+impl NodeCountState {
+    /// The state of a node version: its labels, and which of `tracked`
+    /// properties it carries with a non-null value.
+    pub(crate) fn of<'a>(
+        labels: BTreeSet<String>,
+        tracked: &BTreeSet<String>,
+        mut property: impl FnMut(&str) -> Option<&'a namidb_core::Value>,
+    ) -> Self {
+        let present = tracked
+            .iter()
+            .filter(|name| {
+                property(name.as_str())
+                    .is_some_and(|value| !matches!(value, namidb_core::Value::Null))
+            })
+            .cloned()
+            .collect();
+        Self { labels, present }
+    }
+
+    fn has(&self, label: &str, property: &str) -> bool {
+        self.labels.contains(label) && self.present.contains(property)
+    }
+}
+
+/// Final `(before, after)` state of every node one commit changed. `None` is
+/// absence (create / delete). `tracked` is the property set the states were
+/// computed against: presence of any other property is unknown.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NodeCountChanges {
+    pub(crate) tracked: BTreeSet<String>,
+    pub(crate) changes: Vec<(Option<NodeCountState>, Option<NodeCountState>)>,
 }
 
 /// Snapshot-stable, lazily populated exact cardinalities.
@@ -184,10 +463,37 @@ impl ExactNodeCountCell {
     pub(crate) fn count(&self, label: Option<&str>) -> Option<u64> {
         let guard = self.counts.read().ok()?;
         let counts = guard.as_ref()?;
-        Some(match label {
+        match label {
             None => counts.total,
-            Some(label) => counts.by_label.get(label).copied().unwrap_or(0),
-        })
+            Some(label) => counts.label(label),
+        }
+    }
+
+    /// Exact live nodes of `label` whose `property` is present and not null,
+    /// when this generation tracks the pair.
+    pub(crate) fn presence(&self, label: &str, property: &str) -> Option<u64> {
+        let guard = self.counts.read().ok()?;
+        guard
+            .as_ref()?
+            .presence
+            .get(&(label.to_string(), property.to_string()))
+            .copied()
+    }
+
+    fn tracked_properties(&self) -> BTreeSet<String> {
+        self.counts
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|counts| {
+                    counts
+                        .presence
+                        .keys()
+                        .map(|(_, property)| property.clone())
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
     }
 
     fn snapshot(&self) -> Option<ExactNodeCounts> {
@@ -197,19 +503,39 @@ impl ExactNodeCountCell {
             .and_then(|guard| guard.as_ref().map(|counts| counts.as_ref().clone()))
     }
 
+    /// Install a complete total + per-label vector (manifest metadata or a
+    /// full reconciliation). Presence already known for this generation is
+    /// kept when its label count agrees.
     pub(crate) fn install(&self, total: u64, by_label: HashMap<String, u64>) {
         if let Ok(mut guard) = self.counts.write() {
-            *guard = if by_label.values().any(|count| *count == 0 || *count > total) {
-                None
-            } else {
-                Some(Arc::new(ExactNodeCounts { total, by_label }))
+            if by_label.values().any(|count| *count == 0 || *count > total) {
+                *guard = None;
+                return;
+            }
+            let previous = guard.as_ref().map(|counts| counts.as_ref().clone());
+            let mut counts = ExactNodeCounts {
+                total: Some(total),
+                by_label,
+                labels_complete: true,
+                presence: HashMap::new(),
             };
+            if let Some(previous) = previous {
+                for (pair, present) in previous.presence {
+                    if previous.by_label.get(&pair.0) == counts.by_label.get(&pair.0)
+                        || (counts.label(&pair.0) == Some(0)
+                            && !previous.by_label.contains_key(&pair.0))
+                    {
+                        counts.presence.insert(pair, present);
+                    }
+                }
+            }
+            *guard = counts.consistent().then(|| Arc::new(counts));
         }
     }
 
     fn install_snapshot(&self, counts: Option<ExactNodeCounts>) {
         if let Ok(mut guard) = self.counts.write() {
-            *guard = counts.map(Arc::new);
+            *guard = counts.filter(|counts| !counts.is_empty()).map(Arc::new);
         }
     }
 }
@@ -222,53 +548,149 @@ impl ExactNodeCountCell {
 /// `count(*)`. The writer guarantees one final change per node, but this
 /// defensive validation also protects migrations from corrupt/legacy seed
 /// metadata.
-fn apply_node_label_changes(
+///
+/// A tracked presence pair whose property the batch did not compute (it was
+/// installed between the batch's preparation and its commit) is forgotten,
+/// not guessed.
+fn apply_node_count_changes(
     mut counts: ExactNodeCounts,
-    changes: &[NodeLabelChange],
+    changes: &NodeCountChanges,
 ) -> Option<ExactNodeCounts> {
-    for (old_labels, new_labels) in changes {
-        match (old_labels.is_some(), new_labels.is_some()) {
-            (false, true) => counts.total = counts.total.checked_add(1)?,
-            (true, false) => counts.total = counts.total.checked_sub(1)?,
-            _ => {}
+    counts
+        .presence
+        .retain(|(_, property), _| changes.tracked.contains(property));
+    for (old, new) in &changes.changes {
+        if let Some(total) = &mut counts.total {
+            match (old.is_some(), new.is_some()) {
+                (false, true) => *total = total.checked_add(1)?,
+                (true, false) => *total = total.checked_sub(1)?,
+                _ => {}
+            }
         }
 
-        if let Some(old_labels) = old_labels {
-            for label in old_labels {
-                if new_labels
-                    .as_ref()
-                    .is_some_and(|labels| labels.contains(label))
-                {
+        if let Some(old) = old {
+            for label in &old.labels {
+                if new.as_ref().is_some_and(|new| new.labels.contains(label)) {
                     continue;
                 }
-                let remove = {
-                    let count = counts.by_label.get_mut(label)?;
-                    *count = count.checked_sub(1)?;
-                    *count == 0
-                };
-                if remove {
-                    counts.by_label.remove(label);
+                match counts.by_label.get_mut(label) {
+                    Some(count) => {
+                        *count = count.checked_sub(1)?;
+                        if *count == 0 && counts.labels_complete {
+                            counts.by_label.remove(label);
+                        }
+                    }
+                    // Complete knowledge says the label has no node, yet a
+                    // node carried it.
+                    None if counts.labels_complete => return None,
+                    None => {}
                 }
             }
         }
-        if let Some(new_labels) = new_labels {
-            for label in new_labels {
-                if old_labels
-                    .as_ref()
-                    .is_some_and(|labels| labels.contains(label))
-                {
+        if let Some(new) = new {
+            for label in &new.labels {
+                if old.as_ref().is_some_and(|old| old.labels.contains(label)) {
                     continue;
                 }
-                let count = counts.by_label.entry(label.clone()).or_insert(0);
-                *count = count.checked_add(1)?;
+                match counts.by_label.get_mut(label) {
+                    Some(count) => *count = count.checked_add(1)?,
+                    None if counts.labels_complete => {
+                        counts.by_label.insert(label.clone(), 1);
+                    }
+                    None => {}
+                }
+            }
+        }
+        for ((label, property), present) in &mut counts.presence {
+            let before = old.as_ref().is_some_and(|old| old.has(label, property));
+            let after = new.as_ref().is_some_and(|new| new.has(label, property));
+            match (before, after) {
+                (false, true) => *present = present.checked_add(1)?,
+                (true, false) => *present = present.checked_sub(1)?,
+                _ => {}
             }
         }
     }
 
-    if counts.by_label.values().any(|count| *count > counts.total) {
-        return None;
+    counts.consistent().then_some(counts)
+}
+
+/// Signed change of the counts a running seed is computing, accumulated from
+/// the commits that land while it scans.
+#[derive(Debug, Default)]
+struct CountSeedDelta {
+    by_label: HashMap<String, i64>,
+    presence: HashMap<(String, String), i64>,
+}
+
+/// One background label seed: it scans `labels` at `generation` and the
+/// commits after that generation are folded into `delta`, so its result can
+/// be rolled forward to whatever generation is current when it finishes.
+#[derive(Debug)]
+struct CountSeed {
+    id: u64,
+    labels: BTreeSet<String>,
+    pairs: BTreeSet<(String, String)>,
+    delta: CountSeedDelta,
+    /// A commit whose delta is unknown landed meanwhile.
+    poisoned: bool,
+}
+
+impl CountSeed {
+    fn fold(&mut self, changes: Option<&NodeCountChanges>) {
+        let Some(changes) = changes else {
+            self.poisoned = true;
+            return;
+        };
+        if self
+            .pairs
+            .iter()
+            .any(|(_, property)| !changes.tracked.contains(property))
+        {
+            self.poisoned = true;
+            return;
+        }
+        for (old, new) in &changes.changes {
+            for label in &self.labels {
+                let before = old.as_ref().is_some_and(|old| old.labels.contains(label));
+                let after = new.as_ref().is_some_and(|new| new.labels.contains(label));
+                if before != after {
+                    *self.delta.by_label.entry(label.clone()).or_default() +=
+                        if after { 1 } else { -1 };
+                }
+            }
+            for (label, property) in &self.pairs {
+                let before = old.as_ref().is_some_and(|old| old.has(label, property));
+                let after = new.as_ref().is_some_and(|new| new.has(label, property));
+                if before != after {
+                    *self
+                        .delta
+                        .presence
+                        .entry((label.clone(), property.clone()))
+                        .or_default() += if after { 1 } else { -1 };
+                }
+            }
+        }
     }
-    Some(counts)
+}
+
+/// Exact counts a seed scan measured at its start generation.
+#[derive(Debug, Default)]
+pub(crate) struct CountSeedResult {
+    pub(crate) by_label: HashMap<String, u64>,
+    pub(crate) presence: HashMap<(String, String), u64>,
+}
+
+/// Upper bound on presence pairs the ledger tracks, so the per-commit delta
+/// stays a handful of map probes per changed node.
+pub(crate) const MAX_TRACKED_PRESENCE_PAIRS: usize = 64;
+
+fn roll_forward(value: u64, delta: i64) -> Option<u64> {
+    if delta >= 0 {
+        value.checked_add(delta as u64)
+    } else {
+        value.checked_sub(delta.unsigned_abs())
+    }
 }
 
 /// Shared cache that lives at `WriterSession` scope and is cloned (as
@@ -339,6 +761,15 @@ pub struct PropertyIndexCache {
     node_counts: RwLock<Option<(u64, Arc<ExactNodeCountCell>)>>,
     /// Number of full node reconciliations performed to seed `node_counts`.
     node_count_reconciliation_scans: AtomicU64,
+    /// The background label seed in flight, if any (one at a time).
+    count_seed: std::sync::Mutex<Option<CountSeed>>,
+    /// A seed a reader asked for but could not start because a commit moved
+    /// the generation past its snapshot. The writer starts it right after its
+    /// next node commit, from a snapshot of exactly that generation.
+    count_seed_request: std::sync::Mutex<Option<CountSeedRequest>>,
+    next_count_seed_id: AtomicU64,
+    /// Seeds that finished and installed their counts.
+    count_seeds_installed: AtomicU64,
     /// Ordered String-index prefix reads used by `ORDER BY ... SKIP/LIMIT`.
     ordered_prefix_calls: AtomicU64,
     /// Geometric prefix expansions needed when a global id-primary sidecar's
@@ -462,6 +893,16 @@ impl PropertyIndexCache {
     #[cfg(test)]
     pub(crate) fn has_memtable_claimant_indices(&self) -> bool {
         !self.current_memtable_claimant_cell().is_empty()
+    }
+
+    pub(crate) fn memtable_vector_tail_specs(
+        &self,
+    ) -> Vec<((String, String), crate::manifest::VectorMetric, usize)> {
+        self.current_memtable_claimant_cell().vector_tail_specs()
+    }
+
+    pub(crate) fn memtable_text_changed_specs(&self) -> Vec<TextChangedSpec> {
+        self.current_memtable_claimant_cell().text_changed_specs()
     }
 
     pub(crate) fn memtable_claimant_pairs(&self) -> BTreeSet<(String, String)> {
@@ -624,9 +1065,214 @@ impl PropertyIndexCache {
         self.node_count_cell_at(generation)?.count(label)
     }
 
+    /// `true` when the total node count is known at `generation`.
+    #[cfg(test)]
     pub(crate) fn node_counts_initialized_at(&self, generation: u64) -> bool {
         self.node_count_cell_at(generation)
             .is_some_and(|cell| cell.count(None).is_some())
+    }
+
+    /// The properties whose presence a commit at `generation` must report,
+    /// or `None` when nothing is counted (no known count and no seed running),
+    /// so the commit can skip computing deltas at all.
+    pub(crate) fn count_tracking_at(&self, generation: u64) -> Option<BTreeSet<String>> {
+        let cell = self
+            .node_count_cell_at(generation)
+            .filter(|cell| cell.snapshot().is_some());
+        let seed = self
+            .count_seed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cell.is_none() && seed.is_none() {
+            return None;
+        }
+        let mut tracked = cell
+            .map(|cell| cell.tracked_properties())
+            .unwrap_or_default();
+        if let Some(seed) = seed.as_ref() {
+            tracked.extend(seed.pairs.iter().map(|(_, property)| property.clone()));
+        }
+        Some(tracked)
+    }
+
+    /// Presence count of the current generation (not a pinned snapshot's).
+    pub(crate) fn current_presence(&self, label: &str, property: &str) -> Option<u64> {
+        self.node_count_cell_at(self.generation())?
+            .presence(label, property)
+    }
+
+    /// Label count of the current generation (not a pinned snapshot's).
+    pub(crate) fn current_label_count(&self, label: &str) -> Option<u64> {
+        self.node_count_cell_at(self.generation())?
+            .count(Some(label))
+    }
+
+    /// Register a seed of `labels` (and the presence `pairs`, whose labels
+    /// must be among them) scanned at `generation`. Returns its id, or `None`
+    /// when another seed is running or a commit already moved past
+    /// `generation` (the scan would miss that commit's delta).
+    pub(crate) fn begin_count_seed(
+        &self,
+        generation: u64,
+        labels: BTreeSet<String>,
+        pairs: BTreeSet<(String, String)>,
+    ) -> Option<u64> {
+        let _transition = self
+            .generation_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.generation() != generation {
+            return None;
+        }
+        let mut seed = self
+            .count_seed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seed.is_some() {
+            return None;
+        }
+        let id = self.next_count_seed_id.fetch_add(1, Ordering::Relaxed) + 1;
+        *seed = Some(CountSeed {
+            id,
+            labels,
+            pairs,
+            delta: CountSeedDelta::default(),
+            poisoned: false,
+        });
+        Some(id)
+    }
+
+    /// `true` while a seed is registered.
+    pub(crate) fn count_seed_running(&self) -> bool {
+        self.count_seed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Drop seed `id` without installing anything.
+    pub(crate) fn abort_count_seed(&self, id: u64) {
+        let mut seed = self
+            .count_seed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seed.as_ref().is_some_and(|seed| seed.id == id) {
+            *seed = None;
+        }
+    }
+
+    /// Roll seed `id`'s scan result forward over the commits that landed
+    /// while it ran and install it into the current generation. Returns
+    /// `false` (installing nothing) when the seed was poisoned or replaced.
+    pub(crate) fn finish_count_seed(&self, id: u64, result: CountSeedResult) -> bool {
+        let _transition = self
+            .generation_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seed = {
+            let mut guard = self
+                .count_seed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !guard.as_ref().is_some_and(|seed| seed.id == id) {
+                return false;
+            }
+            guard.take().expect("checked above")
+        };
+        if seed.poisoned {
+            return false;
+        }
+        let generation = self.generation();
+        let Some(cell) = self.node_count_cell_at(generation) else {
+            return false;
+        };
+        let mut counts = cell.snapshot().unwrap_or_default();
+        for label in &seed.labels {
+            let Some(scanned) = result.by_label.get(label) else {
+                return false;
+            };
+            let delta = seed.delta.by_label.get(label).copied().unwrap_or(0);
+            let Some(now) = roll_forward(*scanned, delta) else {
+                return false;
+            };
+            match counts.label(label) {
+                // Already known (and kept exact by every commit since): the
+                // two must agree, or one of them is wrong.
+                Some(known) if known != now => {
+                    tracing::warn!(
+                        label,
+                        known,
+                        seeded = now,
+                        "node-count seed disagrees; discarding counts"
+                    );
+                    cell.install_snapshot(None);
+                    return false;
+                }
+                Some(_) => {}
+                None => {
+                    counts.by_label.insert(label.clone(), now);
+                }
+            }
+        }
+        for pair in &seed.pairs {
+            if counts.presence.len() >= MAX_TRACKED_PRESENCE_PAIRS
+                && !counts.presence.contains_key(pair)
+            {
+                break;
+            }
+            let Some(scanned) = result.presence.get(pair) else {
+                return false;
+            };
+            let delta = seed.delta.presence.get(pair).copied().unwrap_or(0);
+            let Some(now) = roll_forward(*scanned, delta) else {
+                return false;
+            };
+            counts.presence.insert(pair.clone(), now);
+        }
+        if !counts.consistent() {
+            return false;
+        }
+        cell.install_snapshot(Some(counts));
+        self.count_seeds_installed.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Ask the writer to start a seed after its next node commit.
+    pub(crate) fn request_count_seed(
+        &self,
+        labels: BTreeSet<String>,
+        pairs: BTreeSet<(String, String)>,
+    ) {
+        let mut request = self
+            .count_seed_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match request.as_mut() {
+            Some((pending_labels, pending_pairs)) => {
+                pending_labels.extend(labels);
+                pending_pairs.extend(pairs);
+            }
+            None => *request = Some((labels, pairs)),
+        }
+    }
+
+    pub(crate) fn count_seed_requested(&self) -> bool {
+        self.count_seed_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    pub(crate) fn take_count_seed_request(&self) -> Option<CountSeedRequest> {
+        self.count_seed_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Seeds that installed their counts (diagnostics and tests).
+    pub fn count_seeds_installed(&self) -> u64 {
+        self.count_seeds_installed.load(Ordering::Relaxed)
     }
 
     pub(crate) fn insert_node_counts_at(
@@ -720,7 +1366,7 @@ impl PropertyIndexCache {
     /// The caller publishes this only after manifest/WAL durability succeeds.
     pub(crate) fn advance_with_node_changes(
         &self,
-        changes: Option<&[NodeLabelChange]>,
+        changes: Option<&NodeCountChanges>,
         claimant_delta: Option<&MemtableClaimantDelta>,
     ) {
         let retired = {
@@ -735,6 +1381,14 @@ impl PropertyIndexCache {
                     .filter(|(generation, _)| *generation == old_generation)
                     .and_then(|(_, cell)| cell.snapshot())
             });
+            if let Some(seed) = self
+                .count_seed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                seed.fold(changes);
+            }
             let carried_claimants = claimant_delta
                 .map(|delta| {
                     self.memtable_incremental_rows.fetch_add(
@@ -775,7 +1429,7 @@ impl PropertyIndexCache {
             if let Ok(mut w) = self.node_counts.write() {
                 let cell = Arc::new(ExactNodeCountCell::default());
                 cell.install_snapshot(carried.and_then(|counts| {
-                    changes.and_then(|changes| apply_node_label_changes(counts, changes))
+                    changes.and_then(|changes| apply_node_count_changes(counts, changes))
                 }));
                 *w = Some((new_generation, cell));
             }
@@ -850,6 +1504,15 @@ impl PropertyIndexCache {
                 .generation_transition
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(seed) = self
+                .count_seed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                // The node set changed by an unknown amount (attached SSTs).
+                seed.poisoned = true;
+            }
             let new_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
             let retired_indices = std::mem::take(
                 &mut *self
@@ -1029,18 +1692,10 @@ mod tests {
 
     #[test]
     fn impossible_exact_count_delta_discards_metadata_instead_of_saturating() {
-        let labels = |names: &[&str]| {
-            Some(
-                names
-                    .iter()
-                    .map(|name| (*name).to_string())
-                    .collect::<BTreeSet<_>>(),
-            )
-        };
-
         let underflow = PropertyIndexCache::new();
         underflow.insert_node_counts_at(underflow.generation(), 0, HashMap::new());
-        underflow.advance_with_node_changes(Some(&[(labels(&["Doc"]), None)]), None);
+        underflow
+            .advance_with_node_changes(Some(&changes(vec![(state(&["Doc"], &[]), None)])), None);
         assert_eq!(
             underflow.node_count_at(None, underflow.generation()),
             None,
@@ -1053,12 +1708,214 @@ mod tests {
             u64::MAX,
             HashMap::from([("Doc".to_string(), u64::MAX)]),
         );
-        overflow.advance_with_node_changes(Some(&[(None, labels(&["Other"]))]), None);
+        overflow
+            .advance_with_node_changes(Some(&changes(vec![(None, state(&["Other"], &[]))])), None);
         assert_eq!(
             overflow.node_count_at(None, overflow.generation()),
             None,
             "an overflowing create must never publish a wrapped/saturated count"
         );
+    }
+
+    fn state(labels: &[&str], present: &[&str]) -> Option<NodeCountState> {
+        Some(NodeCountState {
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            present: present.iter().map(|p| (*p).to_string()).collect(),
+        })
+    }
+
+    fn changes(changes: Vec<(Option<NodeCountState>, Option<NodeCountState>)>) -> NodeCountChanges {
+        NodeCountChanges {
+            tracked: ["embedding".to_string()].into_iter().collect(),
+            changes,
+        }
+    }
+
+    fn pair(label: &str, property: &str) -> (String, String) {
+        (label.to_string(), property.to_string())
+    }
+
+    #[test]
+    fn a_seed_rolls_forward_over_commits_that_land_while_it_scans() {
+        let cache = PropertyIndexCache::new();
+        let start = cache.generation();
+        let id = cache
+            .begin_count_seed(
+                start,
+                ["Doc".to_string()].into_iter().collect(),
+                [pair("Doc", "embedding")].into_iter().collect(),
+            )
+            .expect("no commit moved the generation");
+        assert_eq!(
+            cache.count_tracking_at(start),
+            Some(["embedding".to_string()].into_iter().collect()),
+            "a running seed makes commits report presence"
+        );
+        // While the scan runs: one new embedded Doc, one Doc loses its
+        // embedding, one Doc is deleted, one unrelated node is created.
+        cache.advance_with_node_changes(
+            Some(&changes(vec![
+                (None, state(&["Doc"], &["embedding"])),
+                (state(&["Doc"], &["embedding"]), state(&["Doc"], &[])),
+                (state(&["Doc"], &[]), None),
+                (None, state(&["Other"], &["embedding"])),
+            ])),
+            None,
+        );
+        // The scan saw 10 Docs, 7 of them embedded, at `start`.
+        assert!(cache.finish_count_seed(
+            id,
+            CountSeedResult {
+                by_label: HashMap::from([("Doc".to_string(), 10)]),
+                presence: HashMap::from([(pair("Doc", "embedding"), 7)]),
+            }
+        ));
+        let now = cache.generation();
+        assert_eq!(cache.node_count_at(Some("Doc"), now), Some(10));
+        assert_eq!(cache.current_presence("Doc", "embedding"), Some(7));
+        assert_eq!(
+            cache.node_count_at(None, now),
+            None,
+            "the total stays unknown"
+        );
+        assert_eq!(cache.node_count_at(Some("Other"), now), None);
+
+        // Later commits keep the seeded pair exact.
+        cache.advance_with_node_changes(
+            Some(&changes(vec![
+                (state(&["Doc"], &[]), state(&["Doc"], &["embedding"])),
+                (
+                    state(&["Doc"], &["embedding"]),
+                    state(&["Archived"], &["embedding"]),
+                ),
+            ])),
+            None,
+        );
+        assert_eq!(cache.current_presence("Doc", "embedding"), Some(7));
+        assert_eq!(cache.current_label_count("Doc"), Some(9));
+    }
+
+    #[test]
+    fn a_seed_is_discarded_when_a_commit_delta_is_unknown_or_the_generation_moved() {
+        let cache = PropertyIndexCache::new();
+        let start = cache.generation();
+        let labels: BTreeSet<String> = ["Doc".to_string()].into_iter().collect();
+        let pairs: BTreeSet<(String, String)> = [pair("Doc", "embedding")].into_iter().collect();
+        let id = cache
+            .begin_count_seed(start, labels.clone(), pairs.clone())
+            .unwrap();
+        assert!(
+            cache
+                .begin_count_seed(start, labels.clone(), pairs.clone())
+                .is_none(),
+            "one seed at a time"
+        );
+        cache.advance_with_node_changes(None, None);
+        assert!(!cache.finish_count_seed(
+            id,
+            CountSeedResult {
+                by_label: HashMap::from([("Doc".to_string(), 1)]),
+                presence: HashMap::from([(pair("Doc", "embedding"), 1)]),
+            }
+        ));
+        assert_eq!(cache.current_presence("Doc", "embedding"), None);
+        assert!(!cache.count_seed_running());
+        assert!(
+            cache
+                .begin_count_seed(start, labels.clone(), pairs.clone())
+                .is_none(),
+            "a snapshot older than the current generation cannot seed"
+        );
+
+        // A commit prepared before the seed began (so without its property)
+        // poisons it instead of being folded as "no presence change".
+        let id = cache
+            .begin_count_seed(
+                cache.generation(),
+                labels,
+                [pair("Doc", "title")].into_iter().collect(),
+            )
+            .unwrap();
+        cache.advance_with_node_changes(Some(&changes(vec![(None, state(&["Doc"], &[]))])), None);
+        assert!(!cache.finish_count_seed(
+            id,
+            CountSeedResult {
+                by_label: HashMap::from([("Doc".to_string(), 1)]),
+                presence: HashMap::from([(pair("Doc", "title"), 1)]),
+            }
+        ));
+    }
+
+    #[test]
+    fn presence_is_forgotten_when_a_commit_did_not_compute_its_property() {
+        let cache = PropertyIndexCache::new();
+        let id = cache
+            .begin_count_seed(
+                cache.generation(),
+                ["Doc".to_string()].into_iter().collect(),
+                [pair("Doc", "embedding")].into_iter().collect(),
+            )
+            .unwrap();
+        assert!(cache.finish_count_seed(
+            id,
+            CountSeedResult {
+                by_label: HashMap::from([("Doc".to_string(), 2)]),
+                presence: HashMap::from([(pair("Doc", "embedding"), 1)]),
+            }
+        ));
+        cache.advance_with_node_changes(
+            Some(&NodeCountChanges {
+                tracked: BTreeSet::new(),
+                changes: vec![(None, state(&["Doc"], &[]))],
+            }),
+            None,
+        );
+        assert_eq!(cache.current_presence("Doc", "embedding"), None);
+        assert_eq!(cache.current_label_count("Doc"), Some(3));
+    }
+
+    #[test]
+    fn a_full_install_keeps_agreeing_presence_and_seeds_survive_pressure_resets() {
+        let cache = PropertyIndexCache::new();
+        let id = cache
+            .begin_count_seed(
+                cache.generation(),
+                ["Doc".to_string()].into_iter().collect(),
+                [pair("Doc", "embedding")].into_iter().collect(),
+            )
+            .unwrap();
+        cache.reset_preserving_node_counts();
+        assert!(cache.finish_count_seed(
+            id,
+            CountSeedResult {
+                by_label: HashMap::from([("Doc".to_string(), 2)]),
+                presence: HashMap::from([(pair("Doc", "embedding"), 2)]),
+            }
+        ));
+        cache.insert_node_counts_at(
+            cache.generation(),
+            5,
+            HashMap::from([("Doc".to_string(), 2), ("Other".to_string(), 3)]),
+        );
+        assert_eq!(cache.current_presence("Doc", "embedding"), Some(2));
+        assert_eq!(cache.node_count_at(None, cache.generation()), Some(5));
+
+        // An attach (unknown node delta) poisons a running seed.
+        let id = cache
+            .begin_count_seed(
+                cache.generation(),
+                ["Other".to_string()].into_iter().collect(),
+                BTreeSet::new(),
+            )
+            .unwrap();
+        cache.reset();
+        assert!(!cache.finish_count_seed(
+            id,
+            CountSeedResult {
+                by_label: HashMap::from([("Other".to_string(), 3)]),
+                presence: HashMap::new(),
+            }
+        ));
     }
 
     #[test]
@@ -1115,6 +1972,8 @@ mod tests {
             ]),
             captured_pairs,
             rows: 3,
+            tail_changes: HashMap::new(),
+            text_changes: HashMap::new(),
         };
         cache.advance_with_node_changes(None, Some(&delta));
 
