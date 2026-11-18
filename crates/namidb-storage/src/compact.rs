@@ -2825,6 +2825,66 @@ fn catalog_drift(
     drift
 }
 
+/// Drop every physical Search-LSM compaction whose generation is no longer
+/// in `current`: a DROP INDEX, or a DDL that restarted the index (a changed
+/// native-filter catalog retires the generation and a new one starts), landed
+/// while it was being prepared. Its output belongs to a generation no
+/// manifest will reference again, so installing it is impossible and
+/// retrying it pointless; abandoning the whole pass for it would also throw
+/// away every other index's finished work. The rest of the plan installs as
+/// usual, and the caller discards the dropped upload. Returns `true` when
+/// anything was dropped.
+fn drop_retired_search_compactions(
+    prepared: &mut PreparedCompaction,
+    current: &crate::manifest::Manifest,
+) -> bool {
+    let before = prepared.search_compactions.len();
+    let mut retired = Vec::new();
+    prepared.search_compactions.retain(|search| {
+        let captured = &search.selection.captured_state;
+        let alive = current.search_lsm.iter().any(|state| {
+            state.kind == captured.kind
+                && state.index_name == captured.index_name
+                && state.generation_id == captured.generation_id
+        });
+        if !alive {
+            retired.push((
+                captured.kind,
+                captured.index_name.clone(),
+                captured.generation_id,
+                search.output_descriptor().map(|output| output.id),
+                search.selection.selected_ids().collect::<HashSet<_>>(),
+            ));
+        }
+        alive
+    });
+    for (kind, name, generation_id, output, selected) in &retired {
+        if let Some(output) = output {
+            prepared
+                .new_descs
+                .retain(|descriptor| descriptor.id != *output);
+        }
+        prepared.removed_ids.retain(|id| !selected.contains(id));
+        let sst_kind = kind.sst_kind();
+        prepared
+            .consolidated_base_markers
+            .retain(|marker| !(marker.kind == sst_kind && marker.name == *name));
+        prepared.search_lsm_activations.retain(|activation| {
+            !(activation.state.kind == *kind
+                && activation.state.index_name == *name
+                && activation.state.generation_id == *generation_id)
+        });
+        tracing::info!(
+            index = %name,
+            ?kind,
+            %generation_id,
+            "dropping a prepared Search-LSM compaction: its generation was retired by DDL \
+             while it was being built"
+        );
+    }
+    prepared.search_compactions.len() != before
+}
+
 fn drop_conflicting_search_replacements(
     prepared: &mut PreparedCompaction,
     current: &crate::manifest::Manifest,
@@ -3024,6 +3084,14 @@ pub async fn install_prepared(
 
     let mut prepared = prepared;
     drop_conflicting_search_replacements(&mut prepared, &current.manifest);
+    if drop_retired_search_compactions(&mut prepared, &current.manifest) && prepared.is_noop() {
+        return Ok(CompactionOutcome {
+            committed: current.clone(),
+            source_ssts_removed: 0,
+            new_ssts_written: 0,
+            bloom_sidecars_written: 0,
+        });
+    }
     verify_search_replacement_inputs(
         &prepared.base_search_lsm,
         &current.manifest.search_lsm,
