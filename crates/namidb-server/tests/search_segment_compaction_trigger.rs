@@ -38,6 +38,7 @@ async fn boot(store_uri: String) -> String {
         compaction_interval: Duration::ZERO,
         compaction_l0_trigger: 0,
         sweep_min_age: Duration::from_secs(3600),
+        sweep_superseded_min_age: Duration::from_secs(3600),
         sweep_delete: false,
         restore_point_retention: Duration::ZERO,
         bolt_listen: None,

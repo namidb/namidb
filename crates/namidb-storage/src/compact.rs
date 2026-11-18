@@ -243,6 +243,58 @@ impl PreparedCompaction {
     pub fn base_version(&self) -> u64 {
         self.base_version
     }
+
+    /// Every namespace-relative object path this prepare uploaded (sorted,
+    /// deduplicated): each new descriptor's body, bloom and side-cars, every
+    /// rebuilt index body, every Search-LSM consolidation output and every
+    /// activation barrier it wrote. Objects it carried over from its inputs
+    /// (a side-car-only migration keeps the source body, bloom and index
+    /// side-cars) and barriers that were already present are excluded: they
+    /// belong to manifest history, not to this prepare.
+    ///
+    /// A caller whose install did not reference some of these (the install
+    /// lost a precondition, or dropped part of the plan) can delete those
+    /// right away instead of leaving them for the janitor's `min_age`.
+    pub fn uploaded_object_paths(&self) -> Vec<String> {
+        use crate::janitor::descriptor_object_paths;
+        let outputs = self
+            .new_descs
+            .iter()
+            .chain(self.node_rewrites.iter().filter_map(|r| r.output.as_ref()))
+            .chain(
+                self.search_compactions
+                    .iter()
+                    .filter_map(|search| search.output_descriptor()),
+            )
+            .chain(
+                self.search_lsm_activations
+                    .iter()
+                    .filter(|activation| !activation.barrier_already_present)
+                    .map(|activation| &activation.barrier),
+            );
+        let mut uploaded: HashSet<String> = outputs.flat_map(descriptor_object_paths).collect();
+        let carried = self
+            .node_rewrites
+            .iter()
+            .flat_map(|r| r.inputs.iter())
+            .chain(
+                self.search_compactions
+                    .iter()
+                    .flat_map(|search| search.selection.selected_descriptors.iter()),
+            )
+            .chain(
+                self.search_lsm_activations
+                    .iter()
+                    .filter(|activation| activation.barrier_already_present)
+                    .map(|activation| &activation.barrier),
+            );
+        for path in carried.flat_map(descriptor_object_paths) {
+            uploaded.remove(&path);
+        }
+        let mut uploaded: Vec<String> = uploaded.into_iter().collect();
+        uploaded.sort();
+        uploaded
+    }
 }
 
 /// Snapshot of everything the expensive compaction prepare phase needs,
@@ -320,6 +372,11 @@ impl CompactionBasis {
     /// Manifest version this basis was captured at.
     pub fn manifest_version(&self) -> u64 {
         self.base.manifest.version
+    }
+
+    /// The manifest this basis was captured at.
+    pub fn base_manifest(&self) -> &crate::manifest::Manifest {
+        &self.base.manifest
     }
 
     /// Schema committed in the basis manifest — what the maintenance loops

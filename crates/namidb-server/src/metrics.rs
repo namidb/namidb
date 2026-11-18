@@ -340,6 +340,19 @@ pub struct Metrics {
     writer_locks: [WriterLockMetrics; WriterLockKind::ALL.len()],
     compactions: [CompactionMetrics; CompactionTrigger::ALL.len()],
     queries: Arc<QueryRegistry>,
+    /// Latest object-store accounting per namespace, measured by its orphan
+    /// sweep. Rendered summed over namespaces, so no namespace label (and no
+    /// user-controlled cardinality) reaches the exposition.
+    store_bytes: std::sync::Mutex<std::collections::HashMap<String, StoreBytes>>,
+}
+
+/// One namespace's object-store footprint as its last sweep listed it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StoreBytes {
+    sst: u64,
+    wal: u64,
+    manifest: u64,
+    live: u64,
 }
 
 impl Metrics {
@@ -357,6 +370,7 @@ impl Metrics {
             writer_locks: std::array::from_fn(|_| WriterLockMetrics::new()),
             compactions: std::array::from_fn(|_| CompactionMetrics::new()),
             queries: Arc::new(QueryRegistry::default()),
+            store_bytes: Default::default(),
         })
     }
 
@@ -473,6 +487,34 @@ impl Metrics {
         metrics
             .written_ssts
             .fetch_add(written as u64, Ordering::Relaxed);
+    }
+
+    /// Record the object-store footprint one namespace's sweep just listed
+    /// (`namidb_store_bytes`, `namidb_store_live_bytes`).
+    pub fn observe_store_bytes(&self, namespace: &str, report: &namidb_storage::JanitorReport) {
+        let observed = StoreBytes {
+            sst: report.store_sst_bytes,
+            wal: report.store_wal_bytes,
+            manifest: report.store_manifest_bytes,
+            live: report.live_bytes(),
+        };
+        self.store_bytes
+            .lock()
+            .expect("store accounting poisoned")
+            .insert(namespace.to_string(), observed);
+    }
+
+    fn store_bytes_total(&self) -> StoreBytes {
+        self.store_bytes
+            .lock()
+            .expect("store accounting poisoned")
+            .values()
+            .fold(StoreBytes::default(), |sum, ns| StoreBytes {
+                sst: sum.sst.saturating_add(ns.sst),
+                wal: sum.wal.saturating_add(ns.wal),
+                manifest: sum.manifest.saturating_add(ns.manifest),
+                live: sum.live.saturating_add(ns.live),
+            })
     }
 
     /// Render the whole registry in the Prometheus text exposition format
@@ -754,6 +796,26 @@ impl Metrics {
                 metrics.written_ssts.load(Ordering::Relaxed)
             );
         }
+
+        let store = self.store_bytes_total();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_store_bytes Object-store bytes by kind, summed over the latest orphan sweep of each namespace this process swept."
+        );
+        let _ = writeln!(out, "# TYPE namidb_store_bytes gauge");
+        for (kind, bytes) in [
+            ("sst", store.sst),
+            ("wal", store.wal),
+            ("manifest", store.manifest),
+        ] {
+            let _ = writeln!(out, "namidb_store_bytes{{kind=\"{kind}\"}} {bytes}");
+        }
+        let _ = writeln!(
+            out,
+            "# HELP namidb_store_live_bytes SST and WAL bytes referenced by a retained manifest version at the latest sweep."
+        );
+        let _ = writeln!(out, "# TYPE namidb_store_live_bytes gauge");
+        let _ = writeln!(out, "namidb_store_live_bytes {}", store.live);
 
         out
     }

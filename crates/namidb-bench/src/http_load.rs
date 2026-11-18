@@ -110,6 +110,7 @@ pub async fn serve(config: ServeConfig) -> Result<()> {
         flush_interval: config.flush_interval,
         compaction_interval: config.compaction_interval,
         sweep_min_age: Duration::from_secs(24 * 3600),
+        sweep_superseded_min_age: Duration::from_secs(3600),
         sweep_delete: true,
         restore_point_retention: Duration::ZERO,
         bolt_listen: None,

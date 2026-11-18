@@ -1214,6 +1214,11 @@ impl WriterSession {
         self.current.manifest.version
     }
 
+    /// The manifest this writer last committed or loaded.
+    pub fn current_manifest(&self) -> &crate::manifest::Manifest {
+        &self.current.manifest
+    }
+
     /// True when a search index of the current manifest has enough delta
     /// segments to compact. Servers request a compaction after a flush when
     /// this holds — also after a flush that failed because a search index

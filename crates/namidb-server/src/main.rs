@@ -179,6 +179,20 @@ struct Cli {
     )]
     sweep_min_age: Duration,
 
+    /// Age guard for an object referenced by a manifest version the sweep
+    /// retires and by no retained one (a compaction input merged away, a
+    /// replaced search segment, a flushed WAL segment), and for the retired
+    /// manifest versions themselves. Such an object was installed once, so
+    /// it is not an upload waiting for its CAS and does not need
+    /// `--sweep-min-age`; capped at that value.
+    #[arg(
+        long,
+        env = "NAMIDB_SWEEP_SUPERSEDED_MIN_AGE",
+        default_value = "1h",
+        value_parser = humantime::parse_duration,
+    )]
+    sweep_superseded_min_age: Duration,
+
     /// Delete unreachable immutable bodies, WALs, manifests, and pointers
     /// during the sweep. On by default: the retention horizon (RFC-027) makes
     /// deletion safe by construction (an object referenced by no manifest
@@ -491,6 +505,7 @@ fn main() -> anyhow::Result<()> {
         flush_interval: cli.flush_interval,
         compaction_interval: cli.compaction_interval,
         sweep_min_age: cli.sweep_min_age,
+        sweep_superseded_min_age: cli.sweep_superseded_min_age,
         sweep_delete: cli.sweep_delete,
         restore_point_retention: cli.restore_point_retention,
         bolt_listen: cli.bolt_listen,
@@ -625,6 +640,17 @@ mod tests {
         std::env::set_var("NAMIDB_SWEEP_DELETE", "0");
         assert!(!Cli::try_parse_from(base).unwrap().sweep_delete);
         std::env::remove_var("NAMIDB_SWEEP_DELETE");
+
+        assert_eq!(
+            Cli::try_parse_from(base).unwrap().sweep_superseded_min_age,
+            Duration::from_secs(3600)
+        );
+        std::env::set_var("NAMIDB_SWEEP_SUPERSEDED_MIN_AGE", "15m");
+        assert_eq!(
+            Cli::try_parse_from(base).unwrap().sweep_superseded_min_age,
+            Duration::from_secs(900)
+        );
+        std::env::remove_var("NAMIDB_SWEEP_SUPERSEDED_MIN_AGE");
     }
 
     /// `--write-timeout` carries its own 60s default (fourth field report,

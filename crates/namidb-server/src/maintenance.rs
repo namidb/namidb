@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
-use namidb_storage::{CompactionOutcome, SnapshotCell, WriterSession};
+use namidb_storage::{CompactionOutcome, JanitorReport, SnapshotCell, SweepOptions, WriterSession};
 use tokio::sync::{watch, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -233,6 +233,141 @@ pub(crate) async fn keep_restore_point_window(
         Ok(None) => {}
         Err(e) => error!(namespace, error = %e, "restore point window refresh failed"),
     }
+}
+
+/// The sweep settings a server runs with (see `Config::sweep_min_age`,
+/// `Config::sweep_superseded_min_age`, `Config::sweep_delete`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepSettings {
+    pub(crate) min_age: std::time::Duration,
+    pub(crate) superseded_min_age: std::time::Duration,
+    pub(crate) delete: bool,
+}
+
+impl Default for SweepSettings {
+    /// What the CLI defaults to.
+    fn default() -> Self {
+        Self {
+            min_age: std::time::Duration::from_secs(24 * 3600),
+            superseded_min_age: namidb_storage::DEFAULT_SUPERSEDED_MIN_AGE,
+            delete: true,
+        }
+    }
+}
+
+impl SweepSettings {
+    /// The periodic sweep's options at `horizon`.
+    pub(crate) fn options(&self, horizon: u64) -> SweepOptions {
+        SweepOptions {
+            retention_horizon: horizon,
+            min_age: self.min_age,
+            superseded_min_age: self.superseded_min_age,
+            // Only a diagnostics hint: the sweep discovers every level.
+            max_level: 1,
+            delete: self.delete,
+            exact_window: false,
+        }
+    }
+}
+
+/// Run one orphan sweep for a namespace, log it, and publish the store
+/// accounting it measured. The caller holds the scheduler's
+/// [`CompactionScheduler::sweep_guard`], so no compaction prepare is between
+/// upload and install while objects are classified and deleted.
+pub(crate) async fn run_sweep(
+    manifest_store: &namidb_storage::ManifestStore,
+    options: SweepOptions,
+    namespace: &str,
+    metrics: &Metrics,
+) -> namidb_storage::Result<JanitorReport> {
+    let report = namidb_storage::sweep_orphans_with(manifest_store, options).await?;
+    if report.aborted_by_pin {
+        // Nothing was listed: keep the previous accounting.
+        return Ok(report);
+    }
+    metrics.observe_store_bytes(namespace, &report);
+    if report.has_activity() || report.superseded_reclaimed > 0 {
+        info!(
+            namespace,
+            found = report.orphans_found,
+            deleted = report.orphans_deleted,
+            bytes_freed = report.bytes_freed,
+            superseded = report.superseded_reclaimed,
+            superseded_bytes_freed = report.superseded_bytes_freed,
+            retired_versions_loaded = report.retired_versions_loaded,
+            manifest_snapshots = report.manifest_snapshots_reclaimed,
+            manifest_bytes_freed = report.manifest_bytes_freed,
+            pointer_files = report.pointer_files_reclaimed,
+            pointer_bytes_freed = report.pointer_bytes_freed,
+            wal_segments = report.wal_segments_reclaimed,
+            wal_bytes_freed = report.wal_bytes_freed,
+            memtable_snapshots = report.memtable_snapshots_reclaimed,
+            memtable_snapshot_bytes_freed = report.memtable_snapshot_bytes_freed,
+            restore_window_retained = report.restore_window_retained,
+            restore_window_bytes = report.restore_window_bytes,
+            skipped_too_young = report.skipped_too_young,
+            store_sst_bytes = report.store_sst_bytes,
+            store_wal_bytes = report.store_wal_bytes,
+            store_manifest_bytes = report.store_manifest_bytes,
+            live_bytes = report.live_bytes(),
+            exact_window = report.exact_window,
+            dry_run = !options.delete,
+            "orphan sweep"
+        );
+    } else {
+        tracing::debug!(
+            namespace,
+            store_sst_bytes = report.store_sst_bytes,
+            store_wal_bytes = report.store_wal_bytes,
+            store_manifest_bytes = report.store_manifest_bytes,
+            live_bytes = report.live_bytes(),
+            "orphan sweep found nothing to reclaim"
+        );
+    }
+    Ok(report)
+}
+
+/// Delete objects a compaction prepare uploaded that the manifest did not
+/// end up referencing (see [`run_scoped_pass`]). Best effort: a failure is
+/// logged and the object is left for the janitor's `min_age` path.
+async fn discard_unreferenced_uploads(
+    store: &std::sync::Arc<dyn object_store::ObjectStore>,
+    namespace_prefix: &str,
+    relative_paths: Vec<String>,
+    namespace: &str,
+) {
+    use object_store::ObjectStoreExt;
+    if relative_paths.is_empty() {
+        return;
+    }
+    let mut deleted = 0usize;
+    let mut bytes = 0u64;
+    for relative in &relative_paths {
+        let path = object_store::path::Path::from(format!("{namespace_prefix}/{relative}"));
+        let size = match store.head(&path).await {
+            Ok(meta) => meta.size,
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(error) => {
+                warn!(namespace, %path, %error, "could not stat an abandoned compaction upload; leaving it to the sweep");
+                continue;
+            }
+        };
+        match store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                deleted += 1;
+                bytes = bytes.saturating_add(size);
+            }
+            Err(error) => {
+                warn!(namespace, %path, %error, "could not delete an abandoned compaction upload; leaving it to the sweep");
+            }
+        }
+    }
+    info!(
+        namespace,
+        objects = deleted,
+        bytes,
+        "discarded compaction uploads the manifest does not reference"
+    );
 }
 
 /// Request compaction for one namespace.
@@ -810,6 +945,22 @@ async fn run_scoped_pass(
         return Ok(CompactionPass::Cancelled);
     }
 
+    // What this prepare uploaded, computed off-lock. Anything the basis
+    // manifest references is manifest history, not ours to discard, whatever
+    // `uploaded_object_paths` reports.
+    let uploaded: Vec<String> = {
+        let uploaded = prepared.uploaded_object_paths();
+        if uploaded.is_empty() {
+            uploaded
+        } else {
+            let base = namidb_storage::manifest_object_paths(basis.base_manifest());
+            uploaded
+                .into_iter()
+                .filter(|path| !base.contains(path))
+                .collect()
+        }
+    };
+
     // A long prepare may make foreground tasks runnable. Yield before joining
     // the FIFO writer queue so already-ready client work gets a chance to
     // enqueue; once acquired, only manifest validation/CAS runs under it.
@@ -834,7 +985,38 @@ async fn run_scoped_pass(
     let install_started = Instant::now();
     let install = writer.install_prepared_compaction(prepared).await;
 
-    match install {
+    // Uploads the manifest does not reference after the install: everything
+    // on a lost precondition (refused before the CAS), or the part of the
+    // plan an applied install dropped. Both outcomes leave the manifest
+    // referencing exactly what was installed, and only this prepare knows
+    // these paths, so nothing can reference them later. Any other error is
+    // ambiguous (the CAS may have landed): leave the uploads to the janitor.
+    // Not done inside `install_prepared` itself, whose callers may install a
+    // cloned plan again.
+    let discard = match &install {
+        Ok(_) | Err(namidb_storage::Error::Precondition(_)) if !uploaded.is_empty() => {
+            let live = namidb_storage::manifest_object_paths(writer.current_manifest());
+            let unreferenced: Vec<String> = uploaded
+                .into_iter()
+                .filter(|path| !live.contains(path))
+                .collect();
+            (!unreferenced.is_empty()).then(|| {
+                let manifest_store = writer.manifest_store();
+                (
+                    manifest_store.store().clone(),
+                    manifest_store
+                        .paths()
+                        .namespace_prefix()
+                        .as_ref()
+                        .to_string(),
+                    unreferenced,
+                )
+            })
+        }
+        _ => None,
+    };
+
+    let result = match install {
         Ok(outcome) => {
             let l0_after = writer.max_l0_bucket_len();
             let status = if outcome.source_ssts_removed > 0 {
@@ -896,7 +1078,14 @@ async fn run_scoped_pass(
             );
             Err(error)
         }
+    };
+    drop(writer);
+    // Still under this pass's compaction guard, so the janitor is not
+    // listing concurrently; the deletes run off the writer lock.
+    if let Some((store, prefix, unreferenced)) = discard {
+        discard_unreferenced_uploads(&store, &prefix, unreferenced, namespace).await;
     }
+    result
 }
 
 fn is_cancelled(cancel: Option<&watch::Receiver<bool>>) -> bool {
@@ -1465,5 +1654,227 @@ mod tests {
             .expect("drain must succeed");
         assert_eq!(summary.l0_after, 0);
         assert!(summary.passes >= 1);
+    }
+
+    /// Records the path of every write below `/sst/`.
+    #[derive(Debug)]
+    struct RecordSstPuts {
+        inner: Arc<dyn ObjectStore>,
+        puts: StdMutex<Vec<object_store::path::Path>>,
+    }
+
+    impl RecordSstPuts {
+        fn new(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                puts: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn take(&self) -> Vec<object_store::path::Path> {
+            std::mem::take(&mut *self.puts.lock().unwrap())
+        }
+
+        fn record(&self, location: &object_store::path::Path) {
+            if location.as_ref().contains("/sst/") {
+                self.puts.lock().unwrap().push(location.clone());
+            }
+        }
+    }
+
+    impl std::fmt::Display for RecordSstPuts {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordSstPuts({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RecordSstPuts {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.record(location);
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.record(location);
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    async fn run_nodes_pass(state: &AppState) -> namidb_storage::Result<CompactionPass> {
+        let in_flight = StdMutex::new(SearchKeys::new());
+        run_scoped_pass(
+            PassScope::WithoutSearch,
+            CompactionTrigger::Periodic,
+            &state.writer,
+            &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
+            &state.metrics,
+            None,
+            &in_flight,
+        )
+        .await
+    }
+
+    /// A prepare whose install loses its precondition (a competing compaction
+    /// merged its inputs first) uploaded objects no manifest will ever
+    /// reference: the pass deletes them right away instead of leaving them
+    /// for the janitor's `min_age`. The competing compaction's installed
+    /// outputs stay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandoned_prepare_uploads_are_discarded_after_a_lost_install() {
+        use object_store::ObjectStoreExt;
+        let (_unused, paths) =
+            namidb_storage::parse_uri("memory://maintenance-discard-abandoned").unwrap();
+        let blocking = Arc::new(BlockFirstSstGet {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            should_block: AtomicBool::new(false),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let recording = Arc::new(RecordSstPuts::new(blocking.clone()));
+        let store: Arc<dyn ObjectStore> = recording.clone();
+        let writer = WriterSession::open(store.clone(), paths).await.unwrap();
+        let state = AppState::new(writer, None, "maintenance-discard-abandoned".into());
+        for name in ["first", "second"] {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                commit_and_flush(&state, NodeId::new(), name),
+            )
+            .await
+            .expect("setup flush must not block on the SST barrier");
+        }
+        recording.take();
+        blocking.should_block.store(true, Ordering::SeqCst);
+
+        // The pass captures its basis, then blocks on its first input GET.
+        // Meanwhile a competing compaction merges the same inputs.
+        let competing = async {
+            tokio::time::timeout(Duration::from_secs(10), blocking.started.notified())
+                .await
+                .expect("prepare must reach the blocked SST GET");
+            state
+                .writer
+                .lock()
+                .await
+                .compact_l0(&Schema::empty())
+                .await
+                .expect("competing compaction");
+            let installed = recording.take();
+            blocking.release.notify_one();
+            installed
+        };
+        let (pass, installed) = tokio::join!(run_nodes_pass(&state), competing);
+        assert!(
+            matches!(pass, Err(namidb_storage::Error::Precondition(_))),
+            "the pass must lose its install: {pass:?}"
+        );
+        let abandoned = recording.take();
+        assert!(!installed.is_empty());
+        assert!(
+            !abandoned.is_empty(),
+            "the abandoned prepare must have uploaded its merge output"
+        );
+        for path in &abandoned {
+            assert!(
+                store.head(path).await.is_err(),
+                "abandoned upload {path} must be discarded"
+            );
+        }
+        let live =
+            namidb_storage::manifest_object_paths(state.writer.lock().await.current_manifest());
+        for path in &installed {
+            assert!(
+                store.head(path).await.is_ok(),
+                "installed output {path} must stay"
+            );
+            assert!(live.iter().any(|rel| path.as_ref().ends_with(rel.as_str())));
+        }
+        assert!(state
+            .metrics
+            .render()
+            .contains("namidb_compactions_total{trigger=\"periodic\",status=\"stale\"} 1"));
+    }
+
+    /// A successful install keeps every object its prepare uploaded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn installed_prepare_uploads_are_kept() {
+        use object_store::ObjectStoreExt;
+        let (inner, paths) =
+            namidb_storage::parse_uri("memory://maintenance-discard-installed").unwrap();
+        let recording = Arc::new(RecordSstPuts::new(inner));
+        let store: Arc<dyn ObjectStore> = recording.clone();
+        let writer = WriterSession::open(store.clone(), paths).await.unwrap();
+        let state = AppState::new(writer, None, "maintenance-discard-installed".into());
+        for name in ["first", "second"] {
+            commit_and_flush(&state, NodeId::new(), name).await;
+        }
+        recording.take();
+        let pass = run_nodes_pass(&state).await.expect("pass installs");
+        assert!(matches!(pass, CompactionPass::Applied { .. }), "{pass:?}");
+        let uploaded = recording.take();
+        assert!(!uploaded.is_empty());
+        let live =
+            namidb_storage::manifest_object_paths(state.writer.lock().await.current_manifest());
+        for path in &uploaded {
+            assert!(store.head(path).await.is_ok(), "{path} must stay");
+            assert!(
+                live.iter().any(|rel| path.as_ref().ends_with(rel.as_str())),
+                "{path} is referenced by the current manifest"
+            );
+        }
     }
 }

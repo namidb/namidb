@@ -27,8 +27,9 @@ Without retention, the window is just the current version.
 ## How history is kept
 
 Normally the orphan sweep (`janitor.rs`) reclaims a manifest version, and
-every object only it references, once no reader needs it and the object is
-older than `NAMIDB_SWEEP_MIN_AGE`. Retention pins (`pin.rs`) are how a reader
+every object only it references, once no reader needs it and the version has
+been superseded for `NAMIDB_SWEEP_SUPERSEDED_MIN_AGE` (an object no version
+ever referenced waits `NAMIDB_SWEEP_MIN_AGE` instead). Retention pins (`pin.rs`) are how a reader
 outside the process holds history back. Each lease now has a scope:
 
 | Scope | Holder | The sweep keeps |
@@ -54,6 +55,13 @@ dropped. That lets the sweep honour a window of any number of versions by
 loading one extra manifest, instead of loading every version in the window
 on every sweep. A backup of an old point pins only that version (`point`),
 for the same reason.
+
+The price of keeping by write time is that orphans written inside the window
+(failed uploads, abandoned compaction outputs) stay until the window moves
+past them. `POST /v0/admin/sweep` with `"exact_window": true` runs the sweep
+in exact mode (`SweepOptions::exact_window`): the live set is the union of
+every version in the window, read one batch at a time, and only `min_age`
+protects objects that no version references.
 
 The lease expires `retention + max(2 × compaction interval, 15 min)` after
 each refresh. If the writer stops refreshing it (the process stops, the
