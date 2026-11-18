@@ -2108,6 +2108,16 @@ pub(crate) fn create_only_head_cached(store: &Arc<dyn ObjectStore>, location: &O
     create_only_heads().entries.contains_key(&key)
 }
 
+static CREATE_ONLY_HEADS_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test hook: stop reusing create-only HEADs in this process, so a test that
+/// counts HEADs (one per search probe) sees every probe.
+#[doc(hidden)]
+pub fn disable_create_only_head_cache_for_tests() {
+    CREATE_ONLY_HEADS_OFF.store(true, Ordering::Relaxed);
+}
+
 fn create_only_head_cache_max_entries() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
@@ -2137,7 +2147,7 @@ pub(crate) async fn head_create_only(
     location: &ObjectPath,
 ) -> object_store::Result<ObjectMeta> {
     let max_entries = create_only_head_cache_max_entries();
-    if max_entries == 0 {
+    if max_entries == 0 || CREATE_ONLY_HEADS_OFF.load(Ordering::Relaxed) {
         return store.head(location).await;
     }
     let key: HeadKey = (store_instance_token(store), location.as_ref().to_string());

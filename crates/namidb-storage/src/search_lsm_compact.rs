@@ -4763,6 +4763,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "vector-index")]
     fn a_base_built_before_kmeans_splits_is_rebuilt_once() {
         let policy = delta_policy(6, 8);
         let mut manifest = compacted_single_base_fixture();

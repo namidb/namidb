@@ -1881,9 +1881,13 @@ impl PagedRangeSource for LegacyObjectRangeSource {
     }
 }
 
+/// Probes of at most this many pages per level read exactly those pages; a
+/// wider probe reads whole cache pages, which its neighbouring pages share.
+const NARROW_PROBE_PAGES: usize = 16;
+
 // B+tree pages, headers and value records are self-contained blocks read
-// with the same bounds by every probe: cache each as its own entry instead of
-// rounding a few KiB up to a 256 KiB page.
+// with the same bounds by every probe: a narrow probe caches each as its own
+// entry instead of rounding a few KiB up to a 256 KiB page.
 #[async_trait::async_trait]
 impl PagedRangeSource for PinnedObjectRangeSource {
     async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
@@ -1891,9 +1895,17 @@ impl PagedRangeSource for PinnedObjectRangeSource {
             .await
     }
 
+    /// A point lookup (a top-k hydration) touches a few pages per level and
+    /// reads only those; a bulk probe (a batched MERGE over hundreds of keys)
+    /// lands many pages in each cache page, so it reads whole cache pages
+    /// and issues a fraction of the requests.
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        self.read_ranges_as(ranges, crate::range_cache::ReadGranularity::Block)
-            .await
+        let granularity = if ranges.len() <= NARROW_PROBE_PAGES {
+            crate::range_cache::ReadGranularity::Block
+        } else {
+            crate::range_cache::ReadGranularity::Pages
+        };
+        self.read_ranges_as(ranges, granularity).await
     }
 }
 
@@ -1929,7 +1941,10 @@ pub async fn prefetch_node_record_index(source: &PinnedObjectRangeSource) -> Res
         .iter()
         .map(|page| page_range_at(base_offset, *page))
         .collect::<Result<Vec<_>>>()?;
-    PagedRangeSource::read_ranges(source, &ranges).await?;
+    // Exact blocks, the way a point lookup reads each of these pages.
+    source
+        .read_ranges_as(&ranges, crate::range_cache::ReadGranularity::Block)
+        .await?;
     Ok(ranges.len())
 }
 
