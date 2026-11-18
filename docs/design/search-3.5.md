@@ -13,16 +13,21 @@ vector and text segment formats, manifest, range cache), `namidb-query`
 
 ## Implementation status (3.5.0)
 
-3.5.0 ships the parts of S1 and S2 that need no format change. Everything
-below is in memory and rebuilt after a restart, so a 3.5.0 store opens with
-3.4.x and back.
+3.5.0 ships the parts of S1 and S2 that need no incompatible format change.
+The ledger, tails and code caches are in memory and rebuilt after a restart.
+The one on-disk change is backward readable: V5 bases now store their
+navigation and exact f32 pages in zstd frames made only of raw blocks, which
+every earlier reader decodes as before and which let this reader range-read
+single rows (a step towards the row-addressable exact tier of §5.2.3). A
+3.5.0 store opens with 3.4.x and back.
 
 | Step | Shipped in 3.5.0 | Not yet |
 |---|---|---|
 | S1 counts | Exact per-label and per-`(label, property)` presence ledger, maintained by every commit and flush; seeded in the background (at open for vector-indexed labels, otherwise on the first count) and rolled forward over the commits that land during the seed; `count(n)`, `count(n) WHERE n.p IS NOT NULL`, `count(n.p)` answered from it | Persisting the ledger in the manifest (§5.7.1); after a restart the first count of an untracked property waits for a seed |
 | S2 vector freshness | Per-index int8 memtable tail with exact score bounds (§5.2.6 with int8 instead of RaBitQ codes); only rows that can reach the top-k are decoded; adaptive over-fetch instead of `k + \|tail\|`; resident int8 codes for VG6 deltas so only pages that can hold the top-k are read | Recovery-time tail rebuild is lazy (first query after open or flush), not at replay |
 | S2 BM25 freshness | Rows whose label membership and indexed text equal the persisted version no longer force the flat scan (the embedding-only `SET` case of G6) | A text tail for rows whose indexed text did change (§5.5.1): those still take the exact path until flushed |
-| Filters (part of S7) | A property-only filter the index cannot apply that admits at most 4,096 nodes is evaluated on its own columns and only those nodes are scored exactly (the index path hands over after one under-filled round) | Native per-leaf filter bitmaps; filtered search under sustained overlapping writes |
+| V5 read path (towards S4) | Re-ranking range-reads only candidate rows from raw-block exact pages, each checked against its checksummed int8 code (else the page is read whole under its checksum); bulk block decode, a direct navigation-page decoder, lane-parallel int8 scoring | RaBitQ codes and error-bounded rerank (VG7); bases written before 3.5 keep whole-page reads until compaction rewrites them |
+| Filters (part of S7) | A filter the index cannot apply that admits few nodes is resolved to ids (from range indexes for equality/IN on indexed properties, up to 1,024 nodes, before any index search; else by a storage predicate scan for string/boolean equality, or by evaluating property-only filters on their own columns, up to 4,096 after one under-filled round) and only those nodes are scored exactly | Native per-leaf filter bitmaps; filtered search under sustained overlapping writes |
 | S3–S9 | — | Streaming backfill, VG7 partitioned RaBitQ index with SPFresh maintenance, cold path, FT5 blocked postings, hybrid, storage bounds |
 
 Measured on the live-workload bench (M shape, 120k documents, 100k

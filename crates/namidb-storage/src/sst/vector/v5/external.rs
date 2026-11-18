@@ -1370,7 +1370,7 @@ fn write_leaf_page(
             "vector v5 leaf row count changed while emitting nav page",
         ));
     }
-    let nav_ref = write_nav_block(context.output, &nav, context.options.compression_level)?;
+    let nav_ref = write_nav_block(context.output, &nav)?;
     // Drop page-local navigation allocations before the full-precision pass.
     drop(nav);
     let exact_ref = write_exact_block(
@@ -1455,11 +1455,7 @@ impl Write for CrcCountingWriter<'_> {
     }
 }
 
-fn write_nav_block(
-    output: &mut File,
-    nav: &NavPage,
-    compression_level: i32,
-) -> Result<BlockRef, Error> {
+fn write_nav_block(output: &mut File, nav: &NavPage) -> Result<BlockRef, Error> {
     let raw_len = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .serialized_size(nav)
@@ -1467,15 +1463,18 @@ fn write_nav_block(
     validate_block_lengths(raw_len, "navigation page")?;
     let offset = output.stream_position()?;
     let writer = CrcCountingWriter::new(output);
-    let mut encoder = zstd::stream::write::Encoder::new(writer, compression_level)
-        .map_err(|error| Error::invariant(format!("vector v5 nav zstd init failed: {error}")))?;
+    // Navigation pages are int8 codes that barely compress: store them in a
+    // raw-block frame, which any zstd decoder reads, and decode with a copy.
+    let mut encoder =
+        std::io::BufWriter::with_capacity(64 * 1024, RawFrameEncoder::new(writer, raw_len)?);
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .serialize_into(&mut encoder, nav)
         .map_err(|error| Error::invariant(format!("vector v5 nav encode failed: {error}")))?;
     let writer = encoder
-        .finish()
-        .map_err(|error| Error::invariant(format!("vector v5 nav zstd finish failed: {error}")))?;
+        .into_inner()
+        .map_err(|error| Error::invariant(format!("vector v5 nav flush failed: {error}")))?
+        .finish()?;
     let (wire_len, crc32) = writer.finish();
     make_block_ref(offset, wire_len, raw_len, crc32, "navigation page")
 }

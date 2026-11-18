@@ -6727,6 +6727,9 @@ const VECTOR_FLAT_SCAN_BATCH: usize = 256;
 /// read whole by the flat vector scan; a less selective filter scans whole
 /// nodes as before.
 const FILTERED_FLAT_ELIGIBLE_CAP: usize = 4096;
+/// Indexed equality filters the vector index cannot apply natively that admit
+/// at most this many nodes skip the index search entirely.
+const FILTERED_FLAT_FIRST_CAP: usize = 1024;
 
 /// The properties of `alias` that `filter` reads, when it reads nothing else
 /// of the node: property accesses `alias.p`, literals and parameters combined
@@ -6782,8 +6785,62 @@ async fn selective_filter_eligible(
                 return Ok(Some(ids.into_iter().collect()));
             }
         }
+        if let Some(predicates) = string_group_predicates(groups) {
+            // Storage evaluates the conjuncts on their columns and returns ids
+            // only; no node is decoded for the filter.
+            let views = snapshot
+                .scan_label_with_predicates_and_projection_limited(
+                    label,
+                    &predicates,
+                    Some(&[]),
+                    FILTERED_FLAT_ELIGIBLE_CAP + 1,
+                )
+                .await?;
+            if views.len() > FILTERED_FLAT_ELIGIBLE_CAP {
+                return Ok(None);
+            }
+            let mut ids: Vec<NodeId> = views.into_iter().map(|view| view.id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            return Ok(Some(ids));
+        }
     }
     filtered_flat_eligible(snapshot, label, alias, vector_property, filter, params).await
+}
+
+/// Equality/IN groups as storage scan predicates, when every value is a
+/// string or a boolean: those compare the same in storage and in Cypher
+/// (numbers do not: `1 = 1.0` holds in Cypher). The groups are conjuncts of
+/// the filter, so the ids they admit contain every node the filter admits.
+fn string_group_predicates(
+    groups: &[(String, Vec<CoreValue>)],
+) -> Option<Vec<namidb_storage::sst::predicates::ScanPredicate>> {
+    use namidb_storage::sst::predicates::ScanPredicate;
+    use namidb_storage::sst::stats::StatScalar;
+    groups
+        .iter()
+        .map(|(property, values)| {
+            let mut scalars = values
+                .iter()
+                .map(|value| match value {
+                    CoreValue::Str(text) => Some(StatScalar::Utf8(text.clone())),
+                    CoreValue::Bool(flag) => Some(StatScalar::Bool(*flag)),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(if scalars.len() == 1 {
+                ScanPredicate::Eq {
+                    column: property.clone(),
+                    value: scalars.pop().expect("one value"),
+                }
+            } else {
+                ScanPredicate::In {
+                    column: property.clone(),
+                    values: scalars,
+                }
+            })
+        })
+        .collect()
 }
 
 /// Ids of the `label` nodes admitted by a property-only `filter`, read from
@@ -7212,6 +7269,18 @@ async fn try_index_search(
             // fresh overlay), so empty proves there can be no residual match.
             if capped_eligibility.as_ref().is_some_and(BTreeSet::is_empty) {
                 return Ok(Some(Vec::new()));
+            }
+            // Few admitted nodes: scoring them exactly beats an index search
+            // restricted to them, which still probes, reads and re-ranks its
+            // over-fetch (and widens when they sit far from the query).
+            if let Some(ids) = capped_eligibility.as_ref() {
+                if source_filter.is_some()
+                    && flat_eligible.is_none()
+                    && ids.len() <= FILTERED_FLAT_FIRST_CAP
+                {
+                    *flat_eligible = Some(Some(ids.iter().copied().collect()));
+                    return Ok(None);
+                }
             }
         }
         let (raw_hits, index_exhausted, persisted_candidates_complete) =

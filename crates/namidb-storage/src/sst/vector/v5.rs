@@ -334,7 +334,14 @@ pub(crate) fn build_body_v5_with_filter_postings(
     for leaf in &tree.leaves {
         let nav = make_nav_page(&rows, leaf, dim, &reverse_filters)?;
         let nav_raw = serialize(&nav, "navigation page")?;
-        let nav_ref = append_compressed_block(&mut body, &nav_raw, options.compression_level)?;
+        #[cfg(test)]
+        let nav_ref = if tests::COMPRESS_EXACT.with(|flag| flag.get()) {
+            append_compressed_block(&mut body, &nav_raw, options.compression_level)?
+        } else {
+            append_raw_frame_block(&mut body, &nav_raw)?
+        };
+        #[cfg(not(test))]
+        let nav_ref = append_raw_frame_block(&mut body, &nav_raw)?;
 
         let exact_raw_len = leaf
             .len()
@@ -1045,6 +1052,7 @@ impl VectorV5Reader {
     }
 
     fn rank_leaf_pages(&self, query: &[f32]) -> Result<Vec<u32>, Error> {
+        let query_norm = lane_norm(query);
         // A parent centroid's score is not an upper bound on any descendant
         // (especially for inner product), so comparing nodes from different
         // depths in one best-first heap can prune the truly closest leaf. Leaf
@@ -1064,7 +1072,8 @@ impl VectorV5Reader {
                         page,
                         quality(
                             self.metric,
-                            approximate_score(self.metric, query, &node.codes, node.scale) as f64,
+                            approximate_score(self.metric, query, query_norm, &node.codes, node.scale)
+                                as f64,
                         ),
                     )
                 })
@@ -1821,6 +1830,7 @@ fn score_nav_page_bounded(
     visit_order: &mut u64,
 ) -> Result<(), Error> {
     let dim = query.len();
+    let query_norm = lane_norm(query);
     for row in 0..nav.ids.len() {
         if !row_matches_filters(row, &nav.filters, groups) {
             continue;
@@ -1842,7 +1852,7 @@ fn score_nav_page_bounded(
             .scales
             .get(row)
             .ok_or_else(|| Error::invariant("vector v5 nav scale out of range"))?;
-        let score = approximate_score(metric, query, codes, scale);
+        let score = approximate_score(metric, query, query_norm, codes, scale);
         out.insert(
             metric,
             ApproxCandidate {
@@ -1880,46 +1890,78 @@ fn row_matches_filters(
     })
 }
 
-/// Score of `query` against the int8 code `codes * scale`. The sums run in
-/// eight fixed lanes so the compiler can vectorise them while the result stays
-/// deterministic on every platform (no reassociation is left to the compiler).
-fn approximate_score(metric: VectorMetric, query: &[f32], codes: &[i8], scale: f32) -> f32 {
+/// `‖query‖`, summed in the same fixed lanes as [`approximate_score`].
+fn lane_norm(query: &[f32]) -> f32 {
+    const LANES: usize = 8;
+    let split = query.len() - query.len() % LANES;
+    let mut lanes = [0.0f32; LANES];
+    for q in query[..split].chunks_exact(LANES) {
+        for lane in 0..LANES {
+            lanes[lane] += q[lane] * q[lane];
+        }
+    }
+    let mut sum = lanes.iter().sum::<f32>();
+    for q in &query[split..] {
+        sum += *q * *q;
+    }
+    sum.sqrt()
+}
+
+/// Score of `query` (whose [`lane_norm`] is `query_norm`) against the int8
+/// code `codes * scale`. The sums run in eight fixed lanes so the compiler
+/// can vectorise them while the result stays deterministic on every platform
+/// (no reassociation is left to the compiler).
+fn approximate_score(
+    metric: VectorMetric,
+    query: &[f32],
+    query_norm: f32,
+    codes: &[i8],
+    scale: f32,
+) -> f32 {
     const LANES: usize = 8;
     let len = query.len().min(codes.len());
     let (query, codes) = (&query[..len], &codes[..len]);
     let split = len - len % LANES;
     match metric {
-        VectorMetric::Dot | VectorMetric::Cosine => {
+        VectorMetric::Dot => {
             let mut dot = [0.0f32; LANES];
-            let mut query_norm = [0.0f32; LANES];
+            for (q, c) in query[..split]
+                .chunks_exact(LANES)
+                .zip(codes[..split].chunks_exact(LANES))
+            {
+                for lane in 0..LANES {
+                    dot[lane] += q[lane] * c[lane] as f32;
+                }
+            }
+            let mut dot_sum = dot.iter().sum::<f32>();
+            for (q, c) in query[split..].iter().zip(&codes[split..]) {
+                dot_sum += *q * *c as f32;
+            }
+            dot_sum * scale
+        }
+        VectorMetric::Cosine => {
+            let mut dot = [0.0f32; LANES];
             let mut code_norm = [0i32; LANES];
             for (q, c) in query[..split]
                 .chunks_exact(LANES)
                 .zip(codes[..split].chunks_exact(LANES))
             {
                 for lane in 0..LANES {
-                    let code = c[lane] as f32;
-                    dot[lane] += q[lane] * code;
-                    query_norm[lane] += q[lane] * q[lane];
+                    dot[lane] += q[lane] * c[lane] as f32;
                     code_norm[lane] += c[lane] as i32 * c[lane] as i32;
                 }
             }
             let mut dot_sum = dot.iter().sum::<f32>();
-            let mut query_sum = query_norm.iter().sum::<f32>();
             let mut code_sum = code_norm.iter().map(|v| *v as i64).sum::<i64>();
             for (q, c) in query[split..].iter().zip(&codes[split..]) {
                 dot_sum += *q * *c as f32;
-                query_sum += *q * *q;
                 code_sum += *c as i64 * *c as i64;
             }
-            if metric == VectorMetric::Dot {
-                return dot_sum * scale;
-            }
             // cos(q, s·c) = q·c / (|q| |c|) for any positive scale s.
-            if query_sum == 0.0 || code_sum == 0 || scale == 0.0 {
+            if query_norm == 0.0 || code_sum == 0 || scale == 0.0 {
                 0.0
             } else {
-                dot_sum / (query_sum.sqrt() * (code_sum as f32).sqrt())
+                dot_sum / (query_norm * (code_sum as f32).sqrt())
             }
         }
         VectorMetric::Euclidean => {
@@ -1987,6 +2029,8 @@ fn quality(metric: VectorMetric, score: f64) -> f64 {
     }
 }
 
+/// How pages were written before 3.5 (tests build such bases to cover them).
+#[cfg(test)]
 fn append_compressed_block(
     output: &mut Vec<u8>,
     raw: &[u8],
@@ -2253,7 +2297,7 @@ impl<W: Write> Write for RawFrameEncoder<W> {
     }
 }
 
-/// Append `raw` as a raw-block frame (an exact page).
+/// Append `raw` as a raw-block frame (an exact or navigation page).
 fn append_raw_frame_block(output: &mut Vec<u8>, raw: &[u8]) -> Result<BlockRef, Error> {
     let raw_len = raw.len() as u64;
     if raw_len > MAX_RAW_BLOCK_BYTES || raw_frame_len(raw_len) > MAX_COMPRESSED_BLOCK_BYTES {
