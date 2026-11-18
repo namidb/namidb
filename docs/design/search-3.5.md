@@ -22,11 +22,15 @@ below is in memory and rebuilt after a restart, so a 3.5.0 store opens with
 | S1 counts | Exact per-label and per-`(label, property)` presence ledger, maintained by every commit and flush; seeded in the background (at open for vector-indexed labels, otherwise on the first count) and rolled forward over the commits that land during the seed; `count(n)`, `count(n) WHERE n.p IS NOT NULL`, `count(n.p)` answered from it | Persisting the ledger in the manifest (§5.7.1); after a restart the first count of an untracked property waits for a seed |
 | S2 vector freshness | Per-index int8 memtable tail with exact score bounds (§5.2.6 with int8 instead of RaBitQ codes); only rows that can reach the top-k are decoded; adaptive over-fetch instead of `k + \|tail\|`; resident int8 codes for VG6 deltas so only pages that can hold the top-k are read | Recovery-time tail rebuild is lazy (first query after open or flush), not at replay |
 | S2 BM25 freshness | Rows whose label membership and indexed text equal the persisted version no longer force the flat scan (the embedding-only `SET` case of G6) | A text tail for rows whose indexed text did change (§5.5.1): those still take the exact path until flushed |
+| Filters (part of S7) | A property-only filter the index cannot apply that admits at most 4,096 nodes is evaluated on its own columns and only those nodes are scored exactly (the index path hands over after one under-filled round) | Native per-leaf filter bitmaps; filtered search under sustained overlapping writes |
 | S3–S9 | — | Streaming backfill, VG7 partitioned RaBitQ index with SPFresh maintenance, cold path, FT5 blocked postings, hybrid, storage bounds |
 
-Measured on the live-workload bench (M shape) with 120k documents and 100k
-embeddings — numbers in the release notes of 3.5.0 and in the PR that shipped
-it. Under sustained re-embedding writes, vector top-k latency stays dominated
+Measured on the live-workload bench (M shape, 120k documents, 100k
+embeddings, then 80k more embedding writes), 3.4.2 → 3.5.0, p50: presence
+count settled 7.2 s → 7 ms; filtered vector top-10 settled 21.5 s (3/10
+timeouts) → 3.0 s; BM25 under embedding writes 23.6 s (10/15 timeouts) →
+1.5 s; a fresh embedding found by top-1 18.9 s → 3.5 s; unfiltered vector
+top-10 settled 948 → 801 ms. Under sustained re-embedding writes, vector top-k latency stays dominated
 by the V5 base and its maintenance competing for the same two CPUs and the
 bandwidth cap; that is what S4/S5 address.
 
