@@ -40,11 +40,24 @@ crates.io release will establish and document that API explicitly.
   holding rows that can reach the top-k are read and scored. Hits and scores
   are unchanged: every returned score is still the exact f32 score, and the
   same rows win.
+- **Vector search re-ranks by reading single rows.** The exact f32 pages of
+  a vector base are now written uncompressed inside standard zstd frames
+  (raw blocks), so a query reads just the candidate rows it re-ranks
+  instead of decompressing every probed page whole: a cold top-10 fetches
+  about a third of the bytes it did, and a warm one spends a fraction of
+  the CPU. Each row read this way must agree with the checksummed int8 code
+  it was ranked by, or its page is read whole under the page checksum.
+  Navigation pages decode with one bulk call and a direct decoder instead
+  of a per-element visit, and approximate scores run in fixed lanes the
+  compiler vectorises. Bases written by earlier releases are read as before
+  until compaction rewrites them; hits and exact scores are unchanged.
 - **Vector search with a selective metadata filter reads only what the
   filter admits.** When a filter (`search.vector({… filter: {ley: $ley}})`
   or a `WHERE` on node properties) is not one the index can apply and admits
   few nodes, the filter is evaluated on its own columns first and only the
-  admitted nodes (up to 4,096) are read whole and scored exactly. It used to
+  admitted nodes (up to 4,096) are read whole and scored exactly. Equality
+  and `IN` conditions on properties with a range index take their ids from
+  the index instead. It used to
   widen the index search through rounds that each read their whole
   over-fetch, then scan every node of the label in full. Results are the
   same exact top-k.
@@ -59,8 +72,9 @@ crates.io release will establish and document that API explicitly.
 - Count seeds run on a dedicated background runtime, so a seed still in
   flight when a caller's runtime shuts down cannot wedge the shared
   object-range cache.
-- No on-disk format changes. A store written by this release opens with
-  3.4.x and back.
+- No incompatible on-disk format change. A store written by this release
+  opens with 3.4.x and back: the raw-block exact pages are ordinary zstd
+  frames to an earlier reader.
 
 ## [3.4.2] - 2026-11-17
 

@@ -20,7 +20,8 @@ pub mod external;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Write};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::mem::size_of;
 use std::ops::Range;
 use std::sync::Arc;
@@ -220,7 +221,14 @@ pub struct VectorV5Reader {
     footer_offset: u64,
     footer: Footer,
     metric: VectorMetric,
+    /// Per page: whether its exact block is a confirmed raw-block frame
+    /// (`RAW_UNKNOWN` until a query reads its frame header).
+    raw_pages: Box<[AtomicU8]>,
 }
+
+const RAW_UNKNOWN: u8 = 0;
+const RAW_YES: u8 = 1;
+const RAW_NO: u8 = 2;
 
 impl std::fmt::Debug for VectorV5Reader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -330,7 +338,14 @@ pub(crate) fn build_body_v5_with_filter_postings(
                 exact_raw.extend_from_slice(&component.to_le_bytes());
             }
         }
-        let exact_ref = append_compressed_block(&mut body, &exact_raw, options.compression_level)?;
+        #[cfg(test)]
+        let exact_ref = if tests::COMPRESS_EXACT.with(|flag| flag.get()) {
+            append_compressed_block(&mut body, &exact_raw, options.compression_level)?
+        } else {
+            append_raw_frame_block(&mut body, &exact_raw)?
+        };
+        #[cfg(not(test))]
+        let exact_ref = append_raw_frame_block(&mut body, &exact_raw)?;
         page_refs.push(PageRef {
             row_count: u32::try_from(leaf.len())
                 .map_err(|_| Error::invariant("vector v5 page exceeds u32 rows"))?,
@@ -435,12 +450,24 @@ impl VectorV5Reader {
         let footer: Footer = deserialize(&footer_bytes, footer_len, "footer")?;
         let metric = parse_metric(&footer.metric)?;
         validate_footer(&footer, footer_offset)?;
+        let raw_pages = footer
+            .pages
+            .iter()
+            .map(|page| {
+                AtomicU8::new(if raw_frame_candidate(&page.exact) {
+                    RAW_UNKNOWN
+                } else {
+                    RAW_NO
+                })
+            })
+            .collect();
         Ok(Self {
             source,
             file_len,
             footer_offset,
             footer,
             metric,
+            raw_pages,
         })
     }
 
@@ -568,7 +595,10 @@ impl VectorV5Reader {
             .await?;
         let supported_groups = prepare_groups(&self.footer.filter_properties, groups);
         let applied_filter_groups = supported_groups.len();
-        let leaf_order = self.rank_leaf_pages(query)?;
+        let leaf_order = {
+            namidb_core::profile_scope!("v5.rank_leaves");
+            self.rank_leaf_pages(query)?
+        };
 
         let mut approximate = BoundedApproxCandidates::new(rerank_k);
         let mut eligible_rows_seen = 0usize;
@@ -582,7 +612,10 @@ impl VectorV5Reader {
                     .iter()
                     .map(|page| self.footer.pages[*page as usize].nav.range())
                     .collect::<Result<Vec<_>, _>>()?;
-                let blocks = self.source.read_ranges(&ranges).await?;
+                let blocks = {
+                    namidb_core::profile_scope!("v5.nav.read");
+                    self.source.read_ranges(&ranges).await?
+                };
                 if blocks.len() != ranges.len() {
                     return Err(Error::invariant(
                         "vector v5 range source returned wrong nav block count",
@@ -597,8 +630,11 @@ impl VectorV5Reader {
                         "navigation block",
                     )?;
                     let page_ref = &self.footer.pages[page as usize];
-                    let nav =
-                        decode_nav_page(&wire, &page_ref.nav, page_ref.row_count, self.footer.dim)?;
+                    let nav = {
+                        namidb_core::profile_scope!("v5.nav.decode");
+                        decode_nav_page(&wire, &page_ref.nav, page_ref.row_count, self.footer.dim)?
+                    };
+                    namidb_core::profile_scope!("v5.nav.score");
                     score_nav_page_bounded(
                         self.metric,
                         query,
@@ -642,19 +678,97 @@ impl VectorV5Reader {
             page_groups.push((page, candidate_start, candidate_end));
             candidate_start = candidate_end;
         }
+        let row_bytes = (self.footer.dim as usize)
+            .checked_mul(4)
+            .ok_or_else(|| Error::invariant("vector v5 row byte size overflows"))?;
+        let query_norms = QueryNorms::of(query);
         for wave in page_groups.chunks(workspace_plan.exact_batch_pages.max(1)) {
-            let ranges = wave
+            // Pages stored as raw-block frames serve just the candidate rows;
+            // a page whose layout or rows do not check out is read whole.
+            let mut whole = Vec::new();
+            let mut spans = Vec::new();
+            let mut plans = Vec::new();
+            for &(page, candidate_start, candidate_end) in wave {
+                let exact = &self.footer.pages[page as usize].exact;
+                let state = self.raw_pages[page as usize].load(AtomicOrdering::Relaxed);
+                if state == RAW_NO {
+                    whole.push((page, candidate_start, candidate_end));
+                    continue;
+                }
+                let header = (state == RAW_UNKNOWN).then(|| {
+                    spans.push(raw_frame_header_range(exact));
+                    spans.len() - 1
+                });
+                let rows = plan_raw_rows(
+                    exact,
+                    &approximate[candidate_start..candidate_end],
+                    row_bytes as u64,
+                    &mut spans,
+                );
+                plans.push((page, candidate_start, candidate_end, header, rows));
+            }
+            if !spans.is_empty() {
+                let parts = {
+                    namidb_core::profile_scope!("v5.exact.read_rows");
+                    self.source.read_ranges(&spans).await?
+                };
+                if parts.len() != spans.len() {
+                    return Err(Error::invariant(
+                        "vector v5 range source returned wrong exact row count",
+                    ));
+                }
+                namidb_core::profile_scope!("v5.exact.score_rows");
+                for (page, candidate_start, candidate_end, header, rows) in plans {
+                    let exact = &self.footer.pages[page as usize].exact;
+                    if let Some(header) = header {
+                        let raw = parts[header].as_ref() == raw_frame_header(exact.raw_len);
+                        self.raw_pages[page as usize].store(
+                            if raw { RAW_YES } else { RAW_NO },
+                            AtomicOrdering::Relaxed,
+                        );
+                        if !raw {
+                            whole.push((page, candidate_start, candidate_end));
+                            continue;
+                        }
+                    }
+                    let scored = score_raw_rows(
+                        self.metric,
+                        query,
+                        &query_norms,
+                        &parts,
+                        &spans,
+                        &approximate[candidate_start..candidate_end],
+                        &rows,
+                        row_bytes,
+                    );
+                    match scored {
+                        Some(scored) => {
+                            for (id, score) in scored {
+                                exact_hits.insert(self.metric, id, score);
+                            }
+                        }
+                        None => whole.push((page, candidate_start, candidate_end)),
+                    }
+                }
+            }
+            if whole.is_empty() {
+                continue;
+            }
+            let ranges = whole
                 .iter()
                 .map(|(page, _, _)| self.footer.pages[*page as usize].exact.range())
                 .collect::<Result<Vec<_>, _>>()?;
-            let wires = self.source.read_ranges(&ranges).await?;
+            let wires = {
+                namidb_core::profile_scope!("v5.exact.read");
+                self.source.read_ranges(&ranges).await?
+            };
             if wires.len() != ranges.len() {
                 return Err(Error::invariant(
                     "vector v5 range source returned wrong exact block count",
                 ));
             }
             for ((&(page, candidate_start, candidate_end), wire), range) in
-                wave.iter().zip(wires).zip(ranges)
+                whole.iter().zip(wires).zip(ranges)
             {
                 require_len(
                     &wire,
@@ -663,6 +777,7 @@ impl VectorV5Reader {
                     "exact block",
                 )?;
                 let page_ref = &self.footer.pages[page as usize];
+                namidb_core::profile_scope!("v5.exact.decode_score");
                 let raw = decode_block(&wire, &page_ref.exact, "exact page")?;
                 let expected = (page_ref.row_count as usize)
                     .checked_mul(self.footer.dim as usize)
@@ -674,9 +789,6 @@ impl VectorV5Reader {
                         raw.len()
                     )));
                 }
-                let row_bytes = (self.footer.dim as usize)
-                    .checked_mul(4)
-                    .ok_or_else(|| Error::invariant("vector v5 row byte size overflows"))?;
                 for candidate in &approximate[candidate_start..candidate_end] {
                     let start = (candidate.row as usize)
                         .checked_mul(row_bytes)
@@ -687,14 +799,7 @@ impl VectorV5Reader {
                     let row = raw
                         .get(start..end)
                         .ok_or_else(|| Error::invariant("vector v5 exact row out of range"))?;
-                    let mut vector = Vec::with_capacity(self.footer.dim as usize);
-                    for bytes in row.chunks_exact(4) {
-                        vector.push(f32::from_le_bytes(
-                            bytes
-                                .try_into()
-                                .map_err(|_| Error::invariant("vector v5 invalid f32 bytes"))?,
-                        ));
-                    }
+                    let vector = f32_row(row);
                     let score = metric_score(self.metric, &vector, query).0 as f32;
                     exact_hits.insert(self.metric, candidate.id, score);
                 }
@@ -882,6 +987,8 @@ struct ApproxCandidate {
     row: u32,
     id: [u8; 16],
     score: f32,
+    /// Quantization step of the row's int8 code.
+    scale: f32,
     visit_order: u64,
 }
 
@@ -1640,6 +1747,7 @@ fn score_nav_page_bounded(
                     .map_err(|_| Error::invariant("vector v5 row exceeds u32"))?,
                 id: nav.ids[row],
                 score,
+                scale,
                 visit_order: *visit_order,
             },
         );
@@ -1668,38 +1776,66 @@ fn row_matches_filters(
     })
 }
 
+/// Score of `query` against the int8 code `codes * scale`. The sums run in
+/// eight fixed lanes so the compiler can vectorise them while the result stays
+/// deterministic on every platform (no reassociation is left to the compiler).
 fn approximate_score(metric: VectorMetric, query: &[f32], codes: &[i8], scale: f32) -> f32 {
+    const LANES: usize = 8;
+    let len = query.len().min(codes.len());
+    let (query, codes) = (&query[..len], &codes[..len]);
+    let split = len - len % LANES;
     match metric {
-        VectorMetric::Dot => query
-            .iter()
-            .zip(codes)
-            .map(|(query, code)| *query * (*code as f32 * scale))
-            .sum(),
-        VectorMetric::Cosine => {
-            let mut dot = 0.0f32;
-            let mut query_norm = 0.0f32;
-            let mut vector_norm = 0.0f32;
-            for (query, code) in query.iter().zip(codes) {
-                let vector = *code as f32 * scale;
-                dot += *query * vector;
-                query_norm += *query * *query;
-                vector_norm += vector * vector;
+        VectorMetric::Dot | VectorMetric::Cosine => {
+            let mut dot = [0.0f32; LANES];
+            let mut query_norm = [0.0f32; LANES];
+            let mut code_norm = [0i32; LANES];
+            for (q, c) in query[..split]
+                .chunks_exact(LANES)
+                .zip(codes[..split].chunks_exact(LANES))
+            {
+                for lane in 0..LANES {
+                    let code = c[lane] as f32;
+                    dot[lane] += q[lane] * code;
+                    query_norm[lane] += q[lane] * q[lane];
+                    code_norm[lane] += c[lane] as i32 * c[lane] as i32;
+                }
             }
-            if query_norm == 0.0 || vector_norm == 0.0 {
+            let mut dot_sum = dot.iter().sum::<f32>();
+            let mut query_sum = query_norm.iter().sum::<f32>();
+            let mut code_sum = code_norm.iter().map(|v| *v as i64).sum::<i64>();
+            for (q, c) in query[split..].iter().zip(&codes[split..]) {
+                dot_sum += *q * *c as f32;
+                query_sum += *q * *q;
+                code_sum += *c as i64 * *c as i64;
+            }
+            if metric == VectorMetric::Dot {
+                return dot_sum * scale;
+            }
+            // cos(q, s·c) = q·c / (|q| |c|) for any positive scale s.
+            if query_sum == 0.0 || code_sum == 0 || scale == 0.0 {
                 0.0
             } else {
-                dot / (query_norm.sqrt() * vector_norm.sqrt())
+                dot_sum / (query_sum.sqrt() * (code_sum as f32).sqrt())
             }
         }
-        VectorMetric::Euclidean => query
-            .iter()
-            .zip(codes)
-            .map(|(query, code)| {
-                let delta = *query - *code as f32 * scale;
-                delta * delta
-            })
-            .sum::<f32>()
-            .sqrt(),
+        VectorMetric::Euclidean => {
+            let mut sum = [0.0f32; LANES];
+            for (q, c) in query[..split]
+                .chunks_exact(LANES)
+                .zip(codes[..split].chunks_exact(LANES))
+            {
+                for lane in 0..LANES {
+                    let delta = q[lane] - c[lane] as f32 * scale;
+                    sum[lane] += delta * delta;
+                }
+            }
+            let mut total = sum.iter().sum::<f32>();
+            for (q, c) in query[split..].iter().zip(&codes[split..]) {
+                let delta = *q - *c as f32 * scale;
+                total += delta * delta;
+            }
+            total.sqrt()
+        }
     }
 }
 
@@ -1785,7 +1921,7 @@ fn decode_nav_page(
     dim: u32,
 ) -> Result<NavPage, Error> {
     let raw = decode_block(wire, block, "navigation page")?;
-    let nav: NavPage = deserialize(&raw, block.raw_len as u64, "navigation page")?;
+    let nav = decode_nav_raw(&raw)?;
     let rows = expected_rows as usize;
     let expected_codes = rows
         .checked_mul(dim as usize)
@@ -1827,6 +1963,385 @@ fn decode_nav_page(
     Ok(nav)
 }
 
+/// Decode a navigation page's bincode body (fixint, little endian, no
+/// trailing bytes) without a per-element serde visit: the code and scale
+/// arrays, which are nearly all of the page, are copied in bulk. Accepts and
+/// rejects exactly what [`deserialize`] does for [`NavPage`].
+fn decode_nav_raw(raw: &[u8]) -> Result<NavPage, Error> {
+    struct Cursor<'a> {
+        bytes: &'a [u8],
+    }
+    fn short() -> Error {
+        Error::invariant("vector v5 navigation page decode failed: truncated")
+    }
+    impl<'a> Cursor<'a> {
+        fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+            if self.bytes.len() < n {
+                return Err(short());
+            }
+            let (head, tail) = self.bytes.split_at(n);
+            self.bytes = tail;
+            Ok(head)
+        }
+        fn len(&mut self, element_bytes: usize) -> Result<usize, Error> {
+            let len = u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes"));
+            // A length whose elements cannot fit in what is left is truncated
+            // input, checked before any allocation.
+            let len = usize::try_from(len).map_err(|_| short())?;
+            if len.checked_mul(element_bytes).is_none_or(|n| n > self.bytes.len()) {
+                return Err(short());
+            }
+            Ok(len)
+        }
+        fn string(&mut self) -> Result<String, Error> {
+            let len = self.len(1)?;
+            String::from_utf8(self.take(len)?.to_vec()).map_err(|_| {
+                Error::invariant("vector v5 navigation page decode failed: invalid utf-8")
+            })
+        }
+    }
+    let mut cursor = Cursor { bytes: raw };
+    let rows = cursor.len(16)?;
+    let ids = cursor
+        .take(rows * 16)?
+        .chunks_exact(16)
+        .map(|id| id.try_into().expect("16 bytes"))
+        .collect();
+    let code_len = cursor.len(1)?;
+    let codes = cursor
+        .take(code_len)?
+        .iter()
+        .map(|byte| *byte as i8)
+        .collect();
+    let scale_len = cursor.len(4)?;
+    let scales = cursor
+        .take(scale_len * 4)?
+        .chunks_exact(4)
+        .map(|scale| f32::from_le_bytes(scale.try_into().expect("4 bytes")))
+        .collect();
+    let mut filters = BTreeMap::new();
+    let properties = cursor.len(8 + 8)?;
+    for _ in 0..properties {
+        let property = cursor.string()?;
+        let mut values = BTreeMap::new();
+        let value_count = cursor.len(8 + 8)?;
+        for _ in 0..value_count {
+            let value = cursor.string()?;
+            let words = cursor.len(8)?;
+            let bitmap = cursor
+                .take(words * 8)?
+                .chunks_exact(8)
+                .map(|word| u64::from_le_bytes(word.try_into().expect("8 bytes")))
+                .collect();
+            values.insert(value, bitmap);
+        }
+        filters.insert(property, values);
+    }
+    if !cursor.bytes.is_empty() {
+        return Err(Error::invariant(
+            "vector v5 navigation page decode failed: trailing bytes",
+        ));
+    }
+    Ok(NavPage {
+        ids,
+        codes,
+        scales,
+        filters,
+    })
+}
+
+/// Raw-content bytes per block of a stored exact page (the zstd maximum).
+const RAW_FRAME_BLOCK_BYTES: u64 = 128 * 1024;
+/// Magic, a single-segment descriptor with a 4-byte content size, the size.
+const RAW_FRAME_HEADER_BYTES: u64 = 9;
+const RAW_FRAME_BLOCK_HEADER_BYTES: u64 = 3;
+
+/// Exact f32 pages are written as zstd frames made only of raw (stored)
+/// blocks. Any zstd decoder, including every earlier V5 reader, decodes them
+/// like any other page, while a reader that recognises the layout can range
+/// read a single row instead of the whole page: re-ranking needs a handful of
+/// rows per page, and f32 embeddings barely compress anyway.
+fn raw_frame_header(raw_len: u32) -> [u8; RAW_FRAME_HEADER_BYTES as usize] {
+    let mut header = [0u8; RAW_FRAME_HEADER_BYTES as usize];
+    header[..4].copy_from_slice(&0xFD2F_B528u32.to_le_bytes());
+    // Frame_Content_Size_flag = 2 (4 bytes), Single_Segment_flag = 1.
+    header[4] = 0b1010_0000;
+    header[5..].copy_from_slice(&raw_len.to_le_bytes());
+    header
+}
+
+fn raw_frame_block_count(raw_len: u64) -> u64 {
+    raw_len.div_ceil(RAW_FRAME_BLOCK_BYTES).max(1)
+}
+
+fn raw_frame_block_header(raw_len: u64, block: u64) -> [u8; RAW_FRAME_BLOCK_HEADER_BYTES as usize] {
+    let size = raw_len
+        .saturating_sub(block * RAW_FRAME_BLOCK_BYTES)
+        .min(RAW_FRAME_BLOCK_BYTES) as u32;
+    let last = u32::from(block + 1 == raw_frame_block_count(raw_len));
+    // Last_Block bit, Block_Type 0 (raw), Block_Size.
+    let value = last | (size << 3);
+    let bytes = value.to_le_bytes();
+    [bytes[0], bytes[1], bytes[2]]
+}
+
+/// Wire length of a raw-block frame holding `raw_len` bytes.
+fn raw_frame_len(raw_len: u64) -> u64 {
+    RAW_FRAME_HEADER_BYTES + raw_frame_block_count(raw_len) * RAW_FRAME_BLOCK_HEADER_BYTES + raw_len
+}
+
+/// `Write` adapter that emits exactly `raw_len` bytes as a raw-block frame.
+struct RawFrameEncoder<W: Write> {
+    inner: W,
+    raw_len: u64,
+    written: u64,
+}
+
+impl<W: Write> RawFrameEncoder<W> {
+    fn new(mut inner: W, raw_len: u64) -> Result<Self, Error> {
+        let header_len = u32::try_from(raw_len)
+            .map_err(|_| Error::invariant("vector v5 exact page exceeds u32 bytes"))?;
+        inner.write_all(&raw_frame_header(header_len))?;
+        if raw_len == 0 {
+            inner.write_all(&raw_frame_block_header(0, 0))?;
+        }
+        Ok(Self {
+            inner,
+            raw_len,
+            written: 0,
+        })
+    }
+
+    fn finish(self) -> Result<W, Error> {
+        if self.written != self.raw_len {
+            return Err(Error::invariant(format!(
+                "vector v5 exact page wrote {} of {} bytes",
+                self.written, self.raw_len
+            )));
+        }
+        Ok(self.inner)
+    }
+}
+
+impl<W: Write> Write for RawFrameEncoder<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.written >= self.raw_len {
+            return Err(std::io::Error::other("raw frame content exceeds its length"));
+        }
+        let offset_in_block = self.written % RAW_FRAME_BLOCK_BYTES;
+        if offset_in_block == 0 {
+            let block = self.written / RAW_FRAME_BLOCK_BYTES;
+            self.inner
+                .write_all(&raw_frame_block_header(self.raw_len, block))?;
+        }
+        let room = (RAW_FRAME_BLOCK_BYTES - offset_in_block).min(self.raw_len - self.written);
+        let take = bytes.len().min(room as usize);
+        self.inner.write_all(&bytes[..take])?;
+        self.written += take as u64;
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Append `raw` as a raw-block frame (an exact page).
+fn append_raw_frame_block(output: &mut Vec<u8>, raw: &[u8]) -> Result<BlockRef, Error> {
+    let raw_len = raw.len() as u64;
+    if raw_len > MAX_RAW_BLOCK_BYTES || raw_frame_len(raw_len) > MAX_COMPRESSED_BLOCK_BYTES {
+        return Err(Error::invariant(format!(
+            "vector v5 exact page too large ({raw_len} bytes)"
+        )));
+    }
+    let offset = output.len();
+    let mut encoder = RawFrameEncoder::new(&mut *output, raw_len)?;
+    encoder.write_all(raw)?;
+    encoder.finish()?;
+    let wire = &output[offset..];
+    Ok(BlockRef {
+        offset: offset as u64,
+        len: u32::try_from(wire.len())
+            .map_err(|_| Error::invariant("vector v5 exact page exceeds u32"))?,
+        raw_len: u32::try_from(raw_len)
+            .map_err(|_| Error::invariant("vector v5 raw block exceeds u32"))?,
+        crc32: crc32fast::hash(wire),
+    })
+}
+
+/// Whether `block`'s length is that of a raw-block frame of its raw length.
+/// The frame header is then checked once per page and every row against its
+/// code; anything else takes the whole-page path.
+fn raw_frame_candidate(block: &BlockRef) -> bool {
+    block.raw_len > 0 && block.len as u64 == raw_frame_len(block.raw_len as u64)
+}
+
+fn raw_frame_header_range(block: &BlockRef) -> Range<u64> {
+    block.offset..block.offset + RAW_FRAME_HEADER_BYTES
+}
+
+/// Absolute object ranges holding raw bytes `raw` of a raw-block frame (more
+/// than one when the bytes straddle a block header).
+fn raw_content_ranges(block: &BlockRef, raw: Range<u64>) -> Vec<Range<u64>> {
+    let raw_len = block.raw_len as u64;
+    let mut ranges = Vec::with_capacity(1);
+    let mut cursor = raw.start;
+    while cursor < raw.end {
+        let index = cursor / RAW_FRAME_BLOCK_BYTES;
+        let block_raw_end = ((index + 1) * RAW_FRAME_BLOCK_BYTES).min(raw_len);
+        let content_start = block.offset
+            + RAW_FRAME_HEADER_BYTES
+            + index * (RAW_FRAME_BLOCK_HEADER_BYTES + RAW_FRAME_BLOCK_BYTES)
+            + RAW_FRAME_BLOCK_HEADER_BYTES;
+        let end = raw.end.min(block_raw_end);
+        ranges.push(
+            content_start + (cursor - index * RAW_FRAME_BLOCK_BYTES)
+                ..content_start + (end - index * RAW_FRAME_BLOCK_BYTES),
+        );
+        cursor = end;
+    }
+    ranges
+}
+
+/// Rows closer than this are fetched in one range.
+const RAW_ROW_COALESCE_GAP: u64 = 32 * 1024;
+
+/// One row's bytes: `(span, offset in span, length)` pieces.
+type RawRowPieces = Vec<(usize, usize, usize)>;
+
+/// Append the ranges holding `candidates`' rows (sorted by row) to `spans`,
+/// merging nearby rows, and return where each row's pieces live.
+fn plan_raw_rows(
+    exact: &BlockRef,
+    candidates: &[ApproxCandidate],
+    row_bytes: u64,
+    spans: &mut Vec<Range<u64>>,
+) -> Vec<RawRowPieces> {
+    let first_span = spans.len();
+    let mut rows = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let raw_start = candidate.row as u64 * row_bytes;
+        let mut pieces = Vec::with_capacity(1);
+        for range in raw_content_ranges(exact, raw_start..raw_start + row_bytes) {
+            let merge = spans.len() > first_span
+                && spans.last().is_some_and(|last| {
+                    range.start >= last.start && range.start <= last.end + RAW_ROW_COALESCE_GAP
+                });
+            if merge {
+                let last = spans.last_mut().expect("checked");
+                last.end = last.end.max(range.end);
+            } else {
+                spans.push(range.clone());
+            }
+            let span = spans.len() - 1;
+            pieces.push((
+                span,
+                (range.start - spans[span].start) as usize,
+                (range.end - range.start) as usize,
+            ));
+        }
+        rows.push(pieces);
+    }
+    rows
+}
+
+fn f32_row(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes(value.try_into().expect("4 bytes")))
+        .collect()
+}
+
+/// `‖q‖₁` and `‖q‖₂` of a query, for the code-consistency check.
+struct QueryNorms {
+    l1: f64,
+    l2: f64,
+}
+
+impl QueryNorms {
+    fn of(query: &[f32]) -> Self {
+        Self {
+            l1: query.iter().map(|v| (*v as f64).abs()).sum(),
+            l2: query.iter().map(|v| *v as f64 * *v as f64).sum::<f64>().sqrt(),
+        }
+    }
+}
+
+/// Whether an exact row read by range agrees with the checksummed int8 code
+/// it was ranked by. Every coordinate of a code is within half a step of the
+/// row (`|x_i − ŝc_i| ≤ s/2`, no clamping since `s = max|x|/127`), which bounds
+/// how far the exact score can be from the approximate one. A row read from
+/// the wrong place or damaged bytes fails it and the page is re-read whole
+/// under its checksum. The tolerance is generous: this guards the layout, the
+/// whole-page checksum still guards the bits.
+fn exact_row_consistent(
+    metric: VectorMetric,
+    norms: &QueryNorms,
+    row: &[f32],
+    exact: f64,
+    candidate: &ApproxCandidate,
+) -> bool {
+    if !exact.is_finite() || row.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let half_step = candidate.scale as f64 * 0.5 * (1.0 + 1e-3) + 1e-9;
+    let error_l2 = half_step * (row.len() as f64).sqrt();
+    let row_norm = row.iter().map(|v| *v as f64 * *v as f64).sum::<f64>().sqrt();
+    let approx = candidate.score as f64;
+    let (bound, slack) = match metric {
+        VectorMetric::Dot => (half_step * norms.l1, 1e-3 * norms.l2 * row_norm + 1e-6),
+        VectorMetric::Cosine => {
+            if row_norm == 0.0 || norms.l2 == 0.0 {
+                return exact == 0.0 && approx == 0.0;
+            }
+            (2.0 * error_l2 / row_norm, 1e-3)
+        }
+        VectorMetric::Euclidean => (error_l2, 1e-3 * (norms.l2 + row_norm) + 1e-6),
+    };
+    (exact - approx).abs() <= bound + slack
+}
+
+/// Exact scores of `candidates` from rows read by range out of a raw-block
+/// frame, or `None` when a row's length or its agreement with its code does
+/// not check out.
+#[allow(clippy::too_many_arguments)]
+fn score_raw_rows(
+    metric: VectorMetric,
+    query: &[f32],
+    norms: &QueryNorms,
+    parts: &[Bytes],
+    spans: &[Range<u64>],
+    candidates: &[ApproxCandidate],
+    rows: &[RawRowPieces],
+    row_bytes: usize,
+) -> Option<Vec<([u8; 16], f32)>> {
+    let mut scored = Vec::with_capacity(candidates.len());
+    let mut row = Vec::with_capacity(row_bytes);
+    for (candidate, pieces) in candidates.iter().zip(rows) {
+        row.clear();
+        for &(span, offset, len) in pieces {
+            let part = parts.get(span)?;
+            if part.len() as u64 != spans[span].end - spans[span].start {
+                return None;
+            }
+            row.extend_from_slice(part.get(offset..offset + len)?);
+        }
+        if row.len() != row_bytes {
+            return None;
+        }
+        let vector = f32_row(&row);
+        let score = metric_score(metric, &vector, query).0;
+        if !exact_row_consistent(metric, norms, &vector, score, candidate) {
+            return None;
+        }
+        scored.push((candidate.id, score as f32));
+    }
+    Some(scored)
+}
+
 fn decode_block(wire: &[u8], block: &BlockRef, label: &str) -> Result<Vec<u8>, Error> {
     if wire.len() != block.len as usize {
         return Err(Error::invariant(format!(
@@ -1843,15 +2358,11 @@ fn decode_block(wire: &[u8], block: &BlockRef, label: &str) -> Result<Vec<u8>, E
             "vector v5 {label} checksum mismatch"
         )));
     }
-    let decoder = zstd::stream::read::Decoder::new(Cursor::new(wire))
-        .map_err(|error| Error::invariant(format!("vector v5 {label} decode failed: {error}")))?;
-    // Never trust the zstd frame's advertised content size. Bound expansion by
-    // the checksummed directory's already-capped raw length (+1 to detect a
-    // lying frame) before allocating the output.
-    let mut limited = decoder.take(block.raw_len as u64 + 1);
-    let mut raw = Vec::with_capacity(block.raw_len as usize);
-    limited
-        .read_to_end(&mut raw)
+    // Never trust the zstd frame's advertised content size: the output buffer
+    // is exactly the checksummed directory's (already capped) raw length, and
+    // a frame that would expand past it fails instead of growing it. One
+    // bulk call decodes several times faster than a streaming reader.
+    let raw = zstd::bulk::decompress(wire, block.raw_len as usize)
         .map_err(|error| Error::invariant(format!("vector v5 {label} decode failed: {error}")))?;
     if raw.len() != block.raw_len as usize {
         return Err(Error::invariant(format!(
@@ -2071,6 +2582,7 @@ fn validate_tree_reachability(footer: &Footer) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::io::Read;
     use std::sync::Mutex;
 
     use rand::{Rng, SeedableRng};
@@ -2079,6 +2591,11 @@ mod tests {
     use super::*;
     use crate::manifest::VectorQuantization;
     use crate::sst::vector::VectorFilterPosting;
+
+    thread_local! {
+        /// Build exact pages the way 3.4 and earlier did (zstd-compressed).
+        pub(super) static COMPRESS_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     #[derive(Debug)]
     struct TrackingSource {
@@ -2107,6 +2624,14 @@ mod tests {
 
         fn range_count(&self) -> usize {
             self.ranges.lock().expect("tracking lock").len()
+        }
+
+        fn longest_range_since(&self, first: usize) -> u64 {
+            self.ranges.lock().expect("tracking lock")[first..]
+                .iter()
+                .map(|range| range.end - range.start)
+                .max()
+                .unwrap_or(0)
         }
 
         fn max_batch_size(&self) -> usize {
@@ -2204,6 +2729,7 @@ mod tests {
                     } else {
                         (ordinal as f32 * 0.03125).sin()
                     },
+                    scale: 0.0,
                     visit_order: ordinal as u64,
                 })
                 .collect();
@@ -3042,5 +3568,244 @@ mod tests {
             "held {} compressed navigation pages at once",
             source.max_batch_size()
         );
+    }
+
+    #[test]
+    fn fast_nav_decoder_matches_bincode_and_rejects_what_it_rejects() {
+        let mut rng = ChaCha8Rng::seed_from_u64(11);
+        for (rows, dim, filter_props) in [(0usize, 4usize, 0usize), (1, 3, 0), (37, 8, 2), (512, 16, 1)] {
+            let words = rows.div_ceil(64);
+            let mut filters = BTreeMap::new();
+            for p in 0..filter_props {
+                let mut values = BTreeMap::new();
+                for v in 0..3 {
+                    values.insert(
+                        format!("válue-{v}"),
+                        (0..words).map(|_| rng.gen::<u64>()).collect::<Vec<_>>(),
+                    );
+                }
+                filters.insert(format!("prop{p}"), values);
+            }
+            let page = NavPage {
+                ids: (0..rows).map(|r| id(r as u32)).collect(),
+                codes: (0..rows * dim).map(|_| rng.gen::<i8>()).collect(),
+                scales: (0..rows).map(|_| rng.gen::<f32>()).collect(),
+                filters,
+            };
+            let raw = serialize(&page, "test").unwrap();
+            let slow: NavPage = deserialize(&raw, raw.len() as u64, "test").unwrap();
+            let fast = decode_nav_raw(&raw).unwrap();
+            assert_eq!(fast.ids, slow.ids);
+            assert_eq!(fast.codes, slow.codes);
+            assert_eq!(
+                fast.scales.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                slow.scales.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(fast.filters, slow.filters);
+            for cut in [0, 1, 7, 8, raw.len() / 2, raw.len().saturating_sub(1)] {
+                if cut < raw.len() {
+                    assert!(decode_nav_raw(&raw[..cut]).is_err(), "cut {cut}");
+                    assert!(deserialize::<NavPage>(&raw[..cut], raw.len() as u64, "t").is_err());
+                }
+            }
+            let mut trailing = raw.clone();
+            trailing.push(0);
+            assert!(decode_nav_raw(&trailing).is_err());
+        }
+        // A declared length larger than the input fails without allocating it.
+        let mut huge = u64::MAX.to_le_bytes().to_vec();
+        huge.extend([0u8; 32]);
+        assert!(decode_nav_raw(&huge).is_err());
+    }
+
+    #[test]
+    fn raw_frames_decode_with_every_zstd_reader() {
+        for len in [1usize, 4096, 131_071, 131_072, 131_073, 2 * 1024 * 1024 + 5] {
+            let raw: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let mut body = vec![7u8; 3];
+            let block = append_raw_frame_block(&mut body, &raw).unwrap();
+            assert!(raw_frame_candidate(&block));
+            let wire = &body[block.offset as usize..];
+            assert_eq!(wire.len() as u64, raw_frame_len(len as u64));
+            assert_eq!(decode_block(wire, &block, "t").unwrap(), raw);
+            // The streaming decoder earlier releases use.
+            let mut streamed = Vec::new();
+            zstd::stream::read::Decoder::new(Cursor::new(wire))
+                .unwrap()
+                .read_to_end(&mut streamed)
+                .unwrap();
+            assert_eq!(streamed, raw);
+            // Every row range maps back onto the raw content.
+            for (start, end) in [(0u64, 1u64), (len as u64 - 1, len as u64), (0, len as u64)] {
+                let mut bytes = Vec::new();
+                for range in raw_content_ranges(&block, start..end) {
+                    bytes.extend_from_slice(&body[range.start as usize..range.end as usize]);
+                }
+                assert_eq!(bytes, raw[start as usize..end as usize]);
+            }
+        }
+    }
+
+    fn rerank_members(rows: u32, dim: usize) -> Vec<([u8; 16], Vec<f32>)> {
+        let mut rng = ChaCha8Rng::seed_from_u64(29);
+        (0..rows)
+            .map(|ordinal| {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+                normalize(&mut v);
+                (id(ordinal), v)
+            })
+            .collect()
+    }
+
+    async fn build_reader(
+        metric: VectorMetric,
+        dim: usize,
+        members: Vec<([u8; 16], Vec<f32>)>,
+        compress_exact: bool,
+    ) -> (VectorV5Reader, Arc<TrackingSource>, Bytes) {
+        COMPRESS_EXACT.with(|flag| flag.set(compress_exact));
+        let built = build_body_v5(
+            &descriptor(metric, dim as u32),
+            members,
+            VectorV5BuildOptions {
+                target_rows_per_page: if dim >= 1024 { 512 } else { 64 },
+                branch_factor: 4,
+                compression_level: 1,
+            },
+        );
+        COMPRESS_EXACT.with(|flag| flag.set(false));
+        let (body, _) = built.expect("build").expect("body");
+        let source = Arc::new(TrackingSource::new(body.clone()));
+        let reader = VectorV5Reader::open(source.clone(), body.len() as u64)
+            .await
+            .expect("open");
+        (reader, source, body)
+    }
+
+    #[tokio::test]
+    async fn row_reads_return_what_whole_compressed_pages_return() {
+        // 3.4 bases (compressed exact pages) and 3.5 bases (raw frames) give
+        // the same hits and scores; the 3.5 base reads only candidate rows.
+        // dim 96 makes rows straddle the 128 KiB block boundaries.
+        for dim in [96usize, 1024] {
+            for metric in [VectorMetric::Cosine, VectorMetric::Dot, VectorMetric::Euclidean] {
+                let members = rerank_members(if dim >= 1024 { 2_000 } else { 600 }, dim);
+                let queries: Vec<Vec<f32>> = members.iter().step_by(97).map(|m| m.1.clone()).collect();
+                let (old, old_source, _) = build_reader(metric, dim, members.clone(), true).await;
+                let (new, new_source, _) = build_reader(metric, dim, members, false).await;
+                let options = VectorV5SearchOptions {
+                    nprobe: 3,
+                    max_nprobe: 3,
+                    rerank_factor: 8,
+                };
+                let page_bytes = if dim >= 1024 { 512 } else { 64 } * dim as u64 * 4;
+                for query in &queries {
+                    let before_old = old_source.bytes_read();
+                    let before_new = new_source.bytes_read();
+                    let first_new = new_source.range_count();
+                    let a = old.search(query, 10, options).await.expect("old");
+                    let b = new.search(query, 10, options).await.expect("new");
+                    assert_eq!(a, b, "{metric:?} dim {dim}");
+                    let old_bytes = old_source.bytes_read() - before_old;
+                    let new_bytes = new_source.bytes_read() - before_new;
+                    // Small rows coalesce into whole-page spans; wide ones
+                    // must cost a fraction of the pages.
+                    if dim >= 1024 {
+                        assert!(
+                            new_bytes * 2 < old_bytes,
+                            "{metric:?} dim {dim}: rows read {new_bytes} vs pages {old_bytes}"
+                        );
+                    }
+                    // No exact page was read whole.
+                    assert!(new_source.longest_range_since(first_new) < page_bytes);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_damaged_row_is_never_scored_silently() {
+        let dim = 64usize;
+        let members = rerank_members(300, dim);
+        let query = members[5].1.clone();
+        let (reader, _, body) = build_reader(VectorMetric::Cosine, dim, members, false).await;
+        let options = VectorV5SearchOptions {
+            nprobe: reader.page_count(),
+            max_nprobe: reader.page_count(),
+            rerank_factor: 32,
+        };
+        let hits = reader.search(&query, 5, options).await.expect("search");
+        assert_eq!(id_value(&hits[0].0), 5);
+        // Flip the exponent byte of one coordinate of row 5 wherever it lives.
+        let needle: Vec<u8> = query.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let at = body
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+            .expect("row 5 is stored contiguously");
+        let mut damaged = body.to_vec();
+        damaged[at + 4 * 7 + 3] ^= 0x40;
+        let damaged = Bytes::from(damaged);
+        let source = Arc::new(TrackingSource::new(damaged.clone()));
+        let reader = VectorV5Reader::open(source, damaged.len() as u64)
+            .await
+            .expect("open");
+        let result = reader.search(&query, 5, options).await;
+        assert!(result.is_err(), "damaged row must fail the page checksum: {result:?}");
+    }
+
+    /// Warm-cache CPU cost of one serving query on a realistic base:
+    /// `cargo test --release -p namidb-storage --features vector-index --lib
+    /// v5_warm_query_cost -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn v5_warm_query_cost() {
+        let rows: u32 = std::env::var("V5_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(60_000);
+        let dim = 1024usize;
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let members: Vec<_> = (0..rows)
+            .map(|ordinal| {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+                normalize(&mut v);
+                (id(ordinal), v)
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let (body, _) = build_body_v5(
+            &descriptor(VectorMetric::Cosine, dim as u32),
+            members,
+            VectorV5BuildOptions::default(),
+        )
+        .expect("build")
+        .expect("body");
+        eprintln!("built {} bytes in {:?}", body.len(), started.elapsed());
+        let source = Arc::new(TrackingSource::new(body.clone()));
+        let reader = VectorV5Reader::open(source, body.len() as u64).await.expect("open");
+        let pages = reader.page_count();
+        let options = VectorV5SearchOptions {
+            nprobe: 24.min(pages),
+            max_nprobe: 192.min(pages),
+            rerank_factor: 8,
+        };
+        let queries: Vec<Vec<f32>> = (0..50)
+            .map(|_| {
+                let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+                normalize(&mut v);
+                v
+            })
+            .collect();
+        for q in &queries[..5] {
+            reader.search(q, 10, options).await.expect("search");
+        }
+        let started = std::time::Instant::now();
+        for q in &queries {
+            reader.search(q, 10, options).await.expect("search");
+        }
+        eprintln!(
+            "pages={pages} per query {:?} (nprobe {}, rerank x{})",
+            started.elapsed() / queries.len() as u32,
+            options.nprobe,
+            options.rerank_factor
+        );
+        eprintln!("{}", namidb_core::profile::dump_table());
     }
 }

@@ -6588,8 +6588,11 @@ async fn vector_search_rows(
             let eligible = match flat_eligible.take() {
                 Some(known) => known,
                 None => {
-                    filtered_flat_eligible(snapshot, label_name, alias, property, filter, params)
-                        .await?
+                    let groups = prefilter.map_or(&[][..], |plan| plan.groups.as_slice());
+                    selective_filter_eligible(
+                        snapshot, label_name, alias, property, filter, groups, params,
+                    )
+                    .await?
                 }
             };
             if let Some(eligible) = eligible {
@@ -6757,6 +6760,30 @@ fn filter_property_projection(filter: &Expression, alias: &str) -> Option<BTreeS
     }
     let mut out = BTreeSet::new();
     (visit(filter, alias, &mut out) && !out.is_empty()).then_some(out)
+}
+
+/// Ids that contain every node a selective `filter` admits, or `None` when no
+/// cheap proof of a small set exists. First from equality/IN groups served by
+/// property indexes (a superset of the admitted nodes, since the groups are
+/// conjuncts of the filter), then by evaluating a property-only filter on its
+/// own columns. The caller re-evaluates the whole filter on each node.
+async fn selective_filter_eligible(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    alias: &str,
+    vector_property: &str,
+    filter: &Expression,
+    groups: &[(String, Vec<CoreValue>)],
+    params: &Params,
+) -> Result<Option<Vec<NodeId>>, ExecError> {
+    if !groups.is_empty() {
+        if let Some(ids) = resolve_capped_filter_eligibility(snapshot, label, groups).await? {
+            if ids.len() <= FILTERED_FLAT_ELIGIBLE_CAP {
+                return Ok(Some(ids.into_iter().collect()));
+            }
+        }
+    }
+    filtered_flat_eligible(snapshot, label, alias, vector_property, filter, params).await
 }
 
 /// Ids of the `label` nodes admitted by a property-only `filter`, read from
@@ -7370,9 +7397,16 @@ async fn try_index_search(
         // hydrates its whole over-fetch to evaluate the filter.
         if let Some(filter) = source_filter {
             if flat_eligible.is_none() {
-                let eligible =
-                    filtered_flat_eligible(snapshot, label, alias, property, filter, params)
-                        .await?;
+                let eligible = selective_filter_eligible(
+                    snapshot,
+                    label,
+                    alias,
+                    property,
+                    filter,
+                    filter_groups,
+                    params,
+                )
+                .await?;
                 let selective = eligible.is_some();
                 *flat_eligible = Some(eligible);
                 if selective {

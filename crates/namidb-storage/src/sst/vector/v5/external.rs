@@ -24,7 +24,7 @@ use super::{
     encode_vector_filter_value, metric_name, validate_build_options, BlockRef, CentroidNode,
     Footer, NavPage, PageRef, VectorGraphBuildStats, VectorIndexDescriptor, VectorMetric,
     VectorV5BuildOptions, FORMAT_VERSION, MAGIC_V5, MAX_COMPRESSED_BLOCK_BYTES, MAX_FOOTER_BYTES,
-    MAX_RAW_BLOCK_BYTES, TRAILER_MAGIC,
+    MAX_RAW_BLOCK_BYTES, RawFrameEncoder, TRAILER_MAGIC,
 };
 use crate::error::Error;
 
@@ -1377,7 +1377,6 @@ fn write_leaf_page(
         context.output,
         partition,
         dim,
-        context.options.compression_level,
         context.config.memory_budget_bytes,
         context.metrics,
     )?;
@@ -1485,7 +1484,6 @@ fn write_exact_block(
     output: &mut File,
     partition: &mut Partition,
     dim: usize,
-    compression_level: i32,
     memory_budget: usize,
     metrics: &mut VectorV5ExternalBuildMetrics,
 ) -> Result<BlockRef, Error> {
@@ -1497,8 +1495,10 @@ fn write_exact_block(
     validate_block_lengths(raw_len, "exact page")?;
     let offset = output.stream_position()?;
     let writer = CrcCountingWriter::new(output);
-    let mut encoder = zstd::stream::write::Encoder::new(writer, compression_level)
-        .map_err(|error| Error::invariant(format!("vector v5 exact zstd init failed: {error}")))?;
+    let mut encoder = std::io::BufWriter::with_capacity(
+        64 * 1024,
+        RawFrameEncoder::new(writer, raw_len)?,
+    );
     partition.rewind(dim)?;
     let mut rows = 0u64;
     while let Some(record) = read_record(partition.spool.as_file_mut(), dim, memory_budget)? {
@@ -1513,9 +1513,10 @@ fn write_exact_block(
             "vector v5 leaf row count changed while emitting exact page",
         ));
     }
-    let writer = encoder.finish().map_err(|error| {
-        Error::invariant(format!("vector v5 exact zstd finish failed: {error}"))
-    })?;
+    let writer = encoder
+        .into_inner()
+        .map_err(|error| Error::invariant(format!("vector v5 exact page flush failed: {error}")))?
+        .finish()?;
     let (wire_len, crc32) = writer.finish();
     make_block_ref(offset, wire_len, raw_len, crc32, "exact page")
 }
