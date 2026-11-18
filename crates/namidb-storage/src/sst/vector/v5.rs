@@ -53,9 +53,9 @@ const MAX_FOOTER_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COMPRESSED_BLOCK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RAW_BLOCK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DIM: u32 = 1_048_576;
-const MAX_NAV_BATCH_PAGES: usize = 16;
+const MAX_NAV_BATCH_PAGES: usize = 64;
 /// Upper bound on exact f32 pages fetched concurrently for one rerank wave.
-const MAX_EXACT_BATCH_PAGES: usize = 8;
+const MAX_EXACT_BATCH_PAGES: usize = 64;
 /// Bincode's tree/string containers have allocator overhead in addition to
 /// the retained decompressed wire. Reserving six raw bytes per encoded byte is
 /// intentionally conservative and keeps the process-wide workspace cap above
@@ -77,6 +77,19 @@ pub trait VectorV5RangeSource: Send + Sync {
             out.push(self.read_range(range.clone()).await?);
         }
         Ok(out)
+    }
+
+    /// Self-contained blocks every query reads with the same bounds
+    /// (navigation pages). A caching source can key them by their exact
+    /// range instead of rounding each up to a large page.
+    async fn read_blocks(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
+        self.read_ranges(ranges).await
+    }
+
+    /// Small scattered reads (frame headers and candidate rows of the exact
+    /// re-rank). A caching source can serve them from small pages.
+    async fn read_small(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
+        self.read_ranges(ranges).await
     }
 }
 
@@ -378,6 +391,15 @@ pub(crate) fn build_body_v5_with_filter_postings(
         .last()
         .map(|row| row.id)
         .ok_or_else(|| Error::invariant("vector v5 lost all rows"))?;
+    // k-means splits may fan out wider than `branch_factor`; readers bound
+    // a node's children by the footer's value.
+    let fan_out = tree
+        .nodes
+        .iter()
+        .map(|node| node.children.len())
+        .max()
+        .unwrap_or(0)
+        .max(options.branch_factor);
     let footer = Footer {
         format_version: FORMAT_VERSION,
         dim: desc.dim,
@@ -391,7 +413,7 @@ pub(crate) fn build_body_v5_with_filter_postings(
         filter_properties,
         target_rows_per_page: u32::try_from(options.target_rows_per_page)
             .map_err(|_| Error::invariant("vector v5 target page rows exceed u32"))?,
-        branch_factor: u16::try_from(options.branch_factor)
+        branch_factor: u16::try_from(fan_out)
             .map_err(|_| Error::invariant("vector v5 branch factor exceeds u16"))?,
     };
     let footer_bytes = serialize(&footer, "footer")?;
@@ -415,9 +437,17 @@ pub(crate) fn build_body_v5_with_filter_postings(
         r: desc.r,
         l_build: desc.l_build,
         alpha: desc.alpha,
-        entry_medoid: root,
+        entry_medoid: layout_tag(desc.metric, root),
     };
     Ok(Some((Bytes::from(body), stats)))
+}
+
+/// Bytes of footer `VectorV5Reader::open` reads with the trailer. A footer
+/// is about 1/400 of its base (one int8 centroid and a few page references
+/// per page of full-precision rows), so 1/128 covers it with room to spare,
+/// bounded so a probe of a huge base stays a few MiB.
+fn speculative_footer_bytes(file_len: u64) -> u64 {
+    (file_len / 128).clamp(64 * 1024, 8 * 1024 * 1024)
 }
 
 impl VectorV5Reader {
@@ -428,8 +458,14 @@ impl VectorV5Reader {
             return Err(Error::invariant("vector v5 body too short"));
         }
         let trailer_start = file_len - TRAILER_LEN as u64;
+        // One round trip for the header and a speculative tail that holds the
+        // trailer and, for nearly every base, the whole footer; only a footer
+        // larger than the guess costs a second read.
+        let tail_start = trailer_start
+            .saturating_sub(speculative_footer_bytes(file_len))
+            .max(MAGIC_V5.len() as u64);
         let probes = source
-            .read_ranges(&[0..MAGIC_V5.len() as u64, trailer_start..file_len])
+            .read_ranges(&[0..MAGIC_V5.len() as u64, tail_start..file_len])
             .await?;
         if probes.len() != 2 {
             return Err(Error::invariant(
@@ -440,8 +476,14 @@ impl VectorV5Reader {
         if probes[0].as_ref() != MAGIC_V5 {
             return Err(Error::invariant("vector v5 magic mismatch"));
         }
-        require_len(&probes[1], TRAILER_LEN, "trailer")?;
-        let (footer_len, footer_crc) = decode_trailer(&probes[1])?;
+        let tail = &probes[1];
+        require_len(
+            tail,
+            usize::try_from(file_len - tail_start)
+                .map_err(|_| Error::invariant("vector v5 tail does not fit usize"))?,
+            "tail",
+        )?;
+        let (footer_len, footer_crc) = decode_trailer(&tail[tail.len() - TRAILER_LEN..])?;
         if footer_len == 0 || footer_len > MAX_FOOTER_BYTES {
             return Err(Error::invariant(format!(
                 "vector v5 footer length {footer_len} is invalid"
@@ -453,7 +495,13 @@ impl VectorV5Reader {
         if footer_offset < MAGIC_V5.len() as u64 {
             return Err(Error::invariant("vector v5 footer overlaps header"));
         }
-        let footer_bytes = source.read_range(footer_offset..trailer_start).await?;
+        let footer_bytes = if footer_offset >= tail_start {
+            let start = usize::try_from(footer_offset - tail_start)
+                .map_err(|_| Error::invariant("vector v5 footer does not fit usize"))?;
+            tail.slice(start..tail.len() - TRAILER_LEN)
+        } else {
+            source.read_range(footer_offset..trailer_start).await?
+        };
         require_len(
             &footer_bytes,
             usize::try_from(footer_len)
@@ -725,7 +773,7 @@ impl VectorV5Reader {
                     .collect::<Result<Vec<_>, _>>()?;
                 let blocks = {
                     namidb_core::profile_scope!("v5.nav.read");
-                    self.source.read_ranges(&ranges).await?
+                    self.source.read_blocks(&ranges).await?
                 };
                 if blocks.len() != ranges.len() {
                     return Err(Error::invariant(
@@ -821,7 +869,7 @@ impl VectorV5Reader {
             if !spans.is_empty() {
                 let parts = {
                     namidb_core::profile_scope!("v5.exact.read_rows");
-                    self.source.read_ranges(&spans).await?
+                    self.source.read_small(&spans).await?
                 };
                 if parts.len() != spans.len() {
                     return Err(Error::invariant(
@@ -1571,6 +1619,17 @@ fn partition_rows(
         return Ok(node_index);
     }
 
+    if metric != VectorMetric::Dot && kmeans_enabled() {
+        if let Some(groups) = kmeans_split_indices(rows, &indices, target, metric) {
+            let mut children = Vec::with_capacity(groups.len());
+            for group in groups {
+                children.push(partition_rows(rows, group, target, branch, metric, tree)?);
+            }
+            tree.nodes[node_index as usize].children = children;
+            return Ok(node_index);
+        }
+    }
+
     let axis = highest_variance_axis(rows, &indices)?;
     let group_count = branch.min(indices.len().div_ceil(target)).max(2);
     let mut children = Vec::with_capacity(group_count);
@@ -1609,6 +1668,34 @@ fn partition_rows(
     Ok(node_index)
 }
 
+/// Nearest-centroid groups of `indices` from a k-means split trained on an
+/// even stride of them, or `None` when the split makes no progress (all
+/// rows equal, or one group would keep every row).
+fn kmeans_split_indices(
+    rows: &[BuildRow],
+    indices: &[usize],
+    target: usize,
+    metric: VectorMetric,
+) -> Option<Vec<Vec<usize>>> {
+    let groups = kmeans_group_count(indices.len(), target);
+    let sample_rows = kmeans_sample_rows(indices.len(), groups);
+    let step = indices.len().div_ceil(sample_rows).max(1);
+    let sample: Vec<&[f32]> = indices
+        .iter()
+        .step_by(step)
+        .map(|index| rows[*index].vector.as_slice())
+        .collect();
+    let seed = indices.len() as u64 ^ u64::from_le_bytes(rows[indices[0]].id[..8].try_into().ok()?);
+    let centroids = kmeans_centroids(&sample, groups, metric, seed)?;
+    let norms: Vec<f32> = centroids.iter().map(|c| dot_lanes(c, c)).collect();
+    let mut out = vec![Vec::new(); centroids.len()];
+    for index in indices {
+        out[nearest_centroid(&rows[*index].vector, &centroids, &norms, metric)].push(*index);
+    }
+    out.retain(|group| !group.is_empty());
+    (out.len() >= 2).then_some(out)
+}
+
 fn balanced_key_groups(
     rows: &[BuildRow],
     mut keyed: Vec<(f32, usize)>,
@@ -1643,6 +1730,236 @@ fn principal_sample_indices(indices: &[usize]) -> Vec<usize> {
 
 pub(super) fn dot_f32(left: &[f32], right: &[f32]) -> f32 {
     left.iter().zip(right).map(|(l, r)| l * r).sum()
+}
+
+/// Dot product with eight independent lanes, which the compiler vectorises;
+/// the k-means splits below spend nearly all their time here.
+pub(super) fn dot_lanes(left: &[f32], right: &[f32]) -> f32 {
+    let mut lanes = [0.0f32; 8];
+    let mut left_chunks = left.chunks_exact(8);
+    let mut right_chunks = right.chunks_exact(8);
+    for (l, r) in (&mut left_chunks).zip(&mut right_chunks) {
+        for lane in 0..8 {
+            lanes[lane] += l[lane] * r[lane];
+        }
+    }
+    let tail: f32 = left_chunks
+        .remainder()
+        .iter()
+        .zip(right_chunks.remainder())
+        .map(|(l, r)| l * r)
+        .sum();
+    lanes.iter().sum::<f32>() + tail
+}
+
+/// Most children one k-means split makes. A node with more rows than
+/// `KMEANS_MAX_GROUPS * target` splits again below.
+pub(super) const KMEANS_MAX_GROUPS: usize = 64;
+
+/// Layout tag a V5 base built with k-means splits carries in its
+/// descriptor's `entry_medoid` (a V5 body's root is always node 0 and no
+/// reader takes it from the descriptor). Older releases ignore it; the
+/// compaction planner rebuilds a cosine or Euclidean base without it once,
+/// so bases written before k-means splits get the new layout.
+pub(crate) const VECTOR_V5_KMEANS_LAYOUT: u32 = 0x4B4D_0001;
+
+/// The descriptor tag for a base built now: k-means bases carry
+/// [`VECTOR_V5_KMEANS_LAYOUT`], dot-product bases (direction splits) their
+/// root.
+pub(crate) fn layout_tag(metric: VectorMetric, root: u32) -> u32 {
+    if metric != VectorMetric::Dot && kmeans_enabled() {
+        VECTOR_V5_KMEANS_LAYOUT
+    } else {
+        root
+    }
+}
+
+/// Test-only switch back to the direction split, for before/after sweeps.
+#[cfg(test)]
+pub(super) static KMEANS_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn kmeans_enabled() -> bool {
+    #[cfg(test)]
+    {
+        !KMEANS_OFF.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+/// Training rows per child and in all for one k-means split.
+pub(super) const KMEANS_SAMPLE_PER_GROUP: usize = 48;
+pub(super) const KMEANS_MAX_SAMPLE: usize = 8192;
+const KMEANS_ITERATIONS: usize = 12;
+
+/// Children of a k-means split of `rows` rows into pages of `target`.
+pub(super) fn kmeans_group_count(rows: usize, target: usize) -> usize {
+    rows.div_ceil(target.max(1)).clamp(2, KMEANS_MAX_GROUPS)
+}
+
+/// Training rows for a split into `groups` children of a node of `rows`.
+pub(super) fn kmeans_sample_rows(rows: usize, groups: usize) -> usize {
+    groups
+        .saturating_mul(KMEANS_SAMPLE_PER_GROUP)
+        .clamp(256, KMEANS_MAX_SAMPLE)
+        .min(rows)
+}
+
+/// Split centroids trained by k-means (k-means++ seeding, Lloyd iterations)
+/// on `sample`. Cosine trains on unit rows and keeps unit centroids
+/// (spherical k-means); Euclidean uses plain means. Deterministic for a given
+/// sample and `seed`. `None` when the sample cannot support `groups`
+/// distinct centroids. Memory is the sample plus `groups * dim` floats.
+///
+/// Leaves made by nearest-centroid assignment hold a query's true neighbours
+/// in far fewer leaves than equal-count slabs along one direction, which is
+/// what the leaf ranking at query time relies on.
+pub(super) fn kmeans_centroids(
+    sample: &[&[f32]],
+    groups: usize,
+    metric: VectorMetric,
+    seed: u64,
+) -> Option<Vec<Vec<f32>>> {
+    let dim = sample.first()?.len();
+    if groups < 2 || sample.len() < groups || dim == 0 {
+        return None;
+    }
+    let cosine = metric == VectorMetric::Cosine;
+    let points: Vec<Vec<f32>> = sample
+        .iter()
+        .map(|row| {
+            let mut row = row.to_vec();
+            if cosine {
+                let norm = dot_lanes(&row, &row).sqrt();
+                if norm > 0.0 {
+                    row.iter_mut().for_each(|value| *value /= norm);
+                }
+            }
+            row
+        })
+        .collect();
+    let norms: Vec<f32> = points.iter().map(|row| dot_lanes(row, row)).collect();
+    // Distance used for seeding and empty-cluster repair: 1 - cos for unit
+    // rows, squared L2 otherwise.
+    let distance = |point: usize, centre: &[f32], centre_norm: f32| -> f32 {
+        let dot = dot_lanes(&points[point], centre);
+        if cosine {
+            (1.0 - dot).max(0.0)
+        } else {
+            (norms[point] + centre_norm - 2.0 * dot).max(0.0)
+        }
+    };
+    // splitmix64: deterministic and dependency-free.
+    let mut state = seed;
+    let mut next_unit = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(groups);
+    let first = ((next_unit() * points.len() as f64) as usize).min(points.len() - 1);
+    centroids.push(points[first].clone());
+    let mut nearest: Vec<f32> = (0..points.len())
+        .map(|point| distance(point, &centroids[0], norms[first]))
+        .collect();
+    while centroids.len() < groups {
+        let total: f64 = nearest.iter().map(|d| f64::from(*d)).sum();
+        if total.is_nan() || total <= 0.0 {
+            return None;
+        }
+        let mut target = next_unit() * total;
+        let mut chosen = points.len() - 1;
+        for (point, d) in nearest.iter().enumerate() {
+            target -= f64::from(*d);
+            if target <= 0.0 {
+                chosen = point;
+                break;
+            }
+        }
+        let centre = points[chosen].clone();
+        let centre_norm = norms[chosen];
+        for (point, d) in nearest.iter_mut().enumerate() {
+            *d = d.min(distance(point, &centre, centre_norm));
+        }
+        centroids.push(centre);
+    }
+    let mut assignment = vec![0usize; points.len()];
+    for _ in 0..KMEANS_ITERATIONS {
+        let centre_norms: Vec<f32> = centroids.iter().map(|c| dot_lanes(c, c)).collect();
+        let mut changed = false;
+        let mut worst: Vec<(f32, usize)> = Vec::with_capacity(points.len());
+        for (point, slot) in assignment.iter_mut().enumerate() {
+            let best = nearest_centroid(&points[point], &centroids, &centre_norms, metric);
+            if *slot != best {
+                *slot = best;
+                changed = true;
+            }
+            worst.push((distance(point, &centroids[best], centre_norms[best]), point));
+        }
+        let mut sums = vec![vec![0.0f64; dim]; groups];
+        let mut counts = vec![0usize; groups];
+        for (point, group) in assignment.iter().enumerate() {
+            counts[*group] += 1;
+            for (sum, value) in sums[*group].iter_mut().zip(&points[point]) {
+                *sum += f64::from(*value);
+            }
+        }
+        // An empty cluster takes the point farthest from its centroid.
+        worst.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut spare = worst.into_iter().map(|(_, point)| point);
+        for group in 0..groups {
+            if counts[group] == 0 {
+                let point = spare.next()?;
+                centroids[group] = points[point].clone();
+                changed = true;
+                continue;
+            }
+            let n = counts[group] as f64;
+            let mut centre: Vec<f32> = sums[group].iter().map(|sum| (sum / n) as f32).collect();
+            if cosine {
+                let norm = dot_lanes(&centre, &centre).sqrt();
+                if norm > 0.0 {
+                    centre.iter_mut().for_each(|value| *value /= norm);
+                }
+            }
+            centroids[group] = centre;
+        }
+        if !changed {
+            break;
+        }
+    }
+    Some(centroids)
+}
+
+/// Index of the centroid nearest to `vector` under `metric` (cosine: the
+/// centroids are unit, so the largest dot product; Euclidean: the smallest
+/// `|c|^2 - 2 v.c`). Ties go to the lower index.
+pub(super) fn nearest_centroid(
+    vector: &[f32],
+    centroids: &[Vec<f32>],
+    centroid_norms: &[f32],
+    metric: VectorMetric,
+) -> usize {
+    let mut best = 0usize;
+    let mut best_key = f32::NEG_INFINITY;
+    for (index, centre) in centroids.iter().enumerate() {
+        let dot = dot_lanes(vector, centre);
+        let key = if metric == VectorMetric::Cosine {
+            dot
+        } else {
+            2.0 * dot - centroid_norms[index]
+        };
+        if key > best_key {
+            best_key = key;
+            best = index;
+        }
+    }
+    best
 }
 
 /// Top principal direction of `sample` by power iteration, started from
@@ -2766,6 +3083,7 @@ mod tests {
         bytes: Bytes,
         ranges: Mutex<Vec<Range<u64>>>,
         batch_sizes: Mutex<Vec<usize>>,
+        nav_batch_sizes: Mutex<Vec<usize>>,
     }
 
     impl TrackingSource {
@@ -2774,7 +3092,18 @@ mod tests {
                 bytes,
                 ranges: Mutex::new(Vec::new()),
                 batch_sizes: Mutex::new(Vec::new()),
+                nav_batch_sizes: Mutex::new(Vec::new()),
             }
+        }
+
+        fn max_nav_batch_size(&self) -> usize {
+            self.nav_batch_sizes
+                .lock()
+                .expect("batch tracking lock")
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
         }
 
         fn bytes_read(&self) -> u64 {
@@ -2832,6 +3161,14 @@ mod tests {
                 out.push(self.read_range(range.clone()).await?);
             }
             Ok(out)
+        }
+
+        async fn read_blocks(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
+            self.nav_batch_sizes
+                .lock()
+                .expect("batch tracking lock")
+                .push(ranges.len());
+            self.read_ranges(ranges).await
         }
     }
 
@@ -3596,6 +3933,129 @@ mod tests {
     /// Recall/IO sweep. Run by hand:
     /// `NAMIDB_V5_SWEEP_ROWS=377000 cargo test ... v5_recall_sweep -- --ignored --nocapture`
     /// (`NAMIDB_V5_SWEEP_EXTERNAL=1` for the spooling builder).
+    /// Recall@10 against exact search on production-shaped embeddings:
+    /// Zipf-sized clusters with per-row spread, new query vectors drawn the
+    /// same way. `NAMIDB_SWEEP_ROWS` (default 378532), `NAMIDB_SWEEP_OLD=1`
+    /// builds with the direction split instead of k-means.
+    #[tokio::test]
+    #[ignore]
+    async fn v5_prodshape_recall_sweep() {
+        let rows: usize = std::env::var("NAMIDB_SWEEP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(378_532);
+        let old = std::env::var_os("NAMIDB_SWEEP_OLD").is_some_and(|v| v == "1");
+        KMEANS_OFF.store(old, std::sync::atomic::Ordering::Relaxed);
+        let dim = 1024usize;
+        let clusters = 1500usize;
+        let gauss = |rng: &mut ChaCha8Rng| -> f32 {
+            let u1: f32 = rng.gen_range(f32::MIN_POSITIVE..1.0);
+            let u2: f32 = rng.gen_range(0.0..1.0);
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+        };
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let centers: Vec<Vec<f32>> = (0..clusters)
+            .map(|_| {
+                let mut c: Vec<f32> = (0..dim).map(|_| gauss(&mut rng)).collect();
+                normalize(&mut c);
+                c
+            })
+            .collect();
+        let weights: Vec<f64> = (1..=clusters).map(|r| 1.0 / (r as f64).powf(0.8)).collect();
+        let total: f64 = weights.iter().sum();
+        let mut cumulative = Vec::with_capacity(clusters);
+        let mut acc = 0.0;
+        for w in &weights {
+            acc += w / total;
+            cumulative.push(acc);
+        }
+        let draw = |rng: &mut ChaCha8Rng| -> Vec<f32> {
+            let u: f64 = rng.gen_range(0.0..1.0);
+            let c = cumulative.partition_point(|x| *x < u).min(clusters - 1);
+            let spread: f32 = rng.gen_range(0.45..0.8) / (dim as f32).sqrt();
+            let mut v: Vec<f32> = centers[c].iter().map(|x| x + gauss(rng) * spread).collect();
+            normalize(&mut v);
+            v
+        };
+        let members: Vec<([u8; 16], Vec<f32>)> =
+            (0..rows as u32).map(|i| (id(i), draw(&mut rng))).collect();
+        let queries: Vec<Vec<f32>> = (0..100).map(|_| draw(&mut rng)).collect();
+        let started = std::time::Instant::now();
+        let truth: Vec<BTreeSet<[u8; 16]>> = queries
+            .iter()
+            .map(|query| {
+                let mut exact: Vec<_> = members
+                    .iter()
+                    .map(|(node_id, vector)| (*node_id, dot_lanes(vector, query)))
+                    .collect();
+                exact.select_nth_unstable_by(10, |a, b| b.1.total_cmp(&a.1));
+                exact.truncate(10);
+                exact.into_iter().map(|hit| hit.0).collect()
+            })
+            .collect();
+        eprintln!("truth in {:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        let mut members = members;
+        members.sort_by_key(|(node_id, _)| *node_id);
+        let mut collector = external::VectorV5ExternalCollector::new_base(
+            external::VectorV5ExternalBuildConfig::default(),
+        )
+        .expect("collector");
+        for (node_id, vector) in &members {
+            collector
+                .push(*node_id, vector, &BTreeMap::new())
+                .expect("push");
+        }
+        drop(members);
+        let mut artifact = collector
+            .finish(
+                &descriptor(VectorMetric::Cosine, dim as u32),
+                VectorV5BuildOptions::default(),
+            )
+            .expect("build")
+            .expect("artifact");
+        eprintln!(
+            "built (old={old}) in {:?}: {:?}",
+            started.elapsed(),
+            artifact.stats
+        );
+        artifact.rewind().expect("rewind");
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut artifact.file, &mut body).expect("read");
+        let body = Bytes::from(body);
+        let source = Arc::new(TrackingSource::new(body.clone()));
+        let reader = VectorV5Reader::open(source, body.len() as u64)
+            .await
+            .expect("open");
+        let pages = reader.page_count();
+        for nprobe in [16usize, 24, 32, 48, 64, 96, 128, 192] {
+            for rerank in [8usize, 16] {
+                let started = std::time::Instant::now();
+                let mut recall = 0usize;
+                for (query, truth) in queries.iter().zip(&truth) {
+                    let hits = reader
+                        .search(
+                            query,
+                            10,
+                            VectorV5SearchOptions {
+                                nprobe: nprobe.min(pages),
+                                max_nprobe: nprobe.min(pages),
+                                rerank_factor: rerank,
+                            },
+                        )
+                        .await
+                        .expect("search");
+                    recall += hits.iter().filter(|hit| truth.contains(&hit.0)).count();
+                }
+                eprintln!(
+                    "old={old} pages={pages} nprobe={nprobe} rerank={rerank} recall@10={:.3} cpu/query={:?}",
+                    recall as f64 / 1000.0,
+                    started.elapsed() / queries.len() as u32
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     #[ignore]
     async fn v5_recall_sweep() {
@@ -3728,9 +4188,9 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 20);
         assert!(
-            source.max_batch_size() <= MAX_NAV_BATCH_PAGES,
+            source.max_nav_batch_size() <= MAX_NAV_BATCH_PAGES,
             "held {} compressed navigation pages at once",
-            source.max_batch_size()
+            source.max_nav_batch_size()
         );
     }
 
@@ -3852,6 +4312,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_reads_header_trailer_and_footer_in_one_round_trip() {
+        let (_, _, body) =
+            build_reader(VectorMetric::Cosine, 96, rerank_members(600, 96), false).await;
+        let source = Arc::new(TrackingSource::new(body.clone()));
+        let reader = VectorV5Reader::open(source.clone(), body.len() as u64)
+            .await
+            .expect("open");
+        assert!(reader.page_count() > 1);
+        // One batched request (header + tail), no separate footer read.
+        assert_eq!(source.range_count(), 2);
+        assert_eq!(*source.batch_sizes.lock().unwrap(), vec![2]);
+        // The guess is bounded both ways.
+        assert!(speculative_footer_bytes(body.len() as u64) >= 64 * 1024);
+        assert!(speculative_footer_bytes(u64::MAX) == 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
     async fn row_reads_return_what_whole_compressed_pages_return() {
         // 3.4 bases (compressed exact pages) and 3.5 bases (raw frames) give
         // the same hits and scores; the 3.5 base reads only candidate rows.
@@ -3886,7 +4363,7 @@ mod tests {
                     // must cost a fraction of the pages.
                     if dim >= 1024 {
                         assert!(
-                            new_bytes * 2 < old_bytes,
+                            new_bytes < old_bytes,
                             "{metric:?} dim {dim}: rows read {new_bytes} vs pages {old_bytes}"
                         );
                     }

@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
 
 use object_store::path::Path;
-use object_store::ObjectStoreExt;
 use uuid::Uuid;
 
 use namidb_core::{NodeId, Value};
@@ -293,7 +292,10 @@ async fn pin_descriptor(
         descriptor.path
     );
     let path = Path::from(absolute.as_str());
-    let meta = match snapshot.store.head(&path).await {
+    // Search SSTs live at create-only UUID paths: reuse this process's
+    // earlier stat of the object instead of a HEAD round trip per segment and
+    // barrier on every query (a failed read through the source drops it).
+    let meta = match crate::range_cache::head_create_only(&snapshot.store, &path).await {
         Ok(meta) => meta,
         Err(error) => {
             let error = Error::ObjectStore(error);
@@ -592,6 +594,44 @@ async fn open_vector_generation(
         point_count,
         metric: catalog.metric,
     }))
+}
+
+/// Open every active vector and text generation of `snapshot` once, so the
+/// next query finds segment metadata resident: object stats, vector base
+/// footers (centroid and routing levels, kept by the reader cache) and the
+/// barrier and FT4 dictionary blocks (kept by the range cache, in memory and
+/// on the disk tier when one is configured). Each generation is bounded by
+/// the same metadata-in-workspace check a query applies. Returns how many
+/// vector and text generations it opened, and the indexes served by a single
+/// legacy-format base instead (the caller warms those through the base path).
+pub(super) async fn prefetch_search_metadata(
+    snapshot: &Snapshot<'_>,
+) -> Result<(usize, usize, Vec<(SearchLsmKind, String)>)> {
+    #[allow(unused_mut)]
+    let mut not_active = Vec::new();
+    #[allow(unused_mut)]
+    let mut vectors = 0usize;
+    #[cfg(feature = "vector-index")]
+    for index in &snapshot.manifest.manifest.vector_indexes {
+        crate::cancel::check()?;
+        match open_vector_generation(snapshot, &index.name).await? {
+            ActiveSearch::Ready(_) => vectors += 1,
+            ActiveSearch::NotActive => not_active.push((SearchLsmKind::Vector, index.name.clone())),
+            ActiveSearch::Unavailable => {}
+        }
+    }
+    #[allow(unused_mut)]
+    let mut texts = 0usize;
+    #[cfg(feature = "text-index")]
+    for index in &snapshot.manifest.manifest.text_indexes {
+        crate::cancel::check()?;
+        match open_text_generation(snapshot, &index.name).await? {
+            ActiveSearch::Ready(_) => texts += 1,
+            ActiveSearch::NotActive => not_active.push((SearchLsmKind::Text, index.name.clone())),
+            ActiveSearch::Unavailable => {}
+        }
+    }
+    Ok((vectors, texts, not_active))
 }
 
 #[cfg(feature = "text-index")]
@@ -1930,6 +1970,54 @@ mod tests {
     ) {
         let absolute = format!("{}/{}", paths.namespace_prefix().as_ref(), relative);
         store.put(&Path::from(absolute), body.into()).await.unwrap();
+    }
+
+    #[cfg(feature = "vector-index")]
+    #[tokio::test]
+    async fn prefetch_stats_every_active_segment_and_barrier_once() {
+        let fixture = vector_fixture().await;
+        let memtable = crate::memtable::Memtable::new();
+        let view = memtable.snapshot_view();
+        let segment = Path::from(format!(
+            "{}/{}",
+            fixture.paths.namespace_prefix().as_ref(),
+            fixture.first_segment_path
+        ));
+        let barrier = Path::from(format!(
+            "{}/{}",
+            fixture.paths.namespace_prefix().as_ref(),
+            fixture.barrier_path
+        ));
+        let snapshot = Snapshot::new(fixture.loaded, &view, fixture.store.clone(), fixture.paths);
+        let before = snapshot
+            .try_vector_search("law_vec", &[1.0, 0.0], 2, 64)
+            .await
+            .unwrap();
+        crate::range_cache::forget_create_only_heads_with_prefix(
+            snapshot.paths.namespace_prefix().as_ref(),
+        );
+        assert!(!crate::range_cache::create_only_head_cached(
+            &fixture.store,
+            &segment
+        ));
+
+        let summary = snapshot.prefetch_read_metadata().await.unwrap();
+        assert_eq!(summary.vector_indexes, 1);
+        assert_eq!(summary.text_indexes, 0);
+        assert!(crate::range_cache::create_only_head_cached(
+            &fixture.store,
+            &segment
+        ));
+        assert!(crate::range_cache::create_only_head_cached(
+            &fixture.store,
+            &barrier
+        ));
+        // Prefetching changes no answer.
+        let after = snapshot
+            .try_vector_search("law_vec", &[1.0, 0.0], 2, 64)
+            .await
+            .unwrap();
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
     }
 
     #[cfg(feature = "vector-index")]

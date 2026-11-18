@@ -1487,6 +1487,18 @@ impl ManifestStore {
         &self,
         mine: Option<Epoch>,
     ) -> Result<(LoadedManifest, WriterFence)> {
+        self.claim_writer_from(mine, None).await
+    }
+
+    /// [`Self::claim_writer_unless_newer`] starting from a manifest the
+    /// caller just loaded, which saves reloading it on open. The claim is a
+    /// pointer CAS against that base, so a base that went stale meanwhile
+    /// only costs a retry from a fresh load.
+    pub async fn claim_writer_from(
+        &self,
+        mine: Option<Epoch>,
+        mut loaded: Option<LoadedManifest>,
+    ) -> Result<(LoadedManifest, WriterFence)> {
         // A genuine concurrent claim resolves quickly: the winner advances
         // the pointer, so a reloaded base sees a higher version within a
         // couple of rounds and we make progress. A CAS loss where the
@@ -1512,7 +1524,10 @@ impl ManifestStore {
         let mut repair_passes = 0usize;
         let mut last_version: Option<u64> = None;
         loop {
-            let base = self.load_current().await?;
+            let base = match loaded.take() {
+                Some(base) => base,
+                None => self.load_current().await?,
+            };
             if let Some(mine) = mine {
                 if base.manifest.epoch > mine {
                     return Err(Error::Fenced {

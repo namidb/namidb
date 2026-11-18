@@ -290,6 +290,31 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
 /// `input_bytes` is what the rebuild would read: the generation's own
 /// segments when they can be merged ([`vector_segments_mergeable`]), the
 /// namespace's Nodes corpus otherwise.
+/// Whether the generation's vector base predates k-means splits: a cosine
+/// or Euclidean base whose descriptor lacks the layout tag.
+#[cfg(feature = "vector-index")]
+fn vector_base_layout_stale(state: &SearchLsmState, descriptors: &[SstDescriptor]) -> bool {
+    state
+        .segments
+        .iter()
+        .zip(descriptors)
+        .any(|(segment, descriptor)| {
+            segment.role == SearchSegmentRole::Base
+                && segment.payload == SearchSegmentPayload::Complete
+                && matches!(
+                    &descriptor.kind_specific,
+                    KindSpecificStats::VectorGraph { metric, entry_medoid, .. }
+                        if metric != "dot"
+                            && *entry_medoid != crate::sst::vector::v5::VECTOR_V5_KMEANS_LAYOUT
+                )
+        })
+}
+
+#[cfg(not(feature = "vector-index"))]
+fn vector_base_layout_stale(_: &SearchLsmState, _: &[SstDescriptor]) -> bool {
+    false
+}
+
 fn vector_base_rebuild_due(
     state: &SearchLsmState,
     descriptors: &[SstDescriptor],
@@ -313,6 +338,11 @@ fn vector_base_rebuild_due(
             }
             SearchSegmentRole::Base => base_rows = segment.live_payload_count,
         }
+    }
+    // A base written before k-means splits is rebuilt once, from its own
+    // segments when they fold, within the same input bound as any rebuild.
+    if vector_base_layout_stale(state, descriptors) {
+        return Ok(true);
     }
     let Some(newest_delta) = newest_delta else {
         return Ok(false);
@@ -2357,6 +2387,9 @@ pub(super) async fn prepare_search_compactions(
     prepare_search_compactions_with(store, paths, base, selections, true).await
 }
 
+/// Serializes Search-LSM base rebuilds across every namespace of a process.
+static BASE_REBUILD_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// [`prepare_search_compactions`]; `vector_segment_merge: false` forces every
 /// vector base through the node scan (tests compare the two builds).
 async fn prepare_search_compactions_with(
@@ -2373,6 +2406,15 @@ async fn prepare_search_compactions_with(
     let (base_selections, delta_selections): (Vec<_>, Vec<_>) = selections
         .into_iter()
         .partition(|selection| selection.mode == SearchCompactionMode::BasePrefix);
+    // Base rebuilds run one at a time per process: each is bounded by the
+    // index-build memory and spool budgets, so several namespaces rebuilding
+    // at once (every pre-3.5.1 vector base after an upgrade, say) would
+    // multiply both. Delta runs stay concurrent.
+    let base_gate = if base_selections.is_empty() {
+        None
+    } else {
+        Some(BASE_REBUILD_GATE.lock().await)
+    };
     // A full-text base over FT4 segments folds by merging postings and a
     // vector base over VG5/VG6 segments by merging their rows; only the rest
     // (legacy or shadow bases, Building generations) scan the node corpus.
@@ -2520,6 +2562,7 @@ async fn prepare_search_compactions_with(
         built.extend(build_result?);
     }
 
+    drop(base_gate);
     for selection in delta_selections {
         built.push(match selection.mode {
             SearchCompactionMode::DeltaRun => {
@@ -4282,6 +4325,9 @@ mod tests {
                     r: 8,
                     l_build: 16,
                     alpha: 1.2,
+                    #[cfg(feature = "vector-index")]
+                    entry_medoid: crate::sst::vector::v5::VECTOR_V5_KMEANS_LAYOUT,
+                    #[cfg(not(feature = "vector-index"))]
                     entry_medoid: 0,
                 },
                 _ => unreachable!(),
@@ -4714,6 +4760,86 @@ mod tests {
         assert!(select_search_compactions(&trickle, policy)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "vector-index")]
+    fn a_base_built_before_kmeans_splits_is_rebuilt_once() {
+        let policy = delta_policy(6, 8);
+        let mut manifest = compacted_single_base_fixture();
+        assert!(select_search_compactions(&manifest, policy)
+            .unwrap()
+            .is_empty());
+        let base = manifest.search_lsm[0].segments[0].sst_id;
+        let untag = |manifest: &mut Manifest, metric: &str| {
+            let descriptor = manifest
+                .ssts
+                .iter_mut()
+                .find(|descriptor| descriptor.id == base)
+                .unwrap();
+            descriptor.kind_specific = KindSpecificStats::VectorGraph {
+                dim: 2,
+                metric: metric.into(),
+                point_count: descriptor.row_count,
+                r: 8,
+                l_build: 16,
+                alpha: 1.2,
+                entry_medoid: 0,
+            };
+            let descriptor = descriptor.clone();
+            let segment = &mut manifest.search_lsm[0].segments[0];
+            if matches!(segment.format, SearchSegmentFormat::VectorV5Base) {
+                segment.content_xxh3 = crate::search_lsm::legacy_base_content_fingerprint(
+                    &descriptor,
+                    segment.format,
+                    &segment.complete_filter_properties,
+                );
+            }
+        };
+        untag(&mut manifest, "cosine");
+        let selection = select_search_compactions(&manifest, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(selection.mode, SearchCompactionMode::BasePrefix);
+        // Within the same input bound as any vector rebuild.
+        let tight = SearchCompactionPolicy {
+            vector_base_max_input_bytes: 1,
+            ..policy
+        };
+        assert!(select_search_compactions(&manifest, tight)
+            .unwrap()
+            .is_empty());
+        // Dot-product bases keep direction splits and are left alone.
+        untag(&mut manifest, "dot");
+        let state = &manifest.search_lsm[0];
+        let descriptors: Vec<SstDescriptor> = state
+            .segments
+            .iter()
+            .map(|segment| {
+                manifest
+                    .ssts
+                    .iter()
+                    .find(|descriptor| descriptor.id == segment.sst_id)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        assert!(!vector_base_layout_stale(state, &descriptors));
+        untag(&mut manifest, "euclidean");
+        let state = &manifest.search_lsm[0];
+        let descriptors: Vec<SstDescriptor> = state
+            .segments
+            .iter()
+            .map(|segment| {
+                manifest
+                    .ssts
+                    .iter()
+                    .find(|descriptor| descriptor.id == segment.sst_id)
+                    .unwrap()
+                    .clone()
+            })
+            .collect();
+        assert!(vector_base_layout_stale(state, &descriptors));
     }
 
     fn delta_policy(trigger: usize, hard_cap: usize) -> SearchCompactionPolicy {

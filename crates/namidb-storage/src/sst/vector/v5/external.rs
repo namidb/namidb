@@ -404,6 +404,14 @@ impl VectorV5ExternalCollector {
                 metrics.peak_logical_memory_bytes, self.config.memory_budget_bytes
             )));
         }
+        // k-means splits may fan out wider than `branch_factor`; readers
+        // bound a node's children by the footer's value.
+        let fan_out = nodes
+            .iter()
+            .map(|node| node.children.len())
+            .max()
+            .unwrap_or(0)
+            .max(options.branch_factor);
         let footer = Footer {
             format_version: FORMAT_VERSION,
             dim: desc.dim,
@@ -417,7 +425,7 @@ impl VectorV5ExternalCollector {
             filter_properties: self.filter_properties.into_iter().collect(),
             target_rows_per_page: u32::try_from(effective_target)
                 .map_err(|_| Error::invariant("vector v5 effective page rows exceed u32"))?,
-            branch_factor: u16::try_from(options.branch_factor)
+            branch_factor: u16::try_from(fan_out)
                 .map_err(|_| Error::invariant("vector v5 branch factor exceeds u16"))?,
         };
         write_footer(&mut artifact, &footer)?;
@@ -435,7 +443,7 @@ impl VectorV5ExternalCollector {
             r: desc.r,
             l_build: desc.l_build,
             alpha: desc.alpha,
-            entry_medoid: root,
+            entry_medoid: super::layout_tag(desc.metric, root),
         };
         Ok(Some(VectorV5ExternalArtifact {
             file: artifact,
@@ -1072,6 +1080,11 @@ fn partition_multiway(
     if stats.max_variance <= f64::EPSILON {
         return partition_by_rank(partition, requested_groups, dim, context);
     }
+    if context.desc.metric != VectorMetric::Dot && super::kmeans_enabled() {
+        if let Some(children) = partition_kmeans(partition, stats, depth, context)? {
+            return Ok(children);
+        }
+    }
 
     let sample_capacity_by_budget = context
         .config
@@ -1169,6 +1182,99 @@ fn partition_multiway(
         return partition_by_rank(partition, requested_groups, dim, context);
     }
     Ok(children)
+}
+
+/// Split by nearest centroid of a k-means model trained on a bounded hash
+/// sample of the partition (see [`super::kmeans_centroids`]). The sample is
+/// at most `KMEANS_MAX_SAMPLE` rows and is shrunk to fit an eighth of the
+/// memory budget; the assignment streams the spool once. `None` when the
+/// sample cannot train a split or the split makes no progress, leaving the
+/// partition to the direction split.
+fn partition_kmeans(
+    partition: &mut Partition,
+    stats: &PartitionStats,
+    depth: usize,
+    context: &mut ExternalBuildContext<'_>,
+) -> Result<Option<Vec<Partition>>, Error> {
+    let dim = context.desc.dim as usize;
+    let metric = context.desc.metric;
+    let rows = partition.rows as usize;
+    let groups = super::kmeans_group_count(rows, context.effective_target);
+    // The sample is held twice (as read and as training rows).
+    let row_bytes = dim.saturating_mul(std::mem::size_of::<f32>() * 2).max(1);
+    // Leave the rest of the budget to the tree metadata and leaf emission.
+    let by_budget = (context.config.memory_budget_bytes / 8) / row_bytes;
+    let limit = super::kmeans_sample_rows(rows, groups).min(by_budget);
+    if limit < groups.saturating_mul(2) {
+        return Ok(None);
+    }
+    let mut heap: BinaryHeap<DirectionSample> = BinaryHeap::with_capacity(limit + 1);
+    partition.rewind(dim)?;
+    while let Some(record) = read_record(
+        partition.spool.as_file_mut(),
+        dim,
+        context.config.memory_budget_bytes,
+    )? {
+        let hash = stable_hash(&record.id, stats.split_axis, depth, 0x6B);
+        let sample = DirectionSample {
+            key: (hash, record.id),
+            vector: record.vector,
+        };
+        if heap.len() < limit {
+            heap.push(sample);
+        } else if heap.peek().is_some_and(|largest| sample.key < largest.key) {
+            heap.pop();
+            heap.push(sample);
+        }
+    }
+    let sample = heap.into_sorted_vec();
+    context.metrics.observe_working(
+        sample
+            .len()
+            .saturating_add(groups)
+            .saturating_mul(row_bytes),
+    );
+    let seed = sample
+        .first()
+        .map(|first| first.key.0 ^ depth as u64)
+        .unwrap_or(depth as u64);
+    let training = sample
+        .iter()
+        .map(|sample| sample.vector.as_slice())
+        .collect::<Vec<_>>();
+    let Some(centroids) = super::kmeans_centroids(&training, groups, metric, seed) else {
+        return Ok(None);
+    };
+    drop(training);
+    drop(sample);
+    let norms: Vec<f32> = centroids.iter().map(|c| super::dot_lanes(c, c)).collect();
+    let mut children = create_partitions(
+        centroids.len(),
+        &context.config.scratch_dir,
+        dim,
+        context.metrics,
+    )?;
+    partition.rewind(dim)?;
+    while let Some(record) = read_record(
+        partition.spool.as_file_mut(),
+        dim,
+        context.config.memory_budget_bytes,
+    )? {
+        let child = super::nearest_centroid(&record.vector, &centroids, &norms, metric);
+        children[child].append(&record)?;
+        context.metrics.scratch_bytes_written = context
+            .metrics
+            .scratch_bytes_written
+            .saturating_add(record.wire_bytes() as u64);
+    }
+    for child in &mut children {
+        child.flush()?;
+    }
+    children.retain(|child| child.rows > 0);
+    if children.len() < 2 || children.iter().any(|child| child.rows == partition.rows) {
+        return Ok(None);
+    }
+    Ok(Some(children))
 }
 
 /// Rows hashed into the split-direction sample.
@@ -1785,7 +1891,11 @@ mod tests {
             assert_eq!(artifact.stats.point_count, 1, "{metric:?}");
             assert_eq!(artifact.stats.min_node_id, node_id, "{metric:?}");
             assert_eq!(artifact.stats.max_node_id, node_id, "{metric:?}");
-            assert_eq!(artifact.stats.entry_medoid, 0, "{metric:?}");
+            assert_eq!(
+                artifact.stats.entry_medoid,
+                super::super::layout_tag(metric, 0),
+                "{metric:?}"
+            );
             assert_eq!(artifact.metrics.input_rows, 1, "{metric:?}");
             assert_eq!(artifact.metrics.indexed_rows, 1, "{metric:?}");
             assert_eq!(artifact.metrics.page_count, 1, "{metric:?}");

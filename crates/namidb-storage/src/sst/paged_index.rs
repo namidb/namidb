@@ -1881,15 +1881,71 @@ impl PagedRangeSource for LegacyObjectRangeSource {
     }
 }
 
+/// Probes of at most this many pages per level read exactly those pages; a
+/// wider probe reads whole cache pages, which its neighbouring pages share.
+const NARROW_PROBE_PAGES: usize = 16;
+
+// B+tree pages, headers and value records are self-contained blocks read
+// with the same bounds by every probe: a narrow probe caches each as its own
+// entry instead of rounding a few KiB up to a 256 KiB page.
 #[async_trait::async_trait]
 impl PagedRangeSource for PinnedObjectRangeSource {
     async fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
-        PinnedObjectRangeSource::read_range(self, range).await
+        self.read_range_as(range, crate::range_cache::ReadGranularity::Block)
+            .await
     }
 
+    /// A point lookup (a top-k hydration) touches a few pages per level and
+    /// reads only those; a bulk probe (a batched MERGE over hundreds of keys)
+    /// lands many pages in each cache page, so it reads whole cache pages
+    /// and issues a fraction of the requests.
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        PinnedObjectRangeSource::read_ranges(self, ranges).await
+        let granularity = if ranges.len() <= NARROW_PROBE_PAGES {
+            crate::range_cache::ReadGranularity::Block
+        } else {
+            crate::range_cache::ReadGranularity::Pages
+        };
+        self.read_ranges_as(ranges, granularity).await
     }
+}
+
+/// Internal pages a node-record prefetch warms at most (1 MiB).
+pub const PREFETCH_NODE_RECORD_INTERNAL_PAGES: u32 = 256;
+
+/// Warm the range cache with the two headers and the internal levels of a
+/// `.nloc2` exact-record B+tree, in two round trips, so the first point
+/// lookup after a start pays only for its leaves and records instead of
+/// walking every level of the tree one round trip at a time. Writers append
+/// the internal levels after the leaves, so they are the pages from
+/// `leaf_count` on; a tree whose upper levels exceed
+/// [`PREFETCH_NODE_RECORD_INTERNAL_PAGES`] warms only its root. Returns the
+/// number of pages warmed.
+pub async fn prefetch_node_record_index(source: &PinnedObjectRangeSource) -> Result<usize> {
+    crate::cancel::check()?;
+    let locator_header = PagedRangeSource::read_range(source, header_range_at(0)?).await?;
+    let locator_header = Header::decode(&locator_header, PagedIndexKind::NodeLocator)?;
+    locator_header.require_authoritative_integrity()?;
+    let base_offset = locator_header.values_offset;
+    let header = PagedRangeSource::read_range(source, header_range_at(base_offset)?).await?;
+    let header = Header::decode(&header, PagedIndexKind::NodeRecord)?;
+    header.require_authoritative_integrity()?;
+    let internal = header.leaf_count..header.page_count;
+    let pages: Vec<u32> = if internal.len() as u64 <= u64::from(PREFETCH_NODE_RECORD_INTERNAL_PAGES)
+        && internal.contains(&header.root_page)
+    {
+        internal.collect()
+    } else {
+        vec![header.root_page]
+    };
+    let ranges = pages
+        .iter()
+        .map(|page| page_range_at(base_offset, *page))
+        .collect::<Result<Vec<_>>>()?;
+    // Exact blocks, the way a point lookup reads each of these pages.
+    source
+        .read_ranges_as(&ranges, crate::range_cache::ReadGranularity::Block)
+        .await?;
+    Ok(ranges.len())
 }
 
 /// Probe unique keys without fetching or decoding the complete sidecar.
@@ -3872,6 +3928,40 @@ mod tests {
         assert_eq!(stats.index_entries, 10_000);
         assert!(stats.leaf_entries_examined < 1_000);
         assert!(stats.bytes_read < body.len() / 20);
+    }
+
+    #[tokio::test]
+    async fn node_record_prefetch_leaves_a_probe_only_leaves_and_records() {
+        let mut builder = NodeLocatorRecordBuilder::new();
+        for n in 0..60_000u128 {
+            builder.push(&id(n), &id(n)).unwrap();
+        }
+        let body = builder.finish().unwrap();
+        let locator = Header::decode(&body[..HEADER_SIZE], PagedIndexKind::NodeLocator).unwrap();
+        let base = locator.values_offset as usize;
+        let records =
+            Header::decode(&body[base..base + HEADER_SIZE], PagedIndexKind::NodeRecord).unwrap();
+        let internal = records.page_count - records.leaf_count;
+        assert!(internal >= 2, "the fixture needs an internal level");
+
+        let store = RangeProbeStore::new(Duration::ZERO);
+        let path = Path::from("prefetch/nodes.nloc2");
+        store.put(&path, PutPayload::from(body)).await.unwrap();
+        let cache = ImmutableRangeCache::open(page_cache_config())
+            .await
+            .unwrap();
+        let source = pinned_test_source(store.clone(), &path, Some(cache)).await;
+
+        let warmed = prefetch_node_record_index(&source).await.unwrap();
+        assert_eq!(warmed, internal as usize);
+        let before = store.state.range_gets.load(Ordering::SeqCst);
+        let (found, _) = probe_node_records_from_source(&source, &[id(31_337)])
+            .await
+            .unwrap();
+        assert_eq!(found.get(&id(31_337)), Some(&id(31_337).to_vec()));
+        // One leaf and one record value: the headers and every internal
+        // page come from the cache.
+        assert_eq!(store.state.range_gets.load(Ordering::SeqCst) - before, 2);
     }
 
     #[tokio::test]

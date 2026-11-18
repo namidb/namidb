@@ -334,6 +334,18 @@ impl crate::sst::vector::v5::VectorV5RangeSource for SearchObjectRangeSource {
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         self.pinned.read_ranges(ranges).await
     }
+
+    async fn read_blocks(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.pinned
+            .read_ranges_as(ranges, crate::range_cache::ReadGranularity::Block)
+            .await
+    }
+
+    async fn read_small(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.pinned
+            .read_ranges_as(ranges, crate::range_cache::ReadGranularity::Fine)
+            .await
+    }
 }
 
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
@@ -6443,6 +6455,8 @@ impl<'mt> Snapshot<'mt> {
         };
         let waiting_since = std::time::Instant::now();
         let mut starts = 0_u32;
+        // This query needs the seed: let it read at full speed meanwhile.
+        let _awaiting = crate::range_cache::AwaitingBackground::new();
         loop {
             if let Some(count) = read(&cache) {
                 return Ok(Some(count));
@@ -9858,6 +9872,118 @@ impl<'mt> Snapshot<'mt> {
         }))
     }
 
+    /// Warm what a namespace's first queries would otherwise fetch one round
+    /// trip at a time: the Parquet footers of up to
+    /// [`PREFETCH_NODE_SST_LIMIT`] node SSTs (row-group indexes for id
+    /// lookups and scans) and the metadata of every active vector and text
+    /// index generation (see `search_lsm_read::prefetch_search_metadata`),
+    /// including a generation compacted to one base (the base reader the
+    /// first query would open).
+    /// Reads only metadata, never property values, vector pages or postings,
+    /// so its memory is what the caches it fills already bound. Errors stop
+    /// the prefetch and are returned; nothing depends on it having run.
+    pub async fn prefetch_read_metadata(&self) -> Result<PrefetchSummary> {
+        let started = std::time::Instant::now();
+        // Search indexes come first in a query's critical path, then node
+        // hydration: warm all three concurrently.
+        let node_ssts = async {
+            let mut node_ssts = 0usize;
+            for idx in self
+                .manifest
+                .index
+                .node_descriptors()
+                .into_iter()
+                .take(PREFETCH_NODE_SST_LIMIT)
+            {
+                crate::cancel::check()?;
+                let desc = &self.manifest.manifest.ssts[idx];
+                let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+                self.node_sst_metadata(desc, &absolute).await?;
+                node_ssts += 1;
+            }
+            Ok::<_, Error>(node_ssts)
+        };
+        let node_records = async {
+            let mut pages = 0usize;
+            for idx in self
+                .manifest
+                .index
+                .node_descriptors()
+                .into_iter()
+                .take(PREFETCH_NODE_SST_LIMIT)
+            {
+                crate::cancel::check()?;
+                let desc = &self.manifest.manifest.ssts[idx];
+                if !crate::manifest::node_locator_has_exact_records(desc) {
+                    continue;
+                }
+                let Some(locator) = desc
+                    .node_locator
+                    .as_ref()
+                    .filter(|locator| locator.entry_count == desc.row_count)
+                else {
+                    continue;
+                };
+                let absolute = format!(
+                    "{}/{}",
+                    self.paths.namespace_prefix().as_ref(),
+                    locator.path
+                );
+                let source = self
+                    .pinned_sidecar_source(&absolute, Some(locator.size_bytes))
+                    .await?;
+                pages += crate::sst::paged_index::prefetch_node_record_index(&source).await?;
+            }
+            Ok::<_, Error>(pages)
+        };
+        let search = self.prefetch_search_indexes();
+        let (node_ssts, node_record_pages, (vector_indexes, text_indexes)) =
+            futures::try_join!(node_ssts, node_records, search)?;
+        Ok(PrefetchSummary {
+            node_ssts,
+            node_record_pages,
+            vector_indexes,
+            text_indexes,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    /// Open every active search generation's readers (see
+    /// [`Self::prefetch_read_metadata`]); `(vector, text)` indexes opened.
+    async fn prefetch_search_indexes(&self) -> Result<(usize, usize)> {
+        #[cfg(any(feature = "text-index", feature = "vector-index"))]
+        let (vector_indexes, text_indexes) = {
+            let (mut vectors, mut texts, legacy) =
+                search_lsm_read::prefetch_search_metadata(self).await?;
+            // A generation compacted to one base is read through the base
+            // path; open its reader the way that path does.
+            for (kind, name) in legacy {
+                crate::cancel::check()?;
+                let Some(selected) = self.select_search_base(kind, &name).await? else {
+                    continue;
+                };
+                let desc = &self.manifest.manifest.ssts[selected.descriptor_index];
+                match kind {
+                    #[cfg(feature = "vector-index")]
+                    SearchLsmKind::Vector => {
+                        vectors +=
+                            usize::from(self.fetch_vector_search_index(desc).await?.is_some());
+                    }
+                    #[cfg(feature = "text-index")]
+                    SearchLsmKind::Text => {
+                        texts += usize::from(self.fetch_text_search_index(desc).await?.is_some());
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {}
+                }
+            }
+            (vectors, texts)
+        };
+        #[cfg(not(any(feature = "text-index", feature = "vector-index")))]
+        let (vector_indexes, text_indexes) = (0, 0);
+        Ok((vector_indexes, text_indexes))
+    }
+
     /// Low-level vector-index probe retained for storage callers and benchmark
     /// harnesses that only need the decoded hits. An absent/undecodable index is
     /// represented as an empty result; query execution must use
@@ -11589,7 +11715,31 @@ fn optional_accelerator_fallback(error: &Error) -> bool {
             object_store::Error::NotFound { .. } | object_store::Error::Precondition { .. }
         ) | Error::Invariant(_)
             | Error::Corrupted { .. }
-    )
+    ) || matches!(error, Error::ObjectStore(object_store::Error::Generic { source, .. })
+        if source_chain_reports_missing_object(source.as_ref()))
+}
+
+/// Whether a wrapped object-store error (a pinned range read, through the
+/// range cache) was caused by the object being gone or replaced: the same
+/// condition a HEAD reports as `NotFound` / `Precondition`. Search objects
+/// are stat'ed once per process, so a disappeared object first shows up here.
+fn source_chain_reports_missing_object(source: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    let mut depth = 0;
+    while let Some(error) = current {
+        if let Some(
+            object_store::Error::NotFound { .. } | object_store::Error::Precondition { .. },
+        ) = error.downcast_ref::<object_store::Error>()
+        {
+            return true;
+        }
+        depth += 1;
+        if depth > 16 {
+            break;
+        }
+        current = error.source();
+    }
+    false
 }
 
 fn update_edge_point_winner(
@@ -12828,7 +12978,11 @@ pub(crate) fn spawn_count_seed(
         let _unregister = unregister;
         let started = std::time::Instant::now();
         let snapshot = owned.borrow();
-        match snapshot.scan_count_seed(&labels, &pairs).await {
+        // A seed reads every page of the properties it counts: let queries
+        // have the store first.
+        let seeded =
+            crate::range_cache::background_reads(snapshot.scan_count_seed(&labels, &pairs)).await;
+        match seeded {
             Ok(result) => {
                 let installed = cache.finish_count_seed(id, result);
                 tracing::info!(
@@ -13024,6 +13178,20 @@ impl std::fmt::Debug for PinnedSnapshot {
             .field("version", &self.version)
             .finish()
     }
+}
+
+/// Node SSTs whose footers [`Snapshot::prefetch_read_metadata`] reads.
+pub const PREFETCH_NODE_SST_LIMIT: usize = 256;
+
+/// What [`Snapshot::prefetch_read_metadata`] warmed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PrefetchSummary {
+    pub node_ssts: usize,
+    /// Upper-level pages of exact node-record indexes warmed.
+    pub node_record_pages: usize,
+    pub vector_indexes: usize,
+    pub text_indexes: usize,
+    pub elapsed: std::time::Duration,
 }
 
 /// Atomic publisher cell for the currently-active [`OwnedSnapshot`].

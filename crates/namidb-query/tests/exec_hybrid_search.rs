@@ -477,6 +477,9 @@ mod indexed_sparse_filter {
 
     impl TextGetProbe {
         fn new() -> Self {
+            // Probes are counted by their barrier HEADs; the engine otherwise
+            // stats a create-only barrier once per process.
+            namidb_storage::range_cache::disable_create_only_head_cache_for_tests();
             Self {
                 inner: Arc::new(InMemory::new()),
                 text_gets: AtomicUsize::new(0),
