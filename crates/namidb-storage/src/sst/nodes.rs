@@ -331,6 +331,79 @@ pub(crate) fn decode_node_extra_properties(
     Ok(out)
 }
 
+/// Whether node row `row` holds a non-null `property`, without building its
+/// value: a declared column answers from its validity, the overflow JSON is
+/// walked with every value skipped (only `null` is told apart), and so is the
+/// binary property cell. A presence count over a vector property therefore
+/// never materialises a vector.
+pub(crate) fn row_has_property(
+    batch: &RecordBatch,
+    row: usize,
+    label_def: &LabelDef,
+    property: &str,
+) -> Result<bool> {
+    if let Some(def) = label_def.properties.iter().find(|p| p.name == property) {
+        if batch
+            .column_by_name(&prop_column_name(def))
+            .is_some_and(|column| column.is_valid(row))
+        {
+            return Ok(true);
+        }
+    }
+    if let Some(json) = batch
+        .column_by_name(OVERFLOW_JSON)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .filter(|c| !c.is_null(row))
+    {
+        if json_has_non_null_key(json.value(row), property)? {
+            return Ok(true);
+        }
+    }
+    if let Some(binary) = batch
+        .column_by_name(BINARY_PROPS)
+        .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+        .filter(|c| !c.is_null(row))
+    {
+        if property_pages::canonical_map_has_non_null(binary.value(row), property)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the overflow JSON object has `key` with a non-null value. Every
+/// value is skipped as `IgnoredAny`; nothing is built.
+fn json_has_non_null_key(json: &str, key: &str) -> Result<bool> {
+    use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+
+    struct HasKey<'k>(&'k str);
+
+    impl<'de> Visitor<'de> for HasKey<'_> {
+        type Value = bool;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an overflow JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<bool, A::Error> {
+            let mut found = false;
+            while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if name.as_ref() == self.0 {
+                    found |= map.next_value::<Option<IgnoredAny>>()?.is_some();
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(found)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let found = deserializer.deserialize_map(HasKey(key))?;
+    deserializer.end()?;
+    Ok(found)
+}
+
 /// Parse only the `keep` entries of an overflow JSON object. The others are
 /// skipped as `IgnoredAny`, which never builds a `Value` for them.
 fn decode_selected_json(json: &str, keep: &BTreeSet<&str>) -> Result<BTreeMap<String, Value>> {

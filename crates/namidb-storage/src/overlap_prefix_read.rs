@@ -34,7 +34,7 @@ use super::{
 use crate::error::{Error, Result};
 use crate::memtable::{MemKey, MemOp};
 use crate::sst::nodes::{
-    RangedNodeBatchStream, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, SCHEMA_VERSION,
+    row_has_property, RangedNodeBatchStream, COL_LSN, COL_NODE_ID, COL_TOMBSTONE, SCHEMA_VERSION,
 };
 use crate::sst::predicates::ScanPredicate;
 
@@ -769,5 +769,247 @@ impl NodeScanCursor {
             }
         }
         Ok(Some(out))
+    }
+}
+
+/// One SST's side of a presence merge: per row only `(id, lsn, keep)`.
+struct PresenceCursor {
+    stream: RangedNodeBatchStream,
+    label_def: LabelDef,
+    pages: Option<Arc<NodePropertyPageReader>>,
+    rows: VecDeque<(NodeId, u64, bool)>,
+    ordinal: u64,
+    last: Option<NodeId>,
+    done: bool,
+}
+
+impl Snapshot<'_> {
+    /// Exact number of live `label` nodes whose `property` is present and
+    /// not null, from an id-ordered merge of the memtable and every node SST
+    /// that keeps one `(id, lsn, verdict)` per row of the row groups it is
+    /// in. Values are never built: presence comes from the property pages'
+    /// row states when an SST has them, otherwise from the row's column
+    /// validity or a skipping walk of its overflow JSON. Each SST read
+    /// without pages admits a row group only when its uncompressed size is
+    /// at most `max_row_group_bytes`.
+    ///
+    /// `None` when the merge cannot answer within that bound or at all (an
+    /// SST out of id order, a row count that disagrees with the manifest, the
+    /// full-body diagnostic mode); the caller then decides whether a
+    /// materialising scan is affordable.
+    pub(crate) async fn count_label_presence_merged(
+        &self,
+        label: &str,
+        property: &str,
+        max_row_group_bytes: u64,
+    ) -> Result<Option<u64>> {
+        if matches!(self.ranged_mode, RangedMode::Force(false)) {
+            return Ok(None);
+        }
+        let dict = &self.manifest.manifest.label_dict;
+        let label_id = dict.id(label);
+        let property_column = vec![property.to_string()];
+
+        // The memtable side, one verdict per id (each payload is decoded on
+        // its own and dropped).
+        let mut memtable: BTreeMap<NodeId, (u64, bool)> = BTreeMap::new();
+        for (key, entry) in self.node_entries() {
+            let MemKey::Node { id } = key else {
+                continue;
+            };
+            if memtable.get(id).is_some_and(|(lsn, _)| *lsn >= entry.lsn) {
+                continue;
+            }
+            let keep = match &entry.op {
+                MemOp::Tombstone => false,
+                MemOp::Upsert(payload) => {
+                    let view = node_view_from_payload(*id, entry.lsn, payload, dict, "")?;
+                    view.labels.contains(label)
+                        && view
+                            .properties
+                            .get(property)
+                            .is_some_and(|value| !value.is_null())
+                }
+            };
+            memtable.insert(*id, (entry.lsn, keep));
+        }
+        let mut memtable = memtable.into_iter().peekable();
+
+        let mut cursors = Vec::new();
+        for idx in self.manifest.index.node_descriptors() {
+            let desc = &self.manifest.manifest.ssts[idx];
+            // An SST without `label` still holds versions that may shadow
+            // an older labelled one, so every node SST takes part.
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+            let metadata = self.node_sst_metadata(desc, &absolute).await?;
+            let label_def = self.label_def_for_node_sst(desc);
+            let pages = self.node_property_reader(desc).await?;
+            if pages.is_none()
+                && metadata
+                    .row_groups()
+                    .iter()
+                    .any(|group| group.total_byte_size().max(0) as u64 > max_row_group_bytes)
+            {
+                return Ok(None);
+            }
+            let columns: &[String] = if pages.is_some() {
+                &[]
+            } else {
+                &property_column
+            };
+            let (stream, _) = node_scan_after_async(
+                self.store.clone(),
+                Path::from(absolute),
+                desc.size_bytes,
+                &label_def,
+                &[],
+                Some(columns),
+                Some(metadata),
+                None,
+            )
+            .await?;
+            cursors.push((
+                idx,
+                PresenceCursor {
+                    ordinal: stream.skipped_rows(),
+                    stream,
+                    label_def,
+                    pages,
+                    rows: VecDeque::new(),
+                    last: None,
+                    done: false,
+                },
+            ));
+        }
+
+        let mut count = 0_u64;
+        let mut settled = 0_u64;
+        loop {
+            for (idx, cursor) in &mut cursors {
+                while cursor.rows.is_empty() && !cursor.done {
+                    let desc = &self.manifest.manifest.ssts[*idx];
+                    let Some(reader) = cursor.stream.next_row_group().await? else {
+                        if cursor.ordinal != desc.row_count {
+                            return Ok(None);
+                        }
+                        cursor.done = true;
+                        break;
+                    };
+                    for batch in reader {
+                        let batch = batch.map_err(|error| {
+                            Error::invariant(format!("presence node scan read: {error}"))
+                        })?;
+                        crate::cancel::check()?;
+                        let id_col = batch
+                            .column_by_name(COL_NODE_ID)
+                            .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                            .ok_or_else(|| Error::invariant("node_id column missing"))?;
+                        let tomb_col = batch
+                            .column_by_name(COL_TOMBSTONE)
+                            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+                            .ok_or_else(|| Error::invariant("tombstone column missing"))?;
+                        let lsn_col = batch
+                            .column_by_name(COL_LSN)
+                            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                            .ok_or_else(|| Error::invariant("lsn column missing"))?;
+                        let mut ids = Vec::with_capacity(batch.num_rows());
+                        let mut candidates = Vec::with_capacity(batch.num_rows());
+                        for row in 0..batch.num_rows() {
+                            let id_bytes: [u8; 16] = id_col
+                                .value(row)
+                                .try_into()
+                                .map_err(|_| Error::invariant("node_id row length != 16"))?;
+                            let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
+                            if cursor.last.is_some_and(|last| last >= id) {
+                                return Ok(None);
+                            }
+                            cursor.last = Some(id);
+                            ids.push(id_bytes);
+                            candidates.push(
+                                !tomb_col.value(row)
+                                    && row_carries_label(
+                                        &batch,
+                                        row,
+                                        label,
+                                        label_id,
+                                        dict,
+                                        &desc.scope,
+                                    ),
+                            );
+                        }
+                        let present = match &cursor.pages {
+                            Some(pages) => {
+                                let wanted: Vec<[u8; 16]> = ids
+                                    .iter()
+                                    .zip(&candidates)
+                                    .filter(|(_, candidate)| **candidate)
+                                    .map(|(id, _)| *id)
+                                    .collect();
+                                let mut found = pages
+                                    .presence_of_node_ids(property, &wanted)
+                                    .await?
+                                    .into_iter();
+                                candidates
+                                    .iter()
+                                    .map(|candidate| *candidate && found.next().unwrap_or(false))
+                                    .collect::<Vec<_>>()
+                            }
+                            None => {
+                                let mut present = Vec::with_capacity(candidates.len());
+                                for (row, candidate) in candidates.iter().enumerate() {
+                                    present.push(
+                                        *candidate
+                                            && row_has_property(
+                                                &batch,
+                                                row,
+                                                &cursor.label_def,
+                                                property,
+                                            )?,
+                                    );
+                                }
+                                present
+                            }
+                        };
+                        for (row, (id_bytes, keep)) in ids.iter().zip(present).enumerate() {
+                            cursor.rows.push_back((
+                                NodeId::from_uuid(Uuid::from_bytes(*id_bytes)),
+                                lsn_col.value(row),
+                                keep,
+                            ));
+                        }
+                        cursor.ordinal += batch.num_rows() as u64;
+                    }
+                }
+            }
+
+            let next = cursors
+                .iter()
+                .filter_map(|(_, cursor)| cursor.rows.front().map(|row| row.0))
+                .chain(memtable.peek().map(|(id, _)| *id))
+                .min();
+            let Some(id) = next else {
+                return Ok(Some(count));
+            };
+            let mut winner: Option<(u64, bool)> = None;
+            if memtable.peek().is_some_and(|(mem_id, _)| *mem_id == id) {
+                winner = memtable.next().map(|(_, version)| version);
+            }
+            for (_, cursor) in &mut cursors {
+                if cursor.rows.front().is_some_and(|row| row.0 == id) {
+                    let (_, lsn, keep) = cursor.rows.pop_front().expect("front checked");
+                    if winner.is_none_or(|(best, _)| lsn > best) {
+                        winner = Some((lsn, keep));
+                    }
+                }
+            }
+            if winner.is_some_and(|(_, keep)| keep) {
+                count += 1;
+            }
+            settled += 1;
+            if settled % 4096 == 0 {
+                crate::cancel::check()?;
+                tokio::task::yield_now().await;
+            }
+        }
     }
 }

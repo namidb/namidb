@@ -926,6 +926,35 @@ pub(crate) fn decode_canonical_value(bytes: &[u8]) -> Result<Value> {
     decode_top_level_value(bytes, &NodePropertyPageConfig::default())
 }
 
+/// Whether a canonical property map (a node's binary property cell) has
+/// `key` with a non-null value. Every other value is skipped, so no vector or
+/// string is built.
+pub(crate) fn canonical_map_has_non_null(bytes: &[u8], key: &str) -> Result<bool> {
+    let config = NodePropertyPageConfig::default();
+    let mut decoder = ValueDecoder {
+        bytes,
+        cursor: 0,
+        elements: 1,
+        config: &config,
+    };
+    if decoder.read_u8()? != 11 {
+        return Err(corrupted("binary property cell is not a map"));
+    }
+    let count = decoder.read_collection_count()?;
+    decoder.require_future_elements(count)?;
+    for _ in 0..count {
+        let name = decoder.read_length_prefixed()?;
+        if name == key.as_bytes() {
+            return Ok(decoder
+                .bytes
+                .get(decoder.cursor)
+                .is_some_and(|tag| *tag != 0));
+        }
+        decoder.skip(1)?;
+    }
+    Ok(false)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PageIndexEntry {
     property_id: u32,
@@ -1870,6 +1899,65 @@ impl NodePropertyPageReader {
     /// Project named properties for an explicit NodeId batch. Input order and
     /// duplicates are preserved. Unknown/absent properties are explicit
     /// [`PropertyCell::Absent`] values.
+    /// Whether each of `node_ids` (ascending, distinct) has a non-null
+    /// `property` in this SST, reading only that property's pages and never
+    /// decoding a value: a presence count over a vector property costs the
+    /// pages' bytes, not a decoded vector per row. Pages are checksummed and
+    /// their row order validated as in [`Self::project_node_ids`].
+    pub async fn presence_of_node_ids(
+        &self,
+        property: &str,
+        node_ids: &[[u8; 16]],
+    ) -> Result<Vec<bool>> {
+        if node_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(Error::invariant(
+                "node property presence probe needs ascending distinct ids",
+            ));
+        }
+        validate_projection_names(&[property.to_string()], &self.config)?;
+        let mut present = vec![false; node_ids.len()];
+        let (Some(first), Some(last)) = (node_ids.first(), node_ids.last()) else {
+            return Ok(present);
+        };
+        let Some(catalog) = self.catalog_entry(property) else {
+            return Ok(present);
+        };
+        let pages = self.load_property_index(catalog).await?;
+        let selected_pages = pages
+            .iter()
+            .filter(|page| page.last_node_id >= *first && page.first_node_id <= *last)
+            .filter(|page| {
+                let start = node_ids.partition_point(|id| *id < page.first_node_id);
+                node_ids
+                    .get(start)
+                    .is_some_and(|id| *id <= page.last_node_id)
+            })
+            .collect::<Vec<_>>();
+        let mut cursor = 0;
+        while cursor < selected_pages.len() {
+            let end = next_payload_batch_end(&selected_pages, cursor, &self.config);
+            let encoded_pages = self
+                .read_payload_pages(&selected_pages[cursor..end])
+                .await?;
+            for (page, encoded) in selected_pages[cursor..end].iter().zip(encoded_pages) {
+                walk_page_rows(
+                    &encoded,
+                    page,
+                    self.header.sst_id,
+                    &self.config,
+                    |node_id, _, has_value, _| {
+                        if let Ok(position) = node_ids.binary_search(&node_id) {
+                            present[position] = has_value;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            cursor = end;
+        }
+        Ok(present)
+    }
+
     pub async fn project_node_ids(
         &self,
         properties: &[String],
@@ -2756,6 +2844,37 @@ fn decode_page_selected(
     config: &NodePropertyPageConfig,
     mut selected: impl FnMut([u8; 16], u64) -> bool,
 ) -> Result<Vec<([u8; 16], u64, PropertyCell)>> {
+    let mut rows = Vec::new();
+    walk_page_rows(
+        encoded,
+        page,
+        sst_id,
+        config,
+        |node_id, ordinal, present, value| {
+            if selected(node_id, ordinal) {
+                let cell = if present {
+                    PropertyCell::Value(decode_top_level_value(value, config)?)
+                } else {
+                    PropertyCell::Null
+                };
+                rows.push((node_id, ordinal, cell));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(rows)
+}
+
+/// Validate one payload page (checksums, header, row order, boundaries) and
+/// hand every row to `visit` as `(node_id, ordinal, has_value, value_bytes)`
+/// without decoding the value. `has_value` is false for an explicit null.
+fn walk_page_rows(
+    encoded: &[u8],
+    page: &PageIndexEntry,
+    sst_id: [u8; 16],
+    config: &NodePropertyPageConfig,
+    mut visit: impl FnMut([u8; 16], u64, bool, &[u8]) -> Result<()>,
+) -> Result<()> {
     if encoded.len() as u64 != page.encoded_len
         || crc32fast::hash(encoded) != page.crc32
         || salted_page_hash(encoded, sst_id, page.property_id, page.page_ordinal)
@@ -2803,7 +2922,6 @@ fn decode_page_selected(
         ));
     }
     let mut cursor = PAGE_HEADER_LEN;
-    let mut rows = Vec::new();
     let mut previous_node_id = None;
     let mut previous_ordinal = None;
     let mut first_node_id = None;
@@ -2844,14 +2962,7 @@ fn decode_page_selected(
         first_ordinal.get_or_insert(ordinal);
         last_node_id = Some(node_id);
         last_ordinal = Some(ordinal);
-        if selected(node_id, ordinal) {
-            let cell = if state == 0 {
-                PropertyCell::Null
-            } else {
-                PropertyCell::Value(decode_top_level_value(value, config)?)
-            };
-            rows.push((node_id, ordinal, cell));
-        }
+        visit(node_id, ordinal, state == 1, value)?;
         previous_node_id = Some(node_id);
         previous_ordinal = Some(ordinal);
         cursor = value_end;
@@ -2866,7 +2977,7 @@ fn decode_page_selected(
             "node property page boundary or trailing-byte mismatch",
         ));
     }
-    Ok(rows)
+    Ok(())
 }
 
 fn salted_page_hash(encoded: &[u8], sst_id: [u8; 16], property_id: u32, page_ordinal: u32) -> u64 {
@@ -3018,6 +3129,77 @@ impl ValueDecoder<'_> {
                 "node property Value has unknown tag {other}"
             ))),
         }
+    }
+
+    /// Advance past one encoded value with the same bounds checks as
+    /// [`Self::decode`], building nothing.
+    fn skip(&mut self, depth: u16) -> Result<()> {
+        if depth > self.config.max_value_depth {
+            return Err(corrupted(format!(
+                "node property Value depth exceeds {}",
+                self.config.max_value_depth
+            )));
+        }
+        self.elements = self
+            .elements
+            .checked_add(1)
+            .ok_or_else(|| corrupted("node property Value element count overflows"))?;
+        if self.elements > self.config.max_value_elements {
+            return Err(corrupted(format!(
+                "node property Value elements exceed {}",
+                self.config.max_value_elements
+            )));
+        }
+        match self.read_u8()? {
+            0 => {}
+            1 => {
+                self.read_u8()?;
+            }
+            2 | 3 | 9 => {
+                self.read_exact(8)?;
+            }
+            8 => {
+                self.read_exact(4)?;
+            }
+            4 | 5 => {
+                self.read_length_prefixed()?;
+            }
+            6 => {
+                let count = self.read_collection_count()?;
+                self.consume_leaf_elements(count)?;
+                let byte_len = count
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| corrupted("node property vector byte length overflows"))?;
+                self.read_exact(byte_len)?;
+            }
+            7 => {
+                let count = self.read_collection_count()?;
+                self.consume_leaf_elements(count)?;
+                self.read_exact(count)?;
+                self.read_exact(4)?;
+            }
+            10 => {
+                let count = self.read_collection_count()?;
+                self.require_future_elements(count)?;
+                for _ in 0..count {
+                    self.skip(depth + 1)?;
+                }
+            }
+            11 => {
+                let count = self.read_collection_count()?;
+                self.require_future_elements(count)?;
+                for _ in 0..count {
+                    self.read_length_prefixed()?;
+                    self.skip(depth + 1)?;
+                }
+            }
+            other => {
+                return Err(corrupted(format!(
+                    "node property Value has unknown tag {other}"
+                )))
+            }
+        }
+        Ok(())
     }
 
     fn read_u8(&mut self) -> Result<u8> {
