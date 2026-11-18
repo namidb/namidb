@@ -1076,3 +1076,94 @@ mod indexed_sparse_filter {
         );
     }
 }
+
+/// Node ids and scores in result order (rows `RETURN node, score`).
+fn ids_scores(rows: &[namidb_query::Row]) -> Vec<(NodeId, f64)> {
+    rows.iter()
+        .filter_map(|r| match (r.get("node"), r.get("score")) {
+            (Some(RuntimeValue::Node(n)), Some(RuntimeValue::Float(s))) => Some((n.id, *s)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn hybrid_hydrates_the_fused_ranking_of_its_legs() {
+    // Enough documents that the fused top-k mixes dense-only, sparse-only and
+    // shared hits, so hydration covers ids the dense leg never loaded. The
+    // result must be exactly the RRF of the two legs run on their own, in rank
+    // order, with every node hydrated.
+    let mut writer = WriterSession::open(store(), paths("hybrid-hydrate"))
+        .await
+        .unwrap();
+    for i in 0..60u32 {
+        let mut p = BTreeMap::new();
+        p.insert("title".into(), CoreValue::Str(format!("doc{i}")));
+        let body = if i % 3 == 0 {
+            format!("quantum notes {i} quantum")
+        } else {
+            format!("pasta notes {i}")
+        };
+        p.insert("body".into(), CoreValue::Str(body));
+        let a = i as f32 / 60.0;
+        p.insert("embedding".into(), CoreValue::Vec(vec![1.0 - a, a, 0.1]));
+        writer
+            .upsert_node(
+                "Doc",
+                NodeId::new(),
+                &NodeWriteRecord {
+                    properties: p,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    writer.commit_batch().await.unwrap();
+
+    let k = 25;
+    let q = vec![0.2, 0.8, 0.1];
+    let dense = ids_scores(
+        &run(
+            &writer,
+            &format!(
+                "CALL search.vector({{label: 'Doc', property: 'embedding', query: $q, k: {}}}) \
+                 YIELD node, score RETURN node, score",
+                k * 8
+            ),
+            q.clone(),
+        )
+        .await,
+    );
+    let sparse = ids_scores(
+        &run(
+            &writer,
+            &format!(
+                "CALL search.bm25({{label: 'Doc', text_properties: ['body'], query: 'quantum', k: {}}}) \
+                 YIELD node, score RETURN node, score",
+                k * 8
+            ),
+            vec![],
+        )
+        .await,
+    );
+    assert!(!dense.is_empty() && !sparse.is_empty());
+    let mut expected = namidb_query::exec::fusion::rrf(
+        &[&dense, &sparse],
+        namidb_query::exec::fusion::DEFAULT_RRF_K,
+    );
+    expected.truncate(k);
+
+    let rows = run(
+        &writer,
+        &format!(
+            "CALL search.hybrid({{label: 'Doc', query_text: 'quantum', text_property: 'body', \
+             query_vector: $q, vector_property: 'embedding', k: {k}}}) \
+             YIELD node, score RETURN node, score, node.title AS title"
+        ),
+        q,
+    )
+    .await;
+    assert_eq!(ids_scores(&rows), expected);
+    assert_eq!(titles(&rows).len(), k, "every fused hit is hydrated");
+}

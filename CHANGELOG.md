@@ -15,6 +15,14 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`search.hybrid` hydrates its fused results in one batch.** It looked up
+  each fused hit on its own, so every hit found only by the full-text leg
+  cost a separate walk over the label's node runs; on a cold cache a top-10
+  over a few hundred thousand documents exceeded the query timeout while
+  each leg alone answered in seconds. The results are unchanged.
+
 ## [3.5.0] - 2026-11-18
 
 ### Changed
