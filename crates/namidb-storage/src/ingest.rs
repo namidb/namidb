@@ -4930,6 +4930,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_presence_merge_counts_exactly_without_decoding_values() {
+        let mut session = WriterSession::open(make_store(), make_paths("ingest-presence-merge"))
+            .await
+            .unwrap();
+        let mut model = CountModel::new();
+        for id in 1..=60u8 {
+            apply_doc(&mut session, &mut model, id, Some(vec!["Doc"]), id % 3 != 0);
+        }
+        session.commit_batch().await.unwrap();
+        session.flush(Schema::empty()).await.unwrap();
+        // Overlapping SST: updates, a delete, a relabel and new ids.
+        for id in (2..=60u8).step_by(7) {
+            apply_doc(&mut session, &mut model, id, Some(vec!["Doc"]), id % 2 == 0);
+        }
+        apply_doc(&mut session, &mut model, 7, None, false);
+        apply_doc(&mut session, &mut model, 8, Some(vec!["Archived"]), true);
+        apply_doc(
+            &mut session,
+            &mut model,
+            61,
+            Some(vec!["Doc", "Archived"]),
+            true,
+        );
+        session.commit_batch().await.unwrap();
+        session.flush(Schema::empty()).await.unwrap();
+        // An explicit null is not presence; then a memtable tail.
+        let mut null_embedding = doc_record(None, Some("t"));
+        null_embedding
+            .properties
+            .insert("embedding".into(), Value::Null);
+        session
+            .upsert_node("Doc", sorted_node_id(9), &null_embedding)
+            .unwrap();
+        model.insert(9, (vec!["Doc"], false));
+        apply_doc(&mut session, &mut model, 1, Some(vec!["Doc"]), false);
+        apply_doc(&mut session, &mut model, 62, Some(vec!["Doc"]), true);
+        session.commit_batch().await.unwrap();
+
+        let owned = session.owned_snapshot();
+        let snapshot = owned.borrow();
+        let (_, present) = model_presence(&model, "Doc");
+        let decodes_before = crate::sst::nodes::BINARY_PROPS_DECODES.with(|n| n.get());
+        let merged = snapshot
+            .count_label_presence_merged("Doc", "embedding", u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(merged, Some(present));
+        // 120+ flushed rows hold an embedding; only the three memtable
+        // payloads (already in memory) are decoded, never an SST cell.
+        assert!(
+            crate::sst::nodes::BINARY_PROPS_DECODES.with(|n| n.get()) - decodes_before <= 3,
+            "presence is read from SSTs without decoding property cells"
+        );
+        assert_eq!(
+            snapshot
+                .count_label_presence_merged("Doc", "missing", u64::MAX)
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        // A row-group bound the SSTs cannot meet leaves the count to a
+        // metered scan instead of reading them.
+        let has_pageless_sst = snapshot
+            .count_label_presence_merged("Doc", "embedding", 0)
+            .await
+            .unwrap()
+            .is_none();
+        let exact = snapshot
+            .count_nodes_with_property("Doc", "embedding")
+            .await
+            .unwrap();
+        assert_eq!(exact, present, "pageless SSTs: {has_pageless_sst}");
+    }
+
+    #[tokio::test]
     async fn a_presence_count_on_a_stale_snapshot_is_seeded_by_the_next_commit() {
         let mut session = WriterSession::open(make_store(), make_paths("ingest-presence-stale"))
             .await

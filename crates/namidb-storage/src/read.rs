@@ -490,9 +490,18 @@ impl VectorSearchIndex {
     }
 }
 
+/// Largest row group (uncompressed, all columns) a presence count reads from
+/// an SST without property pages. Larger ones are left to a metered scan.
+const PRESENCE_MAX_ROW_GROUP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A presence count holds at most one row group of `(id, lsn, verdict)` rows
+/// per node SST (128 Ki rows by default), about this many bytes per row.
+const PRESENCE_ROW_GROUP_ROWS: u64 = 128 * 1024;
+const PRESENCE_ROW_BYTES: usize = 48;
+
 #[cfg(feature = "vector-index")]
 /// Leaf pages every clustered-base vector query probes at least.
-const MIN_VECTOR_V5_NPROBE: usize = 24;
+const MIN_VECTOR_V5_NPROBE: usize = 64;
 
 #[cfg(feature = "vector-index")]
 fn vector_v5_search_options(
@@ -504,8 +513,11 @@ fn vector_v5_search_options(
     // spans many 512-row leaves once the corpus is large, and the true nearest
     // neighbours are spread across them. On 377k 1024-dimension rows in 1024
     // leaves (principal-direction splits) 16 leaves gave recall@10 0.94-0.97
-    // and 24 gave 0.995. Probe `ef / 4` leaves, at least 24; the pages are
-    // fetched concurrently, so this costs bandwidth, not round trips.
+    // and 24 gave 0.995 on synthetic clusters. On real text embeddings at the
+    // same scale 24 leaves found a document's own embedding in only 25 of
+    // 29 self-queries, and 64 found all 29. Probe `ef / 4` leaves, at least
+    // 64; the pages are fetched concurrently, so this costs bandwidth, not
+    // round trips.
     // Widening eventually reaches every page when `ef` approaches the corpus,
     // preserving the exact-fallback/exhaustion logic.
     let nprobe = ef.div_ceil(4).max(MIN_VECTOR_V5_NPROBE).min(page_count);
@@ -6342,6 +6354,57 @@ impl<'mt> Snapshot<'mt> {
     /// with an empty projection (ids only, the same path a general
     /// `WHERE n.p IS NOT NULL` takes).
     async fn scan_presence_count(&self, label: &str, property: &str) -> Result<u64> {
+        // The merge keeps one (id, lsn, verdict) per row of the row groups it
+        // is in, never a value. Reserve that working set, plus one admitted
+        // row group, from the shared search workspace so a seed and the
+        // queries it serves cannot together outgrow the process.
+        let workspace = self
+            .manifest
+            .index
+            .node_descriptors()
+            .into_iter()
+            .map(|idx| {
+                let rows = self.manifest.manifest.ssts[idx]
+                    .row_count
+                    .min(PRESENCE_ROW_GROUP_ROWS);
+                usize::try_from(rows)
+                    .unwrap_or(usize::MAX)
+                    .saturating_mul(PRESENCE_ROW_BYTES)
+            })
+            .fold(PRESENCE_MAX_ROW_GROUP_BYTES as usize, usize::saturating_add);
+        let merged =
+            match crate::search_workspace::reserve_search_workspace("presence count", workspace)
+                .await
+            {
+                Ok(_workspace) => {
+                    self.count_label_presence_merged(label, property, PRESENCE_MAX_ROW_GROUP_BYTES)
+                        .await?
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        label,
+                        property,
+                        %error,
+                        "presence count working set does not fit the search workspace"
+                    );
+                    None
+                }
+            };
+        if let Some(count) = merged {
+            namidb_core::profile::record("Snapshot::presence_count.merged", 0);
+            return Ok(count);
+        }
+        // The materialising scans below keep every matching row until
+        // last-writer-wins settles. A query meters them against its memory
+        // budget; with nothing metering (a background count seed) they could
+        // grow without limit, so the seed gives up instead and the next count
+        // query scans under its own budget.
+        if !crate::cancel::RetainMeter::new().active() {
+            return Err(Error::precondition(format!(
+                "presence count of {label}.{property} needs a materialising scan, \
+                 which only runs under a query's memory budget"
+            )));
+        }
         if self.node_scan_is_disjoint() {
             let mut count = 0_u64;
             self.visit_label_with_projection::<_, Error>(label, &[property.to_string()], |view| {
@@ -12693,14 +12756,12 @@ fn count_seed_pairs(
     label: &str,
     property: Option<&str>,
 ) -> BTreeSet<(String, String)> {
+    // Only the pair asked for: seeding every vector-indexed property along
+    // with a plain label count made `count(n)` read every vector of the label.
+    let _ = manifest;
     let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
     if let Some(property) = property {
         pairs.insert((label.to_string(), property.to_string()));
-    }
-    for index in &manifest.vector_indexes {
-        if index.label == label {
-            pairs.insert((label.to_string(), index.property.clone()));
-        }
     }
     pairs
 }
