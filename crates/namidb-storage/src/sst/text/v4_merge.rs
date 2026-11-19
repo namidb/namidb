@@ -444,7 +444,8 @@ impl PostingStream<'_> {
             self.block += 1;
             let compressed = block_on(self.reader.source.read_range(reference.wire.range()?))?;
             let raw = decode_block(&compressed, &reference.wire, "posting block")?;
-            self.postings = decode_posting_block(&raw, reference)?.into_iter();
+            // A merge re-encodes positions: keep them.
+            self.postings = decode_posting_block(&raw, reference, true)?.into_iter();
         }
     }
 }

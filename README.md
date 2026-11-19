@@ -381,6 +381,28 @@ CALL search.hybrid({
 RETURN node.title AS title, score ORDER BY score DESC;
 ```
 
+**Fusion modes.** `fusion` is `'rrf'` (the default) or `'linear'`:
+
+- **`'rrf'` — Reciprocal Rank Fusion.** Each leg contributes `1 / (rrf_k + rank)` (rank is 1-based within that leg) for every node it returns, and the fused score is the sum. Only ranks matter, so the cosine and BM25 scales never need calibrating. `rrf_k` (default `60`, must be `> 0`) flattens (larger) or sharpens (smaller) the preference for top ranks. `alpha` is not accepted with `'rrf'`.
+- **`'linear'` — weighted blend of normalised scores.** Each leg's scores are min-max normalised **within that leg's own result list** (its best hit → 1, its worst → 0; a leg whose hits all tie, or that has a single hit, maps them to 1), and the fused score is `alpha · vector + (1 − alpha) · bm25`; a node missing from a leg contributes 0 there. `alpha` is the **vector (dense) leg's weight**, a number in `[0, 1]` (default `0.5`; `1` = vector only, `0` = BM25 only). Passing `alpha` without `fusion` selects `'linear'`; `rrf_k` is not accepted with `'linear'`.
+
+Each leg first retrieves `8 × k` candidates (override with `k_dense` / `k_sparse`) so a node ranked well by one leg but just outside the other's window still contributes.
+
+```cypher
+// Default: reciprocal rank fusion.
+CALL search.hybrid({label: 'Doc', query_text: $text, text_property: 'body',
+                    query_vector: $q, vector_property: 'embedding', k: 10})
+YIELD node, score RETURN node.title, score;
+
+// Linear blend weighted 70 % on the vector leg, 30 % on BM25.
+CALL search.hybrid({label: 'Doc', query_text: $text, text_property: 'body',
+                    query_vector: $q, vector_property: 'embedding', k: 10,
+                    fusion: 'linear', alpha: 0.7})
+YIELD node, score RETURN node.title, score;
+```
+
+**Filters.** `filter` (on `search.vector`, `search.bm25` and `search.hybrid`) is a map of node-property conditions: a scalar is equality, a list is `IN`, and `{eq|ne|gt|gte|lt|lte|in: value}` combine with AND. Every leg returns exactly its `k` best *matching* nodes, or all of them when fewer match — a filter never trims an already-truncated top-k. How a filter is applied depends on its selectivity: equality groups the index stores natively are applied inside the index; a filter that admits few nodes (found through a property index, or a bounded scan of the filter's own property columns) is answered by scoring exactly those nodes; a broad filter is applied during retrieval, widening the candidate depth until `k` matches are found or the index is exhausted, with the exact scan as the last resort.
+
 There's also a per-row `bm25(text, query)` scalar for inline use when you don't need corpus-wide IDF, and the MCP `hybrid_search` tool exposes the same fusion to agents.
 
 The full vector-index design — freshness gating, all three metrics, int8 quantization, and the index-vs-flat equivalence — is [RFC-030](./docs/rfc/030-vector-index.md); the multi-tenant filtered-ANN pre-filtering path behind the `filter` argument is [RFC-032](./docs/rfc/032-filtered-ann-prefiltering.md).

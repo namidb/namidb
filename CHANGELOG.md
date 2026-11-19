@@ -56,6 +56,15 @@ crates.io release will establish and document that API explicitly.
   (`NAMIDB_BACKGROUND_NICE`, default 10; 0 keeps the normal priority), so a
   query gets the CPU first while a merge or build runs.
 
+- **`search.hybrid` fusion options are validated together.** `alpha` (the
+  vector leg's weight in the linear blend, `[0, 1]`) now selects
+  `fusion: 'linear'` when `fusion` is omitted; it was silently ignored by the
+  default RRF before. `alpha` with `fusion: 'rrf'` and `rrf_k` with
+  `fusion: 'linear'` are rejected; a non-string `fusion` is rejected instead
+  of falling back to RRF; and every option error, an unknown `fusion`
+  included, is raised before either leg runs. The README documents both
+  modes, including the per-leg min-max normalisation of `'linear'`.
+
 ### Added
 
 - **`search.vector` takes an index name**: `{index: 'name', query, k}` in the map
@@ -88,6 +97,60 @@ crates.io release will establish and document that API explicitly.
   retry into the same destination is sent) keeps the destination objects a
   previous attempt already finished, matched by path and size, instead of
   copying the whole snapshot again. Restores still replace everything.
+- **Full-text search uses its block-max scorer on a complete first delta.**
+  A full-text index whose only segment is the generation's first delta (the
+  index built by flushes, never consolidated into a base) was not recognised
+  as holding the whole corpus once any later flush had touched no indexed
+  text (an embedding backfill, writes to other labels). Every `search.bm25`
+  and every sparse leg of `search.hybrid` then took the exhaustive scorer,
+  decoding every posting of every query term, frequent terms included. Such a
+  segment, and a base followed by such proven-empty flushes, now serve from
+  the block-max exact top-k, with identical results.
+- **Full-text scoring does far less work per posting.** Each posting block
+  created and released its own decompression context (a fresh allocation and
+  release of its window every block); every posting allocated a list of its
+  token positions, although only terms inside a phrase need them; and the
+  scorer re-measured its working set by walking every decoded posting of
+  every query term after each scored document. Blocks now decompress through
+  one reused context per thread, positions are kept only for phrase terms,
+  and each block's size is measured once when it loads. Scores and results
+  are unchanged.
+- **A low-degree hop over many rows resolves its endpoints together.** An
+  Expand proved the target label of, or hydrated, each input row's
+  endpoints on their own, so joining every row of a ranked search to its
+  parent node (`CALL search.hybrid(...) YIELD node MATCH (p:P)-[:R]->(node)`)
+  paid a few dependent store reads per row. For a single hop whose
+  adjacency is already read ahead per window of input rows, the endpoints of
+  the whole window (up to 4,096) are now resolved in one call; the rows are
+  unchanged.
+- **Full-text posting lists are read ahead.** Postings of all query terms
+  are consumed together in document order, so each term fetched its posting
+  list one cache page at a time, each fetch a dependent object-store round
+  trip. A term whose next block is not resident now reads its following
+  contiguous blocks in the same request (up to 1 MiB per term and 8 MiB per
+  query, held in the search workspace reservation); blocks the block-max
+  scorer then skips are dropped unread.
+- **Full-text dictionary lookups run concurrently.** Each query term's
+  dictionary block was fetched after the previous one, one object-store round
+  trip per term before the first posting was read.
+- **The dense leg of `search.hybrid` no longer loads its candidates.** It
+  loaded every one of its `8 × k` vector candidates in full (properties,
+  text and embedding) although only the fused top `k` are returned and those
+  are loaded again; the cost grew linearly with `k`. Candidates are now
+  carried as identity and score, and only the fused results are loaded.
+- **Filtered search answers selective filters without widening.**
+  `search.bm25` and `search.hybrid` with a `filter` the full-text index cannot
+  apply natively widened a ranked prefix, loading every candidate to test the
+  filter, up to 65,536 candidates and then a scan of the whole corpus; a
+  one-value equality on a property without an index ran into the query
+  timeout on a few hundred thousand documents. A filter that admits at most
+  4,096 nodes (found through a property index, or a scan of the filter's own
+  property columns that stops as soon as the filter proves broad) is now
+  answered by scoring exactly those nodes with the index's corpus-wide
+  statistics. Broad filters keep the widening route, which still returns
+  exactly `k` matching rows or all of them, and are recognised as broad from
+  an id-ordered prefix of the label when its node runs overlap (the bounded
+  column scan could not stop early there). Results equal the exact scan's.
 
 ## [3.5.1] - 2026-11-18
 

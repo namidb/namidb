@@ -140,7 +140,6 @@ impl OpenedTextGeneration {
     /// additional checks prove that no winner reconciliation is necessary.
     fn authoritative_single_base(&self, dirty_ids: &[[u8; 16]]) -> Option<&OpenedTextSegment> {
         if !dirty_ids.is_empty()
-            || !self.state.proven_empty_event_ranges.is_empty()
             || self.state.segments.len() != 1
             || self.segments.len() != 1
             || self.state.equal_lsn_conflict_count != 0
@@ -148,22 +147,47 @@ impl OpenedTextGeneration {
             return None;
         }
         let segment = &self.segments[0];
-        let frontier = self.state.base_frontier?;
-        let SearchSegmentStats::Text {
-            doc_count: SearchStatValue::Absolute(documents),
-            total_len: SearchStatValue::Absolute(total_len),
-            term_df_violation_count: 0,
-        } = segment.segment.stats
-        else {
-            return None;
+        // A singleton segment holds the whole corpus when it is either the
+        // base, or the first delta of the generation (a delta applied to the
+        // empty corpus at event 0). Either way its relative statistics are
+        // absolute, so the only extra condition is coverage: every event of
+        // the generation is in the segment or in a range proven to change no
+        // indexed text. Flushes that touch no indexed property (an embedding
+        // backfill, writes to other labels) only add proven-empty ranges, and
+        // must not demote a complete segment to the exhaustive reconciled
+        // scorer.
+        let (documents, total_len) = match (segment.segment.role, segment.segment.stats) {
+            (
+                SearchSegmentRole::Base,
+                SearchSegmentStats::Text {
+                    doc_count: SearchStatValue::Absolute(documents),
+                    total_len: SearchStatValue::Absolute(total_len),
+                    term_df_violation_count: 0,
+                },
+            ) => (documents, total_len),
+            (
+                SearchSegmentRole::Delta,
+                SearchSegmentStats::Text {
+                    doc_count: SearchStatValue::Delta(documents),
+                    total_len: SearchStatValue::Delta(total_len),
+                    term_df_violation_count: 0,
+                },
+            ) => (
+                u64::try_from(documents).ok()?,
+                u64::try_from(total_len).ok()?,
+            ),
+            _ => return None,
         };
         let event_range = segment.segment.event_ranges.as_slice();
-        if frontier == 0
-            || self.state.next_event_seq != frontier
-            || event_range.len() != 1
+        if event_range.len() != 1
             || event_range[0].start != 0
-            || event_range[0].end != frontier
-            || segment.segment.role != SearchSegmentRole::Base
+            || !events_fully_covered(
+                event_range[0],
+                &self.state.proven_empty_event_ranges,
+                self.state.next_event_seq,
+            )
+            || (segment.segment.role == SearchSegmentRole::Base
+                && self.state.base_frontier != Some(event_range[0].end))
             || segment.segment.format != SearchSegmentFormat::TextV4
             || segment.segment.suppress_count != 0
             || segment.segment.equal_lsn_conflict_count != 0
@@ -181,6 +205,29 @@ impl OpenedTextGeneration {
         }
         Some(segment)
     }
+}
+
+/// Whether `segment` (starting at event 0) plus the proven-empty ranges cover
+/// exactly the events `[0, next_event_seq)`, with no gap and no overlap.
+#[cfg(feature = "text-index")]
+fn events_fully_covered(
+    segment: crate::search_lsm::SearchEventRange,
+    proven_empty: &[crate::search_lsm::SearchEventRange],
+    next_event_seq: u64,
+) -> bool {
+    if segment.start != 0 || !segment.is_valid() {
+        return false;
+    }
+    let mut ranges = proven_empty.to_vec();
+    ranges.sort_by_key(|range| range.start);
+    let mut covered = segment.end;
+    for range in ranges {
+        if !range.is_valid() || range.start != covered {
+            return false;
+        }
+        covered = range.end;
+    }
+    covered == next_event_seq && next_event_seq > 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1656,6 +1703,41 @@ async fn reconcile_text_candidates(
     Ok(Some(accepted))
 }
 
+/// The query as the active generation expands it plus its corpus-wide BM25
+/// statistics, without scoring any document. Same availability contract as
+/// [`text_search`]: anything that would make it fall back is `Unavailable`.
+#[cfg(feature = "text-index")]
+pub(super) async fn text_query_stats(
+    snapshot: &Snapshot<'_>,
+    index_name: &str,
+    query: &crate::text::TextQuery,
+    dirty_ids: &[[u8; 16]],
+) -> Result<
+    ActiveSearch<(
+        crate::text::TextQuery,
+        crate::sst::text::v4::TextV4GlobalStats,
+    )>,
+> {
+    let generation = match open_text_generation(snapshot, index_name).await? {
+        ActiveSearch::NotActive => return Ok(ActiveSearch::NotActive),
+        ActiveSearch::Unavailable => return Ok(ActiveSearch::Unavailable),
+        ActiveSearch::Ready(generation) => generation,
+    };
+    if !dirty_ids.is_empty() {
+        match text_generation_contains_live(&generation, dirty_ids).await? {
+            Some(false) => {}
+            Some(true) | None => return Ok(ActiveSearch::Unavailable),
+        }
+    }
+    let Some(expanded) = globally_expanded_text_query(&generation, query).await? else {
+        return Ok(ActiveSearch::Unavailable);
+    };
+    let Some(global) = global_text_stats(&generation, &expanded).await? else {
+        return Ok(ActiveSearch::Unavailable);
+    };
+    Ok(ActiveSearch::Ready((expanded, global)))
+}
+
 #[cfg(feature = "text-index")]
 pub(super) async fn text_search(
     snapshot: &Snapshot<'_>,
@@ -2500,6 +2582,208 @@ mod tests {
             store,
             paths,
         }
+    }
+
+    /// The corpus of [`authoritative_text_base_fixture`] held by the
+    /// generation's first delta (events `[0, 1)`), followed by
+    /// `proven_empty_tail` flushes that changed no indexed text.
+    #[cfg(feature = "text-index")]
+    async fn singleton_text_delta_fixture(proven_empty_tail: u64) -> TextFixture {
+        use crate::manifest::{LoadedManifest, Manifest, ManifestPointer, TextIndexDescriptor};
+        use crate::search_lsm::{
+            encode_search_barrier, search_barrier_descriptor, text_lsm_catalog_signature,
+            SearchEventRange, SearchLsmStatus,
+        };
+        use crate::sst::text::v4::{
+            build_delta_v4, TextV4BuildContext, TextV4BuildOptions, TextV4Mutation,
+        };
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = crate::paths::NamespacePaths::new(
+            "tests",
+            namidb_core::NamespaceId::new("search-lsm-text-singleton-delta").unwrap(),
+        );
+        let index =
+            TextIndexDescriptor::new("law_text".into(), "Articulo".into(), vec!["texto".into()]);
+        let mut manifest = Manifest::empty(crate::fence::Epoch::ZERO, Uuid::from_u128(950));
+        manifest.text_indexes.push(index.clone());
+        let mut state = SearchLsmState {
+            index_name: index.name.clone(),
+            kind: SearchLsmKind::Text,
+            catalog_signature: text_lsm_catalog_signature(&manifest, &index),
+            generation_id: Uuid::from_u128(951),
+            status: SearchLsmStatus::Building,
+            ..SearchLsmState::default()
+        };
+        let documents = (1..=32u128)
+            .map(|value| TextV4Mutation {
+                node_id: *Uuid::from_u128(value).as_bytes(),
+                lsn: value as u64,
+                before: None,
+                after: Some(text_payload(
+                    if value == 1 {
+                        "rare rare rare common"
+                    } else if value % 5 == 0 {
+                        "common common tail tail tail"
+                    } else {
+                        "common tail"
+                    },
+                    value % 2 == 1,
+                )),
+            })
+            .collect::<Vec<_>>();
+        let sst_id = Uuid::from_u128(960);
+        let artifact = build_delta_v4(
+            &state,
+            TextV4BuildContext {
+                sst_id,
+                event_ranges: vec![SearchEventRange::new(0, 1)],
+                complete_filter_properties: vec!["vigente".into()],
+            },
+            documents,
+            TextV4BuildOptions {
+                postings_per_block: 2,
+                terms_per_dictionary_block: 2,
+                compression_level: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let relative = format!("sst/L0/{sst_id}.ft");
+        put_relative(&store, &paths, &relative, artifact.body.clone()).await;
+        let mut descriptors = vec![text_search_descriptor(
+            &artifact.output.segment,
+            relative,
+            artifact.body.len() as u64,
+            &index.name,
+        )];
+        state.status = SearchLsmStatus::Active;
+        state.segments = vec![artifact.output.segment];
+        state.proven_empty_event_ranges = (1..=proven_empty_tail)
+            .map(|event| SearchEventRange::new(event, event + 1))
+            .collect();
+        state.next_event_seq = 1 + proven_empty_tail;
+        let barrier_id = Uuid::from_u128(999);
+        state.compat_barrier_sst_id = Some(barrier_id);
+        let barrier = encode_search_barrier(&state).unwrap();
+        let barrier_path = format!("sst/L0/{barrier_id}.slb");
+        put_relative(&store, &paths, &barrier_path, barrier.clone()).await;
+        descriptors.push(search_barrier_descriptor(
+            &state,
+            barrier_id,
+            crate::manifest::SstLevel(0),
+            barrier_path,
+            barrier.len() as u64,
+        ));
+        manifest.ssts = descriptors;
+        manifest.search_lsm.push(state);
+        let pointer = ManifestPointer {
+            version: manifest.version,
+            epoch: manifest.epoch,
+            manifest_path: "manifest/v0.json".into(),
+        };
+        TextFixture {
+            loaded: LoadedManifest::new(pointer, None, None, manifest),
+            store,
+            paths,
+        }
+    }
+
+    #[cfg(feature = "text-index")]
+    #[tokio::test]
+    async fn complete_singleton_delta_serves_block_max_with_exhaustive_parity() {
+        for proven_empty_tail in [0, 3] {
+            let fixture = singleton_text_delta_fixture(proven_empty_tail).await;
+            let memtable = crate::memtable::Memtable::new();
+            let view = memtable.snapshot_view();
+            let snapshot = Snapshot::new(fixture.loaded, &view, fixture.store, fixture.paths);
+            let mut generation = match open_text_generation(&snapshot, "law_text").await.unwrap() {
+                ActiveSearch::Ready(generation) => generation,
+                other => panic!("expected an active generation, found {other:?}"),
+            };
+            assert!(
+                generation.authoritative_single_base(&[]).is_some(),
+                "a first delta covering every unproven event is the whole corpus \
+                 (proven-empty tail {proven_empty_tail})"
+            );
+            assert!(generation
+                .authoritative_single_base(&[*Uuid::from_u128(500).as_bytes()])
+                .is_none());
+            for query in ["rare common", "common tail", "tail"] {
+                let parsed = crate::text::parse_query(query);
+                let global = global_text_stats(&generation, &parsed)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let reader = &generation.segments[0].reader;
+                for k in [1, 3, 32] {
+                    let fast = reader
+                        .search_query_base_block_max_exact(&parsed, &global, k, &[])
+                        .await
+                        .unwrap();
+                    assert!(fast.block_max_pruning, "{query} k={k}");
+                    assert_eq!(fast.block_max_fallback, None, "{query} k={k}");
+                    let exhaustive = reader
+                        .search_query_exact(&parsed, &global, k, &[])
+                        .await
+                        .unwrap();
+                    let key = |hits: &[crate::sst::text::v4::TextV4Hit]| {
+                        hits.iter()
+                            .map(|hit| (hit.node_id, hit.score.to_bits()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(key(&fast.hits), key(&exhaustive.hits), "{query} k={k}");
+                    let served = snapshot
+                        .text_search("law_text", "Articulo", &parsed, Some(k))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        served
+                            .iter()
+                            .map(|(id, score)| (*id.0.as_bytes(), score.to_bits()))
+                            .collect::<Vec<_>>(),
+                        key(&exhaustive.hits),
+                        "{query} k={k}"
+                    );
+                }
+            }
+            // An unproven event (a gap in coverage) is not a complete corpus.
+            generation.state.next_event_seq += 1;
+            assert!(generation.authoritative_single_base(&[]).is_none());
+        }
+    }
+
+    #[cfg(feature = "text-index")]
+    #[test]
+    fn event_coverage_requires_a_contiguous_exact_cover() {
+        use crate::search_lsm::SearchEventRange as R;
+        assert!(events_fully_covered(R::new(0, 4), &[], 4));
+        assert!(events_fully_covered(
+            R::new(0, 4),
+            &[R::new(5, 6), R::new(4, 5)],
+            6
+        ));
+        assert!(
+            !events_fully_covered(R::new(0, 4), &[R::new(5, 6)], 6),
+            "gap"
+        );
+        assert!(
+            !events_fully_covered(R::new(0, 4), &[R::new(3, 6)], 6),
+            "overlap"
+        );
+        assert!(
+            !events_fully_covered(R::new(0, 4), &[R::new(4, 5)], 6),
+            "short"
+        );
+        assert!(
+            !events_fully_covered(R::new(1, 4), &[], 4),
+            "not from event 0"
+        );
+        assert!(
+            !events_fully_covered(R::new(0, 4), &[], 3),
+            "past the frontier"
+        );
     }
 
     #[test]

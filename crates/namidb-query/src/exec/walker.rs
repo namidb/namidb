@@ -2087,7 +2087,13 @@ pub(crate) async fn execute_expand(
     let mut meter = crate::exec::memory::GrowthMeter::new();
     let mut exact_memo_bytes = 0usize;
     let mut rows = rows;
+    // Endpoints of the current seed window, resolved once for all of its
+    // seeds; see `window_expand_targets`.
+    let mut window_targets: Option<(std::collections::HashSet<NodeId>, ExpandTargets)> = None;
     for row_index in 0..rows.len() {
+        if row_index >= prefetched_until {
+            window_targets = None;
+        }
         if row_index >= prefetched_until && (exact_prefetch || seed_prefetch) {
             let window_end = row_index
                 .saturating_add(SEED_PREFETCH_WINDOW)
@@ -2128,6 +2134,18 @@ pub(crate) async fn execute_expand(
                     &mut meter,
                 )
                 .await?;
+                if seed_prefetch && max == 1 && !back_reference {
+                    window_targets = window_expand_targets(
+                        window,
+                        source,
+                        direction,
+                        snapshot,
+                        &neighbour_memo,
+                        target_labels,
+                        skip_target_materialize,
+                    )
+                    .await?;
+                }
             }
             prefetched_until = window_end;
         }
@@ -2465,15 +2483,28 @@ pub(crate) async fn execute_expand(
                 // prewarm the ordinary point cache for this window. This
                 // keeps work proportional to touched endpoints and avoids
                 // hydrating large vectors solely to evaluate `(:Label)`.
-                let target_membership = prepare_expand_targets(
-                    snapshot,
-                    target_labels,
-                    &unique_targets,
-                    skip_target_materialize,
-                    true,
-                    max > 1,
-                )
-                .await?;
+                let window_hit = window_targets.as_ref().and_then(|(covered, targets)| {
+                    unique_targets
+                        .iter()
+                        .all(|id| covered.contains(id))
+                        .then_some(targets)
+                });
+                let own_targets;
+                let target_membership = match window_hit {
+                    Some(targets) => targets,
+                    None => {
+                        own_targets = prepare_expand_targets(
+                            snapshot,
+                            target_labels,
+                            &unique_targets,
+                            skip_target_materialize,
+                            true,
+                            max > 1,
+                        )
+                        .await?;
+                        &own_targets
+                    }
+                };
                 // Flattened so a window is a plain slice of the (step, edge)
                 // sequence. `shortest == First` breaking out of this loop is
                 // what the per-step break did before: once a hit is found in
@@ -2560,7 +2591,7 @@ pub(crate) async fn execute_expand(
                         let target_view_opt = if back_reference {
                             None
                         } else if skip_target_materialize {
-                            if !match &target_membership {
+                            if !match target_membership {
                                 ExpandTargets::Membership(membership) => {
                                     membership.get(&target_id).copied().unwrap_or(false)
                                 }
@@ -2569,7 +2600,7 @@ pub(crate) async fn execute_expand(
                                 continue;
                             }
                             None
-                        } else if let ExpandTargets::Views(views, rejected) = &target_membership {
+                        } else if let ExpandTargets::Views(views, rejected) = target_membership {
                             // The hop's own materialisation answers directly, so a
                             // large fan-out no longer depends on cache retention.
                             // The batch resolves by id across every descriptor, so
@@ -2611,7 +2642,7 @@ pub(crate) async fn execute_expand(
                                     None => continue,
                                 },
                             }
-                        } else if matches!(&target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
+                        } else if matches!(target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
                         {
                             // Proven not to carry the label (single hop, over budget).
                             continue;
@@ -4320,10 +4351,25 @@ fn hybrid_text_filter_candidate_cap() -> usize {
         .unwrap_or(DEFAULT_HYBRID_TEXT_FILTER_CANDIDATE_CAP)
 }
 
+/// Largest filter-admitted set the filtered sparse leg scores directly
+/// (`NAMIDB_HYBRID_TEXT_FILTER_SELECTIVE_CAP`, `0` disables the route). Never
+/// above the bounded eligibility scan's own cap.
+#[cfg(feature = "text-index")]
+fn hybrid_text_filter_selective_cap() -> usize {
+    std::env::var("NAMIDB_HYBRID_TEXT_FILTER_SELECTIVE_CAP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(FILTERED_FLAT_ELIGIBLE_CAP)
+        .min(FILTERED_FLAT_ELIGIBLE_CAP)
+}
+
 /// Filtered sparse retrieval for `search.hybrid`.
 ///
 /// FT4 first applies every complete String/Bool equality/IN group inside its
-/// postings. An authoritative text index is then widened geometrically and
+/// postings. A filter it cannot apply that admits few nodes (a property index
+/// or a bounded scan of the filter's own columns says so) is answered by
+/// scoring exactly those nodes with the index's corpus statistics
+/// ([`bm25_selective_filtered`]). An authoritative text index is then widened geometrically and
 /// each newly exposed prefix slice is hydrated exactly once for any residual
 /// range/negative predicate. The configured cap bounds indexed candidates and
 /// object-store hydration; reaching it without `target` survivors falls back
@@ -4377,6 +4423,25 @@ async fn bm25_ranked_filtered(
             let mut processed_prefix = 0usize;
             let mut survivors = Vec::with_capacity(query_initial_capacity(target, candidate_cap));
             let mut use_groups = !native_groups.is_empty();
+            // Groups the index cannot apply natively are decided below on the
+            // first round; a purely residual filter is checked for
+            // selectivity right away.
+            if !use_groups {
+                if let Some(hits) = bm25_selective_filtered(
+                    snapshot,
+                    label,
+                    &props,
+                    &parsed,
+                    &index_name,
+                    target,
+                    (filter, params),
+                    native_groups,
+                )
+                .await?
+                {
+                    return Ok(hits);
+                }
+            }
 
             loop {
                 let hits = if use_groups {
@@ -4399,6 +4464,20 @@ async fn bm25_ranked_filtered(
                         // leg's `native_groups_supported` downgrade).
                         None if processed_prefix == 0 => {
                             use_groups = false;
+                            if let Some(hits) = bm25_selective_filtered(
+                                snapshot,
+                                label,
+                                &props,
+                                &parsed,
+                                &index_name,
+                                target,
+                                (filter, params),
+                                native_groups,
+                            )
+                            .await?
+                            {
+                                return Ok(hits);
+                            }
                             snapshot
                                 .text_search(&index_name, label, &parsed, Some(fetch))
                                 .await?
@@ -4476,6 +4555,123 @@ async fn bm25_ranked_filtered(
         Some((filter, params, filter_properties)),
     )
     .await
+}
+
+/// Selective-filter route of the filtered sparse leg: when the filter admits
+/// few nodes (resolved from a property index or a bounded scan of the
+/// filter's own columns, never whole rows), score exactly those nodes with
+/// the index's corpus-wide statistics instead of widening a ranked prefix
+/// until enough of it survives. A one-in-ten-thousand filter otherwise
+/// hydrates the whole widening budget and then rescans the corpus.
+///
+/// Scores equal the index's and the exact scan's: the same expanded terms,
+/// IDF over the whole corpus, length normalisation and phrase constraint.
+/// `None` when the filter is not selective or the index cannot supply
+/// statistics; the caller keeps its widening route.
+#[cfg(feature = "text-index")]
+#[allow(clippy::too_many_arguments)]
+async fn bm25_selective_filtered(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    props: &[String],
+    parsed: &crate::exec::text_scoring::TextQuery,
+    index_name: &str,
+    target: usize,
+    filter: (&Expression, &Params),
+    native_groups: &[(String, Vec<CoreValue>)],
+) -> Result<Option<Vec<(NodeId, f64)>>, ExecError> {
+    use crate::exec::text_scoring::{bm25_idf, bm25_term_score};
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    use namidb_storage::search_workspace::bm25_max_document_bytes;
+    use std::collections::BTreeMap;
+
+    let (filter, params) = filter;
+    let cap = hybrid_text_filter_selective_cap();
+    if cap == 0 {
+        return Ok(None);
+    }
+    let Some(eligible) =
+        selective_filter_eligible(snapshot, label, "node", "", filter, native_groups, params)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if eligible.len() > cap {
+        return Ok(None);
+    }
+    if eligible.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let Some((expanded, stats)) = snapshot
+        .text_query_corpus_stats(index_name, label, parsed)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let n_docs = usize::try_from(stats.document_count).unwrap_or(usize::MAX);
+    let avg_len = namidb_storage::text::avg_len(stats.total_document_len, n_docs);
+    let mut scored_terms: BTreeMap<String, f64> = BTreeMap::new();
+    for term in expanded.base_terms() {
+        let Some(df) = stats.document_frequency.get(term) else {
+            return Ok(None);
+        };
+        scored_terms.insert(
+            term.to_string(),
+            bm25_idf(n_docs, usize::try_from(*df).unwrap_or(usize::MAX)),
+        );
+    }
+    let phrase_plan = Bm25PhrasePlan::new(&expanded.phrases);
+    let max_document_bytes = bm25_max_document_bytes();
+
+    const SCORE_BATCH: usize = 256;
+    const SCORE_FANOUT: usize = 4;
+    let batches: Vec<Vec<Option<namidb_storage::NodeView>>> = stream::iter(
+        eligible
+            .chunks(SCORE_BATCH)
+            .map(|chunk| snapshot.batch_lookup_nodes(label, chunk))
+            .collect::<Vec<_>>(),
+    )
+    .buffered(SCORE_FANOUT)
+    .try_collect()
+    .await?;
+    let mut ranked: Vec<(NodeId, f64)> = Vec::new();
+    for view in batches.into_iter().flatten().flatten() {
+        crate::exec::limits::check_deadline()?;
+        if bm25_document_bytes(&view, props, max_document_bytes)?.is_none() {
+            continue;
+        }
+        let id = view.id;
+        let mut row = Row::new();
+        row.set(
+            "node".to_string(),
+            RuntimeValue::Node(Box::new(NodeValue::from(view))),
+        );
+        if evaluate(filter, &row, params)?.as_bool() != Some(true) {
+            continue;
+        }
+        let Some(RuntimeValue::Node(node)) = row.get("node") else {
+            unreachable!("the residual-filter row always contains its node");
+        };
+        let Some(analysis) =
+            analyse_bm25_document(node.as_ref(), props, max_document_bytes, &phrase_plan)?
+        else {
+            continue;
+        };
+        if !analysis.phrases_match {
+            continue;
+        }
+        let mut score = 0.0;
+        for (term, idf) in &scored_terms {
+            let tf = analysis.counts.get(term.as_str()).copied().unwrap_or(0);
+            score += bm25_term_score(*idf, tf, analysis.document_len, avg_len);
+        }
+        if score > 0.0 {
+            ranked.push((id, score));
+        }
+    }
+    sort_bm25_hits(&mut ranked);
+    ranked.truncate(target);
+    Ok(Some(ranked))
 }
 
 /// Borrow the configured string fields from either the storage view used by
@@ -5581,6 +5777,7 @@ async fn vector_search_procedure(
         Some(&prefilter),
         ef,
         params,
+        VectorRowMaterialization::WholeNode,
     )
     .await?;
     let raw: Vec<Vec<RuntimeValue>> = rows
@@ -5771,6 +5968,7 @@ async fn db_index_vector_call(
         Some(&prefilter),
         ef,
         params,
+        VectorRowMaterialization::WholeNode,
     )
     .await?;
     let raw: Vec<Vec<RuntimeValue>> = rows
@@ -5890,10 +6088,41 @@ async fn hybrid_search_procedure(
         _ => Vec::new(),
     };
     let prefilter = proc_vector_prefilter(map.get("filter"));
-    let fusion_mode = map
-        .get("fusion")
-        .and_then(proc_str)
-        .unwrap_or_else(|| "rrf".to_string());
+    // `fusion`: 'rrf' (default) or 'linear'. `alpha` is the linear blend's
+    // weight on the dense (vector) leg, so it selects linear fusion when
+    // `fusion` is omitted and contradicts an explicit 'rrf'; `rrf_k` is the
+    // reciprocal-rank constant and only means something to RRF.
+    let fusion_mode = match map.get("fusion") {
+        None if map.contains_key("alpha") => "linear".to_string(),
+        None => "rrf".to_string(),
+        Some(value) => proc_str(value)
+            .map(|mode| mode.to_ascii_lowercase())
+            .ok_or_else(|| {
+                proc_unsupported("search.hybrid `fusion` must be the string 'rrf' or 'linear'")
+            })?,
+    };
+    match fusion_mode.as_str() {
+        "rrf" if map.contains_key("alpha") => {
+            return Err(proc_unsupported(
+                "search.hybrid `alpha` weights the linear blend (alpha on the vector leg, \
+                 1 - alpha on the BM25 leg) and cannot be combined with `fusion: 'rrf'`; \
+                 use `fusion: 'linear', alpha: <0..1>` or drop `alpha`",
+            ))
+        }
+        "linear" if map.contains_key("rrf_k") => {
+            return Err(proc_unsupported(
+                "search.hybrid `rrf_k` is the reciprocal-rank constant of `fusion: 'rrf'` \
+                 and cannot be combined with `fusion: 'linear'`; use `alpha` to weight the \
+                 linear blend",
+            ))
+        }
+        "rrf" | "linear" => {}
+        other => {
+            return Err(proc_unsupported(format!(
+                "search.hybrid `fusion` must be 'rrf' or 'linear', got '{other}'"
+            )))
+        }
+    }
     // A present-but-wrong-type tuning value is an error, not a silent default.
     let opt_f64 = |key: &str| -> Result<Option<f64>, ExecError> {
         match map.get(key) {
@@ -5919,7 +6148,10 @@ async fn hybrid_search_procedure(
     }
     let alpha = opt_f64("alpha")?.unwrap_or(0.5);
     if !(0.0..=1.0).contains(&alpha) {
-        return Err(proc_unsupported("search.hybrid `alpha` must be in [0, 1]"));
+        return Err(proc_unsupported(format!(
+            "search.hybrid `alpha` must be a number in [0, 1] (the vector leg's weight in \
+             `fusion: 'linear'`; 1 = vector only, 0 = BM25 only), got {alpha}"
+        )));
     }
     // Per-leg candidate depth before fusion: over-fetch so a node ranked well in
     // one leg but just outside the other's window still contributes.
@@ -5945,6 +6177,7 @@ async fn hybrid_search_procedure(
         ));
     }
 
+    let started = std::time::Instant::now();
     // Dense leg (vector KNN), best-first.
     let dense: Vec<(NodeId, f64)> = if dense_configured {
         let qv = map
@@ -5972,6 +6205,7 @@ async fn hybrid_search_procedure(
             Some(&prefilter),
             ef,
             params,
+            VectorRowMaterialization::IdentityOnly,
         )
         .await?;
         rows_to_id_score(&rows)
@@ -5979,6 +6213,7 @@ async fn hybrid_search_procedure(
         Vec::new()
     };
 
+    let dense_done = std::time::Instant::now();
     // Sparse leg (BM25), best-first.
     let sparse: Vec<(NodeId, f64)> = if sparse_configured {
         let qtext = map
@@ -6009,17 +6244,14 @@ async fn hybrid_search_procedure(
         Vec::new()
     };
 
+    let sparse_done = std::time::Instant::now();
     // Both legs are filtered before fusion. RRF therefore uses ranks within the
     // eligible population, and linear normalization is no longer skewed by
     // high-scoring ineligible sparse documents.
-    let fused = match fusion_mode.to_ascii_lowercase().as_str() {
-        "rrf" => fusion::rrf(&[&dense, &sparse], rrf_k),
-        "linear" => fusion::linear(&[&dense, &sparse], &[alpha, 1.0 - alpha]),
-        other => {
-            return Err(proc_unsupported(format!(
-                "unknown fusion `{other}` (rrf|linear)"
-            )))
-        }
+    let fused = if fusion_mode == "linear" {
+        fusion::linear(&[&dense, &sparse], &[alpha, 1.0 - alpha])
+    } else {
+        fusion::rrf(&[&dense, &sparse], rrf_k)
     };
 
     // Materialise the fused candidates in rank order. The residual filter is
@@ -6058,6 +6290,18 @@ async fn hybrid_search_procedure(
             raw.push(vec![node_rv, RuntimeValue::Float(*score)]);
         }
     }
+    tracing::debug!(
+        target: "namidb::search_timing",
+        k,
+        k_dense,
+        k_sparse,
+        dense_hits = dense.len(),
+        sparse_hits = sparse.len(),
+        dense_ms = dense_done.duration_since(started).as_secs_f64() * 1e3,
+        sparse_ms = sparse_done.duration_since(dense_done).as_secs_f64() * 1e3,
+        hydrate_ms = sparse_done.elapsed().as_secs_f64() * 1e3,
+        "search.hybrid timing"
+    );
     project_proc_rows("search.hybrid", &["node", "score"], raw, yield_items)
 }
 
@@ -6756,8 +7000,19 @@ async fn flat_vector_search(
         prefilter.as_ref(),
         ef_search,
         params,
+        VectorRowMaterialization::WholeNode,
     )
     .await
+}
+
+/// How much of each vector hit a caller needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorRowMaterialization {
+    /// The whole node is bound (a projection may read any property).
+    WholeNode,
+    /// Only the node's identity and the score; the caller hydrates what it
+    /// keeps. A residual filter still hydrates the candidates it evaluates.
+    IdentityOnly,
 }
 
 /// Core of the vector KNN: serve a pre-evaluated query vector `q` from the
@@ -6783,6 +7038,7 @@ async fn vector_search_rows(
     prefilter: Option<&ProcVectorPrefilter>,
     ef_search: Option<usize>,
     params: &Params,
+    materialize: VectorRowMaterialization,
 ) -> Result<Vec<Row>, ExecError> {
     use crate::exec::expr::vector_score;
 
@@ -6826,6 +7082,7 @@ async fn vector_search_rows(
             ef_search,
             params,
             &mut flat_eligible,
+            materialize,
         )
         .await?
         {
@@ -6897,9 +7154,18 @@ async fn vector_search_rows(
                 }
             };
             if let Some(eligible) = eligible {
-                for chunk in eligible.chunks(VECTOR_FLAT_SCAN_BATCH) {
-                    let views = snapshot.batch_lookup_nodes(label_name, chunk).await?;
-                    for view in views.into_iter().flatten() {
+                use futures::stream::{self, StreamExt};
+                // At most `FILTERED_FLAT_ELIGIBLE_CAP` ids: a few batches,
+                // fetched with a small overlap instead of one after another.
+                let mut batches = stream::iter(
+                    eligible
+                        .chunks(VECTOR_FLAT_SCAN_BATCH)
+                        .map(|chunk| snapshot.batch_lookup_nodes(label_name, chunk))
+                        .collect::<Vec<_>>(),
+                )
+                .buffered(FILTERED_FLAT_LOOKUP_FANOUT);
+                while let Some(views) = batches.next().await {
+                    for view in views?.into_iter().flatten() {
                         consider(view)?;
                     }
                     crate::exec::memory::release_storage_rows();
@@ -6958,7 +7224,11 @@ async fn vector_search_rows(
     }
     scan?;
     let mut scored = top.into_sorted();
-    if score_only {
+    if score_only && materialize == VectorRowMaterialization::IdentityOnly {
+        for (_, id, _, row) in scored.iter_mut() {
+            row.set(alias.to_string(), node_runtime(*id));
+        }
+    } else if score_only {
         let ids: Vec<NodeId> = scored.iter().map(|(_, id, _, _)| *id).collect();
         let views = snapshot
             .batch_lookup_nodes(label.unwrap_or(""), &ids)
@@ -7023,6 +7293,15 @@ fn building_vector_index_message(
 
 /// Nodes reconciled per batch by the flat vector scan's cursor.
 const VECTOR_FLAT_SCAN_BATCH: usize = 256;
+
+/// Batches of a selective filter's eligible ids the flat vector route looks
+/// up concurrently.
+/// Id-ordered prefix [`filtered_flat_eligible`] evaluates first when node runs
+/// overlap: a filter admitting at least a quarter of the label is proven broad
+/// there without reconciling the whole label.
+const FILTERED_FLAT_SAMPLE_ROWS: usize = 4 * FILTERED_FLAT_ELIGIBLE_CAP;
+
+const FILTERED_FLAT_LOOKUP_FANOUT: usize = 4;
 
 /// At most this many nodes admitted by a property-only source filter are
 /// read whole by the flat vector scan; a less selective filter scans whole
@@ -7165,14 +7444,24 @@ async fn filtered_flat_eligible(
         return Ok(None);
     };
     let projection: Vec<String> = properties.into_iter().collect();
-    let mut eligible: Vec<NodeId> = Vec::new();
-    let mut overflow = false;
-    snapshot
-        .visit_label_with_projection::<_, ExecError>(label, &projection, |view| {
+    // With overlapping node runs the visitor below reconciles the whole label
+    // before its first callback, so it cannot stop early. Evaluate an
+    // id-ordered prefix first: a filter that already admits more than the
+    // cap there is broad, and a label shorter than the prefix is answered by
+    // it outright.
+    if !snapshot.node_scan_is_disjoint() {
+        let sample = snapshot
+            .scan_label_with_predicates_and_projection_limited(
+                label,
+                &[],
+                Some(&projection),
+                FILTERED_FLAT_SAMPLE_ROWS,
+            )
+            .await?;
+        let complete = sample.len() < FILTERED_FLAT_SAMPLE_ROWS;
+        let mut admitted: Vec<NodeId> = Vec::new();
+        for view in sample {
             crate::exec::limits::check_deadline()?;
-            if overflow {
-                return Ok(());
-            }
             let id = view.id;
             let mut row = Row::new();
             row.set(
@@ -7180,17 +7469,57 @@ async fn filtered_flat_eligible(
                 RuntimeValue::Node(Box::new(NodeValue::from(view))),
             );
             if evaluate(filter, &row, params)?.as_bool() == Some(true) {
-                if eligible.len() == FILTERED_FLAT_ELIGIBLE_CAP {
-                    overflow = true;
-                } else {
-                    eligible.push(id);
+                if admitted.len() == FILTERED_FLAT_ELIGIBLE_CAP {
+                    return Ok(None);
                 }
+                admitted.push(id);
+            }
+        }
+        if complete {
+            admitted.sort_unstable();
+            admitted.dedup();
+            return Ok(Some(admitted));
+        }
+    }
+    // Stops the column scan at the first admitted node past the cap: a broad
+    // filter is known to be broad after `cap / selectivity` rows, not after
+    // reading the whole label.
+    enum Visit {
+        Overflow,
+        Failed(ExecError),
+    }
+    impl From<namidb_storage::Error> for Visit {
+        fn from(error: namidb_storage::Error) -> Self {
+            Visit::Failed(error.into())
+        }
+    }
+    let mut eligible: Vec<NodeId> = Vec::new();
+    let visited = snapshot
+        .visit_label_with_projection::<_, Visit>(label, &projection, |view| {
+            crate::exec::limits::check_deadline().map_err(Visit::Failed)?;
+            let id = view.id;
+            let mut row = Row::new();
+            row.set(
+                alias.to_string(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            if evaluate(filter, &row, params)
+                .map_err(|e| Visit::Failed(e.into()))?
+                .as_bool()
+                == Some(true)
+            {
+                if eligible.len() == FILTERED_FLAT_ELIGIBLE_CAP {
+                    return Err(Visit::Overflow);
+                }
+                eligible.push(id);
             }
             Ok(())
         })
-        .await?;
-    if overflow {
-        return Ok(None);
+        .await;
+    match visited {
+        Ok(()) => {}
+        Err(Visit::Overflow) => return Ok(None),
+        Err(Visit::Failed(error)) => return Err(error),
     }
     eligible.sort_unstable();
     eligible.dedup();
@@ -7301,6 +7630,7 @@ async fn try_index_search(
     ef_search: Option<usize>,
     params: &Params,
     flat_eligible: &mut Option<Option<Vec<NodeId>>>,
+    materialize: VectorRowMaterialization,
 ) -> Result<Option<Vec<Row>>, ExecError> {
     use crate::exec::expr::vector_score;
     use crate::plan::logical::VectorDistance;
@@ -7511,6 +7841,7 @@ async fn try_index_search(
     let mut delta_overfetch = 0_usize;
     let mut rounds_left = max_rounds;
     while rounds_left > 0 {
+        let round_started = std::time::Instant::now();
         let kprime = k
             .saturating_mul(mult)
             .saturating_add(delta_overfetch)
@@ -7621,6 +7952,7 @@ async fn try_index_search(
                 let exhausted = persisted_complete || hits.len() < kprime;
                 (hits, exhausted, persisted_complete)
             };
+        let probe_ms = round_started.elapsed().as_secs_f64() * 1e3;
         if delta_overfetch == 0 && delta_len > 0 && !index_exhausted {
             let survivors = raw_hits
                 .iter()
@@ -7701,8 +8033,21 @@ async fn try_index_search(
         // Per-candidate deadline probe: a widened filtered ANN can do many cold
         // node lookups and must stay interruptible the way the flat scan is.
         let mut out = Vec::with_capacity(query_initial_capacity(k, scored.len()));
+        // A caller that needs only identities and scores (the hybrid dense
+        // leg, which hydrates its fused top-k itself) skips hydration when no
+        // residual predicate has to read the node: the hits already carry
+        // exact scores (an int8 index was rescored from hydrated views above).
+        if materialize == VectorRowMaterialization::IdentityOnly && source_filter.is_none() {
+            for &(score, id) in scored.iter().take(k) {
+                let mut row = Row::new();
+                row.set(alias.to_string(), node_runtime(id));
+                row.set(score_alias.to_string(), RuntimeValue::Float(score));
+                out.push(row);
+            }
+        }
         const HYDRATE_BATCH: usize = 64;
-        'batches: for batch in scored.chunks(HYDRATE_BATCH) {
+        let hydrate_candidates: &[(f64, NodeId)] = if out.is_empty() { &scored } else { &[] };
+        'batches: for batch in hydrate_candidates.chunks(HYDRATE_BATCH) {
             crate::exec::limits::check_deadline()?;
             let ids: Vec<NodeId> = batch
                 .iter()
@@ -7748,6 +8093,16 @@ async fn try_index_search(
             }
         }
 
+        tracing::debug!(
+            target: "namidb::search_timing",
+            k,
+            kprime,
+            ef,
+            rows = out.len(),
+            probe_ms,
+            materialize_ms = round_started.elapsed().as_secs_f64() * 1e3 - probe_ms,
+            "vector index round timing"
+        );
         if out.len() >= k {
             return Ok(Some(out));
         }
@@ -7956,6 +8311,69 @@ async fn prefetch_seed_neighbours(
         memo.insert(id, Arc::new(edges));
     }
     Ok(true)
+}
+
+/// Endpoints resolved together for one seed window at most. Beyond it each
+/// seed resolves its own endpoints as before.
+const SEED_WINDOW_TARGETS_MAX: usize = 4_096;
+
+/// Resolve the endpoints of a whole seed window of a single hop at once.
+///
+/// [`prepare_expand_targets`] ran per seed, so a low-degree hop over many
+/// seeds (every row of a ranked search joined to its parent, say) paid its
+/// label-membership proof or node hydration as a few dependent reads per
+/// seed. The window's partner lists are already memoised by
+/// [`prefetch_seed_neighbours`]; their union is resolved here in one call
+/// with the hop's own arguments. Every answer [`ExpandTargets`] gives is per
+/// endpoint id, so each seed reads the shared result exactly as it would its
+/// own. Returns the ids covered with the result, or `None` when the window
+/// has fewer than two seeds or more than [`SEED_WINDOW_TARGETS_MAX`]
+/// endpoints.
+async fn window_expand_targets(
+    rows: &[Row],
+    source: &str,
+    direction: RelationshipDirection,
+    snapshot: &Snapshot<'_>,
+    memo: &HashMap<NodeId, Arc<Vec<EdgeView>>>,
+    target_labels: &[String],
+    skip_target_materialize: bool,
+) -> Result<Option<(std::collections::HashSet<NodeId>, ExpandTargets)>, ExecError> {
+    let mut seeds = std::collections::HashSet::new();
+    let mut covered = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+    for row in rows {
+        let Some(RuntimeValue::Node(seed)) = row.get(source) else {
+            continue;
+        };
+        if !seeds.insert(seed.id) {
+            continue;
+        }
+        let Some(edges) = memo.get(&seed.id) else {
+            continue;
+        };
+        for edge in edges.iter() {
+            let target = partner_id(edge, direction, seed.id);
+            if covered.insert(target) {
+                if targets.len() == SEED_WINDOW_TARGETS_MAX {
+                    return Ok(None);
+                }
+                targets.push(target);
+            }
+        }
+    }
+    if seeds.len() < 2 || targets.is_empty() {
+        return Ok(None);
+    }
+    let resolved = prepare_expand_targets(
+        snapshot,
+        target_labels,
+        &targets,
+        skip_target_materialize,
+        true,
+        false,
+    )
+    .await?;
+    Ok(Some((covered, resolved)))
 }
 
 /// Estimated heap footprint of a memoised partner list, for the query's
