@@ -885,6 +885,7 @@ async fn measure_vector_track(
                 applied_filter_groups: 0,
                 probed_pages: 0,
                 eligible_rows_seen: 0,
+                reranked_rows: 0,
             }
         };
         cold_us.push(elapsed_us(started));

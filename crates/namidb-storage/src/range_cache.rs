@@ -1927,6 +1927,89 @@ impl PinnedObjectRangeSource {
             .await
     }
 
+    /// Read `blocks` (sorted by offset, non-overlapping) with a few large
+    /// GETs instead of one per block: neighbouring blocks are grouped into
+    /// spans of about `span_bytes`, up to `parallel` spans are in flight, and
+    /// each block is admitted to the range cache as the exact entry a later
+    /// [`ReadGranularity::Block`] read of that range finds. Returns the blocks
+    /// in input order. Blocks above the Block entry limit are returned but
+    /// not admitted (a Block read of them is page-normalized).
+    pub async fn prime_blocks(
+        &self,
+        blocks: &[Range<u64>],
+        span_bytes: u64,
+        parallel: usize,
+    ) -> crate::error::Result<Vec<Bytes>> {
+        for block in blocks {
+            self.validate_range(block)?;
+        }
+        if blocks.windows(2).any(|pair| pair[1].start < pair[0].end) {
+            return Err(crate::error::Error::Corrupted {
+                path: self.meta.location.to_string(),
+                detail: "primed blocks must be sorted and must not overlap".into(),
+            });
+        }
+        // Group consecutive blocks into spans; a gap larger than a small
+        // read would be wasted bytes, so it starts a new span.
+        const MAX_SPAN_GAP: u64 = 64 * 1024;
+        let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut start = 0usize;
+        for index in 1..=blocks.len() {
+            let split = index == blocks.len()
+                || blocks[index].start.saturating_sub(blocks[index - 1].end) > MAX_SPAN_GAP
+                || blocks[index].end - blocks[start].start > span_bytes.max(1);
+            if split {
+                if start < index {
+                    groups.push(start..index);
+                }
+                start = index;
+            }
+        }
+        let token = match &self.range_cache {
+            Some(_) => Some(format!(
+                "{}@{}",
+                self.generation
+                    .cache_token()
+                    .map_err(|error| pinned_range_cache_error(&self.meta.location, error))?,
+                cache_store_token(&self.store)
+            )),
+            None => None,
+        };
+        let path = self.meta.location.to_string();
+        let spans: Vec<Vec<Bytes>> = stream::iter(groups)
+            .map(|group| {
+                let token = token.clone();
+                let path = &path;
+                async move {
+                    let members = &blocks[group];
+                    let span = members[0].start..members[members.len() - 1].end;
+                    let wire = self.direct_read(span.clone()).await?;
+                    let mut out = Vec::with_capacity(members.len());
+                    for block in members {
+                        let start = usize::try_from(block.start - span.start)
+                            .expect("validated range fits usize");
+                        let end = usize::try_from(block.end - span.start)
+                            .expect("validated range fits usize");
+                        let bytes = Bytes::copy_from_slice(&wire[start..end]);
+                        if let (Some(cache), Some(token)) = (&self.range_cache, &token) {
+                            if !block.is_empty() && block.end - block.start <= MAX_BLOCK_READ_BYTES
+                            {
+                                // An entry the cache refuses (admission) is
+                                // only a later miss, never an error.
+                                let _ = cache.insert(path, token, block.clone(), bytes.clone());
+                            }
+                        }
+                        out.push(bytes);
+                    }
+                    Ok::<_, crate::error::Error>(out)
+                }
+            })
+            .buffered(parallel.max(1))
+            .try_collect()
+            .await?;
+        Ok(spans.into_iter().flatten().collect())
+    }
+
     fn validate_range(&self, range: &Range<u64>) -> crate::error::Result<()> {
         if range.start > range.end || range.end > self.meta.size {
             return Err(crate::error::Error::Corrupted {
@@ -2680,6 +2763,52 @@ mod tests {
                 80_016 + FINE_RANGE_PAGE_BYTES + DEFAULT_RANGE_CACHE_PAGE_BYTES as u64
             )
         );
+    }
+
+    #[tokio::test]
+    async fn primed_blocks_are_read_in_large_spans_and_then_hit_as_blocks() {
+        let mut config = memory_config(8 * 1024 * 1024);
+        config.page_size_bytes = DEFAULT_RANGE_CACHE_PAGE_BYTES;
+        let cache = ImmutableRangeCache::open(config).await.unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = ObjectPath::from("objects/primed");
+        let body = Bytes::from(
+            (0..1024 * 1024u32)
+                .map(|value| (value % 241) as u8)
+                .collect::<Vec<_>>(),
+        );
+        store
+            .put(&location, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        let meta = store.head(&location).await.unwrap();
+        let source =
+            PinnedObjectRangeSource::from_meta_with_cache(store, meta, Some(cache)).unwrap();
+        // 64 contiguous 3 KiB blocks, a gap too large to read through, and
+        // 16 more: three spans of at most 100 KiB.
+        let mut blocks: Vec<Range<u64>> = (0..64u64)
+            .map(|i| 10_000 + i * 3_072..10_000 + (i + 1) * 3_072)
+            .collect();
+        blocks.extend((0..16u64).map(|i| 700_000 + i * 3_072..700_000 + (i + 1) * 3_072));
+        let primed = source.prime_blocks(&blocks, 100 * 1024, 2).await.unwrap();
+        assert_eq!(primed.len(), blocks.len());
+        for (range, bytes) in blocks.iter().zip(&primed) {
+            assert_eq!(bytes, &body.slice(range.start as usize..range.end as usize));
+        }
+        let after_prime = source.stats();
+        assert_eq!(after_prime.remote_requests, 3);
+        // Every block is now an exact Block entry: no further remote reads.
+        let again = source
+            .read_ranges_as(&blocks, ReadGranularity::Block)
+            .await
+            .unwrap();
+        assert_eq!(again, primed);
+        assert_eq!(source.stats().remote_requests, after_prime.remote_requests);
+        // Unsorted or overlapping input is refused.
+        assert!(source
+            .prime_blocks(&[20..30, 10..25], 1024, 1)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -15,57 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
-### Added
-
-- **Accent-insensitive full-text search.** New full-text indexes, the flat
-  `search.bm25` scan and the `bm25()` scalar fold text and queries the same
-  way (Unicode NFKD, combining marks removed, case folded, plus `ß`, `æ`,
-  `œ`, `ø`, `ł` and similar letters), so `pension` finds `pensión`. CJK,
-  Hangul and kana are unchanged. `CREATE FULLTEXT INDEX ... OPTIONS
-  {analyzer: 'exact'}` (or `indexConfig: {`fulltext.analyzer`: 'exact'}`)
-  keeps the previous lowercase-only matching; unknown options are errors.
-- **Existing full-text indexes are migrated in the background.** An index
-  created by an earlier release keeps its analyzer, and queries against it
-  are analyzed the same way, until a background rebuild (one index at a
-  time, during quiet maintenance windows, within the index-build memory
-  budget) swaps in the folded index with one commit. A rebuild outrun by
-  writes to the index's documents is retried later. `NAMIDB_TEXT_REANALYSIS=off`
-  disables it. Releases 3.4.3 to 3.5.1 open the new data; they serve a folded
-  index by exact scan until their next flush rebuilds it with their own
-  analyzer (checked by `tests/compat/old_binaries_open_new_data.sh`).
-- **`search.vector` takes an index name**: `{index: 'name', query, k}` in the map
-  form, or the positional `search.vector(indexName, k, queryVector [, {ef,
-  filter}])` of `db.index.vector.queryNodes`. An unknown option, a missing
-  argument or a wrong argument type answers with the accepted forms, and
-  common spellings from other APIs (`vector`, `top_k`, ...) name the option
-  they mean. The options map of `db.index.vector.queryNodes` rejects unknown
-  keys too.
-- **`CALL search.vector|bm25|hybrid(...) YIELD *`** (and `db.index.vector.queryNodes`) binds `node` and `score`; other procedures answer `YIELD *` with an error asking for the column names.
-- **`NAMIDB_PREOPEN_NAMESPACES`** (multi-tenant): a comma-separated list of
-  namespaces the server opens in the background as it starts, so their
-  writer claim, recovery and metadata prefetch happen before the first
-  request instead of during it. A name with no data is skipped, never
-  created.
-- **`search.vector` takes an index name**: `{index: 'name', query, k}` in the map
-  form, or the positional `search.vector(indexName, k, queryVector [, {ef,
-  filter}])` of `db.index.vector.queryNodes`. An unknown option, a missing
-  argument or a wrong argument type answers with the accepted forms, and
-  common spellings from other APIs (`vector`, `top_k`, ...) name the option
-  they mean. The options map of `db.index.vector.queryNodes` rejects unknown
-  keys too.
-- **`CALL search.vector|bm25|hybrid(...) YIELD *`** (and `db.index.vector.queryNodes`) binds `node` and `score`; other procedures answer `YIELD *` with an error asking for the column names.
-- **`NAMIDB_PREOPEN_NAMESPACES`** (multi-tenant): a comma-separated list of
-  namespaces the server opens in the background as it starts, so their
-  writer claim, recovery and metadata prefetch happen before the first
-  request instead of during it. A name with no data is skipped, never
-  created.
-
 ### Changed
 
-- **Procedure options are checked strictly.** `search.bm25` rejects unknown
-  keys with the list of valid ones, like the other `search.*` and `algo.*`
-  procedures; giving both `text_property` and `text_properties`, or a
-  non-string `fusion`, is an error.
 - **Graph neighbourhood statements answer in about a second.** A statement
   that expands each of many seed nodes in a correlated subquery
   (`UNWIND $ids ... CALL { WITH n OPTIONAL MATCH (n)-[r]->(m) ... LIMIT $per }`,
@@ -113,6 +64,78 @@ crates.io release will establish and document that API explicitly.
   of falling back to RRF; and every option error, an unknown `fusion`
   included, is raised before either leg runs. The README documents both
   modes, including the per-leg min-max normalisation of `'linear'`.
+- Vector bases written before this release are rebuilt once, through the
+  existing memory-gated, one-at-a-time base rebuild, after a query first
+  opens them. Until the new base installs, the old one serves through its
+  int8 pages.
+- **Procedure options are checked strictly.** `search.bm25` rejects unknown
+  keys with the list of valid ones, like the other `search.*` and `algo.*`
+  procedures; giving both `text_property` and `text_properties`, or a
+  non-string `fusion`, is an error.
+
+### Added
+
+- **Accent-insensitive full-text search.** New full-text indexes, the flat
+  `search.bm25` scan and the `bm25()` scalar fold text and queries the same
+  way (Unicode NFKD, combining marks removed, case folded, plus `ß`, `æ`,
+  `œ`, `ø`, `ł` and similar letters), so `pension` finds `pensión`. CJK,
+  Hangul and kana are unchanged. `CREATE FULLTEXT INDEX ... OPTIONS
+  {analyzer: 'exact'}` (or `indexConfig: {`fulltext.analyzer`: 'exact'}`)
+  keeps the previous lowercase-only matching; unknown options are errors.
+- **Existing full-text indexes are migrated in the background.** An index
+  created by an earlier release keeps its analyzer, and queries against it
+  are analyzed the same way, until a background rebuild (one index at a
+  time, during quiet maintenance windows, within the index-build memory
+  budget) swaps in the folded index with one commit. A rebuild outrun by
+  writes to the index's documents is retried later. `NAMIDB_TEXT_REANALYSIS=off`
+  disables it. Releases 3.4.3 to 3.5.1 open the new data; they serve a folded
+  index by exact scan until their next flush rebuilds it with their own
+  analyzer (checked by `tests/compat/old_binaries_open_new_data.sh`).
+- **`search.vector` takes an index name**: `{index: 'name', query, k}` in the map
+  form, or the positional `search.vector(indexName, k, queryVector [, {ef,
+  filter}])` of `db.index.vector.queryNodes`. An unknown option, a missing
+  argument or a wrong argument type answers with the accepted forms, and
+  common spellings from other APIs (`vector`, `top_k`, ...) name the option
+  they mean. The options map of `db.index.vector.queryNodes` rejects unknown
+  keys too.
+- **`CALL search.vector|bm25|hybrid(...) YIELD *`** (and `db.index.vector.queryNodes`) binds `node` and `score`; other procedures answer `YIELD *` with an error asking for the column names.
+- **`NAMIDB_PREOPEN_NAMESPACES`** (multi-tenant): a comma-separated list of
+  namespaces the server opens in the background as it starts, so their
+  writer claim, recovery and metadata prefetch happen before the first
+  request instead of during it. A name with no data is skipped, never
+  created.
+- `bench/mixed_concurrency.py`: a mixed read workload of 18 query shapes
+  (BM25, vector, hybrid, search-then-filter, anchored 1-3 hop traversals,
+  GraphRAG chains) at increasing concurrency, reporting throughput,
+  percentiles, errors, `Retry-After` coverage and peak RSS; it can also
+  write a synthetic corpus of the shape it expects.
+- `bench/rollback_compat.sh`: opens data written by a new server with older
+  release binaries (reads compared, a write accepted) and back.
+
+- **RaBitQ navigation for vector bases.** A vector base now carries a
+  1-bit RaBitQ code per row (codes plus three factors: 140 bytes at
+  1,024 dimensions instead of the 1,044-byte int8 row). A query scores the
+  probed pages from these codes, picks candidates with the estimator's
+  error bound, and re-ranks them with the exact `f32` rows in two waves
+  (the best estimates first, then only candidates whose bound still reaches
+  the exact `k`-th score), so scores stay exact. Bases with the section
+  probe at least 128 pages instead of 64. On a 386k × 1024
+  production-shaped synthetic namespace overlap@10 is 0.987 (int8 at its
+  default: 0.984); on a harder anisotropic set 0.976 (int8: 0.938), with
+  lower cold latency than int8. The code tier is about 1/7.5 of the int8
+  tier's memory and counts against `NAMIDB_CACHE_MAX_BYTES` like any cached
+  range. See `docs/architecture/object-native-storage.md`.
+- When a namespace opens, the metadata prefetch also warms each vector
+  base's RaBitQ code, id and filter blocks into the range cache (within
+  half of its RAM budget), with a few 8 MiB ranged reads.
+
+### Compatibility
+
+- The RaBitQ section sits between the exact pages and the footer of the
+  same `NAMIVG05` object, behind a fixed 32-byte locator. The footer,
+  trailer, manifest and sidecars are unchanged, and 3.5.1, 3.5.0 and 3.4.3
+  read bases written by this release through their int8 pages. Rolling
+  back needs no action and does not trigger rebuilds.
 
 ### Fixed
 
@@ -193,6 +216,56 @@ crates.io release will establish and document that API explicitly.
   exactly `k` matching rows or all of them, and are recognised as broad from
   an id-ordered prefix of the label when its node runs overlap (the bounded
   column scan could not stop early there). Results equal the exact scan's.
+- **Concurrent reads run concurrently.** A 2-CPU server ran about one
+  query at a time: four concurrent clients each waited about four times the
+  single-query latency, and from eight clients on the read gate turned
+  queries away with 503 after five seconds. Profiles showed the CPUs mostly
+  idle, the work stuck in four places:
+  - **glibc's allocator.** The official image limited glibc to two arenas
+    (`MALLOC_ARENA_MAX=2`) and set `MALLOC_TRIM_THRESHOLD_`, which also froze
+    glibc's mmap threshold at 128 KiB. Every query thread fought over two
+    arena locks, and every buffer of 128 KiB or more (pages, postings,
+    zstd contexts) became an mmap/munmap pair plus page faults under the
+    process-wide mm lock; system time was about as large as user time. The server
+    binary now allocates through mimalloc (per-thread heaps, freed pages
+    returned on a short delay, `mi_collect` on memory-pressure reclaim), and
+    the image no longer sets `MALLOC_TRIM_THRESHOLD_`.
+  - **The blocking-pool queue lock.** A `file://` store read every range in
+    two blocking-pool hops (open, then read), and each hop takes Tokio's
+    single blocking-pool mutex from an async worker. With a few hundred
+    range reads per query the two async workers of a 2-CPU server spent
+    most of their time waiting for that mutex. Ranged reads are now one
+    `pread` on dedicated I/O threads fed by small per-group queues
+    (`NAMIDB_LOCAL_IO_THREADS`), with metadata, ETag and preconditions
+    identical to `LocalFileSystem`.
+  - **A fixed 256 MiB search workspace.** Every concurrent BM25/vector
+    search reserves its scoring workspace from one shared pool; on an
+    8-CPU server a third or more of the searches queued on it while CPUs
+    were idle. The default now grows with the CPUs: 128 MiB per CPU, at
+    least 256 MiB (unchanged up to two CPUs), at most 2 GiB and an eighth of
+    `NAMIDB_MEMORY_MAX_BYTES`, and the official image no longer pins it to
+    256 MiB. `NAMIDB_SEARCH_WORKSPACE_MAX_BYTES` still overrides it.
+  - **Admission.** At most `max(4, CPUs)` reads ran and the rest were
+    refused after 5 s, without `Retry-After`. Reads now default to two per
+    CPU (counted from the container's CPU quota) and wait in a fair queue
+    for request memory, a slot and then execution memory headroom (the
+    process below its ceiling and room in the shared query working-memory
+    pool) instead of being refused on one resident-set sample. One deadline
+    set when the request arrives covers all of it:
+    `NAMIDB_QUERY_ADMISSION_WAIT_MS` (30 s), capped at half the read
+    timeout (15 s by default). After it: 503 with `code: "overloaded"` or
+    `"memory_pressure"` and `Retry-After`. Every overload refusal now
+    carries `Retry-After`. The read timeout now counts from the request's
+    arrival, so queueing plus execution never exceeds it and a client or
+    proxy that waits for the read timeout hears back first. A Bolt
+    statement inside an explicit transaction checks memory once and never
+    waits (the transaction holds the writer); an auto-commit RUN's wait
+    ends on `RESET` or disconnect.
+  The async runtime uses one worker per CPU the cgroup grants and keeps
+  idle blocking threads for 60 s instead of 10 s. Measured with
+  `bench/mixed_concurrency.py` on a 2-CPU / 6 GiB container over a local
+  store of about 8 GB: at 16 concurrent clients, 1.98 to 8.44 queries/s and
+  31% to 0% errors; at 64 clients, 82% to 0% errors; peak RSS under 2 GiB.
 
 ## [3.5.1] - 2026-11-18
 

@@ -28,6 +28,8 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
+# Lock-free MPMC queue feeding the local file store's read threads.
+crossbeam-channel = "0.5"
 object_store = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

@@ -63,20 +63,23 @@ COPY LICENSE /usr/share/licenses/namidb/LICENSE
 USER namidb:namidb
 EXPOSE 8080
 
-# Bound glibc's per-thread allocation arenas. Large FTS/vector decodes and
-# compactions otherwise leave many 64/128 MiB arenas resident after their
-# temporary working set is dropped, obscuring the engine cache budget and
-# increasing OOM risk during long-running bulk loads.
+# The server allocates through mimalloc (see src/main.rs). MALLOC_ARENA_MAX
+# bounds glibc's arenas for the C libraries that still call glibc's malloc
+# directly (zstd's contexts), so they cannot leave 64/128 MiB arenas resident
+# after a large decode. MALLOC_TRIM_THRESHOLD_ is deliberately NOT set: setting
+# it freezes glibc's mmap threshold at 128 KiB, which turned every zstd
+# decompression context into an mmap/munmap pair plus page faults under the
+# process-wide mm lock, once per decoded block on every query.
+# NAMIDB_SEARCH_WORKSPACE_MAX_BYTES is left to the server's default, which
+# grows with the CPUs and memory the container is given.
 ENV NAMIDB_LISTEN=0.0.0.0:8080 \
     NAMIDB_SPOOL_DIR=/var/tmp/namidb-spool \
     NAMIDB_INDEX_BUILD_SPOOL_DIR=/var/tmp/namidb-spool \
-    NAMIDB_SEARCH_WORKSPACE_MAX_BYTES=268435456 \
     NAMIDB_SEARCH_MAX_RESULT_BYTES=67108864 \
     NAMIDB_BM25_MAX_DOCUMENT_BYTES=1048576 \
     NAMIDB_EDGE_DECODE_MAX_BYTES=67108864 \
     RUST_LOG=info \
-    MALLOC_ARENA_MAX=2 \
-    MALLOC_TRIM_THRESHOLD_=131072
+    MALLOC_ARENA_MAX=2
 
 # Liveness: /v0/livez takes no lock and reads no namespace state, so a busy
 # engine (a long write or compaction holding the writer lock) still answers.

@@ -315,6 +315,30 @@ fn vector_base_layout_stale(_: &SearchLsmState, _: &[SstDescriptor]) -> bool {
     false
 }
 
+/// Whether this process opened the generation's base and found it written
+/// without the RaBitQ navigation section (by a release before it). Such a
+/// base serves through its int8 pages; one rebuild, within the same input
+/// bound as any other, writes the section. Older releases ignore the section
+/// and never consult this, so a rollback triggers no rebuild.
+#[cfg(feature = "vector-index")]
+fn vector_base_lacks_rabitq(state: &SearchLsmState, descriptors: &[SstDescriptor]) -> bool {
+    state
+        .segments
+        .iter()
+        .zip(descriptors)
+        .any(|(segment, descriptor)| {
+            segment.role == SearchSegmentRole::Base
+                && segment.payload == SearchSegmentPayload::Complete
+                && segment.format == crate::search_lsm::SearchSegmentFormat::VectorV5Base
+                && crate::sst::vector::v5::base_lacks_rabitq(&descriptor.path)
+        })
+}
+
+#[cfg(not(feature = "vector-index"))]
+fn vector_base_lacks_rabitq(_: &SearchLsmState, _: &[SstDescriptor]) -> bool {
+    false
+}
+
 fn vector_base_rebuild_due(
     state: &SearchLsmState,
     descriptors: &[SstDescriptor],
@@ -342,6 +366,9 @@ fn vector_base_rebuild_due(
     // A base written before k-means splits is rebuilt once, from its own
     // segments when they fold, within the same input bound as any rebuild.
     if vector_base_layout_stale(state, descriptors) {
+        return Ok(true);
+    }
+    if vector_base_lacks_rabitq(state, descriptors) {
         return Ok(true);
     }
     let Some(newest_delta) = newest_delta else {
@@ -4933,6 +4960,65 @@ mod tests {
             })
             .collect();
         assert!(vector_base_layout_stale(state, &descriptors));
+    }
+
+    #[cfg(feature = "vector-index")]
+    #[test]
+    fn a_base_opened_without_a_rabitq_section_is_rebuilt_within_the_memory_gate() {
+        let policy = delta_policy(6, 8);
+        let mut manifest = compacted_single_base_fixture();
+        // The registry is process-wide: give this base an object name no
+        // other test shares, so marking it cannot leak into fixtures that
+        // run in parallel.
+        let base = manifest.search_lsm[0].segments[0].sst_id;
+        let path = format!(
+            "sst/level1/{}-vector-graph-rabitq-backfill.vg",
+            Uuid::new_v4().simple()
+        );
+        for descriptor in &mut manifest.ssts {
+            if descriptor.id == base {
+                descriptor.path = path.clone();
+            }
+        }
+        // A legacy base binds its descriptor by fingerprint.
+        let segment = &manifest.search_lsm[0].segments[0];
+        if validate_search_lsm(&manifest).is_err() {
+            let descriptor = manifest.ssts.iter().find(|d| d.id == base).unwrap();
+            let fingerprint = legacy_base_content_fingerprint(
+                descriptor,
+                segment.format,
+                &segment.complete_filter_properties,
+            );
+            manifest.search_lsm[0].segments[0].content_xxh3 = fingerprint;
+        }
+        validate_search_lsm(&manifest).unwrap();
+        assert!(select_search_compactions(&manifest, policy)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            manifest.search_lsm[0].segments[0].format,
+            SearchSegmentFormat::VectorV5Base
+        );
+        // The read path records a base it opened without the section.
+        crate::sst::vector::v5::note_base_without_rabitq(&format!("ns-prefix/{path}"));
+        let selection = select_search_compactions(&manifest, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(selection.mode, SearchCompactionMode::BasePrefix);
+        assert_eq!(selection.selected_segment_start, 0);
+        // The same input bound as any vector rebuild applies.
+        let tight = SearchCompactionPolicy {
+            vector_base_max_input_bytes: 1,
+            ..policy
+        };
+        assert!(select_search_compactions(&manifest, tight)
+            .unwrap()
+            .is_empty());
+        // Another base (e.g. the rebuilt one) is not affected.
+        assert!(!crate::sst::vector::v5::base_lacks_rabitq(&format!(
+            "sst/level1/{}-vector-graph-rabitq-backfill.vg",
+            Uuid::new_v4().simple()
+        )));
     }
 
     fn delta_policy(trigger: usize, hard_cap: usize) -> SearchCompactionPolicy {

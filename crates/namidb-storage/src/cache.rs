@@ -1852,6 +1852,12 @@ impl SstCache {
         key: String,
         reader: Arc<crate::sst::vector::v5::VectorV5Reader>,
     ) -> bool {
+        // Every read path that opens a base caches it here: record a base
+        // without the RaBitQ section for its backfill rebuild, whether or
+        // not the reader itself is admitted.
+        if reader.rabitq_absent() {
+            crate::sst::vector::v5::note_base_without_rabitq(&key);
+        }
         let required_bytes =
             cache_key_weight(&key).saturating_add(reader.resident_metadata_bytes());
         if !fits_capacity(self.budgets.decoded.search_index_bytes, required_bytes) {

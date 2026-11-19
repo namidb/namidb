@@ -1200,7 +1200,9 @@ fn spawn_metadata_prefetch(state: &Arc<NamespaceState>) {
                     node_record_pages = summary.node_record_pages,
                     vector_indexes = summary.vector_indexes,
                     text_indexes = summary.text_indexes,
+                    vector_code_bytes = summary.vector_code_bytes,
                     elapsed_ms = summary.elapsed.as_millis() as u64,
+                    total_elapsed_ms = summary.total_elapsed.as_millis() as u64,
                     "prefetched namespace read metadata"
                 ),
                 Err(error) => tracing::warn!(
