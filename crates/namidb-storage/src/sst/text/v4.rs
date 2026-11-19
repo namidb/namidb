@@ -533,13 +533,30 @@ impl QueryMaskUnionBuilder {
     }
 }
 
-/// Most posting blocks one cursor reads ahead of the block it needs.
+/// Most posting blocks one cursor reads ahead of the block it needs, unless
+/// the rest of its list fits its share of the read-ahead allowance.
 const POSTING_READAHEAD_BLOCKS: usize = 16;
-/// Compressed bytes one cursor may read ahead per fetch.
+/// Compressed bytes one cursor may hold read ahead.
 const POSTING_READAHEAD_BYTES: usize = 4 * 1024 * 1024;
-/// Compressed bytes all cursors of one fetch may read ahead together (a
-/// prefix query can expand to dozens of terms).
-const POSTING_READAHEAD_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+/// Compressed bytes all cursors of one query may hold read ahead (a prefix
+/// query can expand to dozens of terms).
+const POSTING_READAHEAD_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Compressed bytes a query over these posting lists may hold read ahead:
+/// part of its workspace reservation, so read-ahead never outgrows it.
+fn posting_readahead_allowance<'a>(lists: impl Iterator<Item = &'a [PostingBlockRef]>) -> usize {
+    lists
+        .map(|blocks| {
+            blocks
+                .iter()
+                .fold(0usize, |total, block| {
+                    total.saturating_add(block.wire.len as usize)
+                })
+                .min(POSTING_READAHEAD_BYTES)
+        })
+        .fold(0usize, usize::saturating_add)
+        .min(POSTING_READAHEAD_TOTAL_BYTES)
+}
 
 #[derive(Debug)]
 struct PostingCursor {
@@ -2544,6 +2561,17 @@ impl TextV4Reader {
         let mut sources = Vec::<std::result::Result<Bytes, usize>>::with_capacity(jobs.capacity());
         let mut ranges = Vec::<Range<u64>>::new();
         let mut ahead = Vec::<(usize, usize, usize)>::new();
+        // Read-ahead stays inside the allowance the workspace reservation
+        // already counts: each cursor fetching now gets an equal share of
+        // what the query does not hold yet.
+        let readahead_held = cursors
+            .iter()
+            .flat_map(|cursor| cursor.readahead.values())
+            .fold(0usize, |total, bytes| total.saturating_add(bytes.len()));
+        let readahead_share =
+            posting_readahead_allowance(cursors.iter().map(|cursor| cursor.blocks.as_slice()))
+                .saturating_sub(readahead_held)
+                / cursor_indices.len().max(1);
         let mut previous = None;
         for &cursor_index in cursor_indices {
             if previous.is_some_and(|previous| previous >= cursor_index) {
@@ -2575,9 +2603,26 @@ impl TextV4Reader {
                 // A cursor that keeps needing blocks reads further ahead each
                 // time, so a long posting list costs a few round trips, not
                 // one per block, while a query that stops early reads little.
-                let mut budget = (POSTING_READAHEAD_TOTAL_BYTES / cursor_indices.len())
-                    .min(POSTING_READAHEAD_BYTES);
-                for next in block_index + 1..block_index + cursor.readahead_window {
+                let mut budget = readahead_share;
+                // A posting list whose remaining blocks fit the budget is read
+                // whole: block-max pruning decides which blocks it needs one
+                // round trip at a time, which on a cold object store costs far
+                // more than the blocks it skips.
+                let mut remaining = 0usize;
+                for following in &cursor.blocks[block_index + 1..] {
+                    let range = following.wire.range()?;
+                    remaining =
+                        remaining.saturating_add(range.end.saturating_sub(range.start) as usize);
+                    if remaining > budget {
+                        break;
+                    }
+                }
+                let window = if remaining <= budget {
+                    cursor.blocks.len() - block_index
+                } else {
+                    cursor.readahead_window
+                };
+                for next in block_index + 1..block_index + window {
                     let Some(following) = cursor.blocks.get(next) else {
                         break;
                     };
@@ -3641,6 +3686,9 @@ fn estimate_exact_search_workspace(
             )
             .saturating_add(entry.term.capacity())
     });
+    let posting_bytes = posting_bytes.saturating_add(posting_readahead_allowance(
+        entries.values().map(|entry| entry.blocks.as_slice()),
+    ));
     let mut combined_bytes = 0usize;
     let mut filter_peak = 0usize;
     for (property, alternatives) in groups {
