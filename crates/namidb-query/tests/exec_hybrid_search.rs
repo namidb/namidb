@@ -1237,11 +1237,13 @@ mod indexed_sparse_filter {
                 let _cap = CapEnvGuard::with_selective(64, 4096);
                 let before = probe.barrier_pins();
                 let rows = titled_scores(&writer, call).await;
-                assert_eq!(
-                    probe.barrier_pins() - before,
-                    1,
-                    "the selective route reads the corpus statistics once and \
-                     never widens: {call}"
+                // One statistics read, plus (for a String equality) the
+                // native filter-group attempt the coordinator refuses on an
+                // unindexed property. No widening rounds.
+                let pins = probe.barrier_pins() - before;
+                assert!(
+                    (1..=2).contains(&pins),
+                    "the selective route must not widen ({pins} pins): {call}"
                 );
                 rows
             };
@@ -1257,6 +1259,41 @@ mod indexed_sparse_filter {
             );
             assert_eq!(selective, exact, "{call}");
         }
+    }
+
+    #[tokio::test]
+    async fn filtered_bm25_selective_route_skips_the_widening_rounds() {
+        let docs = selective_docs();
+        let borrowed = borrowed_docs(&docs);
+        let (writer, _, probe) = indexed_corpus("bm25-selective-rounds", &borrowed).await;
+        // Every `other` document outranks every `acme` one for `alpha`, so
+        // the ranked-prefix route must widen past the first 40 hits.
+        let call = "CALL search.bm25({ label: 'Doc', query: 'alpha', text_property: 'body', \
+             k: 4, filter: { tenant: 'acme' } }) YIELD node, score \
+             RETURN node.title AS title, score";
+        let (widened, widening_pins) = {
+            let _cap = CapEnvGuard::with_selective(4096, 0);
+            let before = probe.barrier_pins();
+            let rows = titled_scores(&writer, call).await;
+            (rows, probe.barrier_pins() - before)
+        };
+        let (selective, selective_pins) = {
+            let _cap = CapEnvGuard::with_selective(4096, 4096);
+            let before = probe.barrier_pins();
+            let rows = titled_scores(&writer, call).await;
+            (rows, probe.barrier_pins() - before)
+        };
+        assert_eq!(selective.len(), 4);
+        assert_eq!(selective, widened);
+        assert!(
+            widening_pins >= 3,
+            "the fixture must force widening rounds ({widening_pins} pins)"
+        );
+        assert!(
+            selective_pins <= 2,
+            "a refused native group plus one statistics read, no widening \
+             ({selective_pins} pins)"
+        );
     }
 
     #[tokio::test]
