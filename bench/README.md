@@ -36,6 +36,18 @@ so you can diff the two backends directly.
   against Kuzu (via the `kuzu` PyPI package).
 - `bench/load_ndjson.py`: loads a `graph-shape-generate --ndjson-dir` graph
   through whichever `namidb` Python package the interpreter imports.
+- `bench/mixed_concurrency.py`: a mixed read workload against a running
+  server (18 shapes: BM25, vector, hybrid, search-then-filter, 1-3 hop
+  traversals, GraphRAG chains) at concurrency 1/4/8/16/32/64. It reports
+  throughput, speed-up over a single stream, p50/p95/p99, errors, how many
+  refusals carried `Retry-After`, and peak RSS (`--rss-pid`). `--load`
+  writes a synthetic Doc/Section corpus of the shape it expects; `--schema`
+  maps the shapes onto another graph. Run the server in a container with
+  `--cpus`/`--memory` to measure a sized deployment.
+- `bench/rollback_compat.sh <new server> <old server>...`: writes data with
+  the new binary (flushed SSTs, property/full-text/vector indexes, an
+  unflushed WAL tail), checks every old binary reads it identically and
+  accepts a write, then checks the new binary reads it back.
 
 ## End-to-end workflow
 
