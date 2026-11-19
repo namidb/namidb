@@ -15,6 +15,23 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Backups of large namespaces no longer fail on long object reads.** A
+  snapshot copy read every object as one GET, throttled by the upload behind
+  it, so a multi-GB SST kept a single request open for minutes. The object
+  store client's per-request timeout cut it every 30 seconds, and the client's
+  body retries share one budget per object, so the object, and the whole
+  backup with it, failed after about three minutes of streaming; the retry
+  then started from zero. Objects larger than one part are now read as 8 MiB
+  ranged requests, each read completely and retried on its own (up to six
+  attempts, pinned to the object's ETag), and a failed object is logged with
+  its path, size and elapsed time.
+- **A retried backup resumes.** `POST /v0/admin/backup` with `force` (how a
+  retry into the same destination is sent) keeps the destination objects a
+  previous attempt already finished, matched by path and size, instead of
+  copying the whole snapshot again. Restores still replace everything.
+
 ## [3.5.1] - 2026-11-18
 
 ### Fixed

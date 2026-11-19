@@ -98,6 +98,28 @@ pub async fn copy_namespace_snapshot(
     overwrite: bool,
     verify: bool,
 ) -> Result<SnapshotCopyReport> {
+    copy_namespace_snapshot_resumable(
+        src_store, src_paths, dst_store, dst_paths, version, overwrite, verify, false,
+    )
+    .await
+}
+
+/// [`copy_namespace_snapshot`] that, with `resume`, keeps destination objects
+/// a previous attempt of the same copy already wrote (same path and size;
+/// snapshot objects are immutable and uniquely named). Meant for retrying a
+/// backup into its own destination; a restore over a damaged namespace should
+/// not resume, since it must replace whatever is there.
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_namespace_snapshot_resumable(
+    src_store: Arc<dyn ObjectStore>,
+    src_paths: NamespacePaths,
+    dst_store: Arc<dyn ObjectStore>,
+    dst_paths: NamespacePaths,
+    version: Option<u64>,
+    overwrite: bool,
+    verify: bool,
+    resume: bool,
+) -> Result<SnapshotCopyReport> {
     // Refuse to stomp a live destination (one with a manifest pointer, see
     // [`has_manifest_pointer`]) unless explicitly told to.
     if !overwrite && has_manifest_pointer(&dst_store, &dst_paths).await? {
@@ -144,7 +166,8 @@ pub async fn copy_namespace_snapshot(
     }
 
     let result = copy_snapshot_pinned(
-        &src_store, &src_paths, &dst_store, &dst_paths, manifest, overwrite, verify, &mut pin,
+        &src_store, &src_paths, &dst_store, &dst_paths, manifest, overwrite, verify, resume,
+        &mut pin,
     )
     .await;
     if let Err(e) = pin.release().await {
@@ -241,6 +264,7 @@ async fn copy_snapshot_pinned(
     mut manifest: Manifest,
     overwrite: bool,
     verify: bool,
+    resume: bool,
     pin: &mut RetentionPin,
 ) -> Result<SnapshotCopyReport> {
     let source_version = manifest.version;
@@ -283,7 +307,7 @@ async fn copy_snapshot_pinned(
         for rel in rels {
             let from = Path::from(format!("{}/{}", src_prefix.as_ref(), rel));
             let to = Path::from(format!("{}/{}", dst_prefix.as_ref(), rel));
-            bytes_copied += copy_object(src_store, dst_store, &from, &to).await?;
+            bytes_copied += copy_object(src_store, dst_store, &from, &to, resume).await?;
             objects_copied += 1;
             pin.renew_if_due().await?;
         }
@@ -298,6 +322,7 @@ async fn copy_snapshot_pinned(
                 &src_prefix,
                 &dst_prefix,
                 &paged.path,
+                resume,
             )
             .await?
             {
@@ -319,6 +344,7 @@ async fn copy_snapshot_pinned(
                 &src_prefix,
                 &dst_prefix,
                 &paged.path,
+                resume,
             )
             .await?
             {
@@ -340,6 +366,7 @@ async fn copy_snapshot_pinned(
                 &src_prefix,
                 &dst_prefix,
                 &paged.path,
+                resume,
             )
             .await?
             {
@@ -352,9 +379,15 @@ async fn copy_snapshot_pinned(
             pin.renew_if_due().await?;
         }
         if let Some(point) = crate::manifest::edge_point_sidecar_path(sst) {
-            if let Some(size) =
-                copy_optional_accelerator(src_store, dst_store, &src_prefix, &dst_prefix, &point)
-                    .await?
+            if let Some(size) = copy_optional_accelerator(
+                src_store,
+                dst_store,
+                &src_prefix,
+                &dst_prefix,
+                &point,
+                resume,
+            )
+            .await?
             {
                 bytes_copied += size;
                 objects_copied += 1;
@@ -368,6 +401,7 @@ async fn copy_snapshot_pinned(
                 &src_prefix,
                 &dst_prefix,
                 &locator.path,
+                resume,
             )
             .await?
             {
@@ -386,6 +420,7 @@ async fn copy_snapshot_pinned(
                         &src_prefix,
                         &dst_prefix,
                         &properties.path,
+                        resume,
                     )
                     .await?
                     {
@@ -410,7 +445,7 @@ async fn copy_snapshot_pinned(
     for seg in &manifest.wal_segments {
         let from = src_paths.wal_segment(seg.seq);
         let to = dst_paths.wal_segment(seg.seq);
-        bytes_copied += copy_object(src_store, dst_store, &from, &to).await?;
+        bytes_copied += copy_object(src_store, dst_store, &from, &to, resume).await?;
         objects_copied += 1;
         pin.renew_if_due().await?;
     }
@@ -622,27 +657,39 @@ async fn verify_snapshot(
     Ok(())
 }
 
-/// Part size for the streaming copy path. Objects at or below one part are
-/// copied with a plain buffered PUT (the common case: manifests, pointers,
-/// small SSTs); larger ones stream through a multipart upload in parts of
-/// this size. 8 MiB clears every cloud store's minimum non-final part size
-/// (S3: 5 MiB) and, with 10k parts, bounds a single object at 80 GB.
+/// Part size for the copy path. Objects at or below one part are copied with
+/// one GET and a plain buffered PUT (the common case: manifests, pointers,
+/// small SSTs); larger ones are read as ranged GETs of this size and written
+/// through a multipart upload in parts of this size. 8 MiB clears every cloud
+/// store's minimum non-final part size (S3: 5 MiB) and, with 10k parts, bounds
+/// a single object at 80 GB.
 const COPY_PART_SIZE: usize = 8 * 1024 * 1024;
 
-/// Cap on multipart parts concurrently in flight, which bounds the copy's
-/// memory at roughly `COPY_MAX_IN_FLIGHT_PARTS * COPY_PART_SIZE` per object.
+/// Cap on parts concurrently in flight on each side (ranged reads ahead of the
+/// upload, and part uploads), which bounds the copy's memory at roughly
+/// `2 * COPY_MAX_IN_FLIGHT_PARTS * COPY_PART_SIZE` per object.
 const COPY_MAX_IN_FLIGHT_PARTS: usize = 4;
 
-/// Stream one object from `src` to `dst`, returning its byte length. Plain
-/// GET + PUT so it works across backends (s3 -> file, file -> gs, ...); a
-/// same-store fast path via `ObjectStore::copy` is a later optimisation.
+/// Attempts per part read. Every attempt is a fresh ranged request, so the
+/// client's per-request timeout and retry budget apply to one part instead of
+/// to the whole object.
+const COPY_PART_ATTEMPTS: u32 = 6;
+
+/// Copy one object from `src` to `dst`, returning its byte length. Plain GET +
+/// PUT so it works across backends (s3 -> file, file -> gs, ...).
+///
+/// With `resume`, an object already present at the destination with the
+/// source's size is kept: snapshot objects are immutable and uniquely named,
+/// and a destination object only becomes visible once its upload completed,
+/// so a retried copy picks up where the failed one stopped.
 async fn copy_object(
     src: &Arc<dyn ObjectStore>,
     dst: &Arc<dyn ObjectStore>,
     from: &Path,
     to: &Path,
+    resume: bool,
 ) -> Result<u64> {
-    copy_object_with_part_size(src, dst, from, to, COPY_PART_SIZE).await
+    copy_object_with_part_size(src, dst, from, to, COPY_PART_SIZE, resume).await
 }
 
 /// Copy a cache-like range accelerator when it still exists.
@@ -658,6 +705,7 @@ async fn copy_optional_accelerator(
     src_prefix: &Path,
     dst_prefix: &Path,
     relative: &str,
+    resume: bool,
 ) -> Result<Option<u64>> {
     let from = Path::from(format!("{}/{}", src_prefix.as_ref(), relative));
     let to = Path::from(format!("{}/{}", dst_prefix.as_ref(), relative));
@@ -675,23 +723,66 @@ async fn copy_optional_accelerator(
     // Once the source is known to exist, propagate every copy failure. In
     // particular a destination multipart `NotFound` must not be mistaken for
     // an absent source accelerator and silently swallowed.
-    copy_object(src, dst, &from, &to).await.map(Some)
+    copy_object(src, dst, &from, &to, resume).await.map(Some)
 }
 
-/// [`copy_object`] with the part-size threshold explicit so tests can force
-/// the multipart path without allocating multi-MiB fixtures. Never buffers
-/// more than one part (plus the bounded in-flight uploads) regardless of the
-/// object's size, so a multi-GB compacted SST cannot OOM the process.
+/// [`copy_object`] with the part size explicit so tests can force the
+/// multipart path without allocating multi-MiB fixtures.
+///
+/// A large object is never read as one long GET: a stream that stays open for
+/// minutes (throttled by the upload behind it) outlives the client's
+/// per-request timeout, and the client's own body retries share one budget
+/// for the whole object, so one multi-GB SST could fail the whole snapshot.
+/// Each part is its own ranged request, read completely and retried on its
+/// own, and pinned to the object's ETag where the store reports one. Never
+/// buffers more than the bounded in-flight parts regardless of the object's
+/// size, so a multi-GB compacted SST cannot OOM the process.
 async fn copy_object_with_part_size(
     src: &Arc<dyn ObjectStore>,
     dst: &Arc<dyn ObjectStore>,
     from: &Path,
     to: &Path,
     part_size: usize,
+    resume: bool,
 ) -> Result<u64> {
-    let result = src.get(from).await?;
-    if result.meta.size <= part_size as u64 {
-        let bytes = result.bytes().await?;
+    let started = std::time::Instant::now();
+    let meta = src.head(from).await.map_err(Error::ObjectStore)?;
+    let size = meta.size;
+    if resume {
+        match dst.head(to).await {
+            Ok(existing) if existing.size == size => {
+                debug!(path = %to, size, "snapshot object already copied; keeping it");
+                return Ok(size);
+            }
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(Error::ObjectStore(error)),
+        }
+    }
+    let result = copy_object_parts(src, dst, from, to, part_size, size, meta.e_tag).await;
+    if let Err(error) = &result {
+        tracing::warn!(
+            path = %from,
+            size,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            %error,
+            "snapshot object copy failed"
+        );
+    }
+    result
+}
+
+async fn copy_object_parts(
+    src: &Arc<dyn ObjectStore>,
+    dst: &Arc<dyn ObjectStore>,
+    from: &Path,
+    to: &Path,
+    part_size: usize,
+    size: u64,
+    e_tag: Option<String>,
+) -> Result<u64> {
+    let part = part_size.max(1) as u64;
+    if size <= part {
+        let bytes = read_part(src, from, 0..size, e_tag.as_deref()).await?;
         let len = bytes.len() as u64;
         dst.put_opts(
             to,
@@ -704,22 +795,33 @@ async fn copy_object_with_part_size(
 
     let upload = dst.put_multipart(to).await.map_err(Error::ObjectStore)?;
     let mut write = WriteMultipart::new_with_chunk_size(upload, part_size);
-    let mut stream = result.into_stream();
+    let ranges = (0..size.div_ceil(part)).map(|i| i * part..((i + 1) * part).min(size));
+    let e_tag = e_tag.as_deref();
+    let mut parts = futures::stream::iter(ranges)
+        .map(|range| read_part(src, from, range, e_tag))
+        .buffered(COPY_MAX_IN_FLIGHT_PARTS);
     let streamed = async {
         let mut len = 0u64;
-        while let Some(chunk) = stream.try_next().await.map_err(Error::ObjectStore)? {
-            len += chunk.len() as u64;
-            // Backpressure: don't buffer the source faster than the parts
-            // upload, or the "streaming" copy degrades into buffering.
+        while let Some(bytes) = parts.next().await {
+            let bytes = bytes?;
+            len += bytes.len() as u64;
+            // Backpressure: don't read the source faster than the parts
+            // upload, or the copy degrades into buffering.
             write
                 .wait_for_capacity(COPY_MAX_IN_FLIGHT_PARTS)
                 .await
                 .map_err(Error::ObjectStore)?;
-            write.put(chunk);
+            write.put(bytes);
+        }
+        if len != size {
+            return Err(Error::precondition(format!(
+                "snapshot object {from} read {len} bytes of {size}"
+            )));
         }
         Ok::<u64, Error>(len)
     }
     .await;
+    drop(parts);
     match streamed {
         Ok(len) => {
             write.finish().await.map_err(Error::ObjectStore)?;
@@ -732,6 +834,60 @@ async fn copy_object_with_part_size(
                 debug!(error = %abort_err, "failed to abort a partial multipart copy");
             }
             Err(e)
+        }
+    }
+}
+
+/// Read `range` of `from` completely, retrying the whole range on failure.
+/// A changed ETag (the object was replaced, which snapshot objects never are)
+/// or a missing object is not retried.
+async fn read_part(
+    src: &Arc<dyn ObjectStore>,
+    from: &Path,
+    range: std::ops::Range<u64>,
+    e_tag: Option<&str>,
+) -> Result<bytes::Bytes> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let options = object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(range.clone())),
+            if_match: e_tag.map(str::to_owned),
+            ..Default::default()
+        };
+        let read = async {
+            let result = src.get_opts(from, options).await?;
+            result.bytes().await
+        }
+        .await;
+        match read {
+            Ok(bytes) if bytes.len() as u64 == range.end - range.start => return Ok(bytes),
+            Ok(bytes) => {
+                return Err(Error::precondition(format!(
+                    "snapshot object {from} returned {} bytes for range {}..{}",
+                    bytes.len(),
+                    range.start,
+                    range.end
+                )))
+            }
+            Err(
+                error @ (object_store::Error::NotFound { .. }
+                | object_store::Error::Precondition { .. }
+                | object_store::Error::NotModified { .. }),
+            ) => return Err(Error::ObjectStore(error)),
+            Err(error) if attempt >= COPY_PART_ATTEMPTS => return Err(Error::ObjectStore(error)),
+            Err(error) => {
+                let backoff = std::time::Duration::from_millis(250u64 << (attempt - 1).min(5));
+                tracing::info!(
+                    path = %from,
+                    start = range.start,
+                    end = range.end,
+                    attempt,
+                    %error,
+                    "snapshot part read failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+            }
         }
     }
 }
@@ -1757,7 +1913,7 @@ mod tests {
         src.put(&from, PutPayload::from(body.clone()))
             .await
             .unwrap();
-        let n = copy_object_with_part_size(&src, &dst, &from, &to, 1024)
+        let n = copy_object_with_part_size(&src, &dst, &from, &to, 1024, false)
             .await
             .unwrap();
         assert_eq!(n, body.len() as u64);
@@ -1780,7 +1936,7 @@ mod tests {
         src.put(&from_small, PutPayload::from(small.clone()))
             .await
             .unwrap();
-        let n = copy_object_with_part_size(&src, &dst, &from_small, &to_small, 1024)
+        let n = copy_object_with_part_size(&src, &dst, &from_small, &to_small, 1024, false)
             .await
             .unwrap();
         assert_eq!(n, small.len() as u64);
@@ -1791,5 +1947,197 @@ mod tests {
         );
         let copied = dst.get(&to_small).await.unwrap().bytes().await.unwrap();
         assert_eq!(copied.as_ref(), small.as_slice());
+    }
+
+    /// Source that records every GET and fails the first read of each range,
+    /// and refuses to serve a large object as one unbounded GET, the way a
+    /// per-request timeout cuts a long stream.
+    #[derive(Debug)]
+    struct FlakyStore {
+        inner: Arc<dyn ObjectStore>,
+        max_unranged: u64,
+        gets: std::sync::Mutex<Vec<Option<std::ops::Range<u64>>>>,
+        failed: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
+    }
+
+    impl std::fmt::Display for FlakyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FlakyStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FlakyStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let range = match &options.range {
+                Some(object_store::GetRange::Bounded(r)) => Some(r.clone()),
+                None => None,
+                Some(other) => panic!("unexpected range form {other:?}"),
+            };
+            if options.head {
+                return self.inner.get_opts(location, options).await;
+            }
+            self.gets.lock().unwrap().push(range.clone());
+            let cut = || object_store::Error::Generic {
+                store: "flaky",
+                source: "request or response body error".into(),
+            };
+            match range {
+                None => {
+                    let size = self.inner.head(location).await?.size;
+                    if size > self.max_unranged {
+                        return Err(cut());
+                    }
+                }
+                Some(r) => {
+                    if self.failed.lock().unwrap().insert((r.start, r.end)) {
+                        return Err(cut());
+                    }
+                }
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    /// A large object is read in part-sized ranges, each retried on its own,
+    /// so a store that cuts long or flaky requests still yields an exact copy.
+    #[tokio::test]
+    async fn large_object_copy_reads_bounded_ranges_and_retries_each_part() {
+        let inner = store();
+        let body: Vec<u8> = (0..10 * 1024u32 + 17).map(|i| (i % 253) as u8).collect();
+        let from = Path::from("src/big.bin");
+        inner
+            .put(&from, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        let flaky = Arc::new(FlakyStore {
+            inner,
+            max_unranged: 1024,
+            gets: Default::default(),
+            failed: Default::default(),
+        });
+        let src: Arc<dyn ObjectStore> = flaky.clone();
+        let dst = store();
+        let to = Path::from("dst/big.bin");
+        let n = copy_object_with_part_size(&src, &dst, &from, &to, 1024, false)
+            .await
+            .unwrap();
+        assert_eq!(n, body.len() as u64);
+        let copied = dst.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(
+            copied.as_ref(),
+            body.as_slice(),
+            "copy must be byte-identical"
+        );
+        let gets = flaky.gets.lock().unwrap().clone();
+        assert!(
+            gets.iter()
+                .all(|r| matches!(r, Some(r) if r.end - r.start <= 1024)),
+            "every read is one bounded part: {gets:?}"
+        );
+        let parts = body.len().div_ceil(1024);
+        assert_eq!(
+            gets.len(),
+            2 * parts,
+            "each part failed once and was retried once"
+        );
+    }
+
+    /// A resumed copy keeps a destination object of the right size and
+    /// re-copies one whose size differs.
+    #[tokio::test]
+    async fn a_resumed_copy_keeps_objects_already_at_the_destination() {
+        let inner = store();
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 7) as u8).collect();
+        let from = Path::from("src/obj.bin");
+        inner
+            .put(&from, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        let flaky = Arc::new(FlakyStore {
+            inner,
+            max_unranged: u64::MAX,
+            gets: Default::default(),
+            failed: Default::default(),
+        });
+        let src: Arc<dyn ObjectStore> = flaky.clone();
+        let dst = store();
+        let to = Path::from("dst/obj.bin");
+        copy_object_with_part_size(&src, &dst, &from, &to, 1024, false)
+            .await
+            .unwrap();
+        let reads = flaky.gets.lock().unwrap().len();
+        let n = copy_object_with_part_size(&src, &dst, &from, &to, 1024, true)
+            .await
+            .unwrap();
+        assert_eq!(n, body.len() as u64);
+        assert_eq!(flaky.gets.lock().unwrap().len(), reads, "nothing re-read");
+
+        dst.put(&to, PutPayload::from(vec![1u8; 10])).await.unwrap();
+        copy_object_with_part_size(&src, &dst, &from, &to, 1024, true)
+            .await
+            .unwrap();
+        let copied = dst.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(
+            copied.as_ref(),
+            body.as_slice(),
+            "a short leftover is replaced"
+        );
     }
 }

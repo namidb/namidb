@@ -5437,8 +5437,11 @@ async fn run_backup_copy(
                 .into_response();
         }
     };
-    let copied = namidb_storage::copy_namespace_snapshot(
-        src_store, src_paths, dst_store, dst_paths, version, req.force, req.verify,
+    // A forced backup is a retry into the backup's own destination: keep the
+    // objects an earlier attempt already finished instead of copying the
+    // whole snapshot again.
+    let copied = namidb_storage::copy_namespace_snapshot_resumable(
+        src_store, src_paths, dst_store, dst_paths, version, req.force, req.verify, req.force,
     )
     .await;
     snapshot_copy_response(copied, "backup")
