@@ -399,20 +399,28 @@ impl MemoryGovernor {
         pool.reserved_bytes().saturating_add(floor) <= pool.capacity_bytes()
     }
 
-    /// Wait, until `deadline`, for the process to be below its ceiling and
-    /// the query pool to have room. Reclaim runs as in [`Self::admit_query`];
-    /// the refusal after the deadline carries the last observation.
+    /// Wait, until `deadline` or this governor's own admission wait,
+    /// whichever comes first, for the process to be below its ceiling and
+    /// the query pool to have room. Reclaim runs as in
+    /// [`Self::admit_query`]; the refusal after the deadline carries the
+    /// last observation.
+    ///
+    /// A governor without an admission wait checks only the ceiling, once:
+    /// a full pool is then left to the statement's own reservation, which
+    /// fails with the same retryable 503.
     pub async fn await_query_headroom(
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<(), MemoryPressure> {
+        let deadline = deadline.min(tokio::time::Instant::now() + self.admission_wait);
+        let wait_for_pool = !self.admission_wait.is_zero();
         loop {
             let resident = match self.observe_resident() {
                 Some(initial) => self.reclaim_off_worker(initial).await,
                 None => 0,
             };
             let pressure = Self::projected_pressure(resident, 0, self.max_bytes);
-            if pressure.is_none() && self.query_pool_has_room() {
+            if pressure.is_none() && (!wait_for_pool || self.query_pool_has_room()) {
                 return Ok(());
             }
             let now = tokio::time::Instant::now();
@@ -1575,6 +1583,19 @@ mod tests {
         let started = Instant::now();
         assert!(waiting.await_query_headroom(deadline).await.is_err());
         assert!(started.elapsed() >= Duration::from_millis(100));
+
+        // Without an admission wait the pool is not waited for: a full pool
+        // is refused by the statement's own reservation instead.
+        let immediate = Arc::new(MemoryGovernor::new(64 << 30));
+        let pool = Arc::clone(immediate.query_memory_pool().unwrap());
+        let holder = namidb_query::QueryMemoryBudget::new(usize::MAX).with_pool(Arc::clone(&pool));
+        holder.charge(pool.capacity_bytes() - (1 << 20)).unwrap();
+        assert!(!immediate.query_pool_has_room());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        assert!(immediate.await_query_headroom(deadline).await.is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(holder);
 
         // No ceiling: always admitted at once.
         let open = Arc::new(MemoryGovernor::new(0).with_admission_wait(Duration::from_secs(5)));
