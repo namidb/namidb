@@ -2703,9 +2703,12 @@ impl<'a> ExternalAssembler<'a> {
         {
             self.flush_posting_block()?;
         }
+        let tf = u32::try_from(self.current_positions.len())
+            .map_err(|_| Error::invariant("text v4 term frequency exceeds u32"))?;
         self.posting_block.push(Posting {
             doc,
             doc_len: self.current_doc_len,
+            tf,
             positions: std::mem::take(&mut self.current_positions),
         });
         self.posting_block_bytes = self.posting_block_bytes.saturating_add(posting_bytes);

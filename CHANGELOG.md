@@ -97,6 +97,15 @@ crates.io release will establish and document that API explicitly.
   decoding every posting of every query term, frequent terms included. Such a
   segment, and a base followed by such proven-empty flushes, now serve from
   the block-max exact top-k, with identical results.
+- **Full-text scoring does far less work per posting.** Each posting block
+  created and released its own decompression context (a fresh allocation and
+  release of its window every block); every posting allocated a list of its
+  token positions, although only terms inside a phrase need them; and the
+  scorer re-measured its working set by walking every decoded posting of
+  every query term after each scored document. Blocks now decompress through
+  one reused context per thread, positions are kept only for phrase terms,
+  and each block's size is measured once when it loads. Scores and results
+  are unchanged.
 - **Full-text dictionary lookups run concurrently.** Each query term's
   dictionary block was fetched after the previous one, one object-store round
   trip per term before the first posting was read.

@@ -11,7 +11,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
-use std::io::{Cursor, Read, Seek, Write};
+use std::io::{Cursor, Seek, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -299,6 +299,11 @@ struct EffectiveMutation {
 struct Posting {
     doc: u64,
     doc_len: u32,
+    /// Term frequency: the number of positions on the wire.
+    tf: u32,
+    /// Token positions. Always present on the build side; on the read side
+    /// only for terms a phrase constraint checks (see
+    /// `PostingCursor::keep_positions`). Scoring needs only `tf`.
     positions: Vec<u32>,
 }
 
@@ -536,7 +541,18 @@ struct PostingCursor {
     blocks: Vec<PostingBlockRef>,
     block_upper_bounds: Vec<f64>,
     next_block: usize,
+    /// The decoded current block. Replace it only through
+    /// [`PostingCursor::set_postings`], which keeps `positions_bytes` exact.
     postings: Vec<Posting>,
+    /// Heap bytes of the position lists in `postings`, measured once when the
+    /// block is installed. The workspace model is evaluated after every
+    /// scored document; re-summing every posting of every cursor there made
+    /// scoring quadratic in the block size.
+    positions_bytes: usize,
+    /// Whether a phrase constraint of the query reads this term's positions.
+    /// Other terms decode only their term frequencies: allocating a position
+    /// list per posting dominated scoring of long documents.
+    keep_positions: bool,
     next_posting: usize,
     /// When metadata skips a window ending inside the next block, discard
     /// decoded postings through this ordinal after the block is authenticated.
@@ -544,6 +560,19 @@ struct PostingCursor {
 }
 
 impl PostingCursor {
+    fn set_postings(&mut self, postings: Vec<Posting>) {
+        self.positions_bytes = postings
+            .iter()
+            .map(|posting| {
+                posting
+                    .positions
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>())
+            })
+            .fold(0usize, usize::saturating_add);
+        self.postings = postings;
+    }
+
     fn current(&self) -> Option<&Posting> {
         self.postings.get(self.next_posting)
     }
@@ -589,7 +618,7 @@ impl PostingCursor {
             .next_posting
             .saturating_add(remaining.partition_point(|posting| posting.doc <= target));
         if self.next_posting == self.postings.len() {
-            self.postings = Vec::new();
+            self.set_postings(Vec::new());
             self.next_posting = 0;
         }
     }
@@ -637,17 +666,7 @@ impl PostingCursor {
                 self.postings
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Posting>())
-                    .saturating_add(
-                        self.postings
-                            .iter()
-                            .map(|posting| {
-                                posting
-                                    .positions
-                                    .capacity()
-                                    .saturating_mul(std::mem::size_of::<u32>())
-                            })
-                            .sum::<usize>(),
-                    ),
+                    .saturating_add(self.positions_bytes),
             )
     }
 }
@@ -1319,6 +1338,8 @@ fn write_doc_table_and_collect_postings<W: Write + Seek>(
             entry.postings.push(Posting {
                 doc: ordinal,
                 doc_len,
+                tf: u32::try_from(positions.len())
+                    .map_err(|_| Error::invariant("text v4 term frequency exceeds u32"))?,
                 positions,
             });
         }
@@ -1627,6 +1648,7 @@ impl TextV4Reader {
                 let idf = *idfs
                     .get(&term)
                     .ok_or_else(|| Error::invariant("text v4 IDF cache lost a term"))?;
+                let keep_positions = query.phrases.iter().flatten().any(|word| *word == term);
                 Ok(PostingCursor {
                     term,
                     idf,
@@ -1634,6 +1656,8 @@ impl TextV4Reader {
                     block_upper_bounds: Vec::new(),
                     next_block: 0,
                     postings: Vec::new(),
+                    positions_bytes: 0,
+                    keep_positions,
                     next_posting: 0,
                     skip_through: None,
                 })
@@ -1725,7 +1749,7 @@ impl TextV4Reader {
                     debug_assert_eq!(posting.doc, doc);
                     score += bm25_term_score(
                         cursor.idf,
-                        posting.positions.len() as u32,
+                        posting.tf,
                         posting.doc_len as usize,
                         corpus_avg_len,
                     );
@@ -1947,6 +1971,7 @@ impl TextV4Reader {
                     })
                     .collect::<Vec<_>>();
                 unsafe_bounds |= block_upper_bounds.is_empty();
+                let keep_positions = query.phrases.iter().flatten().any(|word| *word == term);
                 Ok(PostingCursor {
                     term,
                     idf,
@@ -1954,6 +1979,8 @@ impl TextV4Reader {
                     block_upper_bounds,
                     next_block: 0,
                     postings: Vec::new(),
+                    positions_bytes: 0,
+                    keep_positions,
                     next_posting: 0,
                     skip_through: None,
                 })
@@ -2069,7 +2096,7 @@ impl TextV4Reader {
                     debug_assert_eq!(posting.doc, doc);
                     score += bm25_term_score(
                         cursor.idf,
-                        posting.positions.len() as u32,
+                        posting.tf,
                         posting.doc_len as usize,
                         corpus_avg_len,
                     );
@@ -2087,7 +2114,7 @@ impl TextV4Reader {
                 let cursor = &mut cursors[cursor_index];
                 cursor.next_posting += 1;
                 if cursor.next_posting == cursor.postings.len() {
-                    cursor.postings = Vec::new();
+                    cursor.set_postings(Vec::new());
                     cursor.next_posting = 0;
                     crossed_block_boundary = true;
                 } else if let Some(posting) = cursor.current() {
@@ -2513,7 +2540,7 @@ impl TextV4Reader {
         for reference in &entry.blocks {
             let compressed = self.source.read_range(reference.wire.range()?).await?;
             let raw = decode_block(&compressed, &reference.wire, "posting block")?;
-            let postings = decode_posting_block(&raw, reference)?;
+            let postings = decode_posting_block(&raw, reference, true)?;
             if previous_doc.is_some_and(|previous| previous >= postings[0].doc) {
                 return Err(Error::invariant(
                     "text v4 postings are not sorted across blocks",
@@ -2558,7 +2585,7 @@ impl TextV4Reader {
             // Release the previous block before fetching/decompressing the
             // next; `Vec::clear` would retain it beside compressed + raw +
             // decoded successors at every boundary.
-            cursor.postings = Vec::new();
+            cursor.set_postings(Vec::new());
             cursor.next_posting = 0;
             let Some(reference) = cursor.blocks.get(cursor.next_block).cloned() else {
                 continue;
@@ -2601,11 +2628,12 @@ impl TextV4Reader {
         for ((cursor_index, reference), compressed) in jobs.into_iter().zip(compressed_blocks) {
             let raw = decode_block(&compressed, &reference.wire, "posting block")?;
             largest_raw_bytes = largest_raw_bytes.max(raw.capacity());
-            let decoded = decode_posting_block(&raw, &reference)?;
+            let decoded =
+                decode_posting_block(&raw, &reference, cursors[cursor_index].keep_positions)?;
             *postings_decoded = postings_decoded
                 .checked_add(decoded.len())
                 .ok_or_else(|| Error::invariant("text v4 decoded posting count overflows"))?;
-            cursors[cursor_index].postings = decoded;
+            cursors[cursor_index].set_postings(decoded);
             if let Some(target) = cursors[cursor_index].skip_through.take() {
                 cursors[cursor_index].next_posting = cursors[cursor_index]
                     .postings
@@ -3341,7 +3369,14 @@ fn encode_posting_block(postings: &[Posting]) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
-fn decode_posting_block(raw: &[u8], reference: &PostingBlockRef) -> Result<Vec<Posting>> {
+/// Decode one posting block. Positions are always validated; they are kept
+/// only when `keep_positions` (a phrase reads them), otherwise each posting
+/// carries just its term frequency.
+fn decode_posting_block(
+    raw: &[u8],
+    reference: &PostingBlockRef,
+    keep_positions: bool,
+) -> Result<Vec<Posting>> {
     if raw.len() < POSTING_HEADER_LEN || read_u32(raw, 0)? != reference.posting_count {
         return Err(Error::invariant(
             "text v4 posting block header is inconsistent",
@@ -3371,23 +3406,29 @@ fn decode_posting_block(raw: &[u8], reference: &PostingBlockRef) -> Result<Vec<P
         if positions_end > raw.len() {
             return Err(Error::invariant("text v4 posting positions are truncated"));
         }
-        let mut positions = Vec::with_capacity(tf as usize);
+        let mut positions = if keep_positions {
+            Vec::with_capacity(tf as usize)
+        } else {
+            Vec::new()
+        };
+        let mut previous: Option<u32> = None;
         while cursor < positions_end {
-            positions.push(read_u32(raw, cursor)?);
+            let position = read_u32(raw, cursor)?;
+            if previous.is_some_and(|previous| previous >= position) || position >= doc_len {
+                return Err(Error::invariant(
+                    "text v4 posting positions are inconsistent",
+                ));
+            }
+            previous = Some(position);
+            if keep_positions {
+                positions.push(position);
+            }
             cursor += 4;
-        }
-        if positions.windows(2).any(|pair| pair[0] >= pair[1])
-            || positions
-                .last()
-                .is_some_and(|position| *position >= doc_len)
-        {
-            return Err(Error::invariant(
-                "text v4 posting positions are inconsistent",
-            ));
         }
         postings.push(Posting {
             doc,
             doc_len,
+            tf,
             positions,
         });
     }
@@ -3395,11 +3436,7 @@ fn decode_posting_block(raw: &[u8], reference: &PostingBlockRef) -> Result<Vec<P
         || postings.first().map(|posting| posting.doc) != Some(reference.first_doc)
         || postings.last().map(|posting| posting.doc) != Some(reference.last_doc)
         || postings.windows(2).any(|pair| pair[0].doc >= pair[1].doc)
-        || postings
-            .iter()
-            .map(|posting| posting.positions.len() as u32)
-            .max()
-            != Some(reference.max_tf)
+        || postings.iter().map(|posting| posting.tf).max() != Some(reference.max_tf)
         || postings.iter().map(|posting| posting.doc_len).min() != Some(reference.min_doc_len)
     {
         return Err(Error::invariant(
@@ -3723,6 +3760,11 @@ fn write_compressed_block<W: Write + Seek>(
     })
 }
 
+thread_local! {
+    static BLOCK_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn decode_block(compressed: &[u8], reference: &BlockRef, what: &str) -> Result<Vec<u8>> {
     require_len(compressed, reference.len as usize, what)?;
     if crc32fast::hash(compressed) != reference.compressed_crc32 {
@@ -3731,12 +3773,21 @@ fn decode_block(compressed: &[u8], reference: &BlockRef, what: &str) -> Result<V
         )));
     }
     validate_block_limits(reference)?;
-    let decoder = zstd::stream::read::Decoder::new(compressed)
-        .map_err(|error| Error::invariant(format!("text v4 {what} decoder failed: {error}")))?;
+    // One-shot decompression into a buffer of exactly the declared raw length
+    // (a frame that decodes to more fails as too small for its destination),
+    // with one decompression context reused per thread. A streaming decoder
+    // per block allocated and released its context and window for every
+    // posting block, which dominated full-text scoring.
     let mut raw = Vec::with_capacity(reference.raw_len as usize);
-    decoder
-        .take(u64::from(reference.raw_len) + 1)
-        .read_to_end(&mut raw)
+    BLOCK_DECOMPRESSOR
+        .with(|slot| -> std::io::Result<usize> {
+            let mut slot = slot.borrow_mut();
+            let decompressor = match slot.as_mut() {
+                Some(decompressor) => decompressor,
+                None => slot.insert(zstd::bulk::Decompressor::new()?),
+            };
+            decompressor.decompress_to_buffer(compressed, &mut raw)
+        })
         .map_err(|error| Error::invariant(format!("text v4 {what} decode failed: {error}")))?;
     require_len(&raw, reference.raw_len as usize, what)?;
     if non_zero_xxh3(&raw) != reference.raw_xxh3 {
