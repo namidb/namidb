@@ -5945,6 +5945,7 @@ async fn hybrid_search_procedure(
         ));
     }
 
+    let started = std::time::Instant::now();
     // Dense leg (vector KNN), best-first.
     let dense: Vec<(NodeId, f64)> = if dense_configured {
         let qv = map
@@ -5979,6 +5980,7 @@ async fn hybrid_search_procedure(
         Vec::new()
     };
 
+    let dense_done = std::time::Instant::now();
     // Sparse leg (BM25), best-first.
     let sparse: Vec<(NodeId, f64)> = if sparse_configured {
         let qtext = map
@@ -6009,6 +6011,7 @@ async fn hybrid_search_procedure(
         Vec::new()
     };
 
+    let sparse_done = std::time::Instant::now();
     // Both legs are filtered before fusion. RRF therefore uses ranks within the
     // eligible population, and linear normalization is no longer skewed by
     // high-scoring ineligible sparse documents.
@@ -6058,6 +6061,18 @@ async fn hybrid_search_procedure(
             raw.push(vec![node_rv, RuntimeValue::Float(*score)]);
         }
     }
+    tracing::debug!(
+        target: "namidb::search_timing",
+        k,
+        k_dense,
+        k_sparse,
+        dense_hits = dense.len(),
+        sparse_hits = sparse.len(),
+        dense_ms = dense_done.duration_since(started).as_secs_f64() * 1e3,
+        sparse_ms = sparse_done.duration_since(dense_done).as_secs_f64() * 1e3,
+        hydrate_ms = sparse_done.elapsed().as_secs_f64() * 1e3,
+        "search.hybrid timing"
+    );
     project_proc_rows("search.hybrid", &["node", "score"], raw, yield_items)
 }
 
@@ -7511,6 +7526,7 @@ async fn try_index_search(
     let mut delta_overfetch = 0_usize;
     let mut rounds_left = max_rounds;
     while rounds_left > 0 {
+        let round_started = std::time::Instant::now();
         let kprime = k
             .saturating_mul(mult)
             .saturating_add(delta_overfetch)
@@ -7621,6 +7637,7 @@ async fn try_index_search(
                 let exhausted = persisted_complete || hits.len() < kprime;
                 (hits, exhausted, persisted_complete)
             };
+        let probe_ms = round_started.elapsed().as_secs_f64() * 1e3;
         if delta_overfetch == 0 && delta_len > 0 && !index_exhausted {
             let survivors = raw_hits
                 .iter()
@@ -7748,6 +7765,16 @@ async fn try_index_search(
             }
         }
 
+        tracing::debug!(
+            target: "namidb::search_timing",
+            k,
+            kprime,
+            ef,
+            rows = out.len(),
+            probe_ms,
+            materialize_ms = round_started.elapsed().as_secs_f64() * 1e3 - probe_ms,
+            "vector index round timing"
+        );
         if out.len() >= k {
             return Ok(Some(out));
         }
