@@ -2351,6 +2351,7 @@ mod tests {
             let artifact = build_delta_v4(
                 &state,
                 TextV4BuildContext {
+                    analyzer: crate::text::TextAnalyzer::default(),
                     sst_id,
                     event_ranges: vec![SearchEventRange::new(ordinal as u64, ordinal as u64 + 1)],
                     complete_filter_properties: vec!["vigente".into()],
@@ -2453,6 +2454,7 @@ mod tests {
         let artifact = build_base_v4(
             &state,
             TextV4BuildContext {
+                analyzer: crate::text::TextAnalyzer::default(),
                 sst_id,
                 event_ranges: vec![SearchEventRange::new(0, 1)],
                 complete_filter_properties: vec!["vigente".into()],
@@ -2800,6 +2802,7 @@ mod tests {
             let artifact = build_delta_v4(
                 &state,
                 TextV4BuildContext {
+                    analyzer: crate::text::TextAnalyzer::default(),
                     sst_id,
                     event_ranges: vec![SearchEventRange::new(ordinal as u64, ordinal as u64 + 1)],
                     complete_filter_properties: vec!["vigente".into()],

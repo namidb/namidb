@@ -543,6 +543,7 @@ async fn segment_merged_base_equals_the_node_scan_base() {
             &loaded,
             selections.clone(),
             true,
+            true,
         )
         .await
         .unwrap();
@@ -554,6 +555,7 @@ async fn segment_merged_base_equals_the_node_scan_base() {
             &loaded,
             selections,
             false,
+            true,
         )
         .await
         .unwrap();

@@ -780,10 +780,168 @@ async fn run_compaction_pass(
     };
     let (full, delta_applied) = tokio::join!(long, deltas);
     let full = full?;
-    match (applied.or(delta_applied), full) {
-        (_, CompactionPass::Cancelled) => Ok(CompactionPass::Cancelled),
-        (Some(applied), CompactionPass::Noop) => Ok(applied),
-        (_, full) => Ok(full),
+    let pass = match (applied.or(delta_applied), full) {
+        (_, CompactionPass::Cancelled) => return Ok(CompactionPass::Cancelled),
+        (Some(applied), CompactionPass::Noop) => applied,
+        (_, full) => full,
+    };
+    // Re-tokenize one pre-folding full-text index, only on a periodic tick
+    // that found nothing else to do: the rebuild reads the whole corpus, so it
+    // waits for a quiet window instead of competing with routine maintenance.
+    #[cfg(feature = "text-index")]
+    if trigger == CompactionTrigger::Periodic && matches!(pass, CompactionPass::Noop) {
+        run_text_reanalysis_pass(writer, snapshot, namespace, cancel).await;
+    }
+    Ok(pass)
+}
+
+/// Disables the background analyzer migration of pre-folding full-text
+/// indexes when set to `0`, `false` or `off`. Those indexes keep working
+/// with their original analyzer either way.
+#[cfg(feature = "text-index")]
+const TEXT_REANALYSIS_ENV: &str = "NAMIDB_TEXT_REANALYSIS";
+
+#[cfg(feature = "text-index")]
+fn text_reanalysis_enabled() -> bool {
+    !matches!(
+        std::env::var(TEXT_REANALYSIS_ENV)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    )
+}
+
+/// Retry schedule of an index whose rebuilt base lost its install race
+/// (writes to its documents landed during the rebuild).
+#[cfg(feature = "text-index")]
+fn text_reanalysis_backoff(failures: u32) -> std::time::Duration {
+    const BASE: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    BASE.saturating_mul(1u32 << failures.min(6)).min(MAX)
+}
+
+/// Per `(namespace, index)` failure count and earliest next attempt.
+#[cfg(feature = "text-index")]
+type TextReanalysisRetry = std::collections::HashMap<(String, String), (u32, Instant)>;
+
+#[cfg(feature = "text-index")]
+static TEXT_REANALYSIS_RETRY: std::sync::LazyLock<StdMutex<TextReanalysisRetry>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Rebuild at most one legacy full-text index of `namespace` with the folding
+/// analyzer and swap it in (see `namidb_storage::PreparedTextReanalysis`).
+/// The index serves with its old analyzer until the swap; a lost race only
+/// schedules a retry.
+#[cfg(feature = "text-index")]
+async fn run_text_reanalysis_pass(
+    writer: &Mutex<WriterSession>,
+    snapshot: &SnapshotCell,
+    namespace: &str,
+    cancel: Option<&watch::Receiver<bool>>,
+) {
+    if !text_reanalysis_enabled() || is_cancelled(cancel) {
+        return;
+    }
+    let basis = writer.lock().await.compaction_basis();
+    if basis.needs_compaction()
+        || basis.search_delta_compaction_due()
+        || !basis.planned_search_bases().is_empty()
+    {
+        return;
+    }
+    let now = Instant::now();
+    let candidate = {
+        let retry = TEXT_REANALYSIS_RETRY
+            .lock()
+            .expect("text re-analysis retry map poisoned");
+        basis.legacy_text_indexes().into_iter().find(|index| {
+            retry
+                .get(&(namespace.to_owned(), index.clone()))
+                .is_none_or(|(_, next)| *next <= now)
+        })
+    };
+    let Some(index) = candidate else {
+        return;
+    };
+    let key = (namespace.to_owned(), index.clone());
+    let record_failure = || {
+        let mut retry = TEXT_REANALYSIS_RETRY
+            .lock()
+            .expect("text re-analysis retry map poisoned");
+        let entry = retry.entry(key.clone()).or_insert((0, Instant::now()));
+        entry.1 = Instant::now() + text_reanalysis_backoff(entry.0);
+        entry.0 = entry.0.saturating_add(1);
+        entry.1
+    };
+    info!(namespace, index = %index, "rebuilding full-text index with the accent-folding analyzer");
+    let started = Instant::now();
+    let prepared = match basis.prepare_text_reanalysis(&index).await {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => return,
+        Err(error) => {
+            record_failure();
+            warn!(namespace, index = %index, %error, "full-text re-analysis build failed; will retry");
+            return;
+        }
+    };
+    if is_cancelled(cancel) {
+        return;
+    }
+    let uploaded: Vec<String> = {
+        let base = namidb_storage::manifest_object_paths(basis.base_manifest());
+        prepared
+            .uploaded_object_paths()
+            .into_iter()
+            .filter(|path| !base.contains(path))
+            .collect()
+    };
+    tokio::task::yield_now().await;
+    let mut guard = writer.lock().await;
+    let install = guard.install_text_reanalysis(prepared).await;
+    let discard = match &install {
+        Ok(_) | Err(namidb_storage::Error::Precondition(_)) if !uploaded.is_empty() => {
+            let live = namidb_storage::manifest_object_paths(guard.current_manifest());
+            let unreferenced: Vec<String> = uploaded
+                .into_iter()
+                .filter(|path| !live.contains(path))
+                .collect();
+            (!unreferenced.is_empty()).then(|| {
+                let manifest_store = guard.manifest_store();
+                (
+                    manifest_store.store().clone(),
+                    manifest_store
+                        .paths()
+                        .namespace_prefix()
+                        .as_ref()
+                        .to_string(),
+                    unreferenced,
+                )
+            })
+        }
+        _ => None,
+    };
+    match install {
+        Ok(_) => {
+            snapshot.store(guard.owned_snapshot());
+            TEXT_REANALYSIS_RETRY
+                .lock()
+                .expect("text re-analysis retry map poisoned")
+                .remove(&key);
+            info!(
+                namespace,
+                index = %index,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "full-text index now uses the accent-folding analyzer"
+            );
+        }
+        Err(error) => {
+            record_failure();
+            warn!(namespace, index = %index, %error, "full-text re-analysis not installed; will retry");
+        }
+    }
+    drop(guard);
+    if let Some((store, prefix, unreferenced)) = discard {
+        discard_unreferenced_uploads(&store, &prefix, unreferenced, namespace).await;
     }
 }
 

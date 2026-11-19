@@ -72,6 +72,8 @@ pub use cache_budget::{
     shared_cache_capacity_bytes, shared_cache_usage_bytes, validate_cache_configuration,
     CacheCapacities, DEFAULT_CACHE_MAX_BYTES,
 };
+#[cfg(feature = "text-index")]
+pub use compact::PreparedTextReanalysis;
 pub use compact::{
     compact_l0_to_l1, install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome,
     NodeLayoutMigration, PreparedCompaction,

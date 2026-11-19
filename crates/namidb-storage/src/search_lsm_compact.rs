@@ -1792,6 +1792,7 @@ async fn build_text_segment_merge(
     config.memory_budget_bytes = super::per_collector_index_build_memory_bytes(1)?
         .ok_or_else(|| Error::invariant("text segment merge has no build memory share"))?;
     let context = crate::sst::text::v4::TextV4BuildContext {
+        analyzer: descriptor.effective_analyzer(),
         sst_id: Uuid::now_v7(),
         event_ranges: selection.selected_event_ranges.clone(),
         complete_filter_properties: filters,
@@ -2384,7 +2385,86 @@ pub(super) async fn prepare_search_compactions(
     base: &LoadedManifest,
     selections: Vec<SearchCompactionSelection>,
 ) -> Result<Vec<PreparedSearchCompaction>> {
-    prepare_search_compactions_with(store, paths, base, selections, true).await
+    prepare_search_compactions_with(store, paths, base, selections, true, true).await
+}
+
+/// A BasePrefix over every segment of the Active text generation
+/// `index_name`, for a base re-tokenized from the node corpus (the analyzer
+/// migration: the segments' postings were produced by another analyzer, so
+/// they cannot be folded together). `None` when the generation is not Active
+/// with segments, or owns no exact event prefix.
+#[cfg(feature = "text-index")]
+pub(super) fn select_text_reanalysis(
+    manifest: &Manifest,
+    index_name: &str,
+) -> Result<Option<SearchCompactionSelection>> {
+    let policy = SearchCompactionPolicy::for_scheduling();
+    let Some(state) = manifest
+        .search_lsm
+        .iter()
+        .find(|state| state.kind == SearchLsmKind::Text && state.index_name == index_name)
+    else {
+        return Ok(None);
+    };
+    if state.status != SearchLsmStatus::Active || state.segments.is_empty() {
+        return Ok(None);
+    }
+    if !manifest
+        .ssts
+        .iter()
+        .any(|descriptor| descriptor.kind == SstKind::Nodes)
+    {
+        return Ok(None);
+    }
+    let mut descriptors = Vec::with_capacity(state.segments.len());
+    for segment in &state.segments {
+        let matches = manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.id == segment.sst_id)
+            .collect::<Vec<_>>();
+        let [descriptor] = matches.as_slice() else {
+            return Ok(None);
+        };
+        if descriptor.kind != state.kind.sst_kind() || descriptor.scope != state.index_name {
+            return Ok(None);
+        }
+        descriptors.push((*descriptor).clone());
+    }
+    let Ok(ranges) = compressed_event_union(
+        state
+            .segments
+            .iter()
+            .flat_map(|segment| segment.event_ranges.iter().copied())
+            .chain(state.proven_empty_event_ranges.iter().copied()),
+    ) else {
+        return Ok(None);
+    };
+    if ranges.as_slice() != [SearchEventRange::new(0, state.next_event_seq)] {
+        return Ok(None);
+    }
+    Ok(Some(SearchCompactionSelection {
+        mode: SearchCompactionMode::BasePrefix,
+        captured_state: state.clone(),
+        selected_segment_start: 0,
+        selected_descriptors: descriptors,
+        selected_event_ranges: ranges,
+        captured_coverage_digest: super::input_coverage_digest(&state.coverage)?,
+        hard_segment_cap: policy.hard_segment_cap,
+    }))
+}
+
+/// Build the base a [`select_text_reanalysis`] selection names from the node
+/// corpus, under the process-wide one-base-at-a-time gate and the index-build
+/// memory budget, never by merging the selected segments.
+#[cfg(feature = "text-index")]
+pub(super) async fn prepare_text_reanalysis(
+    store: Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    base: &LoadedManifest,
+    selection: SearchCompactionSelection,
+) -> Result<Vec<PreparedSearchCompaction>> {
+    prepare_search_compactions_with(store, paths, base, vec![selection], true, false).await
 }
 
 /// Serializes Search-LSM base rebuilds across every namespace of a process.
@@ -2398,6 +2478,7 @@ async fn prepare_search_compactions_with(
     base: &LoadedManifest,
     selections: Vec<SearchCompactionSelection>,
     vector_segment_merge: bool,
+    text_segment_merge: bool,
 ) -> Result<Vec<PreparedSearchCompaction>> {
     if selections.is_empty() {
         return Ok(Vec::new());
@@ -2447,11 +2528,13 @@ async fn prepare_search_compactions_with(
     };
     #[cfg(not(feature = "vector-index"))]
     let _ = vector_segment_merge;
+    #[cfg(not(feature = "text-index"))]
+    let _ = text_segment_merge;
     #[cfg(feature = "text-index")]
     let base_selections = {
         let (merged, mut scanned): (Vec<_>, Vec<_>) = base_selections
             .into_iter()
-            .partition(segment_merge_supported);
+            .partition(|selection| text_segment_merge && segment_merge_supported(selection));
         for selection in merged {
             match build_text_segment_merge(store.clone(), paths, base, selection.clone()).await {
                 Ok(merged) => built.push(merged),
@@ -3076,7 +3159,10 @@ fn reconcile_text_payload(
     let payload = text_payload_from_node(descriptor, filters, node);
     match (record.operation, payload) {
         (SearchVersionOperation::Live { .. }, Some(payload)) => {
-            let fingerprint = crate::sst::text::v4::text_v4_payload_fingerprint(&payload)?;
+            let fingerprint = crate::sst::text::v4::text_v4_payload_fingerprint(
+                &payload,
+                descriptor.effective_analyzer(),
+            )?;
             if fingerprint != record.payload_fingerprint {
                 return Err(Error::Corrupted {
                     path: "<captured-nodes-snapshot>".into(),
@@ -3242,6 +3328,7 @@ async fn build_text_delta_run(
     let (sender, mut receiver) = tokio::sync::mpsc::channel::<TextDeltaBuilderMessage>(2);
     let build_state = selection.captured_state.clone();
     let build_context = crate::sst::text::v4::TextV4BuildContext {
+        analyzer: descriptor.effective_analyzer(),
         sst_id: Uuid::now_v7(),
         event_ranges: selection.selected_event_ranges.clone(),
         complete_filter_properties: filters.clone(),
@@ -3297,7 +3384,11 @@ async fn build_text_delta_run(
                         reconcile_text_payload(&descriptor, &filters, record, node.as_ref())?;
                     if let Some(payload) = &payload {
                         live_total_len = live_total_len
-                            .checked_add(crate::text::tokenize(&payload.text).len() as u64)
+                            .checked_add(crate::text::visit_tokens_with(
+                                descriptor.effective_analyzer(),
+                                &payload.text,
+                                |_| {},
+                            ) as u64)
                             .ok_or_else(|| {
                                 Error::invariant("text DeltaRun live token count overflows")
                             })?;
@@ -3884,7 +3975,8 @@ impl TextBaseWork {
             text: parts.join(" "),
             filters: native_filter_payload(&record.properties, &self.filters),
         };
-        let fingerprint = crate::sst::text::v4::text_v4_payload_fingerprint(&payload)?;
+        let analyzer = self.descriptor.effective_analyzer();
+        let fingerprint = crate::sst::text::v4::text_v4_payload_fingerprint(&payload, analyzer)?;
         update_winner_digest(&mut self.digest, node_id, lsn, true, Some(fingerprint));
         self.live_rows = self
             .live_rows
@@ -3892,7 +3984,7 @@ impl TextBaseWork {
             .ok_or_else(|| Error::invariant("FT4 Search-LSM base row count overflows"))?;
         self.live_total_len = self
             .live_total_len
-            .checked_add(crate::text::tokenize(&payload.text).len() as u64)
+            .checked_add(crate::text::visit_tokens_with(analyzer, &payload.text, |_| {}) as u64)
             .ok_or_else(|| Error::invariant("FT4 Search-LSM base token count overflows"))?;
         self.builder.push(crate::sst::text::v4::TextV4Mutation {
             node_id,
@@ -4110,6 +4202,7 @@ fn build_search_compactions_blocking(
                     let builder = crate::sst::text::v4::TextV4ExternalBuilder::with_config_base(
                         &selection.captured_state,
                         crate::sst::text::v4::TextV4BuildContext {
+                            analyzer: descriptor.effective_analyzer(),
                             sst_id,
                             event_ranges: selection.selected_event_ranges.clone(),
                             complete_filter_properties: filters.clone(),

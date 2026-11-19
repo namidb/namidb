@@ -36,7 +36,8 @@ use crate::sst::search_delta::{
     SearchVersionTableReader, SearchVersionTableRef, SearchVersionTableWriter,
 };
 use crate::text::{
-    avg_len, bm25_idf, bm25_term_score, tokenize, TextQuery, PREFIX_EXPANSION_LIMIT,
+    avg_len, bm25_idf, bm25_term_score, tokenize_with, TextAnalyzer, TextQuery,
+    PREFIX_EXPANSION_LIMIT,
 };
 
 #[path = "v4_external.rs"]
@@ -87,6 +88,9 @@ pub struct TextV4Mutation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextV4BuildContext {
+    /// Analyzer of the generation this segment belongs to (see
+    /// [`crate::manifest::TextIndexDescriptor::effective_analyzer`]).
+    pub analyzer: TextAnalyzer,
     pub sst_id: Uuid,
     pub event_ranges: Vec<SearchEventRange>,
     pub complete_filter_properties: Vec<String>,
@@ -748,8 +752,8 @@ impl std::fmt::Debug for TextV4Reader {
 }
 
 /// Canonical fingerprint over analyzed tokens and complete filter values.
-pub fn text_v4_payload_fingerprint(payload: &TextV4Payload) -> Result<u64> {
-    let prepared = prepare_payload(payload)?;
+pub fn text_v4_payload_fingerprint(payload: &TextV4Payload, analyzer: TextAnalyzer) -> Result<u64> {
+    let prepared = prepare_payload(payload, analyzer)?;
     prepared_payload_fingerprint(&prepared)
 }
 
@@ -764,8 +768,8 @@ pub(crate) struct TextV4PreparedPayload {
 }
 
 impl TextV4PreparedPayload {
-    pub(crate) fn new(payload: &TextV4Payload) -> Result<Self> {
-        let prepared = prepare_payload(payload)?;
+    pub(crate) fn new(payload: &TextV4Payload, analyzer: TextAnalyzer) -> Result<Self> {
+        let prepared = prepare_payload(payload, analyzer)?;
         let fingerprint = prepared_payload_fingerprint(&prepared)?;
         Ok(Self {
             prepared,
@@ -977,8 +981,17 @@ fn write_delta_v4_in_memory<W: Write + Seek>(
         if mutation.lsn == 0 {
             return Err(Error::invariant("text v4 mutation uses reserved LSN zero"));
         }
-        let before = mutation.before.as_ref().map(prepare_payload).transpose()?;
-        let after = mutation.after.as_ref().map(prepare_payload).transpose()?;
+        let analyzer = context.analyzer;
+        let before = mutation
+            .before
+            .as_ref()
+            .map(|payload| prepare_payload(payload, analyzer))
+            .transpose()?;
+        let after = mutation
+            .after
+            .as_ref()
+            .map(|payload| prepare_payload(payload, analyzer))
+            .transpose()?;
         if before.as_ref().is_some_and(|payload| {
             payload.filters.keys().any(|property| {
                 context
@@ -2868,12 +2881,12 @@ fn validate_event_ranges(ranges: &[SearchEventRange]) -> Result<()> {
     Ok(())
 }
 
-fn prepare_payload(payload: &TextV4Payload) -> Result<PreparedPayload> {
+fn prepare_payload(payload: &TextV4Payload, analyzer: TextAnalyzer) -> Result<PreparedPayload> {
     if payload.filters.keys().any(|property| property.is_empty()) {
         return Err(Error::invariant("native-filter property name is empty"));
     }
     Ok(PreparedPayload {
-        tokens: tokenize(&payload.text),
+        tokens: tokenize_with(analyzer, &payload.text),
         filters: payload.filters.clone(),
     })
 }
@@ -4036,6 +4049,7 @@ mod tests {
 
     fn context() -> TextV4BuildContext {
         TextV4BuildContext {
+            analyzer: TextAnalyzer::default(),
             sst_id: Uuid::from_u128(12),
             event_ranges: vec![SearchEventRange::new(20, 24)],
             complete_filter_properties: vec!["ambito".into(), "vigente".into()],
@@ -4062,6 +4076,7 @@ mod tests {
 
     fn base_context(sst_id: u128) -> TextV4BuildContext {
         TextV4BuildContext {
+            analyzer: TextAnalyzer::default(),
             sst_id: Uuid::from_u128(sst_id),
             event_ranges: vec![SearchEventRange::new(0, 1)],
             complete_filter_properties: vec!["ambito".into(), "vigente".into()],
@@ -4687,6 +4702,7 @@ mod tests {
     async fn hundred_thousand_candidate_phrase_search_keeps_one_block_per_term() {
         let document_count = 100_000u64;
         let stream_context = TextV4BuildContext {
+            analyzer: TextAnalyzer::default(),
             sst_id: Uuid::from_u128(13),
             event_ranges: vec![SearchEventRange::new(1, document_count + 1)],
             complete_filter_properties: Vec::new(),

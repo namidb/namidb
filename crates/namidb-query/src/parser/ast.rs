@@ -405,6 +405,11 @@ pub struct CreateFulltextIndexClause {
     /// `CREATE FULLTEXT INDEX <name> IF NOT EXISTS …` — a duplicate is a no-op
     /// success instead of an "already exists" error.
     pub if_not_exists: bool,
+    /// `OPTIONS {analyzer: 'exact' | 'folded'}` (or the Neo4j spelling
+    /// `OPTIONS {indexConfig: {`fulltext.analyzer`: …}}`). `None` means the
+    /// default, accent-folding analyzer.
+    #[serde(default)]
+    pub analyzer: Option<namidb_storage::text::TextAnalyzer>,
     pub span: SourceSpan,
 }
 

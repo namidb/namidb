@@ -82,6 +82,8 @@ hex = "0.4"
 crc32fast = "1.4"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
+# Unicode NFKD decomposition for the accent-folding full-text analyzer.
+unicode-normalization = "0.1"
 blake3 = "1.5"
 fs2 = "0.4"
 url = "2"

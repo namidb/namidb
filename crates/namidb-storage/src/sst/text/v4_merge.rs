@@ -585,6 +585,7 @@ mod tests {
 
     fn context(id: u128, events: Range<u64>) -> TextV4BuildContext {
         TextV4BuildContext {
+            analyzer: crate::text::TextAnalyzer::default(),
             sst_id: Uuid::from_u128(id),
             event_ranges: vec![SearchEventRange::new(events.start, events.end)],
             complete_filter_properties: vec!["status".into(), "open".into()],
@@ -777,7 +778,8 @@ mod tests {
                 Some(after) => SearchVersionRecord::live(
                     node(*value),
                     *lsn,
-                    text_v4_payload_fingerprint(after).unwrap(),
+                    text_v4_payload_fingerprint(after, crate::text::TextAnalyzer::default())
+                        .unwrap(),
                     0,
                 ),
                 None => {

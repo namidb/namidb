@@ -648,8 +648,17 @@ impl TextV4ExternalBuilder {
         }
         self.last_node_id = Some(mutation.node_id);
         self.preflight_text(&mutation)?;
-        let before = mutation.before.as_ref().map(prepare_payload).transpose()?;
-        let after = mutation.after.as_ref().map(prepare_payload).transpose()?;
+        let analyzer = self.context.analyzer;
+        let before = mutation
+            .before
+            .as_ref()
+            .map(|payload| prepare_payload(payload, analyzer))
+            .transpose()?;
+        let after = mutation
+            .after
+            .as_ref()
+            .map(|payload| prepare_payload(payload, analyzer))
+            .transpose()?;
         self.push_prepared_body(mutation.node_id, mutation.lsn, before, after)
     }
 
@@ -882,7 +891,11 @@ impl TextV4ExternalBuilder {
                 .map(|payload| payload.text.len())
                 .unwrap_or(0),
         );
-        let after = after.as_ref().map(prepare_payload).transpose()?;
+        let analyzer = self.context.analyzer;
+        let after = after
+            .as_ref()
+            .map(|payload| prepare_payload(payload, analyzer))
+            .transpose()?;
         self.validate_filter_keys(after.as_ref())?;
         let output_record = match (source.operation, after.as_ref()) {
             (SearchVersionOperation::Live { payload_ordinal }, Some(payload)) => {
@@ -3245,6 +3258,7 @@ mod tests {
 
     fn context() -> TextV4BuildContext {
         TextV4BuildContext {
+            analyzer: crate::text::TextAnalyzer::default(),
             sst_id: Uuid::from_u128(502),
             event_ranges: vec![SearchEventRange::new(1, 10_000)],
             complete_filter_properties: vec!["vigente".into()],
@@ -3274,7 +3288,11 @@ mod tests {
         SearchVersionRecord::live(
             node_id,
             lsn,
-            super::super::text_v4_payload_fingerprint(payload).unwrap(),
+            super::super::text_v4_payload_fingerprint(
+                payload,
+                crate::text::TextAnalyzer::default(),
+            )
+            .unwrap(),
             source_ordinal,
         )
     }
@@ -3893,6 +3911,7 @@ mod tests {
         const VOCABULARY: u64 = 400;
         let directory = tempfile::tempdir().unwrap();
         let context = TextV4BuildContext {
+            analyzer: crate::text::TextAnalyzer::default(),
             sst_id: Uuid::from_u128(502),
             event_ranges: vec![SearchEventRange::new(1, documents)],
             complete_filter_properties: vec!["flag".into()],

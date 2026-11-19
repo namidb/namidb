@@ -4862,6 +4862,52 @@ impl<'mt> Snapshot<'mt> {
         let mut sorted_pending: Vec<[u8; 16]> = pending.iter().copied().collect();
         sorted_pending.sort_unstable();
         let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
+        // Probe every SST's exact-record index at once: each probe walks its
+        // B+tree one level per round trip, so probing the SSTs one after the
+        // other multiplied a cold hydration's latency by the SST count. The
+        // results are consumed below in the original SST order, unchanged.
+        let mut exact_probes: HashMap<usize, Result<_>> = {
+            let probes = sst_idxs.iter().filter_map(|&idx| {
+                let desc = &self.manifest.manifest.ssts[idx];
+                if !pending
+                    .iter()
+                    .any(|id| id >= &desc.min_key && id <= &desc.max_key)
+                    || !crate::manifest::node_locator_has_exact_records(desc)
+                {
+                    return None;
+                }
+                let locator = desc
+                    .node_locator
+                    .as_ref()
+                    .filter(|locator| locator.entry_count == desc.row_count)?;
+                let locator_absolute = format!(
+                    "{}/{}",
+                    self.paths.namespace_prefix().as_ref(),
+                    locator.path
+                );
+                let sorted_pending = &sorted_pending;
+                Some(async move {
+                    let probed = match self
+                        .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
+                        .await
+                    {
+                        Ok(source) => {
+                            crate::sst::paged_index::probe_node_records_from_source(
+                                &source,
+                                sorted_pending,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    (idx, probed)
+                })
+            });
+            futures::future::join_all(probes)
+                .await
+                .into_iter()
+                .collect()
+        };
         for idx in sst_idxs {
             let desc = &self.manifest.manifest.ssts[idx];
             // Cheap pre-filter: skip the SST if its [min_key, max_key]
@@ -4889,24 +4935,9 @@ impl<'mt> Snapshot<'mt> {
                     .as_ref()
                     .filter(|locator| locator.entry_count == desc.row_count)
                 {
-                    let locator_absolute = format!(
-                        "{}/{}",
-                        self.paths.namespace_prefix().as_ref(),
-                        locator.path
-                    );
-                    let probed = match self
-                        .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
-                        .await
-                    {
-                        Ok(source) => {
-                            crate::sst::paged_index::probe_node_records_from_source(
-                                &source,
-                                &sorted_pending,
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error),
-                    };
+                    let probed = exact_probes.remove(&idx).ok_or_else(|| {
+                        Error::invariant("exact node-record probe was not scheduled")
+                    })?;
                     match probed {
                         Ok((records, stats)) if stats.index_entries == locator.entry_count => {
                             let decoded = records
@@ -10306,12 +10337,18 @@ impl<'mt> Snapshot<'mt> {
         query: &crate::text::TextQuery,
         k: Option<usize>,
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
+        // The index answers only queries analyzed the way it was built: a
+        // query parsed with another analyzer takes the exact flat scan.
         if !self
             .manifest
             .manifest
             .text_indexes
             .iter()
-            .any(|descriptor| descriptor.name == index_name && descriptor.label == label)
+            .any(|descriptor| {
+                descriptor.name == index_name
+                    && descriptor.label == label
+                    && descriptor.effective_analyzer() == query.analyzer
+            })
         {
             return Ok(None);
         }
@@ -10535,12 +10572,18 @@ impl<'mt> Snapshot<'mt> {
         k: Option<usize>,
         groups: &[(String, Vec<Value>)],
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
+        // The index answers only queries analyzed the way it was built: a
+        // query parsed with another analyzer takes the exact flat scan.
         if !self
             .manifest
             .manifest
             .text_indexes
             .iter()
-            .any(|descriptor| descriptor.name == index_name && descriptor.label == label)
+            .any(|descriptor| {
+                descriptor.name == index_name
+                    && descriptor.label == label
+                    && descriptor.effective_analyzer() == query.analyzer
+            })
         {
             return Ok(None);
         }

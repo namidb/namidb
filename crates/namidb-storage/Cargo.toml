@@ -46,6 +46,7 @@ crc32fast = { workspace = true }
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
 base64 = { workspace = true }
+unicode-normalization = { workspace = true }
 blake3 = { workspace = true }
 fs2 = { workspace = true }
 url = { workspace = true }

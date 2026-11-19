@@ -4,6 +4,7 @@
 use super::ast::*;
 use super::error::{ErrorCode, ParseError, ParseResult, SourceSpan};
 use super::lexer::{Spanned, Token};
+use namidb_storage::text::TextAnalyzer;
 
 pub fn parse_query(src: &str, tokens: Vec<Spanned<Token>>) -> ParseResult<Query> {
     let mut p = Parser::new(src, tokens);
@@ -895,6 +896,7 @@ impl<'src> Parser<'src> {
                 properties.push(self.parse_ddl_property_ref()?);
             }
             self.expect_in(&Token::RBracket, "fulltext-index property list")?;
+            let analyzer = self.parse_fulltext_index_options()?;
             let end = self
                 .tokens
                 .get(self.pos.wrapping_sub(1))
@@ -905,6 +907,7 @@ impl<'src> Parser<'src> {
                 label,
                 properties,
                 if_not_exists,
+                analyzer,
                 span: SourceSpan::new(start, end),
             });
         }
@@ -921,6 +924,7 @@ impl<'src> Parser<'src> {
             properties.push(self.expect_name()?);
         }
         self.expect(&Token::RParen)?;
+        let analyzer = self.parse_fulltext_index_options()?;
         let end = self
             .tokens
             .get(self.pos.wrapping_sub(1))
@@ -931,8 +935,98 @@ impl<'src> Parser<'src> {
             label,
             properties,
             if_not_exists,
+            analyzer,
             span: SourceSpan::new(start, end),
         })
+    }
+
+    /// Optional `OPTIONS { … }` after a full-text index target. Recognised:
+    /// `analyzer` (`'folded'`, the default, or `'exact'`), the Neo4j nesting
+    /// `indexConfig: { `fulltext.analyzer`: …, `fulltext.eventually_consistent`:
+    /// <bool> }` (NamiDB indexes are always consistent, so the latter is
+    /// accepted and has no effect). Any other key is an error, so a typo can
+    /// never silently build an index with the wrong analyzer.
+    fn parse_fulltext_index_options(&mut self) -> Result<Option<TextAnalyzer>, ParseError> {
+        if !matches!(self.peek(), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("OPTIONS")) {
+            return Ok(None);
+        }
+        self.bump(); // OPTIONS
+        let mut analyzer = None;
+        self.parse_fulltext_options_map(&mut analyzer, 0)?;
+        Ok(analyzer)
+    }
+
+    fn parse_fulltext_options_map(
+        &mut self,
+        analyzer: &mut Option<TextAnalyzer>,
+        depth: usize,
+    ) -> Result<(), ParseError> {
+        self.expect(&Token::LBrace)?;
+        if self.eat(&Token::RBrace).is_some() {
+            return Ok(());
+        }
+        loop {
+            let key = self.parse_vector_option_key()?;
+            match key.name.to_ascii_lowercase().as_str() {
+                "indexconfig" if depth == 0 => self.parse_fulltext_options_map(analyzer, 1)?,
+                "analyzer" | "fulltext.analyzer" => {
+                    let next = self.bump().ok_or_else(|| {
+                        ParseError::new(
+                            ErrorCode::UnexpectedEof,
+                            "expected a full-text analyzer name ('folded' or 'exact'), found \
+                             end of input",
+                            SourceSpan::point(self.src.len()),
+                        )
+                    })?;
+                    let word = match &next.value {
+                        Token::String(s) | Token::Ident(s) => Some(s.as_str()),
+                        _ => None,
+                    };
+                    *analyzer = Some(word.and_then(TextAnalyzer::from_name).ok_or_else(|| {
+                        ParseError::new(
+                            ErrorCode::UnexpectedToken,
+                            format!(
+                                "unknown full-text analyzer `{}` (expected one of: {})",
+                                word.map(str::to_owned)
+                                    .unwrap_or_else(|| next.value.label().to_owned()),
+                                TextAnalyzer::NAMES.join(", ")
+                            ),
+                            next.span,
+                        )
+                    })?);
+                }
+                "fulltext.eventually_consistent" => {
+                    let next = self.bump();
+                    if !matches!(
+                        next.as_ref().map(|token| &token.value),
+                        Some(Token::True | Token::False)
+                    ) {
+                        return Err(ParseError::new(
+                            ErrorCode::UnexpectedToken,
+                            "`fulltext.eventually_consistent` must be true or false",
+                            next.map(|token| token.span).unwrap_or(key.span),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(ParseError::new(
+                        ErrorCode::UnexpectedToken,
+                        format!(
+                            "unknown full-text index option `{other}` (expected analyzer, \
+                             indexConfig, fulltext.analyzer, or \
+                             fulltext.eventually_consistent)"
+                        ),
+                        key.span,
+                    ));
+                }
+            }
+            if self.eat(&Token::Comma).is_some() {
+                continue;
+            }
+            break;
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(())
     }
 
     /// `DROP VECTOR INDEX <name> [IF EXISTS]`. Routed here off the
@@ -3558,6 +3652,66 @@ mod tests {
         );
         assert_eq!(n.if_not_exists, m.if_not_exists);
         assert!(neo.as_create_fulltext_index().is_some());
+    }
+
+    #[test]
+    fn create_fulltext_index_analyzer_option() {
+        let analyzer = |src: &str| match &ok(src).head.clauses[0] {
+            Clause::CreateFulltextIndex(c) => c.analyzer,
+            other => panic!("expected CreateFulltextIndex, got {other:?}"),
+        };
+        assert_eq!(analyzer("CREATE FULLTEXT INDEX ix ON :Doc(body)"), None);
+        assert_eq!(
+            analyzer("CREATE FULLTEXT INDEX ix ON :Doc(body) OPTIONS {analyzer: 'exact'}"),
+            Some(TextAnalyzer::Exact)
+        );
+        assert_eq!(
+            analyzer(
+                "CREATE FULLTEXT INDEX ix FOR (d:Doc) ON EACH [d.body] \
+                 OPTIONS {indexConfig: {`fulltext.analyzer`: 'FOLDED', \
+                 `fulltext.eventually_consistent`: false}}"
+            ),
+            Some(TextAnalyzer::Folded)
+        );
+        assert_eq!(
+            analyzer("CREATE FULLTEXT INDEX ix ON :Doc(body) OPTIONS {}"),
+            None
+        );
+        // Display carries an explicit analyzer through a re-parse.
+        let clause = match &ok("CREATE FULLTEXT INDEX ix ON :Doc(body) OPTIONS {analyzer: 'exact'}")
+            .head
+            .clauses[0]
+        {
+            Clause::CreateFulltextIndex(c) => c.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(analyzer(&clause.to_string()), Some(TextAnalyzer::Exact));
+    }
+
+    #[test]
+    fn create_fulltext_index_rejects_unknown_analyzer_options() {
+        for (src, needle) in [
+            (
+                "CREATE FULLTEXT INDEX ix ON :Doc(body) OPTIONS {analyzer: 'english'}",
+                "unknown full-text analyzer `english` (expected one of: exact, folded)",
+            ),
+            (
+                "CREATE FULLTEXT INDEX ix ON :Doc(body) OPTIONS {analyser: 'exact'}",
+                "unknown full-text index option `analyser`",
+            ),
+            (
+                "CREATE FULLTEXT INDEX ix ON :Doc(body) OPTIONS {analyzer: 1}",
+                "unknown full-text analyzer",
+            ),
+            (
+                "CREATE FULLTEXT INDEX ix FOR (d:Doc) ON EACH [d.body] \
+                 OPTIONS {indexConfig: {`fulltext.eventually_consistent`: 'yes'}}",
+                "must be true or false",
+            ),
+        ] {
+            let error = parse(src).expect_err(src)[0].to_string();
+            assert!(error.contains(needle), "{src}: {error}");
+        }
     }
 
     #[test]

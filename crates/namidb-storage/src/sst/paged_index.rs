@@ -1900,13 +1900,40 @@ impl PagedRangeSource for PinnedObjectRangeSource {
     /// lands many pages in each cache page, so it reads whole cache pages
     /// and issues a fraction of the requests.
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        let granularity = if ranges.len() <= NARROW_PROBE_PAGES {
+        let granularity = if ranges.len() <= NARROW_PROBE_PAGES || sparse_ranges(ranges) {
             crate::range_cache::ReadGranularity::Block
         } else {
             crate::range_cache::ReadGranularity::Pages
         };
         self.read_ranges_as(ranges, granularity).await
     }
+}
+
+/// Whole cache pages would move this many times the requested bytes or more
+/// before a batch counts as sparse.
+const SPARSE_PAGE_AMPLIFICATION: u64 = 8;
+
+/// `true` when rounding `ranges` up to whole cache pages would read far more
+/// than they ask for: a few hundred records scattered over a large object (a
+/// top-k hydration's node records) share almost no page, so page reads move
+/// one 256 KiB page per record, sixteen at a time. Such a batch reads exactly
+/// its ranges, all at once, instead.
+fn sparse_ranges(ranges: &[Range<u64>]) -> bool {
+    let page = crate::range_cache::DEFAULT_RANGE_CACHE_PAGE_BYTES as u64;
+    let mut pages = std::collections::BTreeSet::new();
+    let mut wanted = 0u64;
+    for range in ranges {
+        if range.end <= range.start {
+            continue;
+        }
+        wanted = wanted.saturating_add(range.end - range.start);
+        for index in range.start / page..=(range.end - 1) / page {
+            pages.insert(index);
+        }
+    }
+    wanted > 0
+        && (pages.len() as u64).saturating_mul(page)
+            >= wanted.saturating_mul(SPARSE_PAGE_AMPLIFICATION)
 }
 
 /// Internal pages a node-record prefetch warms at most (1 MiB).
@@ -3451,6 +3478,23 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scattered_record_reads_are_sparse_and_dense_scans_are_not() {
+        // 300 records of ~12 KiB spread over a 1 GiB object.
+        let scattered: Vec<std::ops::Range<u64>> = (0..300u64)
+            .map(|i| {
+                let start = i * 3_500_000;
+                start..start + 12_000
+            })
+            .collect();
+        assert!(super::sparse_ranges(&scattered));
+        // Adjacent pages of a bulk probe share cache pages.
+        let dense: Vec<std::ops::Range<u64>> =
+            (0..300u64).map(|i| i * 4096..(i + 1) * 4096).collect();
+        assert!(!super::sparse_ranges(&dense));
+        assert!(!super::sparse_ranges(&[]));
+    }
+
     use std::fmt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;

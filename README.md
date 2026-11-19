@@ -350,6 +350,15 @@ CREATE FULLTEXT INDEX doc_ft IF NOT EXISTS ON :Doc(title, body);
 
 `IF NOT EXISTS` sits between the name and `ON` here too, keeping migration scripts idempotent.
 
+Matching is **accent- and case-insensitive**: text and queries are analyzed identically (Unicode NFKD, combining marks removed, case folded, plus `ß`→`ss`, `æ`→`ae`, `œ`→`oe`, `ø`→`o`, `ł`→`l` and similar letters), so `pension`, `PENSIÓN` and `pensión` are one term, while CJK, Hangul and kana keep their characters. To match accents exactly, opt out per index:
+
+```cypher
+CREATE FULLTEXT INDEX code_ft ON :Doc(code) OPTIONS {analyzer: 'exact'};
+-- Neo4j spelling: OPTIONS {indexConfig: {`fulltext.analyzer`: 'exact'}}
+```
+
+An unknown option or analyzer name is rejected. Indexes created before 3.5.2 keep their lowercase-only analyzer — queries against them are analyzed the same way, so their results do not change — and are rebuilt with accent folding in the background, one at a time, during quiet maintenance windows; the old index serves until the rebuilt one is swapped in with a single commit. `NAMIDB_TEXT_REANALYSIS=off` disables that rebuild. On a rollback to an earlier release, such an index answers by exact scan until that release's next flush rebuilds it with its own analyzer; results stay correct, and an explicit `analyzer: 'exact'` is forgotten by the older release (the index is folded again after the next upgrade).
+
 The first base is built during migration/compaction. Subsequent node flushes
 publish immutable FT4 deltas and their exact update/delete suppress records in
 the same manifest commit; `CALL search.bm25` uses the active base+delta

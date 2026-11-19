@@ -488,6 +488,274 @@ impl CompactionBasis {
     }
 }
 
+/// Re-tokenizing a full-text index built by an older analyzer.
+///
+/// Indexes created before accent folding keep the lowercase-only analyzer
+/// (their descriptor has no `analyzer` field) and stay fully usable: queries
+/// against them are parsed with that analyzer. The migration rebuilds such an
+/// index off-manifest, one at a time, and swaps it in with one manifest
+/// commit:
+///
+/// 1. [`CompactionBasis::prepare_text_reanalysis`] takes a basis manifest,
+///    derives a copy in which the descriptor names the folding analyzer and
+///    the generation carries the matching catalog signature, and builds a
+///    complete base from the node corpus against that copy (bounded by the
+///    index-build memory budget and the process-wide base-rebuild gate). The
+///    live index keeps serving meanwhile; nothing is published.
+/// 2. [`WriterSession::install_text_reanalysis`](crate::WriterSession::install_text_reanalysis)
+///    commits only if the descriptor is unchanged and no segment was added to
+///    or removed from the generation since the basis. Flushes that did not
+///    touch the index's documents (coverage and proven-empty appends only)
+///    and Nodes merges are rebased exactly as for any base rebuild. Otherwise
+///    the install is refused with [`Error::Precondition`]; the bodies are
+///    orphans for the janitor and the caller retries later.
+///
+/// Rollback: a binary that predates the field drops it on its next manifest
+/// rewrite, finds the generation's signature foreign, serves the index by
+/// exact scan until its next flush retires it, and rebuilds it with its own
+/// analyzer. Results stay correct throughout.
+#[cfg(feature = "text-index")]
+#[derive(Debug)]
+pub struct PreparedTextReanalysis {
+    index_name: String,
+    target: crate::text::TextAnalyzer,
+    basis_descriptor: crate::manifest::TextIndexDescriptor,
+    basis_segments: Vec<crate::search_lsm::SearchSegmentRef>,
+    basis_generation: crate::search_lsm::SearchLsmState,
+    inner: PreparedCompaction,
+}
+
+#[cfg(feature = "text-index")]
+impl PreparedTextReanalysis {
+    /// The index this rebuild replaces.
+    pub fn index_name(&self) -> &str {
+        &self.index_name
+    }
+
+    /// Manifest version the rebuild was planned against.
+    pub fn base_version(&self) -> u64 {
+        self.inner.base_version
+    }
+
+    /// Object paths the prepare uploaded (see
+    /// [`PreparedCompaction::uploaded_object_paths`]).
+    pub fn uploaded_object_paths(&self) -> Vec<String> {
+        self.inner.uploaded_object_paths()
+    }
+}
+
+/// `manifest` with text index `index_name` switched to `target` and its
+/// Search-LSM generation re-signed for it; `None` when the index or its
+/// generation is missing.
+#[cfg(feature = "text-index")]
+fn reanalyzed_manifest(
+    manifest: &crate::manifest::Manifest,
+    index_name: &str,
+    target: crate::text::TextAnalyzer,
+) -> Option<crate::manifest::Manifest> {
+    let mut next = manifest.clone();
+    let descriptor = next
+        .text_indexes
+        .iter_mut()
+        .find(|descriptor| descriptor.name == index_name)?;
+    descriptor.analyzer = Some(target);
+    let signature = crate::search_lsm::catalog_signature(
+        &next,
+        crate::search_lsm::SearchLsmKind::Text,
+        index_name,
+    )?;
+    let state = next.search_lsm.iter_mut().find(|state| {
+        state.kind == crate::search_lsm::SearchLsmKind::Text && state.index_name == index_name
+    })?;
+    state.catalog_signature = signature;
+    Some(next)
+}
+
+#[cfg(feature = "text-index")]
+impl CompactionBasis {
+    /// Full-text indexes still on the pre-folding analyzer that
+    /// [`Self::prepare_text_reanalysis`] can rebuild from this basis: legacy
+    /// descriptor, valid Active generation with segments. Metadata only.
+    pub fn legacy_text_indexes(&self) -> Vec<String> {
+        let manifest = &self.base.manifest;
+        if crate::search_lsm::validate_search_lsm(manifest).is_err() {
+            return Vec::new();
+        }
+        manifest
+            .text_indexes
+            .iter()
+            .filter(|descriptor| descriptor.is_legacy_analyzer())
+            .filter(|descriptor| {
+                matches!(
+                    search_lsm_compact::select_text_reanalysis(manifest, &descriptor.name),
+                    Ok(Some(_))
+                )
+            })
+            .map(|descriptor| descriptor.name.clone())
+            .collect()
+    }
+
+    /// Build a folded base for the legacy text index `index_name` off-lock.
+    /// `Ok(None)` when the index is no longer a candidate.
+    pub async fn prepare_text_reanalysis(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<PreparedTextReanalysis>> {
+        let target = crate::text::TextAnalyzer::Folded;
+        let manifest = &self.base.manifest;
+        let Some(basis_descriptor) = manifest
+            .text_indexes
+            .iter()
+            .find(|descriptor| descriptor.name == index_name && descriptor.is_legacy_analyzer())
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(basis_generation) = manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == index_name
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(derived) = reanalyzed_manifest(manifest, index_name, target) else {
+            return Ok(None);
+        };
+        validate_search_lsm(&derived).map_err(|error| {
+            Error::invariant(format!("re-signed text generation is invalid: {error}"))
+        })?;
+        let Some(selection) = search_lsm_compact::select_text_reanalysis(&derived, index_name)?
+        else {
+            return Ok(None);
+        };
+        let derived = LoadedManifest::new(
+            self.base.pointer.clone(),
+            self.base.pointer_etag.clone(),
+            self.base.pointer_version.clone(),
+            derived,
+        );
+        let search_compactions = search_lsm_compact::prepare_text_reanalysis(
+            self.manifest_store.store().clone(),
+            self.manifest_store.paths(),
+            &derived,
+            selection,
+        )
+        .await?;
+        if search_compactions.is_empty() {
+            return Ok(None);
+        }
+        let mut new_descs = Vec::new();
+        let mut removed_ids = Vec::new();
+        for search in &search_compactions {
+            removed_ids.extend(search.selection.selected_ids());
+            if let Some(output) = search.output_descriptor() {
+                new_descs.push(output.clone());
+            }
+        }
+        let max_node_lsn = derived
+            .manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+            .map(|descriptor| descriptor.max_lsn)
+            .max()
+            .unwrap_or(0);
+        let consolidated_base_markers = derived
+            .manifest
+            .text_indexes
+            .iter()
+            .find(|descriptor| descriptor.name == index_name)
+            .map(|descriptor| crate::manifest::SearchIndexBuildState {
+                kind: SstKind::TextIndex,
+                name: index_name.to_owned(),
+                catalog_signature: text_catalog_signature(descriptor),
+                max_node_lsn,
+            })
+            .into_iter()
+            .collect();
+        let inner = PreparedCompaction {
+            new_descs,
+            removed_ids,
+            bloom_count: 0,
+            base_version: derived.manifest.version,
+            base_schema: derived.manifest.schema.clone(),
+            base_vector_indexes: derived.manifest.vector_indexes.clone(),
+            base_text_indexes: derived.manifest.text_indexes.clone(),
+            base_search_lsm: derived.manifest.search_lsm.clone(),
+            node_rewrites: Vec::new(),
+            search_compactions,
+            search_build_states: Vec::new(),
+            consolidated_base_markers,
+            unadoptable_search_markers: Vec::new(),
+            search_lsm_activations: Vec::new(),
+            replaced_search_lsm: Vec::new(),
+        };
+        Ok(Some(PreparedTextReanalysis {
+            index_name: index_name.to_owned(),
+            target,
+            basis_segments: basis_generation.segments.clone(),
+            basis_descriptor,
+            basis_generation,
+            inner,
+        }))
+    }
+}
+
+/// Install half of the analyzer migration (see [`PreparedTextReanalysis`]).
+#[cfg(feature = "text-index")]
+pub(crate) async fn install_text_reanalysis(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    current: &LoadedManifest,
+    prepared: PreparedTextReanalysis,
+) -> Result<CompactionOutcome> {
+    let name = prepared.index_name.as_str();
+    let outrun = |what: &str| {
+        Error::precondition(format!(
+            "abandoning text index `{name}` re-analysis (basis v{}): {what} changed in \
+             manifest v{}; the prepared base is left for the orphan sweep",
+            prepared.inner.base_version, current.manifest.version
+        ))
+    };
+    let descriptor = current
+        .manifest
+        .text_indexes
+        .iter()
+        .find(|descriptor| descriptor.name == name);
+    if descriptor != Some(&prepared.basis_descriptor) {
+        return Err(outrun("the index definition"));
+    }
+    let generation = current.manifest.search_lsm.iter().find(|state| {
+        state.kind == crate::search_lsm::SearchLsmKind::Text && state.index_name == name
+    });
+    let Some(generation) = generation else {
+        return Err(outrun("the index generation"));
+    };
+    // Segments written since the basis hold postings of the old analyzer
+    // that the new base does not cover; refuse rather than mix analyzers.
+    if generation.generation_id != prepared.basis_generation.generation_id
+        || generation.catalog_signature != prepared.basis_generation.catalog_signature
+        || generation.status != prepared.basis_generation.status
+        || generation.segments != prepared.basis_segments
+    {
+        return Err(outrun("the index segments"));
+    }
+    let Some(derived) = reanalyzed_manifest(&current.manifest, name, prepared.target) else {
+        return Err(outrun("the index generation"));
+    };
+    let derived = LoadedManifest::new(
+        current.pointer.clone(),
+        current.pointer_etag.clone(),
+        current.pointer_version.clone(),
+        derived,
+    );
+    install_prepared(manifest_store, fence, &derived, prepared.inner).await
+}
+
 /// The physical Search-LSM consolidations one pass of `scope` plans.
 fn scoped_search_selections(
     manifest: &crate::manifest::Manifest,
@@ -5007,6 +5275,7 @@ impl TextMemberCollector {
     ) -> Result<Self> {
         let mut options = crate::sst::text::ExternalTextIndexBuildOptions::from_env()?;
         options.memory_budget_bytes = memory_budget_bytes;
+        options.analyzer = desc.effective_analyzer();
         Ok(Self {
             label_id: label_dict.id(&desc.label).map(|lid| lid.0),
             desc,
@@ -6921,7 +7190,11 @@ mod tests {
         };
         assert_eq!(
             winner.payload_fingerprint,
-            crate::sst::text::v4::text_v4_payload_fingerprint(&expected_payload).unwrap()
+            crate::sst::text::v4::text_v4_payload_fingerprint(
+                &expected_payload,
+                crate::text::TextAnalyzer::default()
+            )
+            .unwrap()
         );
 
         let empty_memtable = crate::memtable::MemtableSnapshot::empty();

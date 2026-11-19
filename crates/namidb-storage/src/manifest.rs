@@ -47,6 +47,7 @@ use crate::paths::NamespacePaths;
 use crate::search_lsm::SearchLsmState;
 use crate::sst::bloom::BloomDescriptor;
 use crate::sst::stats::{DegreeHistogram, HllSketchBytes, PropertyColumnStats, StatScalar};
+use crate::text::TextAnalyzer;
 use crate::wal::WalSegment;
 
 /// Top-level versioned manifest. Self-contained snapshot of every artefact
@@ -796,20 +797,54 @@ pub struct TextIndexDescriptor {
     /// Text properties concatenated (in this order) to form each document.
     /// Stored sorted so lookups are order-independent.
     pub properties: Vec<String>,
+    /// The analyzer the index is built and queried with. Absent in every
+    /// descriptor written before 3.5.2: such an index was built with the
+    /// lowercase-only analyzer ([`TextAnalyzer::Exact`]) and keeps it until it
+    /// is rebuilt with the folded one in the background. Older releases ignore
+    /// the field (and drop it when they rewrite the manifest, which turns the
+    /// index back into a legacy one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzer: Option<TextAnalyzer>,
 }
 
 impl TextIndexDescriptor {
-    /// Build a descriptor, normalizing `properties` to sorted order so two
-    /// descriptors (or a descriptor and a query request) over the same property
-    /// set compare equal regardless of the order they were given.
-    pub fn new(name: String, label: String, mut properties: Vec<String>) -> Self {
+    /// Build a descriptor with the default ([`TextAnalyzer::Folded`])
+    /// analyzer, normalizing `properties` to sorted order so two descriptors
+    /// (or a descriptor and a query request) over the same property set
+    /// compare equal regardless of the order they were given.
+    pub fn new(name: String, label: String, properties: Vec<String>) -> Self {
+        Self::with_analyzer(name, label, properties, TextAnalyzer::default())
+    }
+
+    /// [`Self::new`] with an explicit analyzer.
+    pub fn with_analyzer(
+        name: String,
+        label: String,
+        mut properties: Vec<String>,
+        analyzer: TextAnalyzer,
+    ) -> Self {
         properties.sort();
         properties.dedup();
         Self {
             name,
             label,
             properties,
+            analyzer: Some(analyzer),
         }
+    }
+
+    /// The analyzer this index's generation is built and queried with: the
+    /// declared one, or [`TextAnalyzer::Exact`] for a descriptor written
+    /// before analyzers existed.
+    pub fn effective_analyzer(&self) -> TextAnalyzer {
+        self.analyzer.unwrap_or(TextAnalyzer::Exact)
+    }
+
+    /// `true` for an index written before analyzers existed: it still uses
+    /// the lowercase-only analyzer only because nobody chose otherwise, so the
+    /// background analyzer migration may rebuild it with the folded one.
+    pub fn is_legacy_analyzer(&self) -> bool {
+        self.analyzer.is_none()
     }
 
     /// `true` iff this index covers `label` over exactly the `properties` set

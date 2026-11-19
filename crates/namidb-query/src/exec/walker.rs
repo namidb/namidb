@@ -3839,7 +3839,10 @@ async fn bm25_search(
             let mut props = options.props.clone();
             props.sort();
             props.dedup();
-            let parsed = crate::exec::text_scoring::parse_query(&options.query);
+            let parsed = crate::exec::text_scoring::parse_query_with(
+                text_analyzer_for(snapshot, &options.label, &props),
+                &options.query,
+            );
             bm25_ranked_flat(
                 snapshot,
                 &options.label,
@@ -3893,7 +3896,7 @@ async fn bm25_ranked(
     query: &str,
     k: Option<usize>,
 ) -> Result<Vec<(NodeId, f64)>, ExecError> {
-    use crate::exec::text_scoring::parse_query;
+    use crate::exec::text_scoring::parse_query_with;
 
     // TextIndexDescriptor canonicalises its property set (sorted + deduped)
     // before compaction concatenates the document fields. Apply the identical
@@ -3906,7 +3909,9 @@ async fn bm25_ranked(
     props.sort();
     props.dedup();
 
-    let parsed = parse_query(query);
+    // Parse with the analyzer of the index that covers (label, props) so the
+    // index path and the flat fallback below agree on every term.
+    let parsed = parse_query_with(text_analyzer_for(snapshot, label, &props), query);
     if parsed.is_empty() {
         return Ok(Vec::new());
     }
@@ -3931,6 +3936,26 @@ async fn bm25_ranked(
     }
 
     bm25_ranked_flat(snapshot, label, &props, &parsed, k, None).await
+}
+
+/// The analyzer a BM25 request over `(label, props)` must use: the one of the
+/// registered full-text index covering exactly that property set (an index
+/// created before 3.5.2 keeps the lowercase-only analyzer until it is
+/// rebuilt), else the folded default. `props` must be canonical (sorted,
+/// deduplicated).
+fn text_analyzer_for(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    props: &[String],
+) -> namidb_storage::text::TextAnalyzer {
+    snapshot
+        .manifest()
+        .manifest
+        .text_indexes
+        .iter()
+        .find(|descriptor| descriptor.matches(label, props))
+        .map(|descriptor| descriptor.effective_analyzer())
+        .unwrap_or_default()
 }
 
 /// Exact flat BM25 fallback with an optional procedure filter.
@@ -4006,7 +4031,7 @@ async fn bm25_ranked_flat(
             }
             let mut counts: HashMap<String, u32> = HashMap::new();
             let Some(document_len) =
-                visit_bm25_document(&view, props, max_document_bytes, |term| {
+                visit_bm25_document(parsed.analyzer, &view, props, max_document_bytes, |term| {
                     increment_bm25_term(&mut counts, term);
                     Ok::<(), ExecError>(())
                 })?
@@ -4107,9 +4132,21 @@ async fn bm25_ranked_flat(
                     Some(RuntimeValue::Node(node)) => node.as_ref(),
                     _ => unreachable!("the residual-filter row always contains its node"),
                 };
-                analyse_bm25_document(node, props, max_document_bytes, &phrase_plan)?
+                analyse_bm25_document(
+                    parsed.analyzer,
+                    node,
+                    props,
+                    max_document_bytes,
+                    &phrase_plan,
+                )?
             } else {
-                analyse_bm25_document(&view, props, max_document_bytes, &phrase_plan)?
+                analyse_bm25_document(
+                    parsed.analyzer,
+                    &view,
+                    props,
+                    max_document_bytes,
+                    &phrase_plan,
+                )?
             };
             let Some(analysis) = analysis else {
                 return Ok(());
@@ -4187,7 +4224,7 @@ async fn bm25_ranked_filtered(
     filter: (&Expression, &Params, &[String]),
     native_groups: &[(String, Vec<CoreValue>)],
 ) -> Result<Vec<(NodeId, f64)>, ExecError> {
-    use crate::exec::text_scoring::parse_query;
+    use crate::exec::text_scoring::parse_query_with;
 
     let (filter, params, filter_properties) = filter;
     if target == 0 {
@@ -4196,7 +4233,7 @@ async fn bm25_ranked_filtered(
     let mut props = props.to_vec();
     props.sort();
     props.dedup();
-    let parsed = parse_query(query);
+    let parsed = parse_query_with(text_analyzer_for(snapshot, label, &props), query);
     if parsed.is_empty() {
         return Ok(Vec::new());
     }
@@ -4384,6 +4421,7 @@ fn bm25_document_bytes(
 /// alphanumeric runs cannot merge across fields, while phrase state held by the
 /// caller remains adjacent across the separator.
 fn visit_bm25_document(
+    analyzer: namidb_storage::text::TextAnalyzer,
     document: &impl Bm25TextDocument,
     props: &[String],
     max_document_bytes: usize,
@@ -4397,17 +4435,16 @@ fn visit_bm25_document(
     let mut tokens_since_deadline_check = 0usize;
     for property in props {
         if let Some(text) = document.bm25_text_field(property) {
-            document_len = document_len.saturating_add(namidb_storage::text::try_visit_tokens(
-                text,
-                |token| {
+            document_len = document_len.saturating_add(
+                namidb_storage::text::try_visit_tokens_with(analyzer, text, |token| {
                     tokens_since_deadline_check += 1;
                     if tokens_since_deadline_check >= 4_096 {
                         tokens_since_deadline_check = 0;
                         crate::exec::limits::check_deadline()?;
                     }
                     visitor(token)
-                },
-            )?);
+                })?,
+            );
         }
     }
     Ok(Some(document_len))
@@ -4504,6 +4541,7 @@ struct Bm25DocumentAnalysis {
 }
 
 fn analyse_bm25_document(
+    analyzer: namidb_storage::text::TextAnalyzer,
     document: &impl Bm25TextDocument,
     props: &[String],
     max_document_bytes: usize,
@@ -4511,11 +4549,12 @@ fn analyse_bm25_document(
 ) -> Result<Option<Bm25DocumentAnalysis>, ExecError> {
     let mut counts = std::collections::HashMap::new();
     let mut phrase_state = phrase_plan.start();
-    let Some(document_len) = visit_bm25_document(document, props, max_document_bytes, |term| {
-        phrase_state.observe(term);
-        increment_bm25_term(&mut counts, term);
-        Ok(())
-    })?
+    let Some(document_len) =
+        visit_bm25_document(analyzer, document, props, max_document_bytes, |term| {
+            phrase_state.observe(term);
+            increment_bm25_term(&mut counts, term);
+            Ok(())
+        })?
     else {
         return Ok(None);
     };
@@ -4560,12 +4599,13 @@ mod bm25_document_streaming_tests {
         let props = strings(&["body", "title"]);
         let expected = crate::exec::text_scoring::tokenize("alpha alpha 東京 beta 大学");
         let mut streamed = Vec::new();
-        let length = visit_bm25_document(&document, &props, usize::MAX, |token| {
-            streamed.push(token.to_owned());
-            Ok(())
-        })
-        .unwrap()
-        .unwrap();
+        let length =
+            visit_bm25_document(Default::default(), &document, &props, usize::MAX, |token| {
+                streamed.push(token.to_owned());
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
         assert_eq!(streamed, expected);
         assert_eq!(length, expected.len());
 
@@ -4575,9 +4615,10 @@ mod bm25_document_streaming_tests {
             strings(&["東京", "beta", "大学"]),
         ];
         let plan = Bm25PhrasePlan::new(&phrases);
-        let analysis = analyse_bm25_document(&document, &props, usize::MAX, &plan)
-            .unwrap()
-            .unwrap();
+        let analysis =
+            analyse_bm25_document(Default::default(), &document, &props, usize::MAX, &plan)
+                .unwrap()
+                .unwrap();
         assert!(analysis.phrases_match);
         assert_eq!(
             analysis.phrases_match,
@@ -4592,7 +4633,7 @@ mod bm25_document_streaming_tests {
         let contiguous_cjk = vec![strings(&["東京", "京大", "大学"])];
         let plan = Bm25PhrasePlan::new(&contiguous_cjk);
         assert!(
-            !analyse_bm25_document(&document, &props, usize::MAX, &plan)
+            !analyse_bm25_document(Default::default(), &document, &props, usize::MAX, &plan)
                 .unwrap()
                 .unwrap()
                 .phrases_match
@@ -4603,6 +4644,7 @@ mod bm25_document_streaming_tests {
     fn document_limit_fails_before_tokenization() {
         let document = document("1234", "5678");
         let error = visit_bm25_document(
+            Default::default(),
             &document,
             &strings(&["body", "title"]),
             7,
@@ -4631,6 +4673,16 @@ struct Bm25SearchArgs {
 
 /// Resolve `search.bm25` options from its single required map argument:
 /// `{label, query, text_property | text_properties, k?, filter?}`.
+/// Every option `search.bm25` reads.
+const BM25_OPTION_KEYS: &[&str] = &[
+    "label",
+    "query",
+    "text_property",
+    "text_properties",
+    "k",
+    "filter",
+];
+
 fn bm25_search_args(args: &[Expression], params: &Params) -> Result<Bm25SearchArgs, ExecError> {
     let map = match args {
         [arg] => match evaluate(arg, &Row::new(), params)? {
@@ -4650,6 +4702,10 @@ fn bm25_search_args(args: &[Expression], params: &Params) -> Result<Bm25SearchAr
         }
     };
 
+    // A typo like `qurey` or `filtre` must fail the call, never run with a
+    // default (an ignored `filter` would silently widen the result).
+    reject_unknown_keys("search.bm25", &map, BM25_OPTION_KEYS)?;
+
     let want_str = |v: &RuntimeValue| match v {
         RuntimeValue::String(s) => Some(s.clone()),
         _ => None,
@@ -4664,7 +4720,12 @@ fn bm25_search_args(args: &[Expression], params: &Params) -> Result<Bm25SearchAr
         .and_then(want_str)
         .ok_or_else(|| proc_unsupported("search.bm25 requires a `query` string"))?;
 
-    // Either a single `text_property` or a list `text_properties`.
+    // Either a single `text_property` or a list `text_properties`, not both.
+    if map.contains_key("text_properties") && map.contains_key("text_property") {
+        return Err(proc_unsupported(
+            "search.bm25 takes either `text_property` or `text_properties`, not both",
+        ));
+    }
     let props: Vec<String> = match (map.get("text_properties"), map.get("text_property")) {
         (Some(RuntimeValue::List(items)), _) => {
             let mut out = Vec::with_capacity(items.len());
@@ -5432,6 +5493,7 @@ async fn db_index_vector_procedure(
         None => (None, None, None),
         Some(a) => match evaluate(a, &Row::new(), params)? {
             RuntimeValue::Map(m) => {
+                reject_unknown_keys("db.index.vector.queryNodes", &m, &["ef", "filter"])?;
                 let ef = match m.get("ef") {
                     Some(value) => Some(as_usize(value).ok_or_else(|| {
                         proc_unsupported("queryNodes option `ef` must be a non-negative integer")
@@ -5507,6 +5569,11 @@ async fn db_index_vector_procedure(
 fn hybrid_text_props(
     map: &std::collections::BTreeMap<String, RuntimeValue>,
 ) -> Result<Vec<String>, ExecError> {
+    if map.contains_key("text_properties") && map.contains_key("text_property") {
+        return Err(proc_unsupported(
+            "search.hybrid takes either `text_property` or `text_properties`, not both",
+        ));
+    }
     match (map.get("text_properties"), map.get("text_property")) {
         (Some(RuntimeValue::List(items)), _) => {
             let mut out = Vec::with_capacity(items.len());
@@ -5607,10 +5674,12 @@ async fn hybrid_search_procedure(
         _ => Vec::new(),
     };
     let prefilter = proc_vector_prefilter(map.get("filter"));
-    let fusion_mode = map
-        .get("fusion")
-        .and_then(proc_str)
-        .unwrap_or_else(|| "rrf".to_string());
+    let fusion_mode = match map.get("fusion") {
+        None => "rrf".to_string(),
+        Some(value) => proc_str(value).ok_or_else(|| {
+            proc_unsupported("search.hybrid `fusion` must be a string ('rrf' or 'linear')")
+        })?,
+    };
     // A present-but-wrong-type tuning value is an error, not a silent default.
     let opt_f64 = |key: &str| -> Result<Option<f64>, ExecError> {
         match map.get(key) {

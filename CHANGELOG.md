@@ -15,6 +15,41 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Accent-insensitive full-text search.** New full-text indexes, the flat
+  `search.bm25` scan and the `bm25()` scalar fold text and queries the same
+  way (Unicode NFKD, combining marks removed, case folded, plus `ß`, `æ`,
+  `œ`, `ø`, `ł` and similar letters), so `pension` finds `pensión`. CJK,
+  Hangul and kana are unchanged. `CREATE FULLTEXT INDEX ... OPTIONS
+  {analyzer: 'exact'}` (or `indexConfig: {`fulltext.analyzer`: 'exact'}`)
+  keeps the previous lowercase-only matching; unknown options are errors.
+- **Existing full-text indexes are migrated in the background.** An index
+  created by an earlier release keeps its analyzer, and queries against it
+  are analyzed the same way, until a background rebuild (one index at a
+  time, during quiet maintenance windows, within the index-build memory
+  budget) swaps in the folded index with one commit. A rebuild outrun by
+  writes to the index's documents is retried later. `NAMIDB_TEXT_REANALYSIS=off`
+  disables it. Releases 3.4.3 to 3.5.1 open the new data; they serve a folded
+  index by exact scan until their next flush rebuilds it with their own
+  analyzer (checked by `tests/compat/old_binaries_open_new_data.sh`).
+
+### Changed
+
+- **Procedure options are checked strictly.** `search.bm25` and the options
+  map of `db.index.vector.queryNodes` reject unknown keys with the list of
+  valid ones, like the other `search.*` and `algo.*` procedures; giving both
+  `text_property` and `text_properties`, or a non-string `fusion`, is an
+  error.
+
+### Fixed
+
+- **Cold top-k hydration reads only the records it needs.** Hydrating a few
+  hundred search hits rounded each scattered node record up to a 256 KiB
+  cache page, sixteen at a time, and probed each node SST's record index one
+  after the other. Scattered batches now read their exact ranges
+  concurrently, and the SSTs are probed together.
+
 ## [3.5.1] - 2026-11-18
 
 ### Fixed

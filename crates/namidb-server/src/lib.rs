@@ -3537,10 +3537,11 @@ async fn run_create_vector_index(
 fn text_index_descriptor_from(
     cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
 ) -> namidb_storage::manifest::TextIndexDescriptor {
-    namidb_storage::manifest::TextIndexDescriptor::new(
+    namidb_storage::manifest::TextIndexDescriptor::with_analyzer(
         cfi.name.name.clone(),
         cfi.label.name.clone(),
         cfi.properties.iter().map(|p| p.name.clone()).collect(),
+        cfi.analyzer.unwrap_or_default(),
     )
 }
 

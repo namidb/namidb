@@ -38,7 +38,8 @@ use crate::search_workspace::{
     MATERIALISED_TEXT_RESULT_BYTES_PER_HIT as MATERIALISED_RESULT_BYTES_PER_HIT,
 };
 use crate::text::{
-    avg_len, bm25_idf, bm25_term_score, tokenize, TextQuery, PREFIX_EXPANSION_LIMIT,
+    avg_len, bm25_idf, bm25_term_score, tokenize_with, TextAnalyzer, TextQuery,
+    PREFIX_EXPANSION_LIMIT,
 };
 
 #[path = "v3_external.rs"]
@@ -1050,7 +1051,7 @@ pub(super) fn build(
     let mut total_len = 0u64;
     for (doc, (id, text)) in members.into_iter().enumerate() {
         let doc = doc as u32;
-        let tokens = tokenize(&text);
+        let tokens = tokenize_with(TextAnalyzer::Exact, &text);
         if tokens.len() > u32::MAX as usize {
             return Err(Error::invariant("text v3 document token count exceeds u32"));
         }
