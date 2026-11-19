@@ -84,9 +84,6 @@ const SCAN_PROOF_MIN_IDS: usize = 4_096;
 /// where a probe is the expensive side.
 const SCAN_PROOF_RATIO: u64 = 10;
 
-/// Without an exact manifest count, scan only for very large batches.
-const SCAN_PROOF_BLIND_MIN_IDS: usize = 50_000;
-
 /// Prove `node`'s filter for `ids`: label membership (or plain existence
 /// for an unlabelled node), exactly as `Expand` proves its endpoints.
 ///
@@ -108,13 +105,17 @@ async fn prove(
         Ok("always") => true,
         Ok("never") => false,
         _ => {
-            ids.len() >= SCAN_PROOF_MIN_IDS
-                && match snapshot.metadata_node_count(scan_label) {
-                    Some(population) => {
-                        (ids.len() as u64).saturating_mul(SCAN_PROOF_RATIO) >= population
-                    }
-                    None => ids.len() >= SCAN_PROOF_BLIND_MIN_IDS,
-                }
+            if ids.len() < SCAN_PROOF_MIN_IDS {
+                false
+            } else {
+                // Exact and cached; with overlapping node files the first
+                // call reconciles ids without reading properties.
+                let population = match snapshot.metadata_node_count(scan_label) {
+                    Some(population) => population,
+                    None => snapshot.count_nodes(scan_label).await?,
+                };
+                (ids.len() as u64).saturating_mul(SCAN_PROOF_RATIO) >= population
+            }
         }
     };
     if scan {

@@ -3084,26 +3084,17 @@ async fn bidirectional_search(
         best: &mut Option<(u32, NodeId)>,
         dead: &std::collections::HashSet<NodeId>,
     ) -> Result<(), ExecError> {
-        use futures::stream::{self, StreamExt};
         let new_depth = side.depth + 1;
         let mut next = Vec::new();
         let mut edges_read = 0usize;
-        // The level's adjacency reads run SEED_PREFETCH_CONCURRENCY at a
-        // time (a cold level is I/O-bound: one partner-list read per node
-        // and type); `buffered` hands them back in frontier order, so the
-        // parents recorded — and the path returned — are exactly those of
-        // a one-at-a-time expansion.
+        // The level's adjacency is read concurrently but handed back in
+        // frontier order (and type order per node), so the parents
+        // recorded — and the path returned — are exactly those of a
+        // one-at-a-time expansion.
         let frontier = std::mem::take(&mut side.frontier);
-        let mut reads = stream::iter(frontier.iter().copied())
-            .map(|node| async move {
-                neighbours_of_any(snapshot, edge_types, dir, node, edge_read_mode)
-                    .await
-                    .map(|edges| (node, edges))
-            })
-            .buffered(SEED_PREFETCH_CONCURRENCY);
-        while let Some(read) = reads.next().await {
-            crate::exec::limits::check_deadline()?;
-            let (node, neighbours) = read?;
+        let lists =
+            read_level_neighbours(snapshot, edge_types, dir, &frontier, edge_read_mode).await?;
+        for (node, neighbours) in frontier.iter().copied().zip(lists) {
             edges_read += neighbours.len();
             for edge in neighbours {
                 let partner = partner_id(&edge, dir, node);
@@ -3409,20 +3400,11 @@ async fn execute_expand_shortest_grouped(
                 // Read the level's adjacency with several reads in flight;
                 // `buffered` keeps frontier order, so emission order is
                 // unchanged.
-                use futures::stream::{self, StreamExt};
                 let tails: Vec<NodeId> = frontier.iter().map(|state| state.tail).collect();
-                let mut reads = stream::iter(tails)
-                    .map(|tail| {
-                        neighbours_of_any(snapshot, edge_types, direction, tail, edge_read_mode)
-                    })
-                    .buffered(SEED_PREFETCH_CONCURRENCY);
-                let mut states = frontier.drain(..);
-                while let Some(read) = reads.next().await {
-                    crate::exec::limits::check_deadline()?;
-                    let neighbours = read?;
-                    let state = states.next().expect("one read per frontier state");
-                    step_neighbours.push((state, neighbours));
-                }
+                let lists =
+                    read_level_neighbours(snapshot, edge_types, direction, &tails, edge_read_mode)
+                        .await?;
+                step_neighbours.extend(frontier.drain(..).zip(lists));
             }
             for (state, neighbours) in step_neighbours {
                 for edge in neighbours {
@@ -8321,6 +8303,38 @@ pub(crate) enum EdgeReadMode {
     Properties,
     /// Bare `DELETE r`: source-keyed SST range without property decoding.
     SparseIdentity,
+}
+
+/// One BFS level's adjacency: `nodes[i]`'s partners over `edge_types`, in
+/// type order — exactly [`neighbours_of_any`] per node. Reads run
+/// `SEED_PREFETCH_CONCURRENCY` at a time and go type by type over the whole
+/// level: a snapshot keeps only a few dozen edge-file readers open, and
+/// node-major reads of a multi-type pattern cycle every type's files per
+/// node, reopening each reader (footer and key array) on every read.
+async fn read_level_neighbours(
+    snapshot: &Snapshot<'_>,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    nodes: &[NodeId],
+    mode: EdgeReadMode,
+) -> Result<Vec<Vec<EdgeView>>, ExecError> {
+    use futures::stream::{self, StreamExt};
+    let mut lists: Vec<Vec<EdgeView>> = vec![Vec::new(); nodes.len()];
+    for edge_type in edge_types {
+        let mut reads = stream::iter(nodes.iter().copied().enumerate())
+            .map(|(index, node)| async move {
+                neighbours_of(snapshot, edge_type, direction, node, mode)
+                    .await
+                    .map(|edges| (index, edges))
+            })
+            .buffered(SEED_PREFETCH_CONCURRENCY);
+        while let Some(read) = reads.next().await {
+            crate::exec::limits::check_deadline()?;
+            let (index, edges) = read?;
+            lists[index].extend(edges);
+        }
+    }
+    Ok(lists)
 }
 
 async fn neighbours_of_any(
