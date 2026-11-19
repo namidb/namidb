@@ -1080,6 +1080,20 @@ impl Metrics {
             "namidb_search_index_builds_in_flight {}",
             namidb_storage::search_progress::builds_in_flight()
         );
+        let _ = writeln!(
+            out,
+            "# HELP namidb_search_index_build_percent Progress of each search index base build \
+             running now, by the index names it builds."
+        );
+        let _ = writeln!(out, "# TYPE namidb_search_index_build_percent gauge");
+        for build in namidb_storage::search_progress::builds_in_flight_detail() {
+            let indexes = build.indexes.join(",").replace(['\\', '"', '\n'], "_");
+            let _ = writeln!(
+                out,
+                "namidb_search_index_build_percent{{indexes=\"{indexes}\"}} {}",
+                build.percent
+            );
+        }
         let routes = namidb_storage::route_telemetry::snapshot();
         let _ = writeln!(
             out,

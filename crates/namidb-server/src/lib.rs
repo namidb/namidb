@@ -3430,6 +3430,33 @@ struct HealthResponse {
     memory_resident_bytes: usize,
     memory_max_bytes: usize,
     memory_pressure: bool,
+    /// Search index base builds running in this process: activations of
+    /// `BUILDING` vector/full-text indexes, background migrations of legacy
+    /// full-text bases and other base rebuilds. Empty when none runs. An
+    /// orchestrator that stops idle engines should wait while it is not
+    /// empty: a stopped build starts over on the next open.
+    search_builds_in_flight: Vec<SearchBuildHealth>,
+}
+
+/// One entry of [`HealthResponse::search_builds_in_flight`].
+#[derive(Serialize)]
+struct SearchBuildHealth {
+    /// Index names the build serves.
+    indexes: Vec<String>,
+    /// Percent complete, 0..100.
+    percent: f64,
+    elapsed_ms: u64,
+}
+
+fn search_builds_in_flight() -> Vec<SearchBuildHealth> {
+    namidb_storage::search_progress::builds_in_flight_detail()
+        .into_iter()
+        .map(|build| SearchBuildHealth {
+            indexes: build.indexes,
+            percent: build.percent,
+            elapsed_ms: build.elapsed_ms,
+        })
+        .collect()
 }
 
 /// Build the health payload + status code from the published snapshot and
@@ -3459,6 +3486,7 @@ fn health_response(
         memory_resident_bytes: memory.resident_bytes(),
         memory_max_bytes: memory.max_bytes(),
         memory_pressure,
+        search_builds_in_flight: search_builds_in_flight(),
     };
     let code = if degraded {
         StatusCode::SERVICE_UNAVAILABLE
@@ -9625,9 +9653,13 @@ mod tests {
             .iter()
             .map(|c| c.as_str().unwrap())
             .collect();
-        assert!(cols.ends_with(&["state", "populationPercent"]), "{cols:?}");
+        assert!(
+            cols.ends_with(&["state", "populationPercent", "migrationPercent"]),
+            "{cols:?}"
+        );
         assert_eq!(doc["state"], "ONLINE");
         assert_eq!(doc["populationPercent"], 100.0);
+        assert!(doc["migrationPercent"].is_null());
     }
 
     #[cfg(feature = "text-index")]
