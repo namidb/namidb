@@ -28,6 +28,7 @@ fn pushdown_at(plan: LogicalPlan, pending: Vec<Expression>) -> LogicalPlan {
         | LogicalPlan::Argument { .. }
         | LogicalPlan::MultiwayJoin { .. }
         | LogicalPlan::EdgeTypeCount { .. }
+        | LogicalPlan::PathCount { .. }
         | LogicalPlan::VectorSearch { .. }
         | LogicalPlan::CallProcedure { .. } => {
             // The detection pass folds predicates over participating
