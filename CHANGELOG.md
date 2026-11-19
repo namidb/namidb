@@ -99,11 +99,13 @@ crates.io release will establish and document that API explicitly.
   cache page, sixteen at a time, and probed each node SST's record index one
   after the other. Scattered batches now read their exact ranges
   concurrently, and the SSTs are probed together.
-- **Cold full-text top-k reads posting lists in fewer round trips.** A
-  block-max query fetched the next posting block of a term one round trip at
-  a time. A term's list is now read ahead (whole when it fits a per-query
-  allowance of 8 MiB, counted in the query's workspace reservation), and
-  `search.hybrid` runs its dense and sparse legs concurrently.
+- **Cold full-text top-k takes fewer round trips.** A query fetched the
+  next posting block of a term one round trip at a time; each term's list is
+  now read ahead (whole when it fits its share of a 16 MiB per-query
+  allowance, which the query's workspace reservation counts). Reconciling a
+  large top-k probed the search version table 64 pages at a time, one batch
+  after another; four batches now run at once. `search.hybrid` runs its dense
+  and sparse legs concurrently.
 - **Backups of large namespaces no longer fail on long object reads.** A
   snapshot copy read every object as one GET, throttled by the upload behind
   it, so a multi-GB SST kept a single request open for minutes. The object
