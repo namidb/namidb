@@ -7265,6 +7265,11 @@ const VECTOR_FLAT_SCAN_BATCH: usize = 256;
 
 /// Batches of a selective filter's eligible ids the flat vector route looks
 /// up concurrently.
+/// Id-ordered prefix [`filtered_flat_eligible`] evaluates first when node runs
+/// overlap: a filter admitting at least a quarter of the label is proven broad
+/// there without reconciling the whole label.
+const FILTERED_FLAT_SAMPLE_ROWS: usize = 4 * FILTERED_FLAT_ELIGIBLE_CAP;
+
 const FILTERED_FLAT_LOOKUP_FANOUT: usize = 4;
 
 /// At most this many nodes admitted by a property-only source filter are
@@ -7408,6 +7413,43 @@ async fn filtered_flat_eligible(
         return Ok(None);
     };
     let projection: Vec<String> = properties.into_iter().collect();
+    // With overlapping node runs the visitor below reconciles the whole label
+    // before its first callback, so it cannot stop early. Evaluate an
+    // id-ordered prefix first: a filter that already admits more than the
+    // cap there is broad, and a label shorter than the prefix is answered by
+    // it outright.
+    if !snapshot.node_scan_is_disjoint() {
+        let sample = snapshot
+            .scan_label_with_predicates_and_projection_limited(
+                label,
+                &[],
+                Some(&projection),
+                FILTERED_FLAT_SAMPLE_ROWS,
+            )
+            .await?;
+        let complete = sample.len() < FILTERED_FLAT_SAMPLE_ROWS;
+        let mut admitted: Vec<NodeId> = Vec::new();
+        for view in sample {
+            crate::exec::limits::check_deadline()?;
+            let id = view.id;
+            let mut row = Row::new();
+            row.set(
+                alias.to_string(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            if evaluate(filter, &row, params)?.as_bool() == Some(true) {
+                if admitted.len() == FILTERED_FLAT_ELIGIBLE_CAP {
+                    return Ok(None);
+                }
+                admitted.push(id);
+            }
+        }
+        if complete {
+            admitted.sort_unstable();
+            admitted.dedup();
+            return Ok(Some(admitted));
+        }
+    }
     // Stops the column scan at the first admitted node past the cap: a broad
     // filter is known to be broad after `cap / selectivity` rows, not after
     // reading the whole label.
@@ -7840,30 +7882,6 @@ async fn try_index_search(
                     && ids.len() <= FILTERED_FLAT_FIRST_CAP
                 {
                     *flat_eligible = Some(Some(ids.iter().copied().collect()));
-                    return Ok(None);
-                }
-            }
-        }
-        // No native posting and no property index for the filter: before
-        // the first residual round hydrates its whole over-fetch, find out
-        // from the filter's own columns (a bounded scan that stops once the
-        // filter proves broad) whether few nodes qualify. Those are scored
-        // exactly by the flat route; a broad filter keeps the widening rounds.
-        if native.is_none() && capped_eligibility.is_none() && flat_eligible.is_none() {
-            if let Some(filter) = source_filter {
-                let eligible = selective_filter_eligible(
-                    snapshot,
-                    label,
-                    alias,
-                    property,
-                    filter,
-                    filter_groups,
-                    params,
-                )
-                .await?;
-                let selective = eligible.is_some();
-                *flat_eligible = Some(eligible);
-                if selective {
                     return Ok(None);
                 }
             }

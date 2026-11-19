@@ -123,10 +123,10 @@ crates.io release will establish and document that API explicitly.
   4,096 nodes (found through a property index, or a scan of the filter's own
   property columns that stops as soon as the filter proves broad) is now
   answered by scoring exactly those nodes with the index's corpus-wide
-  statistics; the vector leg and `search.vector` make the same decision before
-  their first filtered round. Broad filters keep the widening route, which
-  still returns exactly `k` matching rows or all of them. Results equal the
-  exact scan's.
+  statistics. Broad filters keep the widening route, which still returns
+  exactly `k` matching rows or all of them, and are recognised as broad from
+  an id-ordered prefix of the label when its node runs overlap (the bounded
+  column scan could not stop early there). Results equal the exact scan's.
 
 ### Changed
 
