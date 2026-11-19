@@ -121,3 +121,44 @@ The migration is explicit only. A compaction does not rewrite a lone,
 fully compacted 2.x SST on its own: for a vector corpus of many gigabytes
 that is an unplanned full rewrite, and it would also make the namespace
 unreadable to 2.x as a side effect of a maintenance tick.
+
+## Optional sections inside an index object
+
+Some index objects carry data that older releases neither need nor read.
+Such additions do not change the storage format number, because every
+release that reads the format still reads the object exactly as before.
+
+### RaBitQ navigation codes in `NAMIVG05` vector bases (3.5.2)
+
+A clustered vector base is laid out as magic, navigation pages, exact
+pages, footer and trailer. Every `NAMIVG05` reader (3.4.x and later)
+checks that each page block ends at or before the footer, reads only the
+blocks the footer names, and finds the footer from the fixed-size trailer
+at the end of the object. 3.5.2 writes an extra section in the space
+between the last exact page and the footer:
+
+```text
+magic | nav pages | exact pages | RaBitQ page blocks | directory | locator | footer | trailer
+```
+
+- The footer and trailer are byte-for-byte what an older release writes
+  for the same rows, so older readers serve the base through the int8
+  navigation pages, as before.
+- The 32-byte locator holds a magic, the directory's offset and length,
+  the directory's CRC32, and a CRC32 of the locator itself. A reader looks
+  for it only when the gap after the last page can hold it. It then
+  validates the checksums and every block offset and length against the
+  footer before using the section. A base with no section, or with one
+  that does not validate, is served through the int8 pages.
+- No manifest, descriptor or sidecar object changes. The section is part
+  of the base object, so backup, restore and the orphan sweep handle it
+  as part of that object.
+
+A base written before 3.5.2 has no section. A 3.5.2 server that opens one
+to serve a query marks it, and the Search-LSM planner then schedules the
+base's normal rebuild. This rebuild has the same input bound (half the
+cgroup memory limit) and the same one-at-a-time throttle as any other
+vector base rebuild. Until the new base installs, the old base keeps
+serving through its int8 pages. Rolling back to 3.5.1, 3.5.0 or 3.4.3
+needs no action. Those releases read every base 3.5.2 wrote, ignore the
+section, and do not rebuild the base because of it.

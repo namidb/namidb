@@ -61,11 +61,92 @@ Turbopuffer's 2026 ANN v3 description independently reinforces the same
 hierarchical-clustering and approximation/refinement shape: hierarchy bounds
 cold object-store round trips, compact vectors narrow the candidates, and
 full-precision vectors are fetched only for exact reranking.[^tpuf-ann-v3]
-NamiDB currently uses signed int8 navigation/data codes rather than RaBitQ.
-One-bit or product quantization is therefore an optional future wire version,
-not a silent change to the distance semantics: it may ship only after
-per-metric recall, filtered recall, size, and cold-byte gates beat the int8
-baseline.
+Since 3.5.2, a base also carries a RaBitQ navigation tier (one bit per
+rotated dimension).[^rabitq] It is an optional section of the same base
+object; the section's layout and compatibility rules are in
+[storage-format.md](storage-format.md). The int8 navigation pages stay in
+the base, so older releases and bases built before 3.5.2 keep serving
+through them.
+
+#### RaBitQ navigation tier
+
+Per page, each row is coded against the page's center, the dequantized leaf
+centroid scaled by a per-page least-squares factor. The residual is rotated
+by a seeded randomized Hadamard transform (four rounds of sign flips, a
+permutation and a blockwise normalized Walsh-Hadamard transform; the
+dimension is padded to a multiple of 64) and stored as its sign bits plus
+three `f32` factors. Cosine rows and queries are normalized first.
+
+A query rotates `q - c` once per probed page and scores every row of the
+page from a 256-entry lookup table per code byte. The RaBitQ estimator is
+unbiased, and its error is bounded by `ε0 · |r| · sqrt(1 - α²) / α ·
+|q - c| / sqrt(D - 1)` with confidence set by `ε0` (1.9 by default:
+about 94% per pair; the unit tests check the observed failure rate of
+every metric at 128, 1,024 and 1,536 dimensions). Candidate selection is
+driven by that bound: `τ` is the `k`-th largest lower bound seen, and a row
+stays a candidate while its upper bound reaches `τ`. The candidates
+(capped at 8 × the int8 re-rank budget, keeping the highest estimates) are
+re-ranked with exact `f32` rows read from the raw exact pages, so the
+returned scores are exact. Native filters apply before `k`, from per-page
+filter blocks that only filtered queries read.
+
+The re-rank runs in two waves. The best `rerank_factor · k` estimates (80
+for `k = 10`) are re-ranked first; their exact scores give a `k`-th best
+quality far tighter than `τ`, and a remaining candidate is read only while
+its upper bound still reaches it (the same bound that admitted it). A page
+stored at exactly the raw-frame length of its rows is read as raw without
+first reading its frame header; every row is checked against its code, and
+a page whose rows do not check out is re-read whole.
+
+A base with the section probes at least 128 leaf pages (`ef / 4` above
+that), twice the int8 floor, because a probed page costs a 140-byte code row
+per row instead of a 1,044-byte int8 row. Measured under a simulated 30 ms
+object store, 200 queries, `k = 10`:
+
+| Set | Tier, pages probed | overlap@10 | Re-ranked rows, mean / p95 | Warm p50 | Cold p50 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 386k × 1024 production-shaped | int8, 64 | 0.984 | 80 / 80 | 7.4 ms | 305 ms |
+| | RaBitQ, 128 | 0.987 | 119 / 323 | 13.7 ms | 342 ms |
+| 400k × 1024 anisotropic, near-duplicates | int8, 64 | 0.938 | 80 / 80 | 16.0 ms | 473 ms |
+| | RaBitQ, 128 | 0.976 | 53 / 80 | 17.0 ms | 339 ms |
+
+The cold column reads the code blocks from the store. When a namespace
+opens, the server's metadata prefetch also warms each opened base's code,
+id and filter blocks into the range cache (within half of its RAM budget):
+the section stores them contiguously, so they arrive in 8 MiB ranged reads
+(about 190 requests and 1.1 s for the 110 MB of the first set, instead of a
+request per page), and a query then reads only its re-rank rows.
+
+#### Memory per million vectors
+
+| Per 1M vectors | 1,024-d | 1,536-d |
+| --- | ---: | ---: |
+| RaBitQ code tier (codes + factors, `D/8 + 12` B/row) | 140 MB | 204 MB |
+| int8 navigation tier it replaces (`D + 20` B/row) | 1,044 MB | 1,556 MB |
+| Reader metadata (centroid tree, page and section directories) | 6–22 MB | 9–33 MB |
+| Resident for warm navigation (code tier + metadata) | 146–162 MB | 213–237 MB |
+| Whole base object (exact `f32`, int8 pages, section, footer) | ~5.32 GB | ~7.9 GB |
+
+Reader metadata depends on rows per page: 22 MB per million vectors with
+pages of about 80 rows (the 386k namespace above), 6 MB with pages of
+about 270 rows (a 1M-row synthetic set).
+
+The code tier is not pinned. Code blocks are read through the same range
+source as every other block, and the immutable object-range cache keys
+them by their exact ranges. Their bytes therefore count against
+`NAMIDB_CACHE_MAX_BYTES` (the RAM page cache inside it) and are evicted
+like any cached range. A namespace whose code tier fits comfortably in the
+page cache serves warm probes from RAM; a larger one degrades to reading
+code blocks from the object store, which is still about 1/7.5 of the bytes
+int8 navigation reads. The decoded section directory (56 bytes per page) is
+part of the reader metadata, which the open-reader cache weighs against
+its search-index share of the same budget. During a build, the section directory counts toward
+`NAMIDB_INDEX_BUILD_MEMORY_BYTES` and the encoded page blocks are spooled
+to the build scratch directory, not held in memory.
+
+`VectorV5Reader::prefetch_resident_codes(max_bytes)` reads every code
+block of a base into the cache after a namespace opens, and does nothing
+when the code tier is larger than the share it is given.
 
 Native filtering is part of candidate generation, not a post-filter. Each
 filterable value has both cluster-level summaries and exact local bitmaps.
@@ -254,6 +335,7 @@ The object-native release is blocked until all of these pass:
 [^tpuf-architecture]: <https://turbopuffer.com/docs/architecture>
 [^tpuf-filtering]: <https://turbopuffer.com/blog/native-filtering>
 [^tpuf-fts]: <https://turbopuffer.com/blog/fts-v2-postings>
+[^rabitq]: Jianyang Gao and Cheng Long, "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search", SIGMOD 2024.
 [^tpuf-ann-v3]: <https://turbopuffer.com/blog/ann-v3>
 [^spann]: <https://arxiv.org/abs/2111.08566>
 [^spfresh]: <https://arxiv.org/abs/2410.14452>

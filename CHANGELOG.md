@@ -64,6 +64,10 @@ crates.io release will establish and document that API explicitly.
   of falling back to RRF; and every option error, an unknown `fusion`
   included, is raised before either leg runs. The README documents both
   modes, including the per-leg min-max normalisation of `'linear'`.
+- Vector bases written before this release are rebuilt once, through the
+  existing memory-gated, one-at-a-time base rebuild, after a query first
+  opens them. Until the new base installs, the old one serves through its
+  int8 pages.
 
 ### Added
 
@@ -80,6 +84,31 @@ crates.io release will establish and document that API explicitly.
   writer claim, recovery and metadata prefetch happen before the first
   request instead of during it. A name with no data is skipped, never
   created.
+
+- **RaBitQ navigation for vector bases.** A vector base now carries a
+  1-bit RaBitQ code per row (codes plus three factors: 140 bytes at
+  1,024 dimensions instead of the 1,044-byte int8 row). A query scores the
+  probed pages from these codes, picks candidates with the estimator's
+  error bound, and re-ranks them with the exact `f32` rows in two waves
+  (the best estimates first, then only candidates whose bound still reaches
+  the exact `k`-th score), so scores stay exact. Bases with the section
+  probe at least 128 pages instead of 64. On a 386k × 1024
+  production-shaped synthetic namespace overlap@10 is 0.987 (int8 at its
+  default: 0.984); on a harder anisotropic set 0.976 (int8: 0.938), with
+  lower cold latency than int8. The code tier is about 1/7.5 of the int8
+  tier's memory and counts against `NAMIDB_CACHE_MAX_BYTES` like any cached
+  range. See `docs/architecture/object-native-storage.md`.
+- When a namespace opens, the metadata prefetch also warms each vector
+  base's RaBitQ code, id and filter blocks into the range cache (within
+  half of its RAM budget), with a few 8 MiB ranged reads.
+
+### Compatibility
+
+- The RaBitQ section sits between the exact pages and the footer of the
+  same `NAMIVG05` object, behind a fixed 32-byte locator. The footer,
+  trailer, manifest and sidecars are unchanged, and 3.5.1, 3.5.0 and 3.4.3
+  read bases written by this release through their int8 pages. Rolling
+  back needs no action and does not trigger rebuilds.
 
 ### Fixed
 

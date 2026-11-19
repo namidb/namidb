@@ -522,6 +522,11 @@ async fn open_vector_segment(
             if !super::active_vector_base_matches(&wrapped, descriptor, segment) {
                 return Ok(None);
             }
+            // A base written before the RaBitQ section serves through its
+            // int8 pages; the planner rebuilds it (memory-gated) to add one.
+            if reader.rabitq_absent() {
+                crate::sst::vector::v5::note_base_without_rabitq(&descriptor.path);
+            }
             if let Some(cache) = snapshot.cache.as_ref() {
                 cache.insert_vector_v5_reader(cache_key, reader.clone());
             }
@@ -653,6 +658,7 @@ async fn open_vector_generation(
 /// legacy-format base instead (the caller warms those through the base path).
 pub(super) async fn prefetch_search_metadata(
     snapshot: &Snapshot<'_>,
+    #[cfg(feature = "vector-index")] bases: &mut Vec<Arc<crate::sst::vector::v5::VectorV5Reader>>,
 ) -> Result<(usize, usize, Vec<(SearchLsmKind, String)>)> {
     #[allow(unused_mut)]
     let mut not_active = Vec::new();
@@ -662,7 +668,14 @@ pub(super) async fn prefetch_search_metadata(
     for index in &snapshot.manifest.manifest.vector_indexes {
         crate::cancel::check()?;
         match open_vector_generation(snapshot, &index.name).await? {
-            ActiveSearch::Ready(_) => vectors += 1,
+            ActiveSearch::Ready(generation) => {
+                vectors += 1;
+                for segment in &generation.segments {
+                    if let OpenedVectorSegment::V5Base { reader, .. } = segment {
+                        bases.push(reader.clone());
+                    }
+                }
+            }
             ActiveSearch::NotActive => not_active.push((SearchLsmKind::Vector, index.name.clone())),
             ActiveSearch::Unavailable => {}
         }
