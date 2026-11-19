@@ -131,6 +131,8 @@ pub struct VectorV5ExternalBuildMetrics {
     pub scratch_bytes_written: u64,
     pub artifact_bytes_written: u64,
     pub effective_target_rows_per_page: usize,
+    /// Bytes of the RaBitQ section (page blocks, directory and locator).
+    pub rabitq_section_bytes: u64,
 }
 
 impl VectorV5ExternalBuildMetrics {
@@ -366,6 +368,16 @@ impl VectorV5ExternalCollector {
 
         let mut artifact = tempfile::tempfile_in(&self.config.scratch_dir)?;
         artifact.write_all(MAGIC_V5)?;
+        let rabitq = if super::rabitq::section_enabled() {
+            Some(RabitqBuild {
+                encoder: super::rabitq::Encoder::new(desc.metric, dim)?,
+                section: super::rabitq::SectionBuilder::default(),
+                spool: tempfile::tempfile_in(&self.config.scratch_dir)?,
+                has_filters: !self.filter_properties.is_empty(),
+            })
+        } else {
+            None
+        };
         let mut context = ExternalBuildContext {
             config: &self.config,
             desc,
@@ -376,11 +388,32 @@ impl VectorV5ExternalCollector {
             pages: Vec::new(),
             metadata_bytes: 0,
             metrics: &mut metrics,
+            rabitq,
         };
         let root = build_partition(root_partition, 0, &mut context)?;
         let nodes = std::mem::take(&mut context.nodes);
         let pages = std::mem::take(&mut context.pages);
+        let rabitq = context.rabitq.take();
         drop(context);
+        if let Some(mut rabitq) = rabitq {
+            let section_offset = artifact.stream_position()?;
+            rabitq.spool.flush()?;
+            rabitq.spool.seek(SeekFrom::Start(0))?;
+            let copied = std::io::copy(&mut rabitq.spool, &mut artifact)?;
+            if copied != rabitq.section.blocks_len() {
+                return Err(Error::invariant(
+                    "vector v5 rabitq spool length changed while copying",
+                ));
+            }
+            let tail = rabitq.section.finish(
+                &mut artifact,
+                section_offset,
+                &rabitq.encoder,
+                metric_name(desc.metric),
+            )?;
+            metrics.scratch_bytes_written = metrics.scratch_bytes_written.saturating_add(copied);
+            metrics.rabitq_section_bytes = copied.saturating_add(tail);
+        }
         let filter_metadata_bytes = self
             .filter_properties
             .iter()
@@ -867,6 +900,16 @@ struct ExternalBuildContext<'a> {
     pages: Vec<PageRef>,
     metadata_bytes: usize,
     metrics: &'a mut VectorV5ExternalBuildMetrics,
+    rabitq: Option<RabitqBuild>,
+}
+
+/// RaBitQ page blocks are spooled while pages are emitted and appended after
+/// the last exact page (see [`super::rabitq`]).
+struct RabitqBuild {
+    encoder: super::rabitq::Encoder,
+    section: super::rabitq::SectionBuilder,
+    spool: File,
+    has_filters: bool,
 }
 
 impl ExternalBuildContext<'_> {
@@ -1008,7 +1051,7 @@ fn build_partition(
     context.account_metadata()?;
 
     if partition.rows as usize <= context.effective_target {
-        let page = write_leaf_page(&mut partition, context)?;
+        let page = write_leaf_page(&mut partition, node as usize, context)?;
         context.nodes[node as usize].page = Some(page);
         return Ok(node);
     }
@@ -1414,6 +1457,7 @@ fn partition_by_rank(
 
 fn write_leaf_page(
     partition: &mut Partition,
+    node: usize,
     context: &mut ExternalBuildContext<'_>,
 ) -> Result<u32, Error> {
     let dim = context.desc.dim as usize;
@@ -1429,6 +1473,13 @@ fn write_leaf_page(
         filters: BTreeMap::new(),
     };
     let words = rows.div_ceil(64);
+    let metric = context.desc.metric;
+    let mut centroid = Vec::new();
+    let mut center_scale = super::rabitq::CenterScale::default();
+    if context.rabitq.is_some() {
+        let leaf = &context.nodes[node];
+        super::rabitq::leaf_center(&leaf.codes, leaf.scale, 1.0, &mut centroid);
+    }
     partition.rewind(dim)?;
     let mut ordinal = 0usize;
     while let Some(record) = read_record(
@@ -1436,6 +1487,9 @@ fn write_leaf_page(
         dim,
         context.config.memory_budget_bytes,
     )? {
+        if context.rabitq.is_some() {
+            center_scale.push(metric, &record.vector, &centroid);
+        }
         nav.ids.push(record.id);
         let (codes, scale) = quantize_i8(&record.vector);
         if codes.len() != dim || !scale.is_finite() || scale < 0.0 {
@@ -1477,15 +1531,60 @@ fn write_leaf_page(
         ));
     }
     let nav_ref = write_nav_block(context.output, &nav)?;
+    let rabitq_filters = match &context.rabitq {
+        Some(rabitq) if rabitq.has_filters => Some(super::rabitq::serialize_filters(&nav.filters)?),
+        _ => None,
+    };
     // Drop page-local navigation allocations before the full-precision pass.
     drop(nav);
-    let exact_ref = write_exact_block(
-        context.output,
-        partition,
-        dim,
-        context.config.memory_budget_bytes,
-        context.metrics,
-    )?;
+    let mut page_encoder = context.rabitq.as_ref().map(|rabitq| {
+        let leaf = &context.nodes[node];
+        super::rabitq::PageEncoder::new(
+            &rabitq.encoder,
+            &leaf.codes,
+            leaf.scale,
+            center_scale.finish(&centroid),
+            rows,
+        )
+    });
+    let memory_budget = context.config.memory_budget_bytes;
+    let filter_bytes = rabitq_filters.as_ref().map_or(0, Vec::capacity);
+    let exact_ref = {
+        let rabitq = &mut context.rabitq;
+        write_exact_block(
+            context.output,
+            partition,
+            dim,
+            memory_budget,
+            context.metrics,
+            |record, metrics| {
+                if let (Some(encoder), Some(rabitq)) = (page_encoder.as_mut(), rabitq.as_mut()) {
+                    encoder.push(&mut rabitq.encoder, &record.id, &record.vector)?;
+                    let bytes = encoder
+                        .logical_bytes()
+                        .saturating_add(filter_bytes)
+                        .saturating_add(record.logical_bytes());
+                    metrics.observe_working(bytes);
+                    if bytes > memory_budget {
+                        return Err(Error::invariant(format!(
+                            "vector v5 rabitq page requires {bytes} logical bytes, above budget \
+                             {memory_budget}"
+                        )));
+                    }
+                }
+                Ok(())
+            },
+        )?
+    };
+    if let (Some(encoder), Some(rabitq)) = (page_encoder, context.rabitq.as_mut()) {
+        let before = rabitq.section.metadata_bytes();
+        rabitq
+            .section
+            .push_page(&mut rabitq.spool, &encoder.finish(rabitq_filters))?;
+        context.metadata_bytes = context
+            .metadata_bytes
+            .saturating_add(rabitq.section.metadata_bytes().saturating_sub(before));
+    }
     let page = u32::try_from(context.pages.len())
         .map_err(|_| Error::invariant("vector v5 external page count exceeds u32"))?;
     let page_capacity_before = context.pages.capacity();
@@ -1591,6 +1690,7 @@ fn write_exact_block(
     dim: usize,
     memory_budget: usize,
     metrics: &mut VectorV5ExternalBuildMetrics,
+    mut on_record: impl FnMut(&SpoolRecord, &mut VectorV5ExternalBuildMetrics) -> Result<(), Error>,
 ) -> Result<BlockRef, Error> {
     let raw_len = partition
         .rows
@@ -1609,6 +1709,7 @@ fn write_exact_block(
             encoder.write_all(&component.to_le_bytes())?;
         }
         metrics.observe_working(record.logical_bytes());
+        on_record(&record, metrics)?;
         rows += 1;
     }
     if rows != partition.rows {
@@ -2193,19 +2294,23 @@ mod tests {
         let large_rows = rows(4_096, 16);
         // 4,096 rows at 8 rows/page deliberately create ~512 leaf descriptors;
         // 128 KiB is below that footer's measured 140 KiB requirement and must
-        // be rejected. 256 KiB leaves room for both metadata and fixed working
-        // set while still being tiny relative to corpus payload.
-        let budget = 256 * 1024;
+        // be rejected. 384 KiB leaves room for the footer, the RaBitQ section
+        // directory (56 B per page) and the fixed working set while still
+        // being tiny relative to corpus payload.
+        let budget = 384 * 1024;
         let small = build_external(scratch.path(), &desc, &small_rows, 8, budget);
         let large = build_external(scratch.path(), &desc, &large_rows, 8, budget);
         assert!(small.metrics.peak_logical_memory_bytes <= budget);
         assert!(large.metrics.peak_logical_memory_bytes <= budget);
+        // The k-means direction sample is capped at budget / 8 (a budget
+        // term, not a corpus term); everything else must not grow.
         assert!(
             large.metrics.peak_working_memory_bytes
                 <= small
                     .metrics
                     .peak_working_memory_bytes
                     .saturating_mul(2)
+                    .saturating_add(budget / 8)
                     .saturating_add(4096),
             "small={} large={}",
             small.metrics.peak_working_memory_bytes,

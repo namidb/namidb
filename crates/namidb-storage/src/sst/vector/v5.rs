@@ -17,6 +17,14 @@
 //! cold query transfers pages proportional to `nprobe`, not the corpus.
 
 pub mod external;
+mod rabitq;
+
+#[doc(hidden)]
+pub use rabitq::override_epsilon_for_benchmarks as override_rabitq_epsilon_for_benchmarks;
+pub use rabitq::VectorV5CodePrefetch;
+pub(crate) use rabitq::{
+    base_lacks_section as base_lacks_rabitq, note_base_without_section as note_base_without_rabitq,
+};
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -91,6 +99,13 @@ pub trait VectorV5RangeSource: Send + Sync {
     async fn read_small(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
         self.read_ranges(ranges).await
     }
+
+    /// [`Self::read_blocks`] of many neighbouring blocks (sorted by offset)
+    /// read ahead of their use: a caching source can fetch them with a few
+    /// large requests and keep each as the entry `read_blocks` later finds.
+    async fn prime_blocks(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>, Error> {
+        self.read_blocks(ranges).await
+    }
 }
 
 /// Deterministic build controls. They are arguments rather than process-global
@@ -149,6 +164,8 @@ pub struct VectorV5SearchResult {
     /// rerank/truncation. This is an exact corpus count only when
     /// `probed_pages == VectorV5Reader::page_count()`.
     pub eligible_rows_seen: usize,
+    /// Rows whose full-precision vector was read and scored exactly.
+    pub reranked_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +263,32 @@ pub struct VectorV5Reader {
     /// Per page: whether its exact block is a confirmed raw-block frame
     /// (`RAW_UNKNOWN` until a query reads its frame header).
     raw_pages: Box<[AtomicU8]>,
+    /// The RaBitQ navigation section, when the base carries a valid one.
+    rabitq: RabitqState,
+}
+
+/// Whether a base carries a RaBitQ section ([`rabitq`]).
+#[derive(Debug)]
+enum RabitqState {
+    Present(rabitq::RabitqIndex),
+    /// Written before the section existed (or with it disabled).
+    Absent,
+    /// A locator was found but the section did not validate; served by the
+    /// int8 path.
+    Invalid,
+}
+
+/// Size of a base's RaBitQ section, for capacity reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorV5RabitqStats {
+    /// Rotated (padded) dimension: code bits per row.
+    pub padded_dim: usize,
+    /// Bytes of the code blocks every probe reads (codes and factors).
+    pub code_block_bytes: u64,
+    /// Bytes of the whole section (codes, ids, filters, directory, locator).
+    pub section_bytes: u64,
+    /// Decoded directory and rotation retained by the reader.
+    pub resident_metadata_bytes: usize,
 }
 
 const RAW_UNKNOWN: u8 = 0;
@@ -262,6 +305,7 @@ impl std::fmt::Debug for VectorV5Reader {
             .field("point_count", &self.footer.point_count)
             .field("centroid_nodes", &self.footer.nodes.len())
             .field("pages", &self.footer.pages.len())
+            .field("rabitq", &matches!(self.rabitq, RabitqState::Present(_)))
             .finish()
     }
 }
@@ -344,8 +388,49 @@ pub(crate) fn build_body_v5_with_filter_postings(
 
     let mut body = MAGIC_V5.to_vec();
     let mut page_refs = Vec::with_capacity(tree.leaves.len());
-    for leaf in &tree.leaves {
+    let mut page_nodes = vec![usize::MAX; tree.leaves.len()];
+    for (index, node) in tree.nodes.iter().enumerate() {
+        if let Some(page) = node.page {
+            page_nodes[page as usize] = index;
+        }
+    }
+    let mut section = rabitq::section_enabled()
+        .then(|| {
+            Ok::<_, Error>((
+                rabitq::Encoder::new(desc.metric, dim)?,
+                rabitq::SectionBuilder::default(),
+                Vec::new(),
+            ))
+        })
+        .transpose()?;
+    for (page, leaf) in tree.leaves.iter().enumerate() {
         let nav = make_nav_page(&rows, leaf, dim, &reverse_filters)?;
+        if let Some((encoder, builder, bytes)) = section.as_mut() {
+            let node = tree
+                .nodes
+                .get(page_nodes[page])
+                .ok_or_else(|| Error::invariant("vector v5 page has no leaf centroid"))?;
+            let mut centroid = Vec::with_capacity(dim);
+            rabitq::leaf_center(&node.codes, node.scale, 1.0, &mut centroid);
+            let mut center_scale = rabitq::CenterScale::default();
+            for &row_index in leaf {
+                center_scale.push(desc.metric, &rows[row_index].vector, &centroid);
+            }
+            let mut page_encoder = rabitq::PageEncoder::new(
+                encoder,
+                &node.codes,
+                node.scale,
+                center_scale.finish(&centroid),
+                leaf.len(),
+            );
+            for &row_index in leaf {
+                page_encoder.push(encoder, &rows[row_index].id, &rows[row_index].vector)?;
+            }
+            let filters = (!filter_properties.is_empty())
+                .then(|| rabitq::serialize_filters(&nav.filters))
+                .transpose()?;
+            builder.push_page(bytes, &page_encoder.finish(filters))?;
+        }
         let nav_raw = serialize(&nav, "navigation page")?;
         #[cfg(test)]
         let nav_ref = if tests::COMPRESS_EXACT.with(|flag| flag.get()) {
@@ -400,6 +485,16 @@ pub(crate) fn build_body_v5_with_filter_postings(
         .max()
         .unwrap_or(0)
         .max(options.branch_factor);
+    if let Some((encoder, builder, bytes)) = section {
+        let section_offset = body.len() as u64;
+        body.extend_from_slice(&bytes);
+        builder.finish(
+            &mut body,
+            section_offset,
+            &encoder,
+            metric_name(desc.metric),
+        )?;
+    }
     let footer = Footer {
         format_version: FORMAT_VERSION,
         dim: desc.dim,
@@ -525,6 +620,15 @@ impl VectorV5Reader {
                 })
             })
             .collect();
+        let rabitq = Self::open_rabitq(
+            source.as_ref(),
+            &footer,
+            metric,
+            footer_offset,
+            tail_start,
+            tail,
+        )
+        .await?;
         Ok(Self {
             source,
             file_len,
@@ -532,6 +636,82 @@ impl VectorV5Reader {
             footer,
             metric,
             raw_pages,
+            rabitq,
+        })
+    }
+
+    /// Locate and validate the RaBitQ section. Read errors propagate; a
+    /// section that does not validate leaves the base on the int8 path.
+    async fn open_rabitq(
+        source: &dyn VectorV5RangeSource,
+        footer: &Footer,
+        metric: VectorMetric,
+        footer_offset: u64,
+        tail_start: u64,
+        tail: &Bytes,
+    ) -> Result<RabitqState, Error> {
+        let Some(locator_range) = rabitq::locator_range(footer, footer_offset) else {
+            return Ok(RabitqState::Absent);
+        };
+        let read = |range: Range<u64>| async move {
+            if range.start >= tail_start {
+                let start = usize::try_from(range.start - tail_start)
+                    .map_err(|_| Error::invariant("vector v5 tail offset overflows usize"))?;
+                let end = usize::try_from(range.end - tail_start)
+                    .map_err(|_| Error::invariant("vector v5 tail offset overflows usize"))?;
+                Ok::<Bytes, Error>(tail.slice(start..end))
+            } else {
+                source.read_range(range).await
+            }
+        };
+        let locator = read(locator_range).await?;
+        let Some((directory_offset, directory_len, directory_crc)) =
+            rabitq::parse_locator(&locator)
+        else {
+            return Ok(RabitqState::Absent);
+        };
+        let invalid = |reason: &str| {
+            tracing::warn!(
+                reason,
+                "vector v5 RaBitQ section ignored; using int8 navigation"
+            );
+            Ok(RabitqState::Invalid)
+        };
+        let Some(directory_range) =
+            rabitq::directory_range(footer, footer_offset, directory_offset, directory_len)
+        else {
+            return invalid("directory range is out of bounds");
+        };
+        let directory = read(directory_range).await?;
+        if directory.len() as u64 != directory_len || crc32fast::hash(&directory) != directory_crc {
+            return invalid("directory checksum mismatch");
+        }
+        match rabitq::RabitqIndex::open(footer, metric, &directory, directory_offset) {
+            Ok(index) => Ok(RabitqState::Present(index)),
+            Err(error) => invalid(&error.to_string()),
+        }
+    }
+
+    /// Whether queries use the RaBitQ section.
+    pub fn has_rabitq(&self) -> bool {
+        matches!(self.rabitq, RabitqState::Present(_))
+    }
+
+    /// Whether the base was written without a RaBitQ section (as releases
+    /// before it wrote every base); a rebuild adds one.
+    pub fn rabitq_absent(&self) -> bool {
+        matches!(self.rabitq, RabitqState::Absent)
+    }
+
+    pub fn rabitq_stats(&self) -> Option<VectorV5RabitqStats> {
+        let RabitqState::Present(index) = &self.rabitq else {
+            return None;
+        };
+        Some(VectorV5RabitqStats {
+            padded_dim: index.padded_dim(),
+            code_block_bytes: index.code_block_bytes(),
+            section_bytes: index.section_bytes(self.footer_offset),
+            resident_metadata_bytes: index.resident_bytes(),
         })
     }
 
@@ -581,7 +761,12 @@ impl VectorV5Reader {
                     + std::mem::size_of::<CentroidNode>()
             })
             .sum::<usize>();
+        let rabitq = match &self.rabitq {
+            RabitqState::Present(index) => index.resident_bytes(),
+            _ => 0,
+        };
         centroids
+            .saturating_add(rabitq)
             .saturating_add(self.footer.pages.len() * std::mem::size_of::<PageRef>())
             .saturating_add(
                 self.footer
@@ -716,6 +901,42 @@ impl VectorV5Reader {
         options: VectorV5SearchOptions,
         groups: &[(String, Vec<Value>)],
     ) -> Result<VectorV5SearchResult, Error> {
+        if let Some(empty) = self.validate_query(query, k)? {
+            return Ok(empty);
+        }
+        // A zero cosine query scores every row 0; the int8 path returns that.
+        let zero_cosine =
+            self.metric == VectorMetric::Cosine && query.iter().all(|value| *value == 0.0);
+        match &self.rabitq {
+            RabitqState::Present(index) if !zero_cosine => {
+                self.search_rabitq(index, query, k, options, groups).await
+            }
+            _ => self.search_int8(query, k, options, groups).await,
+        }
+    }
+
+    /// Search through the int8 navigation pages even when the base carries a
+    /// RaBitQ section (the path every base without one takes).
+    pub async fn search_filter_groups_int8(
+        &self,
+        query: &[f32],
+        k: usize,
+        options: VectorV5SearchOptions,
+        groups: &[(String, Vec<Value>)],
+    ) -> Result<VectorV5SearchResult, Error> {
+        if let Some(empty) = self.validate_query(query, k)? {
+            return Ok(empty);
+        }
+        self.search_int8(query, k, options, groups).await
+    }
+
+    /// Reject malformed queries; `Some` is the empty result of a query that
+    /// can match nothing.
+    fn validate_query(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Option<VectorV5SearchResult>, Error> {
         if query.len() != self.footer.dim as usize {
             return Err(Error::invariant(format!(
                 "vector v5 query dimension {} != index dimension {}",
@@ -729,13 +950,24 @@ impl VectorV5Reader {
             ));
         }
         if k == 0 || self.footer.point_count == 0 {
-            return Ok(VectorV5SearchResult {
+            return Ok(Some(VectorV5SearchResult {
                 hits: Vec::new(),
                 applied_filter_groups: 0,
                 probed_pages: 0,
                 eligible_rows_seen: 0,
-            });
+                reranked_rows: 0,
+            }));
         }
+        Ok(None)
+    }
+
+    async fn search_int8(
+        &self,
+        query: &[f32],
+        k: usize,
+        options: VectorV5SearchOptions,
+        groups: &[(String, Vec<Value>)],
+    ) -> Result<VectorV5SearchResult, Error> {
         let initial_nprobe = options.nprobe.max(1).min(self.footer.pages.len());
         let max_nprobe = options
             .max_nprobe
@@ -816,6 +1048,7 @@ impl VectorV5Reader {
         }
 
         let mut approximate = approximate.into_sorted_candidates(self.metric);
+        let reranked_rows = approximate.len();
         // Group candidates in-place so one exact f32 page can be read,
         // scored and discarded before the next page arrives.
         approximate.sort_by(|left, right| {
@@ -860,7 +1093,9 @@ impl VectorV5Reader {
                 });
                 let rows = plan_raw_rows(
                     exact,
-                    &approximate[candidate_start..candidate_end],
+                    approximate[candidate_start..candidate_end]
+                        .iter()
+                        .map(|candidate| candidate.row),
                     row_bytes as u64,
                     &mut spans,
                 );
@@ -968,6 +1203,7 @@ impl VectorV5Reader {
             applied_filter_groups,
             probed_pages: fetched,
             eligible_rows_seen,
+            reranked_rows,
         })
     }
 
@@ -1004,6 +1240,7 @@ impl VectorV5Reader {
                 applied_filter_groups: 0,
                 probed_pages: 0,
                 eligible_rows_seen: 0,
+                reranked_rows: 0,
             });
         }
 
@@ -1094,6 +1331,7 @@ impl VectorV5Reader {
             applied_filter_groups,
             probed_pages: self.footer.pages.len(),
             eligible_rows_seen,
+            reranked_rows: eligible_rows_seen,
         })
     }
 
@@ -2685,18 +2923,18 @@ const RAW_ROW_COALESCE_GAP: u64 = 32 * 1024;
 /// One row's bytes: `(span, offset in span, length)` pieces.
 type RawRowPieces = Vec<(usize, usize, usize)>;
 
-/// Append the ranges holding `candidates`' rows (sorted by row) to `spans`,
+/// Append the ranges holding `candidate_rows` (ascending) to `spans`,
 /// merging nearby rows, and return where each row's pieces live.
 fn plan_raw_rows(
     exact: &BlockRef,
-    candidates: &[ApproxCandidate],
+    candidate_rows: impl ExactSizeIterator<Item = u32>,
     row_bytes: u64,
     spans: &mut Vec<Range<u64>>,
 ) -> Vec<RawRowPieces> {
     let first_span = spans.len();
-    let mut rows = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let raw_start = candidate.row as u64 * row_bytes;
+    let mut rows = Vec::with_capacity(candidate_rows.len());
+    for candidate_row in candidate_rows {
+        let raw_start = candidate_row as u64 * row_bytes;
         let mut pieces = Vec::with_capacity(1);
         for range in raw_content_ranges(exact, raw_start..raw_start + row_bytes) {
             let merge = spans.len() > first_span
@@ -3479,9 +3717,10 @@ mod tests {
             .await
             .expect("footer remains intact");
         assert!(reader
-            .search(&[1.0, 2.0], 1, all_probe_options(reader.page_count()))
+            .search_filter_groups_int8(&[1.0, 2.0], 1, all_probe_options(reader.page_count()), &[])
             .await
             .is_err());
+        assert_rabitq_code_corruption_is_detected(&body, &[1.0, 2.0], 1).await;
     }
 
     #[tokio::test]
@@ -3731,7 +3970,30 @@ mod tests {
             .await
             .expect("metadata remains valid");
         assert!(reader
-            .search(&[1.0, 1.0], 3, all_probe_options(reader.page_count()))
+            .search_filter_groups_int8(&[1.0, 1.0], 3, all_probe_options(reader.page_count()), &[])
+            .await
+            .is_err());
+        assert_rabitq_code_corruption_is_detected(&body, &[1.0, 1.0], 3).await;
+    }
+
+    /// The RaBitQ path never reads navigation pages; a flipped code byte
+    /// must fail its block CRC when the page is probed.
+    async fn assert_rabitq_code_corruption_is_detected(body: &Bytes, query: &[f32], k: usize) {
+        let source = Arc::new(TrackingSource::new(body.clone()));
+        let reader = VectorV5Reader::open(source, body.len() as u64)
+            .await
+            .expect("open valid");
+        let codes = reader.rabitq_code_block_range(0).expect("section present");
+        let mut corrupt = body.to_vec();
+        corrupt[codes.start as usize] ^= 0x01;
+        let corrupt = Bytes::from(corrupt);
+        let source = Arc::new(TrackingSource::new(corrupt.clone()));
+        let reader = VectorV5Reader::open(source, corrupt.len() as u64)
+            .await
+            .expect("directory remains valid");
+        assert!(reader.has_rabitq());
+        assert!(reader
+            .search(query, k, all_probe_options(reader.page_count()))
             .await
             .is_err());
     }
@@ -4354,8 +4616,18 @@ mod tests {
                     let before_old = old_source.bytes_read();
                     let before_new = new_source.bytes_read();
                     let first_new = new_source.range_count();
-                    let a = old.search(query, 10, options).await.expect("old");
-                    let b = new.search(query, 10, options).await.expect("new");
+                    // The int8 tier's fixed rerank_factor fan-out isolates the
+                    // exact-page format (RaBitQ fan-out is bound-driven).
+                    let a = old
+                        .search_filter_groups_int8(query, 10, options, &[])
+                        .await
+                        .expect("old")
+                        .hits;
+                    let b = new
+                        .search_filter_groups_int8(query, 10, options, &[])
+                        .await
+                        .expect("new")
+                        .hits;
                     assert_eq!(a, b, "{metric:?} dim {dim}");
                     let old_bytes = old_source.bytes_read() - before_old;
                     let new_bytes = new_source.bytes_read() - before_new;

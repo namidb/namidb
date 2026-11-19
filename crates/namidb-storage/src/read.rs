@@ -369,6 +369,12 @@ impl crate::sst::vector::v5::VectorV5RangeSource for SearchObjectRangeSource {
             .read_ranges_as(ranges, crate::range_cache::ReadGranularity::Fine)
             .await
     }
+
+    async fn prime_blocks(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        // 8 MiB spans, four at a time: a 50 MB code tier is about seven
+        // requests in two round trips instead of one request per page.
+        self.pinned.prime_blocks(ranges, 8 * 1024 * 1024, 4).await
+    }
 }
 
 #[cfg(any(feature = "text-index", feature = "vector-index"))]
@@ -539,6 +545,15 @@ const PRESENCE_ROW_BYTES: usize = 48;
 const MIN_VECTOR_V5_NPROBE: usize = 64;
 
 #[cfg(feature = "vector-index")]
+/// The floor for a base that carries the RaBitQ section. Its 1-bit scan and
+/// bound-pruned re-rank cost a fraction of the int8 path per probed page, so
+/// it probes twice as many: on a hard 400k × 1024 set overlap@10 goes from
+/// 0.938 to 0.976 for less time than int8 at 64 pages (warm 17 vs 16 ms,
+/// cold 339 vs 473 ms at 30 ms store latency); on a production-shaped
+/// 386k set from 0.981 to 0.987.
+const MIN_VECTOR_V5_RABITQ_NPROBE: usize = 128;
+
+#[cfg(feature = "vector-index")]
 fn vector_v5_search_options(
     index: &crate::sst::vector::v5::VectorV5Reader,
     ef: usize,
@@ -555,7 +570,12 @@ fn vector_v5_search_options(
     // round trips.
     // Widening eventually reaches every page when `ef` approaches the corpus,
     // preserving the exact-fallback/exhaustion logic.
-    let nprobe = ef.div_ceil(4).max(MIN_VECTOR_V5_NPROBE).min(page_count);
+    let floor = if index.has_rabitq() {
+        MIN_VECTOR_V5_RABITQ_NPROBE
+    } else {
+        MIN_VECTOR_V5_NPROBE
+    };
+    let nprobe = ef.div_ceil(4).max(floor).min(page_count);
     crate::sst::vector::v5::VectorV5SearchOptions {
         nprobe,
         max_nprobe: nprobe.saturating_mul(8).max(nprobe).min(page_count),
@@ -10142,26 +10162,75 @@ impl<'mt> Snapshot<'mt> {
             }
             Ok::<_, Error>(edge_ssts)
         };
-        let search = self.prefetch_search_indexes();
+        #[cfg(feature = "vector-index")]
+        let mut vector_bases = Vec::new();
+        let search = self.prefetch_search_indexes(
+            #[cfg(feature = "vector-index")]
+            &mut vector_bases,
+        );
         let (node_ssts, node_record_pages, (vector_indexes, text_indexes), edge_ssts) =
             futures::try_join!(node_ssts, node_records, search, edges)?;
+        let metadata_elapsed = started.elapsed();
+        #[cfg(feature = "vector-index")]
+        let vector_code_bytes = self.prefetch_vector_codes(&vector_bases).await?;
+        #[cfg(not(feature = "vector-index"))]
+        let vector_code_bytes = 0;
         Ok(PrefetchSummary {
             node_ssts,
             edge_ssts,
             node_record_pages,
             vector_indexes,
             text_indexes,
-            elapsed: started.elapsed(),
+            vector_code_bytes,
+            elapsed: metadata_elapsed,
+            total_elapsed: started.elapsed(),
         })
+    }
+
+    /// Warm the RaBitQ code and id blocks of each opened vector base into the shared
+    /// range cache, after the metadata, so the first vector query after an
+    /// open scores its probed pages without a round trip per page. Bounded
+    /// to half of the range cache's RAM budget across all bases; a base whose
+    /// codes do not fit in what is left is skipped. Returns the bytes loaded.
+    #[cfg(feature = "vector-index")]
+    async fn prefetch_vector_codes(
+        &self,
+        bases: &[Arc<crate::sst::vector::v5::VectorV5Reader>],
+    ) -> Result<u64> {
+        let Some(range_cache) = crate::range_cache::shared_range_cache_snapshot() else {
+            return Ok(0);
+        };
+        let mut remaining = (range_cache.ram_budget_bytes as u64) / 2;
+        let mut loaded = 0u64;
+        let mut seen = std::collections::HashSet::new();
+        for reader in bases {
+            if !seen.insert(Arc::as_ptr(reader) as usize) {
+                continue;
+            }
+            crate::cancel::check()?;
+            let report = reader.prefetch_resident_codes(remaining).await?;
+            remaining = remaining.saturating_sub(report.loaded_bytes);
+            loaded = loaded.saturating_add(report.loaded_bytes);
+        }
+        Ok(loaded)
     }
 
     /// Open every active search generation's readers (see
     /// [`Self::prefetch_read_metadata`]); `(vector, text)` indexes opened.
-    async fn prefetch_search_indexes(&self) -> Result<(usize, usize)> {
+    async fn prefetch_search_indexes(
+        &self,
+        #[cfg(feature = "vector-index")] vector_bases: &mut Vec<
+            Arc<crate::sst::vector::v5::VectorV5Reader>,
+        >,
+    ) -> Result<(usize, usize)> {
         #[cfg(any(feature = "text-index", feature = "vector-index"))]
         let (vector_indexes, text_indexes) = {
-            let (mut vectors, mut texts, legacy) =
-                search_lsm_read::prefetch_search_metadata(self).await?;
+            let (mut vectors, mut texts, legacy) = search_lsm_read::prefetch_search_metadata(
+                self,
+                #[cfg(feature = "vector-index")]
+                vector_bases,
+            )
+            .await?;
             // A generation compacted to one base is read through the base
             // path; open its reader the way that path does.
             for (kind, name) in legacy {
@@ -10172,10 +10241,14 @@ impl<'mt> Snapshot<'mt> {
                 let desc = &self.manifest.manifest.ssts[selected.descriptor_index];
                 match kind {
                     #[cfg(feature = "vector-index")]
-                    SearchLsmKind::Vector => {
-                        vectors +=
-                            usize::from(self.fetch_vector_search_index(desc).await?.is_some());
-                    }
+                    SearchLsmKind::Vector => match self.fetch_vector_search_index(desc).await? {
+                        Some(VectorSearchIndex::Ranged(reader)) => {
+                            vectors += 1;
+                            vector_bases.push(reader);
+                        }
+                        Some(VectorSearchIndex::Legacy(_)) => vectors += 1,
+                        None => {}
+                    },
                     #[cfg(feature = "text-index")]
                     SearchLsmKind::Text => {
                         texts += usize::from(self.fetch_text_search_index(desc).await?.is_some());
@@ -13475,7 +13548,13 @@ pub struct PrefetchSummary {
     pub node_record_pages: usize,
     pub vector_indexes: usize,
     pub text_indexes: usize,
+    /// RaBitQ code and id blocks of opened vector bases loaded into the
+    /// range cache.
+    pub vector_code_bytes: u64,
+    /// Time to warm the metadata above.
     pub elapsed: std::time::Duration,
+    /// Including the vector code tier, which is read after the metadata.
+    pub total_elapsed: std::time::Duration,
 }
 
 /// Atomic publisher cell for the currently-active [`OwnedSnapshot`].

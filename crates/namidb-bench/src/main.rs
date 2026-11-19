@@ -30,6 +30,8 @@ mod loader;
 #[cfg(feature = "object-native")]
 mod object_native;
 mod queries;
+#[cfg(feature = "object-native")]
+mod rabitq_eval;
 mod runner;
 mod vector_recall;
 
@@ -229,6 +231,56 @@ enum Cmd {
         cache_bytes: usize,
         #[arg(long)]
         timeout_ms: Option<u64>,
+    },
+    /// Build a NAMIVG05 base from a raw f32 corpus and compare its int8 and
+    /// RaBitQ navigation against a supplied exact top-k.
+    #[cfg(feature = "object-native")]
+    RabitqEval {
+        /// Raw little-endian f32 rows to build from (omit to reuse `--base`).
+        #[arg(long)]
+        vectors: Option<PathBuf>,
+        /// Base written by the build (`-` keeps it unlinked: no second copy),
+        /// or read when `--vectors`/`--synthetic` are omitted.
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        dim: usize,
+        #[arg(long, default_value = "cosine")]
+        metric: String,
+        #[arg(long)]
+        queries: PathBuf,
+        #[arg(long)]
+        truth: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        truth_k: usize,
+        #[arg(short, long, default_value_t = 10)]
+        k: usize,
+        /// Comma-separated `ef` values (64 is the engine default).
+        #[arg(long, default_value = "64,400")]
+        efs: String,
+        #[arg(long, default_value_t = 200)]
+        max_queries: usize,
+        #[arg(long, default_value = "/tmp")]
+        spool: PathBuf,
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        build_memory_bytes: usize,
+        /// Simulated object-store round trip for cold queries.
+        #[arg(long, default_value_t = 30)]
+        latency_ms: u64,
+        #[arg(long, default_value_t = 100.0)]
+        bandwidth_mib_per_sec: f64,
+        #[arg(long, default_value_t = 20)]
+        cold_queries: usize,
+        /// Comma-separated RaBitQ bound confidence values to sweep.
+        #[arg(long, default_value = "1.9")]
+        epsilons: String,
+        /// Generate this many production-shaped rows instead of `--vectors`.
+        #[arg(long)]
+        synthetic: Option<usize>,
+        #[arg(long, default_value_t = 20_000)]
+        clusters: usize,
+        #[arg(short = 'S', long, default_value_t = 42)]
+        seed: u64,
     },
     /// Gate V5/FT3, incremental VG6/FT4 and paged forward/inverse graph SSTs.
     ///
@@ -745,6 +797,60 @@ async fn main() -> Result<()> {
                 report.speedup_p50,
                 report.build_secs,
             );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "object-native")]
+        Cmd::RabitqEval {
+            vectors,
+            base,
+            dim,
+            metric,
+            queries,
+            truth,
+            truth_k,
+            k,
+            efs,
+            max_queries,
+            spool,
+            build_memory_bytes,
+            latency_ms,
+            bandwidth_mib_per_sec,
+            cold_queries,
+            epsilons,
+            synthetic,
+            clusters,
+            seed,
+        } => {
+            let epsilons = epsilons
+                .split(',')
+                .map(|value| value.trim().parse::<f32>())
+                .collect::<Result<Vec<_>, _>>()?;
+            let efs = efs
+                .split(',')
+                .map(|value| value.trim().parse::<usize>())
+                .collect::<Result<Vec<_>, _>>()?;
+            let report = rabitq_eval::run(rabitq_eval::RabitqEvalConfig {
+                vectors,
+                base,
+                dim,
+                metric,
+                queries,
+                truth,
+                truth_k,
+                k,
+                efs,
+                max_queries,
+                spool,
+                build_memory_bytes,
+                latency_ms,
+                bandwidth_mib_per_sec,
+                cold_queries,
+                epsilons,
+                synthetic,
+                clusters,
+                seed,
+            })
+            .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         #[cfg(feature = "object-native")]
