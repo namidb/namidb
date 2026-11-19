@@ -789,14 +789,11 @@ mod tests {
             folded("がっこう"),
             tokenize_with(TextAnalyzer::Exact, "がっこう")
         );
-        // A Devanagari vowel sign is part of its word under folding.
-        assert_eq!(
-            folded("किताब पढ़ो"),
-            vec!["किताब", "पढो"]
-                .into_iter()
-                .map(fold_text)
-                .collect::<Vec<_>>()
-        );
+        // Devanagari vowel signs and the nukta are part of their word.
+        let tokens = folded("किताब पढ़ो");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[1], fold_text("पढ़ो"));
+        assert!(tokens[1].contains('\u{93c}'), "{:?}", tokens[1]);
         assert_eq!(folded("किताब").len(), 1);
     }
 

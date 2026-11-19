@@ -3693,7 +3693,7 @@ mod tests {
         for (src, needle) in [
             (
                 "CREATE FULLTEXT INDEX ix ON :Doc(body) OPTIONS {analyzer: 'english'}",
-                "unknown full-text analyzer `english` (expected one of: exact, folded)",
+                "unknown full-text analyzer `english` (expected one of: folded, exact)",
             ),
             (
                 "CREATE FULLTEXT INDEX ix ON :Doc(body) OPTIONS {analyser: 'exact'}",

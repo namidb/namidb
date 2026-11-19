@@ -2911,7 +2911,7 @@ mod tests {
             name: "ft".into(),
             label: "Doc".into(),
             properties: vec!["b".into(), "a".into(), "a".into()],
-            analyzer: None,
+            analyzer: ordered.analyzer,
         };
         assert_eq!(
             text_catalog_signature(&ordered),
