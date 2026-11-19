@@ -479,6 +479,9 @@ pub async fn recover_memtable(
 /// `paths.memtable_snapshot()`. If found and its version is supported,
 /// the snapshot is loaded into the memtable and the WAL replay skips
 /// every record whose LSN is already covered.
+/// WAL segment bodies read ahead of the replay during recovery.
+const RECOVERY_SEGMENT_READ_AHEAD: usize = 8;
+
 pub async fn recover_memtable_with_snapshot(
     manifest: &Manifest,
     wal_store: &WalStore,
@@ -539,15 +542,29 @@ pub async fn recover_memtable_with_snapshot(
     let mut segments: Vec<_> = manifest.wal_segments.iter().collect();
     segments.sort_by_key(|s| s.seq);
 
+    // Fast path: a segment whose every record the snapshot already covers
+    // is skipped without a GET. WAL records are LSN-ascending within a
+    // segment and the descriptor's last_lsn is its high-water mark.
+    segments.retain(|seg_desc| seg_desc.last_lsn > snapshot_floor);
+    // The segment bodies are fetched a few at a time ahead of the replay
+    // (which stays in seq order) instead of one round trip after another.
+    use futures::StreamExt;
+    type SegmentRead<'a> = futures::future::BoxFuture<
+        'a,
+        (
+            &'a crate::manifest::WalSegmentDescriptor,
+            Result<crate::wal::WalSegment>,
+        ),
+    >;
+    let mut reads: Vec<SegmentRead<'_>> = Vec::with_capacity(segments.len());
     for seg_desc in segments {
-        // Fast path: if every record in this segment is already
-        // covered by the snapshot, skip the GET entirely. WAL records
-        // are LSN-ascending within a segment and the descriptor's
-        // last_lsn is its high-water mark.
-        if seg_desc.last_lsn <= snapshot_floor {
-            continue;
-        }
-        let segment = wal_store.read_segment(seg_desc.seq).await?;
+        reads.push(Box::pin(async move {
+            (seg_desc, wal_store.read_segment(seg_desc.seq).await)
+        }));
+    }
+    let mut bodies = futures::stream::iter(reads).buffered(RECOVERY_SEGMENT_READ_AHEAD);
+    while let Some((seg_desc, segment)) = bodies.next().await {
+        let segment = segment?;
         let actual_last_lsn = segment.last_lsn();
         if actual_last_lsn != seg_desc.last_lsn {
             // Asymmetric semantics matter here: `actual > declared` means

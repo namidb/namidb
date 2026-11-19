@@ -1333,6 +1333,125 @@ mod indexed {
     }
 
     #[tokio::test]
+    async fn search_vector_accepts_an_index_name_and_the_positional_form() {
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", "Y", vec![0.0, 0.0, 1.0, 0.0]),
+            ("e", "Y", vec![0.5, 0.5, 0.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-sv-forms", VectorMetric::Cosine, &docs).await;
+        let q = vec![1.0, 0.0, 0.0, 0.0];
+        let expected = titles(
+            &run(
+                &w,
+                "CALL search.vector({label: 'Doc', property: 'embedding', query: $q, k: 2}) \
+                 YIELD node RETURN node.title AS title",
+                q.clone(),
+            )
+            .await,
+        );
+        assert_eq!(expected, vec!["a".to_string(), "e".to_string()]);
+        for cypher in [
+            "CALL search.vector({index: 'doc_emb', query: $q, k: 2}) \
+             YIELD node RETURN node.title AS title",
+            "CALL search.vector({index: 'doc_emb', label: 'Doc', property: 'embedding', \
+             query: $q, k: 2}) YIELD node RETURN node.title AS title",
+            "CALL search.vector('doc_emb', 2, $q) YIELD node RETURN node.title AS title",
+            "CALL search.vector('doc_emb', 2, $q, {ef: 32}) YIELD * RETURN node.title AS title",
+        ] {
+            assert_eq!(
+                titles(&run(&w, cypher, q.clone()).await),
+                expected,
+                "{cypher}"
+            );
+        }
+        // The filtered forms agree with each other.
+        let filtered = titles(
+            &run(
+                &w,
+                "CALL search.vector({index: 'doc_emb', query: $q, k: 2, filter: {kind: 'Y'}}) \
+                 YIELD node RETURN node.title AS title",
+                q.clone(),
+            )
+            .await,
+        );
+        assert_eq!(filtered, vec!["e".to_string(), "c".to_string()]);
+        assert_eq!(
+            titles(
+                &run(
+                    &w,
+                    "CALL search.vector('doc_emb', 2, $q, {filter: {kind: 'Y'}}) \
+                     YIELD node RETURN node.title AS title",
+                    q.clone(),
+                )
+                .await
+            ),
+            filtered
+        );
+    }
+
+    #[tokio::test]
+    async fn search_vector_errors_show_the_accepted_forms() {
+        let docs = vec![
+            ("a", "X", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", "X", vec![0.0, 1.0, 0.0, 0.0]),
+        ];
+        let w = build_index_metric("idx-sv-errors", VectorMetric::Cosine, &docs).await;
+        let mut params = Params::new();
+        params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0, 0.0]));
+        for (cypher, expected) in [
+            (
+                "CALL search.vector({index: 'doc_emb', vector: $q, k: 2}) YIELD node RETURN node",
+                "option `vector` (did you mean `query`?)",
+            ),
+            (
+                "CALL search.vector({index: 'doc_emb', query: $q, top_k: 2}) YIELD node RETURN node",
+                "option `top_k` (did you mean `k`?)",
+            ),
+            (
+                "CALL search.vector({index: 'missing', query: $q}) YIELD node RETURN node",
+                "no vector index named `missing` (vector indexes: doc_emb)",
+            ),
+            (
+                "CALL search.vector({index: 'doc_emb', label: 'Other', query: $q}) \
+                 YIELD node RETURN node",
+                "which the `label` option contradicts",
+            ),
+            (
+                "CALL search.vector({query: $q, k: 2}) YIELD node RETURN node",
+                "search.vector({index: 'name', query: $vector, k: 10})",
+            ),
+            (
+                "CALL search.vector('doc_emb', $q) YIELD node RETURN node",
+                "search.vector('index name', 10, $vector",
+            ),
+            (
+                "CALL search.vector('doc_emb', 2, $q, {filtre: {kind: 'Y'}}) \
+                 YIELD node RETURN node",
+                "does not recognise the option `filtre`",
+            ),
+            (
+                "CALL search.vector('doc_emb', 'two', $q) YIELD node RETURN node",
+                "the second argument (k) must be a non-negative integer",
+            ),
+            (
+                "CALL search.vector() YIELD node RETURN node",
+                "search.vector({label: 'L', property: 'p'",
+            ),
+        ] {
+            let plan = lower(&parse(cypher).unwrap()).unwrap();
+            let err = execute(&plan, &w.snapshot(), &params)
+                .await
+                .expect_err("an invalid search.vector call must fail");
+            assert!(
+                format!("{err:?}").contains(expected),
+                "expected {expected:?} for {cypher}, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn query_nodes_rejects_extra_and_malformed_options() {
         let w = WriterSession::open(store(), paths("idx-qn-invalid-options"))
             .await

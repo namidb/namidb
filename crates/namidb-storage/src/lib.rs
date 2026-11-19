@@ -14,6 +14,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod adjacency;
+pub mod background;
 pub mod backup;
 pub mod cache;
 pub mod cache_budget;

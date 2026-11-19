@@ -221,3 +221,68 @@ async fn labels_survive_a_reopen() {
     assert_eq!(a.len(), 1);
     assert!(a[0].labels.contains("A") && a[0].labels.contains("B"));
 }
+
+/// Endpoint existence over overlapping node SSTs and a non-empty memtable
+/// answers exactly what hydration answers: nodes rewritten in a newer SST,
+/// a node tombstoned in a newer SST, an unlabelled node, a node only in the
+/// memtable, a node tombstoned in the memtable, and ids that never existed.
+#[tokio::test]
+async fn existence_over_overlapping_ssts_matches_hydration() {
+    let (st, ns) = (store(), paths("ml-exist-overlap"));
+    let mut s = WriterSession::open(st.clone(), ns.clone()).await.unwrap();
+    for i in 1..=8 {
+        s.upsert_node_with_labels(labels(&["A"]), nid(i), &rec("old"))
+            .unwrap();
+    }
+    s.upsert_node_with_labels(labels(&["B"]), nid(9), &rec("old"))
+        .unwrap();
+    s.upsert_node_with_labels(Vec::<String>::new(), nid(10), &rec("bare"))
+        .unwrap();
+    s.commit_batch().await.unwrap();
+    s.flush(Schema::empty()).await.unwrap();
+
+    s.upsert_node_with_labels(labels(&["B"]), nid(1), &rec("new"))
+        .unwrap();
+    s.upsert_node_with_labels(labels(&["A", "C"]), nid(5), &rec("new"))
+        .unwrap();
+    s.tombstone_node("A", nid(2)).unwrap();
+    s.upsert_node_with_labels(Vec::<String>::new(), nid(11), &rec("bare"))
+        .unwrap();
+    s.upsert_node_with_labels(labels(&["A"]), nid(12), &rec("new"))
+        .unwrap();
+    s.commit_batch().await.unwrap();
+    s.flush(Schema::empty()).await.unwrap();
+
+    // Memtable only: a new node, and a tombstone over a flushed one.
+    s.upsert_node_with_labels(labels(&["C"]), nid(20), &rec("mem"))
+        .unwrap();
+    s.tombstone_node("A", nid(3)).unwrap();
+    s.commit_batch().await.unwrap();
+
+    let snap = s.snapshot();
+    assert!(
+        snap.metadata_node_count(None).is_none(),
+        "the node SSTs must overlap for this test to mean anything"
+    );
+    let probe: Vec<NodeId> = (1..=25).map(nid).collect();
+    let proved = snap
+        .try_batch_nodes_exist(&probe)
+        .await
+        .unwrap()
+        .expect("overlapping SSTs are answered, not refused");
+    let hydrated: Vec<bool> = snap
+        .batch_lookup_nodes("", &probe)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|view| view.is_some())
+        .collect();
+    assert_eq!(proved, hydrated);
+    let live: Vec<u8> = probe
+        .iter()
+        .zip(&proved)
+        .filter(|(_, live)| **live)
+        .map(|(id, _)| id.as_bytes()[15])
+        .collect();
+    assert_eq!(live, vec![1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20]);
+}

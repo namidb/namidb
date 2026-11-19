@@ -2711,9 +2711,107 @@ async fn apply_sets(
     params: &Params,
     outcome: &mut WriteOutcome,
 ) -> Result<Row, ExecError> {
-    for op in items {
-        row = apply_set(op, row, writer, params, outcome).await?;
+    let mut i = 0;
+    while i < items.len() {
+        // Consecutive property assignments to one node become one
+        // full-record write instead of one per assignment.
+        let run = node_property_run(&items[i..], &row);
+        if run > 1 {
+            row = apply_node_property_run(&items[i..i + run], row, writer, params, outcome).await?;
+            i += run;
+        } else {
+            row = apply_set(&items[i], row, writer, params, outcome).await?;
+            i += 1;
+        }
     }
+    Ok(row)
+}
+
+/// How many leading `items` are `SET <alias>.<key> = ...` on one alias that
+/// is bound to a node in `row` (0 or 1 when there is nothing to merge).
+fn node_property_run(items: &[SetOp], row: &Row) -> usize {
+    let Some(SetOp::Property { target_alias, .. }) = items.first() else {
+        return 0;
+    };
+    if !matches!(row.get(target_alias), Some(RuntimeValue::Node(_))) {
+        return 0;
+    }
+    items
+        .iter()
+        .take_while(
+            |op| matches!(op, SetOp::Property { target_alias: alias, .. } if alias == target_alias),
+        )
+        .count()
+}
+
+/// `SET n.a = x, n.b = y, ...` on one node: each right-hand side is evaluated
+/// in order and sees the assignments before it, every assignment is checked
+/// as [`apply_set`] checks it, and the node is written once with all of them.
+/// A full-record write per assignment wrote (and logged) the whole node, its
+/// large vector and text properties included, once per assignment.
+async fn apply_node_property_run(
+    items: &[SetOp],
+    mut row: Row,
+    writer: &mut WriterSession,
+    params: &Params,
+    outcome: &mut WriteOutcome,
+) -> Result<Row, ExecError> {
+    let Some(SetOp::Property { target_alias, .. }) = items.first() else {
+        unreachable!("node_property_run only counts property assignments");
+    };
+    refresh_staged_write_target(&mut row, target_alias, writer)?;
+    let Some(RuntimeValue::Node(node)) = row.get(target_alias).cloned() else {
+        unreachable!("node_property_run checked the binding");
+    };
+    let mut node = *node;
+    let label_vec: Vec<String> = node.labels.iter().cloned().collect();
+    let mut core_props = node_runtime_props_to_core(&node.properties)?;
+    let mut keys: Vec<&str> = Vec::with_capacity(items.len());
+    for op in items {
+        let SetOp::Property { key, value, .. } = op else {
+            unreachable!("node_property_run only counts property assignments");
+        };
+        let new_val = evaluate(value, &row, params)?;
+        let core = runtime_to_core(&new_val, value).map_err(ExecError::Runtime)?;
+        enforce_unique_on_set(writer, &label_vec, key, &core, node.id).await?;
+        if matches!(core, CoreValue::Null) {
+            if let Some(label) = not_null_label(writer, &label_vec, key) {
+                return Err(ExecError::Constraint(format!(
+                    "{label}.{key} is declared NOT NULL and cannot be set to null \
+                     (not-null constraint)"
+                )));
+            }
+        }
+        node.properties
+            .insert(key.clone(), RuntimeValue::from(core.clone()));
+        core_props.insert(key.clone(), core);
+        if !keys.contains(&key.as_str()) {
+            keys.push(key.as_str());
+        }
+        // The next right-hand side reads this assignment through any alias.
+        synchronize_node_bindings(&mut row, &node);
+    }
+    enforce_composite_unique(writer, &label_vec, &core_props, Some(node.id), Some(&keys)).await?;
+    enforce_vector_dims(writer, &label_vec, &mut core_props, Some(&keys))?;
+    let runtime_props = core_props
+        .iter()
+        .map(|(name, value)| (name.clone(), RuntimeValue::from(value.clone())))
+        .collect();
+    let record = NodeWriteRecord {
+        properties: core_props,
+        schema_version: 1,
+        ..Default::default()
+    };
+    writer
+        .upsert_node_with_labels(node.labels.iter().cloned(), node.id, &record)
+        .map_err(ExecError::Storage)?;
+    outcome.properties_set += items.len() as u64;
+    let updated = NodeValue {
+        id: node.id,
+        labels: node.labels,
+        properties: runtime_props,
+    };
+    synchronize_node_bindings(&mut row, &updated);
     Ok(row)
 }
 

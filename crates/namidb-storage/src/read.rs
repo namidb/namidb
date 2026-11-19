@@ -226,6 +226,29 @@ where
     }
 }
 
+/// Process-wide byte bound of opened edge-SST readers shared by snapshots.
+const SHARED_EDGE_READER_CACHE_MAX_BYTES_ENV: &str = "NAMIDB_EDGE_READER_CACHE_MAX_BYTES";
+const SHARED_EDGE_READER_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Opened edge-SST readers (footer plus fence index) shared by every
+/// snapshot, keyed by store and path. Bounded by
+/// `NAMIDB_EDGE_READER_CACHE_MAX_BYTES`, by default 1/32 of the process
+/// cache budget, at most 64 MiB.
+fn shared_edge_reader_cache() -> &'static Mutex<SnapshotByteCache<String, Arc<PagedEdgeReader>>> {
+    static CACHE: std::sync::OnceLock<Mutex<SnapshotByteCache<String, Arc<PagedEdgeReader>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let bytes = match std::env::var(SHARED_EDGE_READER_CACHE_MAX_BYTES_ENV) {
+            Ok(_) => snapshot_local_cache_max_bytes(SHARED_EDGE_READER_CACHE_MAX_BYTES_ENV),
+            Err(_) => (crate::cache_budget::cache_max_bytes() / 32).min(64 * 1024 * 1024),
+        };
+        Mutex::new(SnapshotByteCache::new(
+            bytes,
+            SHARED_EDGE_READER_CACHE_MAX_ENTRIES,
+        ))
+    })
+}
+
 fn snapshot_local_cache_max_bytes(name: &str) -> usize {
     match std::env::var(name) {
         Ok(value) => match value.trim().parse::<usize>() {
@@ -4165,10 +4188,18 @@ impl<'mt> Snapshot<'mt> {
             return Ok(Some(Vec::new()));
         }
         let Some(descriptors) = self.disjoint_node_descriptors() else {
+            // Overlapping node SSTs (an update rewrote nodes a later SST
+            // also holds) or nodes in the memtable: resolve each id's newest
+            // version instead of hydrating every endpoint.
+            let proved = self.try_batch_nodes_exist_overlapping(ids).await?;
             if let Some(cache) = &self.cache {
-                cache.record_label_membership_fallback();
+                if proved.is_some() {
+                    cache.record_label_membership_fast_path();
+                } else {
+                    cache.record_label_membership_fallback();
+                }
             }
-            return Ok(None);
+            return Ok(proved);
         };
 
         let mut probes_by_descriptor: BTreeMap<usize, Vec<(usize, [u8; 16])>> = BTreeMap::new();
@@ -4432,6 +4463,148 @@ impl<'mt> Snapshot<'mt> {
     /// own fallback would, so an id the postings cannot prove is slower,
     /// never wrong. `None` (overlapping LSN ranges, a sidecar that cannot
     /// prove completeness) leaves the whole batch to the caller.
+    /// [`Self::try_batch_nodes_exist`] over node SSTs whose key ranges
+    /// overlap, or with nodes in the memtable. Each id is resolved at its
+    /// newest version, newest SST first, the way
+    /// [`Self::try_batch_nodes_have_labels_overlapping`] resolves labels:
+    /// a posting under any label in the newest SST that holds the id proves
+    /// a live node there. The bloom filter and the node locator move an id
+    /// the SST does not hold on to the older SSTs. What stays unproven (an
+    /// id in the memtable, an unlabelled node, a tombstone, a missing
+    /// locator) is answered by a point read, never by inference. `None` when
+    /// the SSTs interleave their LSNs over shared keys or a label sidecar is
+    /// missing or fails its checks.
+    async fn try_batch_nodes_exist_overlapping(&self, ids: &[NodeId]) -> Result<Option<Vec<bool>>> {
+        let ssts = &self.manifest.manifest.ssts;
+        let mut order: Vec<usize> = self
+            .manifest
+            .index
+            .node_descriptors()
+            .into_iter()
+            .filter(|idx| ssts[*idx].row_count > 0)
+            .collect();
+        if order.iter().any(|idx| {
+            ssts[*idx].min_key > ssts[*idx].max_key || ssts[*idx].min_lsn > ssts[*idx].max_lsn
+        }) {
+            return Ok(None);
+        }
+        order.sort_by_key(|idx| Reverse(ssts[*idx].max_lsn));
+        let holds =
+            |idx: usize, id: &[u8; 16]| ssts[idx].min_key <= *id && *id <= ssts[idx].max_key;
+        for (rank, &newer) in order.iter().enumerate() {
+            for &older in &order[rank + 1..] {
+                let shares_keys = ssts[newer].min_key <= ssts[older].max_key
+                    && ssts[older].min_key <= ssts[newer].max_key;
+                if shares_keys && ssts[older].max_lsn >= ssts[newer].min_lsn {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let mut output = vec![false; ids.len()];
+        let mut point_read = Vec::new();
+        let mut pending = Vec::new();
+        for (position, id) in ids.iter().enumerate() {
+            if self.node_mem_entry(*id).is_some() {
+                point_read.push(position);
+            } else {
+                pending.push((position, *id.as_bytes()));
+            }
+        }
+        for &idx in &order {
+            if pending.is_empty() {
+                break;
+            }
+            let desc = &ssts[idx];
+            let (mut here, rest): (Vec<_>, Vec<_>) =
+                pending.into_iter().partition(|(_, id)| holds(idx, id));
+            pending = rest;
+            if here.is_empty() {
+                continue;
+            }
+            if let Some(bloom) = self.bloom_filter(desc).await? {
+                let (admitted, absent): (Vec<_>, Vec<_>) =
+                    here.into_iter().partition(|(_, id)| bloom.contains(id));
+                here = admitted;
+                pending.extend(absent);
+            }
+            if here.is_empty() {
+                continue;
+            }
+            let Some(index) = &desc.label_index else {
+                return Ok(None);
+            };
+            let Some(source) = self.label_membership_source(desc).await? else {
+                return Ok(None);
+            };
+            // Any label posting here is a live newest version. The most
+            // populated labels go first, and an id leaves the probe set at
+            // its first hit, so a wide schema costs probes only for the ids
+            // the big labels do not settle.
+            let mut labels: Vec<(u32, u64)> = index
+                .per_label_counts
+                .iter()
+                .copied()
+                .filter(|entry| entry.1 > 0)
+                .collect();
+            labels.sort_by_key(|(label_id, count)| (Reverse(*count), *label_id));
+            let mut unproved = here;
+            for (label_id, _) in &labels {
+                if unproved.is_empty() {
+                    break;
+                }
+                let probe_ids: Vec<[u8; 16]> = unproved.iter().map(|(_, id)| *id).collect();
+                let Some(found) = self
+                    .probe_label_membership(desc, &source, *label_id, &probe_ids)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let mut still = Vec::with_capacity(unproved.len());
+                for ((position, id), found) in unproved.into_iter().zip(found) {
+                    if found {
+                        output[position] = true;
+                    } else {
+                        still.push((position, id));
+                    }
+                }
+                unproved = still;
+            }
+            if unproved.is_empty() {
+                continue;
+            }
+            // No posting: a tombstone or an unlabelled node here, or a bloom
+            // false positive whose version (if any) is older. The locator
+            // lists every row of the SST, tombstones included.
+            let unproved_ids: Vec<[u8; 16]> = unproved.iter().map(|(_, id)| *id).collect();
+            match self.node_locator_presence(desc, &unproved_ids).await? {
+                Some(present) => {
+                    for (position, id) in unproved {
+                        if present.contains(&id) {
+                            point_read.push(position);
+                        } else {
+                            pending.push((position, id));
+                        }
+                    }
+                }
+                None => point_read.extend(unproved.into_iter().map(|(position, _)| position)),
+            }
+        }
+        // Whatever is still pending is in no SST, so it is absent.
+
+        if !point_read.is_empty() {
+            let point_ids: Vec<NodeId> = point_read.iter().map(|position| ids[*position]).collect();
+            let views = self.batch_lookup_nodes("", &point_ids).await?;
+            if let Some(cache) = &self.cache {
+                cache.record_label_membership_point_reads(point_ids.len());
+            }
+            for (position, view) in point_read.into_iter().zip(views) {
+                output[position] = view.is_some();
+            }
+        }
+        Ok(Some(output))
+    }
+
     async fn try_batch_nodes_have_labels_overlapping(
         &self,
         labels: &[String],
@@ -9936,11 +10109,45 @@ impl<'mt> Snapshot<'mt> {
             }
             Ok::<_, Error>(pages)
         };
+        // Edge SST readers (footer and fence index) and bloom filters: the
+        // first graph expansion otherwise opens them one dependent read at a
+        // time per relationship type and direction.
+        let edges = async {
+            use futures::StreamExt;
+            let prefix = self.paths.namespace_prefix();
+            let descs: Vec<&SstDescriptor> = self
+                .manifest
+                .manifest
+                .ssts
+                .iter()
+                .filter(|desc| matches!(desc.kind, SstKind::EdgesFwd | SstKind::EdgesInv))
+                .take(PREFETCH_EDGE_SST_LIMIT)
+                .collect();
+            let mut opens: Vec<futures::future::BoxFuture<'_, Result<()>>> =
+                Vec::with_capacity(descs.len());
+            for desc in descs {
+                let absolute = format!("{}/{}", prefix.as_ref(), desc.path);
+                opens.push(Box::pin(async move {
+                    crate::cancel::check()?;
+                    self.bloom_filter(desc).await?;
+                    self.fetch_paged_edge_reader(&absolute).await?;
+                    Ok(())
+                }));
+            }
+            let mut opened = futures::stream::iter(opens).buffer_unordered(8);
+            let mut edge_ssts = 0usize;
+            while let Some(result) = opened.next().await {
+                result?;
+                edge_ssts += 1;
+            }
+            Ok::<_, Error>(edge_ssts)
+        };
         let search = self.prefetch_search_indexes();
-        let (node_ssts, node_record_pages, (vector_indexes, text_indexes)) =
-            futures::try_join!(node_ssts, node_records, search)?;
+        let (node_ssts, node_record_pages, (vector_indexes, text_indexes), edge_ssts) =
+            futures::try_join!(node_ssts, node_records, search, edges)?;
         Ok(PrefetchSummary {
             node_ssts,
+            edge_ssts,
             node_record_pages,
             vector_indexes,
             text_indexes,
@@ -10591,8 +10798,34 @@ impl<'mt> Snapshot<'mt> {
         if let Some(reader) = self.paged_edge_readers.lock().unwrap().get(&cache_key) {
             return Ok(reader);
         }
-        let reader =
-            Arc::new(PagedEdgeReader::open(self.store.clone(), Path::from(absolute)).await?);
+        // Edge SSTs are immutable and uniquely named, so an opened reader
+        // (its footer and fence index) is shared by every snapshot of the
+        // process. Without it, a statement expanding over every relationship
+        // type re-opened readers whose fence indexes did not fit the small
+        // snapshot-local cache on every lookup.
+        let shared_key = format!(
+            "{}|{absolute}",
+            crate::range_cache::cache_store_token(&self.store)
+        );
+        let shared = shared_edge_reader_cache();
+        let cached = shared.lock().unwrap().get(&shared_key);
+        let reader = match cached {
+            Some(reader) => reader,
+            None => {
+                let reader = Arc::new(
+                    PagedEdgeReader::open(self.store.clone(), Path::from(absolute)).await?,
+                );
+                let weight = shared_key
+                    .len()
+                    .saturating_add(reader.resident_metadata_bytes())
+                    .saturating_add(SNAPSHOT_CACHE_ENTRY_OVERHEAD_BYTES);
+                shared
+                    .lock()
+                    .unwrap()
+                    .insert(shared_key, reader.clone(), weight);
+                reader
+            }
+        };
         let weight = absolute
             .len()
             .saturating_add(reader.resident_metadata_bytes())
@@ -13182,11 +13415,15 @@ impl std::fmt::Debug for PinnedSnapshot {
 
 /// Node SSTs whose footers [`Snapshot::prefetch_read_metadata`] reads.
 pub const PREFETCH_NODE_SST_LIMIT: usize = 256;
+/// Edge SSTs whose readers [`Snapshot::prefetch_read_metadata`] opens.
+pub const PREFETCH_EDGE_SST_LIMIT: usize = 256;
 
 /// What [`Snapshot::prefetch_read_metadata`] warmed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PrefetchSummary {
     pub node_ssts: usize,
+    /// Edge SSTs whose reader and bloom filter were opened.
+    pub edge_ssts: usize,
     /// Upper-level pages of exact node-record indexes warmed.
     pub node_record_pages: usize,
     pub vector_indexes: usize,
