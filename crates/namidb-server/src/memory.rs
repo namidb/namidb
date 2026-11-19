@@ -50,6 +50,8 @@ const RECLAIM_PERCENT: usize = 90;
 const RESUME_PERCENT: usize = 80;
 const HARD_RECLAIM_COOLDOWN: Duration = Duration::from_secs(1);
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
+/// How often a statement waiting for memory headroom re-samples it.
+const ADMISSION_POLL: Duration = Duration::from_millis(25);
 /// How long an unbroken run of refused admissions has to last before it stops
 /// reading as a transient spike and starts being logged as an outage.
 const SUSTAINED_PRESSURE_SECS: u64 = 10;
@@ -293,6 +295,12 @@ pub struct MemoryGovernor {
     query_memory_pool: Option<Arc<namidb_query::QueryMemoryPool>>,
     /// Running queries stopped because the process reached its ceiling.
     query_memory_process_stops: AtomicU64,
+    /// How long a new statement waits in line for memory headroom before it
+    /// is refused (zero: refuse at once, the historical behaviour). A
+    /// burst that briefly pushes resident memory to the ceiling used to turn
+    /// straight into 503s even though the running queries were about to
+    /// finish and give their memory back; queued work now waits for that.
+    admission_wait: Duration,
 }
 
 /// RAII reservation against [`MemoryGovernor`]'s total-memory ceiling.
@@ -342,6 +350,7 @@ impl MemoryGovernor {
             query_memory_max_bytes: 0,
             query_memory_pool: None,
             query_memory_process_stops: AtomicU64::new(0),
+            admission_wait: Duration::ZERO,
         }
         .with_query_memory_max_bytes(percent(max_bytes, AUTO_QUERY_MEMORY_PERCENT))
     }
@@ -363,6 +372,61 @@ impl MemoryGovernor {
             self.query_memory_pool = None;
         }
         self
+    }
+
+    /// Let admissions wait up to `wait` for memory headroom instead of being
+    /// refused on the first over-ceiling sample (builder style).
+    pub fn with_admission_wait(mut self, wait: Duration) -> Self {
+        self.admission_wait = wait;
+        self
+    }
+
+    /// How long an admission may wait for memory headroom.
+    pub fn admission_wait(&self) -> Duration {
+        self.admission_wait
+    }
+
+    /// Whether the shared query working-memory pool can take another
+    /// statement: at least an eighth of one query's budget (and never more
+    /// than an eighth of the pool) must be unreserved. Admitting into a full
+    /// pool only moves the refusal from the queue, where it can wait, into
+    /// the running statement, where it is an error.
+    pub fn query_pool_has_room(&self) -> bool {
+        let Some(pool) = &self.query_memory_pool else {
+            return true;
+        };
+        let floor = (self.query_memory_max_bytes / 8).min(pool.capacity_bytes() / 8);
+        pool.reserved_bytes().saturating_add(floor) <= pool.capacity_bytes()
+    }
+
+    /// Wait, until `deadline`, for the process to be below its ceiling and
+    /// the query pool to have room. Reclaim runs as in [`Self::admit_query`];
+    /// the refusal after the deadline carries the last observation.
+    pub async fn await_query_headroom(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), MemoryPressure> {
+        loop {
+            let resident = match self.observe_resident() {
+                Some(initial) => self.reclaim_off_worker(initial).await,
+                None => 0,
+            };
+            let pressure = Self::projected_pressure(resident, 0, self.max_bytes);
+            if pressure.is_none() && self.query_pool_has_room() {
+                return Ok(());
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                let pressure = pressure.unwrap_or(MemoryPressure {
+                    resident_bytes: resident,
+                    requested_headroom_bytes: 0,
+                    max_bytes: self.max_bytes,
+                });
+                self.note_rejection(&pressure);
+                return Err(pressure);
+            }
+            tokio::time::sleep_until(deadline.min(now + ADMISSION_POLL)).await;
+        }
     }
 
     /// The effective per-query working-memory budget; zero when disabled.
@@ -444,16 +508,22 @@ impl MemoryGovernor {
         if self.max_bytes == 0 {
             return Ok(());
         }
-        let Some(initial) = self.observe_resident() else {
-            return Ok(());
-        };
-        let resident = self.reclaim_off_worker(initial).await;
-
-        if let Some(pressure) = Self::projected_pressure(resident, 0, self.max_bytes) {
-            self.note_rejection(&pressure);
-            return Err(pressure);
+        let deadline = tokio::time::Instant::now() + self.admission_wait;
+        loop {
+            let Some(initial) = self.observe_resident() else {
+                return Ok(());
+            };
+            let resident = self.reclaim_off_worker(initial).await;
+            let Some(pressure) = Self::projected_pressure(resident, 0, self.max_bytes) else {
+                return Ok(());
+            };
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                self.note_rejection(&pressure);
+                return Err(pressure);
+            }
+            tokio::time::sleep_until(deadline.min(now + ADMISSION_POLL)).await;
         }
-        Ok(())
     }
 
     /// Publish the in-flight query registry so refusals can name the
@@ -606,28 +676,57 @@ impl MemoryGovernor {
                 bytes: 0,
             });
         }
-        let Some(initial) = self.observe_resident() else {
-            return Ok(MemoryHeadroomReservation {
-                governor: Arc::clone(self),
-                bytes: 0,
-            });
-        };
-        let resident = self.reclaim_off_worker(initial).await;
-        self.try_reserve_observed(resident, additional_bytes)
+        let deadline = tokio::time::Instant::now() + self.admission_wait;
+        loop {
+            let Some(initial) = self.observe_resident() else {
+                return Ok(MemoryHeadroomReservation {
+                    governor: Arc::clone(self),
+                    bytes: 0,
+                });
+            };
+            let resident = self.reclaim_off_worker(initial).await;
+            let now = tokio::time::Instant::now();
+            // A request larger than the whole ceiling can never fit: refuse
+            // it at once instead of holding it in line until the deadline.
+            let hopeless = additional_bytes >= self.max_bytes;
+            let last_try = hopeless || now >= deadline;
+            match self.try_reserve_observed_quiet(resident, additional_bytes, last_try) {
+                Ok(reservation) => return Ok(reservation),
+                Err(pressure) if last_try => return Err(pressure),
+                Err(_) => tokio::time::sleep_until(deadline.min(now + ADMISSION_POLL)).await,
+            }
+        }
     }
 
+    #[cfg(test)]
     fn try_reserve_observed(
         self: &Arc<Self>,
         resident_bytes: usize,
         additional_bytes: usize,
     ) -> Result<MemoryHeadroomReservation, MemoryPressure> {
+        self.try_reserve_observed_quiet(resident_bytes, additional_bytes, true)
+    }
+
+    /// [`Self::try_reserve_observed`] that counts and logs a refusal only
+    /// when `final_attempt` (a waiting admission retries silently).
+    fn try_reserve_observed_quiet(
+        self: &Arc<Self>,
+        resident_bytes: usize,
+        additional_bytes: usize,
+        final_attempt: bool,
+    ) -> Result<MemoryHeadroomReservation, MemoryPressure> {
+        let note = |pressure: &MemoryPressure| {
+            if final_attempt {
+                self.note_rejection(pressure);
+            }
+        };
         loop {
             let reserved = self.reserved_headroom_bytes.load(Ordering::Acquire);
             let projected_headroom = reserved.saturating_add(additional_bytes);
             if let Some(pressure) =
                 Self::projected_pressure(resident_bytes, projected_headroom, self.max_bytes)
             {
-                self.note_rejection(&pressure);
+                note(&pressure);
                 return Err(pressure);
             }
             let next = reserved.checked_add(additional_bytes).ok_or_else(|| {
@@ -636,7 +735,7 @@ impl MemoryGovernor {
                     requested_headroom_bytes: usize::MAX,
                     max_bytes: self.max_bytes,
                 };
-                self.note_rejection(&pressure);
+                note(&pressure);
                 pressure
             })?;
             match self.reserved_headroom_bytes.compare_exchange_weak(
@@ -1009,17 +1108,33 @@ fn sample_resident_bytes() -> Option<usize> {
         .or_else(|| memory_stats::memory_stats().map(|stats| stats.physical_mem))
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// Allocator-specific "give free memory back to the OS" hook.
+///
+/// The server binary installs one for the global allocator it links (see
+/// `main.rs`); the library cannot know which allocator the final binary uses.
+static ALLOCATOR_RECLAIM: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register how the process's global allocator returns free pages to the
+/// operating system. Called once by the binary that picks the allocator;
+/// later calls are ignored.
+pub fn set_allocator_reclaim(reclaim: fn()) {
+    let _ = ALLOCATOR_RECLAIM.set(reclaim);
+}
+
+/// Ask the allocator(s) to return wholly free pages to the OS: the global
+/// allocator through its registered hook, and glibc's heap (still used by
+/// C dependencies that call `malloc` directly) through `malloc_trim`.
 pub(crate) fn trim_allocator() {
+    if let Some(reclaim) = ALLOCATOR_RECLAIM.get() {
+        reclaim();
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: `malloc_trim(0)` has no pointer preconditions and only asks the
     // process-global glibc allocator to release wholly free pages.
     unsafe {
         libc::malloc_trim(0);
     }
 }
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub(crate) fn trim_allocator() {}
 
 #[cfg(test)]
 mod tests {
@@ -1421,6 +1536,53 @@ mod tests {
             )),
             "got {holders}"
         );
+    }
+
+    /// With an admission wait, a statement arriving over the ceiling waits
+    /// in line for the whole window and only then is refused (counted once,
+    /// not once per re-sample); without one it is refused at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_waits_for_headroom_until_its_deadline() {
+        // A few bytes: the process is always over this ceiling.
+        let immediate = Arc::new(MemoryGovernor::new(1));
+        let started = Instant::now();
+        assert!(immediate.admit_query().await.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // 4 KiB: always exceeded, yet larger than the 16-byte request below.
+        let waiting =
+            Arc::new(MemoryGovernor::new(4096).with_admission_wait(Duration::from_millis(150)));
+        let started = Instant::now();
+        assert!(waiting.admit_query().await.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(
+            waiting.rejected_queries(),
+            1,
+            "one refusal, not one per poll"
+        );
+
+        let started = Instant::now();
+        assert!(waiting.reserve_query_headroom(16).await.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(waiting.rejected_queries(), 2);
+
+        // A request larger than the whole ceiling can never fit: no waiting.
+        let started = Instant::now();
+        assert!(waiting.reserve_query_headroom(usize::MAX).await.is_err());
+        assert!(started.elapsed() < Duration::from_millis(150));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let started = Instant::now();
+        assert!(waiting.await_query_headroom(deadline).await.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(100));
+
+        // No ceiling: always admitted at once.
+        let open = Arc::new(MemoryGovernor::new(0).with_admission_wait(Duration::from_secs(5)));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        assert!(open.await_query_headroom(deadline).await.is_ok());
+        assert!(open.admit_query().await.is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// A run starts at zero and is measured from its start, not restarted by

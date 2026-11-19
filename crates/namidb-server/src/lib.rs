@@ -1364,7 +1364,8 @@ pub async fn run_with_memory_limits(
     };
     let memory = Arc::new(
         memory::MemoryGovernor::new(memory_max_bytes)
-            .with_query_memory_max_bytes(query_memory_max_bytes),
+            .with_query_memory_max_bytes(query_memory_max_bytes)
+            .with_admission_wait(read_admission_wait()),
     );
     if memory.query_memory_max_bytes() > 0 {
         // `auto` is 50% of the process ceiling (25% of the available memory
@@ -2493,13 +2494,11 @@ pub(crate) fn plan_contains_node_scan(plan: &namidb_query::LogicalPlan) -> bool 
 /// get server-side admission instead of each implementing a queue.
 ///
 /// `NAMIDB_MAX_CONCURRENT_QUERIES` overrides the default of
-/// `max(4, available cores)`; `0` disables the gate.
+/// [`default_max_concurrent_queries`]; `0` disables the gate.
 fn read_admission_gate() -> Option<&'static tokio::sync::Semaphore> {
     static GATE: std::sync::OnceLock<Option<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     GATE.get_or_init(|| {
-        let default = std::thread::available_parallelism()
-            .map(|n| n.get().max(4))
-            .unwrap_or(4);
+        let default = default_max_concurrent_queries(available_cpus());
         let permits = std::env::var("NAMIDB_MAX_CONCURRENT_QUERIES")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
@@ -2572,16 +2571,57 @@ fn max_concurrent_queries_per_namespace() -> usize {
         .unwrap_or(0)
 }
 
-/// How long a read may queue for admission before the retryable 503
-/// (`NAMIDB_QUERY_ADMISSION_WAIT_MS`, default 5000). Bounded chiefly for
-/// Bolt, which has no outer request-timeout layer.
-fn read_admission_wait() -> Duration {
-    Duration::from_millis(
-        std::env::var("NAMIDB_QUERY_ADMISSION_WAIT_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .unwrap_or(5_000),
-    )
+/// CPUs this process may use: the cgroup CPU quota when one is set (std
+/// reads `cpu.max`), else the online cores. Sizes the async runtime and the
+/// default read concurrency.
+pub fn available_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Default number of reads that execute at once: two per CPU, at least four.
+///
+/// A read is not pure CPU: it waits on range reads (object store, disk
+/// cache) between bursts of decoding and scoring, so one read per CPU left
+/// the CPUs idle half the time. Two per CPU keeps them busy while bounding
+/// how many working sets are alive at once; everything beyond waits in the
+/// fair admission queue ([`read_admission_wait`]) instead of being refused.
+pub fn default_max_concurrent_queries(cpus: usize) -> usize {
+    cpus.saturating_mul(2).max(4)
+}
+
+/// Default for [`read_admission_wait`]: long enough for a queue of a few
+/// dozen statements to drain on a small server, short enough that a client
+/// hears back well inside the HTTP request ceiling.
+pub const DEFAULT_QUERY_ADMISSION_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a statement may queue for admission (a concurrency slot and
+/// memory headroom) before the retryable 503 with `Retry-After`
+/// (`NAMIDB_QUERY_ADMISSION_WAIT_MS`, default
+/// [`DEFAULT_QUERY_ADMISSION_WAIT`]). Bounded chiefly for Bolt, which has no
+/// outer request-timeout layer.
+pub fn read_admission_wait() -> Duration {
+    std::env::var("NAMIDB_QUERY_ADMISSION_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_QUERY_ADMISSION_WAIT)
+}
+
+/// `Retry-After` (seconds) sent with every overload refusal: the admission
+/// queue's deadline, memory pressure, a full working-memory pool. Short on
+/// purpose: by the time a refusal is sent the queue has already absorbed
+/// the burst for the whole admission window.
+pub const OVERLOAD_RETRY_AFTER_SECS: u64 = 2;
+
+/// Add `Retry-After` to an overload refusal.
+pub(crate) fn with_retry_after(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(OVERLOAD_RETRY_AFTER_SECS),
+    );
+    response
 }
 
 /// Guards a read holds for its whole execution: the admission permit and,
@@ -2603,7 +2643,52 @@ pub async fn acquire_read_admission(
     plan: &namidb_query::LogicalPlan,
     namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
 ) -> Result<ReadAdmission, &'static str> {
+    acquire_read_admission_with_memory(plan, namespace_gate, None)
+        .await
+        .map_err(|refusal| match refusal {
+            AdmissionRefused::Queue(gate) => gate,
+            AdmissionRefused::Memory(_) => "NAMIDB_MEMORY_MAX_BYTES",
+        })
+}
+
+/// Why a read left the admission queue without a slot.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum AdmissionRefused {
+    /// No concurrency slot within the window; carries the knob of the full gate.
+    Queue(&'static str),
+    /// A slot, but no memory headroom within the window.
+    Memory(memory::MemoryPressure),
+}
+
+/// [`acquire_read_admission`] that also waits, holding its place at the
+/// head of the line, for memory headroom ([`memory::MemoryGovernor::await_query_headroom`]):
+/// the process below its ceiling and room in the query working-memory pool.
+/// One deadline covers the whole wait.
+#[doc(hidden)]
+pub async fn acquire_read_admission_with_memory(
+    plan: &namidb_query::LogicalPlan,
+    namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
+    memory: Option<&Arc<memory::MemoryGovernor>>,
+) -> Result<ReadAdmission, AdmissionRefused> {
     let deadline = tokio::time::Instant::now() + read_admission_wait();
+    let admission = acquire_read_slots(plan, namespace_gate, deadline)
+        .await
+        .map_err(AdmissionRefused::Queue)?;
+    if let Some(memory) = memory {
+        memory
+            .await_query_headroom(deadline)
+            .await
+            .map_err(AdmissionRefused::Memory)?;
+    }
+    Ok(admission)
+}
+
+async fn acquire_read_slots(
+    plan: &namidb_query::LogicalPlan,
+    namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
+    deadline: tokio::time::Instant,
+) -> Result<ReadAdmission, &'static str> {
     let namespace = match namespace_gate {
         None => None,
         Some(gate) => match tokio::time::timeout_at(deadline, gate.clone().acquire_owned()).await {
@@ -2629,9 +2714,22 @@ pub async fn acquire_read_admission(
 /// Message for a read turned away by the gate whose knob is `gate`.
 pub(crate) fn admission_exhausted_message(gate: &str) -> String {
     format!(
-        "too many concurrent queries; the read admission queue is full — retry \
-         (raise {gate} to widen the gate)"
+        "too many concurrent queries; waited {}ms in the read admission queue \
+         without a slot — retry (raise {gate} to widen the gate, or \
+         NAMIDB_QUERY_ADMISSION_WAIT_MS to wait longer)",
+        read_admission_wait().as_millis()
     )
+}
+
+/// The HTTP refusal for a read that left the admission queue empty-handed.
+pub(crate) fn admission_refused_observation(
+    started: std::time::Instant,
+    refusal: AdmissionRefused,
+) -> ObservedQuery {
+    match refusal {
+        AdmissionRefused::Queue(gate) => admission_exhausted_observation(started, gate),
+        AdmissionRefused::Memory(pressure) => memory_pressure_observation(started, pressure),
+    }
 }
 
 /// Retryable 503 for a read that could not be admitted within the window.
@@ -2643,13 +2741,18 @@ pub(crate) fn admission_exhausted_observation(
         kind: Some(QueryKind::Read),
         ok: false,
         elapsed: started.elapsed(),
-        response: (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorBody {
-                error: admission_exhausted_message(gate),
-            }),
-        )
-            .into_response(),
+        response: with_retry_after(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": admission_exhausted_message(gate),
+                    "code": "overloaded",
+                    "neo4j_code": "Neo.TransientError.General.DatabaseUnavailable",
+                    "gql_status": "53000",
+                })),
+            )
+                .into_response(),
+        ),
     }
 }
 
@@ -2738,7 +2841,16 @@ fn exec_failure_response(prefix: &str, e: &namidb_query::exec::ExecError) -> Res
             "gql_status": gql_status,
         })),
     };
-    (status, body).into_response()
+    let response = (status, body).into_response();
+    // A full working-memory pool / process ceiling or a full search
+    // workspace is load, not a fault of the statement: tell the client when
+    // to come back.
+    match code {
+        Some("memory_pressure" | "search_workspace_capacity" | "search_index_cache_capacity") => {
+            with_retry_after(response)
+        }
+        _ => response,
+    }
 }
 
 /// Bounded writer-mutex acquisition for foreground request paths. A zero
@@ -3394,16 +3506,18 @@ fn memory_pressure_observation(
         // Same machine-readable fields as a running query stopped by the
         // memory budget's pressure scopes (#203), so clients handle both
         // with one rule.
-        response: (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": error,
-                "code": "memory_pressure",
-                "neo4j_code": "Neo.TransientError.General.DatabaseUnavailable",
-                "gql_status": "53000",
-            })),
-        )
-            .into_response(),
+        response: with_retry_after(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": error,
+                    "code": "memory_pressure",
+                    "neo4j_code": "Neo.TransientError.General.DatabaseUnavailable",
+                    "gql_status": "53000",
+                })),
+            )
+                .into_response(),
+        ),
     }
 }
 
@@ -4653,9 +4767,15 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // actually stopped, so disconnect churn cannot run more reads than
         // the admission gates allow.
         let admission = Arc::new(
-            match acquire_read_admission(&plan, state.query_gate.as_ref()).await {
+            match acquire_read_admission_with_memory(
+                &plan,
+                state.query_gate.as_ref(),
+                Some(&state.memory),
+            )
+            .await
+            {
                 Ok(admission) => admission,
-                Err(gate) => return admission_exhausted_observation(started, gate),
+                Err(refusal) => return admission_refused_observation(started, refusal),
             },
         );
         // Working-memory budget (#203): held until the response body is
@@ -6716,9 +6836,15 @@ async fn run_cypher_multi(
         // actually stopped, so disconnect churn cannot run more reads than
         // the admission gates allow.
         let admission = Arc::new(
-            match acquire_read_admission(&plan, ns_state.query_gate.as_ref()).await {
+            match acquire_read_admission_with_memory(
+                &plan,
+                ns_state.query_gate.as_ref(),
+                Some(&shared.memory),
+            )
+            .await
+            {
                 Ok(admission) => admission,
-                Err(gate) => return admission_exhausted_observation(started, gate),
+                Err(refusal) => return admission_refused_observation(started, refusal),
             },
         );
         // Working-memory budget (#203): held until the response body is

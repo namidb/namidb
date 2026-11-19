@@ -20,8 +20,38 @@ pub(crate) const SEARCH_MAX_RESULT_BYTES_ENV: &str = "NAMIDB_SEARCH_MAX_RESULT_B
 /// Maximum UTF-8 bytes across the configured string fields of one document
 /// analysed by the exact BM25 fallback.
 pub(crate) const BM25_MAX_DOCUMENT_BYTES_ENV: &str = "NAMIDB_BM25_MAX_DOCUMENT_BYTES";
-/// Default transient workspace shared by all concurrent searches: 256 MiB.
+/// Smallest default transient workspace shared by all concurrent searches:
+/// 256 MiB, the default on a server with up to two CPUs. See
+/// [`default_search_workspace_bytes`].
 pub(crate) const DEFAULT_SEARCH_WORKSPACE_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Default workspace per CPU above the floor.
+const SEARCH_WORKSPACE_BYTES_PER_CPU: usize = 128 * 1024 * 1024;
+/// Largest default workspace, whatever the CPU count.
+const SEARCH_WORKSPACE_DEFAULT_CEILING: usize = 2 * 1024 * 1024 * 1024;
+
+/// Default for `NAMIDB_SEARCH_WORKSPACE_MAX_BYTES`.
+///
+/// The server runs about two reads per CPU at once, and every search among
+/// them reserves its scoring workspace here. A fixed 256 MiB made an
+/// 8-CPU server queue a third or more of its searches on the workspace while
+/// the CPUs sat idle. The default therefore grows with the CPUs the process
+/// may use: 128 MiB per CPU, at least 256 MiB, at most 2 GiB, and never more
+/// than an eighth of `NAMIDB_MEMORY_MAX_BYTES` (when set) above the floor.
+pub(crate) fn default_search_workspace_bytes(
+    cpus: usize,
+    memory_max_bytes: Option<usize>,
+) -> usize {
+    let by_cpu = SEARCH_WORKSPACE_BYTES_PER_CPU.saturating_mul(cpus).clamp(
+        DEFAULT_SEARCH_WORKSPACE_MAX_BYTES,
+        SEARCH_WORKSPACE_DEFAULT_CEILING,
+    );
+    match memory_max_bytes {
+        Some(memory) if memory > 0 => {
+            by_cpu.min((memory / 8).max(DEFAULT_SEARCH_WORKSPACE_MAX_BYTES))
+        }
+        _ => by_cpu,
+    }
+}
 /// Default materialised-result allowance for an unbounded search: 64 MiB.
 pub(crate) const DEFAULT_SEARCH_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 /// Default exact-fallback document ceiling: 1 MiB of configured string fields.
@@ -128,6 +158,12 @@ impl SearchWorkspacePool {
         if units > self.semaphore.available_permits() {
             self.contended_reservations.fetch_add(1, Ordering::Relaxed);
         }
+        tracing::trace!(
+            operation,
+            required_bytes,
+            available_bytes = self.semaphore.available_permits() * SEARCH_WORKSPACE_UNIT_BYTES,
+            "search workspace reservation"
+        );
         let permit = if units == 0 {
             None
         } else {
@@ -196,9 +232,13 @@ impl Drop for SearchWorkspaceReservation {
 
 pub(crate) fn shared_search_workspace() -> &'static SearchWorkspacePool {
     SHARED_SEARCH_WORKSPACE.get_or_init(|| {
+        let memory_max_bytes = std::env::var("NAMIDB_MEMORY_MAX_BYTES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok());
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
         let configured = env_bytes(
             SEARCH_WORKSPACE_MAX_BYTES_ENV,
-            DEFAULT_SEARCH_WORKSPACE_MAX_BYTES,
+            default_search_workspace_bytes(cpus, memory_max_bytes),
         );
         let pool = SearchWorkspacePool::new(configured);
         tracing::info!(
@@ -359,6 +399,30 @@ mod tests {
             document.saturating_add(results) <= DEFAULT_SEARCH_WORKSPACE_MAX_BYTES,
             "defaults must not reject every exact unbounded BM25 query"
         );
+    }
+
+    #[test]
+    fn default_workspace_grows_with_cpus_within_memory() {
+        const MIB: usize = 1024 * 1024;
+        // Up to two CPUs: the historical 256 MiB.
+        assert_eq!(default_search_workspace_bytes(1, None), 256 * MIB);
+        assert_eq!(
+            default_search_workspace_bytes(2, Some(4 * 1024 * MIB)),
+            256 * MIB
+        );
+        // Grows per CPU, capped at 2 GiB.
+        assert_eq!(default_search_workspace_bytes(8, None), 1024 * MIB);
+        assert_eq!(default_search_workspace_bytes(64, None), 2048 * MIB);
+        // Never above an eighth of the memory ceiling, never below the floor.
+        assert_eq!(
+            default_search_workspace_bytes(8, Some(4 * 1024 * MIB)),
+            512 * MIB
+        );
+        assert_eq!(
+            default_search_workspace_bytes(8, Some(512 * MIB)),
+            256 * MIB
+        );
+        assert_eq!(default_search_workspace_bytes(8, Some(0)), 1024 * MIB);
     }
 
     #[test]

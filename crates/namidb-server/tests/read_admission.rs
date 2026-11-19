@@ -22,7 +22,7 @@ async fn read_admission_bounds_concurrency_and_rejects_retryably() {
     let state = namidb_server::AppState::new(writer, None, "admission".into());
     let app = namidb_server::build_router(state);
 
-    let post = |app: axum::Router, query: &'static str| async move {
+    let post_full = |app: axum::Router, query: &'static str| async move {
         let body = serde_json::to_vec(&serde_json::json!({ "query": query })).unwrap();
         let response = app
             .oneshot(
@@ -37,8 +37,20 @@ async fn read_admission_bounds_concurrency_and_rejects_retryably() {
             .await
             .unwrap();
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap().to_string());
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, String::from_utf8_lossy(&bytes).into_owned())
+        (
+            status,
+            String::from_utf8_lossy(&bytes).into_owned(),
+            retry_after,
+        )
+    };
+    let post = |app: axum::Router, query: &'static str| async move {
+        let (status, body, _) = post_full(app, query).await;
+        (status, body)
     };
 
     // Deterministic occupancy: hold the single permit directly.
@@ -50,13 +62,25 @@ async fn read_admission_bounds_concurrency_and_rejects_retryably() {
         .await
         .expect("first admission must succeed");
 
-    // A read while the gate is full: retryable 503 naming the knob.
-    let (status, body) = post(app.clone(), "RETURN 1 AS one").await;
+    // A read while the gate is full waits in line for the whole window,
+    // then gets a retryable 503 naming the knob, with `Retry-After`.
+    let waited = std::time::Instant::now();
+    let (status, body, retry_after) = post_full(app.clone(), "RETURN 1 AS one").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
+        waited.elapsed() >= Duration::from_millis(100),
+        "the refusal must come after the queue deadline, not at once"
+    );
+    assert!(
         body.contains("too many concurrent queries")
-            && body.contains("NAMIDB_MAX_CONCURRENT_QUERIES"),
+            && body.contains("NAMIDB_MAX_CONCURRENT_QUERIES")
+            && body.contains("\"code\":\"overloaded\""),
         "rejection must be actionable: {body}"
+    );
+    assert_eq!(
+        retry_after.as_deref(),
+        Some("2"),
+        "refusals carry Retry-After"
     );
 
     // Writes are NOT gated here (they serialize on the writer lock).
@@ -67,8 +91,15 @@ async fn read_admission_bounds_concurrency_and_rejects_retryably() {
         "writes must pass the read gate: {body}"
     );
 
-    // Releasing the permit re-admits reads within the wait window.
+    // A read that arrives while the gate is full is admitted as soon as the
+    // slot frees up inside its window: queued, not refused.
+    let queued = tokio::spawn(post(app.clone(), "RETURN 1 AS one"));
+    tokio::time::sleep(Duration::from_millis(30)).await;
     drop(held);
+    let (status, body) = queued.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "a queued read must run: {body}");
+
+    // Releasing the permit re-admits reads within the wait window.
     tokio::time::sleep(Duration::from_millis(10)).await;
     let (status, body) = post(app.clone(), "RETURN 1 AS one").await;
     assert_eq!(status, StatusCode::OK, "{body}");

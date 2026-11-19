@@ -220,6 +220,168 @@ impl Drop for CasGuard {
     }
 }
 
+/// Threads that serve ranged file reads ([`run_file_io`]).
+///
+/// Tokio's blocking pool keeps every queued task behind one mutex that the
+/// async workers take to submit and the pool threads take to finish and to
+/// park. A query issues a few hundred range reads, so with a handful of
+/// concurrent queries the two async workers of a 2-CPU server spent most
+/// of their time contending for that lock instead of driving requests.
+/// These reads get their own threads fed by MPMC channels.
+///
+/// The threads are split into groups of [`FILE_IO_GROUP`], each with its
+/// own queue, and reads are dealt round-robin across the groups: one queue
+/// for every thread moved the contention into the queue's wake-up lock,
+/// which every submission and every idle thread took. A read stuck on a
+/// slow disk delays only the reads queued behind it in its own group.
+#[cfg(unix)]
+struct FileIoPool {
+    groups: Vec<crossbeam_channel::Sender<FileIoJob>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(unix)]
+type FileIoJob = Box<dyn FnOnce() + Send>;
+
+/// Threads per [`FileIoPool`] queue.
+#[cfg(unix)]
+const FILE_IO_GROUP: usize = 4;
+
+/// `NAMIDB_LOCAL_IO_THREADS`; default eight per CPU, between 8 and 64. A
+/// read that misses the page cache blocks its thread on the disk, so the
+/// pool is sized for I/O concurrency, not for CPU.
+#[cfg(unix)]
+fn file_io_threads() -> usize {
+    std::env::var("NAMIDB_LOCAL_IO_THREADS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .saturating_mul(8)
+                .clamp(8, 64)
+        })
+}
+
+#[cfg(unix)]
+fn file_io_pool() -> &'static FileIoPool {
+    static POOL: std::sync::OnceLock<FileIoPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = file_io_threads();
+        let mut groups = Vec::new();
+        for first in (0..threads).step_by(FILE_IO_GROUP) {
+            let (jobs, queue) = crossbeam_channel::unbounded::<FileIoJob>();
+            for index in first..(first + FILE_IO_GROUP).min(threads) {
+                let queue = queue.clone();
+                std::thread::Builder::new()
+                    .name(format!("namidb-file-io-{index}"))
+                    .spawn(move || {
+                        for job in queue {
+                            // A panicking read must not take the thread with
+                            // it: its caller sees the dropped reply as an error.
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        }
+                    })
+                    .expect("spawn local file I/O thread");
+            }
+            groups.push(jobs);
+        }
+        FileIoPool {
+            groups,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    })
+}
+
+/// Run blocking file work on the [`FileIoPool`] and await its result.
+#[cfg(unix)]
+async fn run_file_io<T, F>(work: F) -> OsResult<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (reply, result) = tokio::sync::oneshot::channel();
+    let pool = file_io_pool();
+    let group = pool.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.groups.len();
+    pool.groups[group]
+        .send(Box::new(move || {
+            let _ = reply.send(work());
+        }))
+        .map_err(|_| generic_err(std::io::Error::other("local file I/O pool is closed")))?;
+    result
+        .await
+        .map_err(|_| generic_err(std::io::Error::other("local file read did not complete")))
+}
+
+/// Outcome of [`ranged_read`].
+#[cfg(unix)]
+enum RangedRead {
+    Done(GetResult),
+    /// Not a case the fast path reproduces exactly; ask `LocalFileSystem`.
+    Fallback(Path, GetOptions),
+}
+
+/// Open, stat, check preconditions and read one byte range, all on the
+/// calling (blocking) thread. Metadata and the ETag are derived exactly as
+/// `object_store::local::LocalFileSystem` derives them, so `If-Match`
+/// pinning by the range cache sees the same tags whichever path served the
+/// read.
+#[cfg(unix)]
+fn ranged_read(path: PathBuf, location: Path, options: GetOptions) -> OsResult<RangedRead> {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(object_store::Error::NotFound {
+                path: path.to_string_lossy().into_owned(),
+                source: Box::new(error),
+            });
+        }
+        Err(_) => return Ok(RangedRead::Fallback(location, options)),
+    };
+    let Ok(metadata) = file.metadata() else {
+        return Ok(RangedRead::Fallback(location, options));
+    };
+    if metadata.is_dir() {
+        return Ok(RangedRead::Fallback(location, options));
+    }
+    let Ok(modified) = metadata.modified() else {
+        return Ok(RangedRead::Fallback(location, options));
+    };
+    let mtime_micros = modified
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let size = metadata.len();
+    let meta = ObjectMeta {
+        location: location.clone(),
+        last_modified: modified.into(),
+        size,
+        e_tag: Some(format!("{:x}-{mtime_micros:x}-{size:x}", metadata.ino())),
+        version: None,
+    };
+    options.check_preconditions(&meta)?;
+    let range = match options.range.as_ref().map(|r| r.as_range(size)) {
+        Some(Ok(range)) if range.start < size => range,
+        _ => return Ok(RangedRead::Fallback(location, options)),
+    };
+    let end = range.end.min(size);
+    let len = usize::try_from(end - range.start).map_err(generic_err)?;
+    let mut buffer = vec![0u8; len];
+    file.read_exact_at(&mut buffer, range.start)
+        .map_err(generic_err)?;
+    let bytes = bytes::Bytes::from(buffer);
+    Ok(RangedRead::Done(GetResult {
+        payload: object_store::GetResultPayload::Stream(
+            futures::stream::once(async move { Ok(bytes) }).boxed(),
+        ),
+        meta,
+        range: range.start..end,
+        attributes: Default::default(),
+    }))
+}
+
 fn is_internal_path(p: &Path) -> bool {
     p.as_ref().starts_with(INTERNAL_DIR)
 }
@@ -327,7 +489,14 @@ impl ObjectStore for LocalFileObjectStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
-        self.inner.get_opts(location, options).await
+        #[cfg(unix)]
+        {
+            self.get_opts_one_hop(location, options).await
+        }
+        #[cfg(not(unix))]
+        {
+            self.inner.get_opts(location, options).await
+        }
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
@@ -364,6 +533,30 @@ impl ObjectStore for LocalFileObjectStore {
 }
 
 impl LocalFileObjectStore {
+    /// Ranged reads (every range-cache miss and SST page read) take one
+    /// blocking-pool hop instead of `LocalFileSystem`'s two: it opens the
+    /// file on one blocking task and reads it on another. Each hop locks the
+    /// blocking pool's single queue mutex from an async worker; with a few
+    /// hundred range reads per query that mutex was where the runtime
+    /// workers of a busy server spent their time. Anything this path does
+    /// not reproduce exactly (HEAD, versions, whole-object reads, an
+    /// unsatisfiable range, an unusual open error) goes to `LocalFileSystem`.
+    #[cfg(unix)]
+    async fn get_opts_one_hop(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
+        if options.head || options.version.is_some() || options.range.is_none() {
+            return self.inner.get_opts(location, options).await;
+        }
+        let path = self.inner.path_to_filesystem(location)?;
+        let owned = location.clone();
+        let read = run_file_io(move || ranged_read(path, owned, options)).await??;
+        match read {
+            RangedRead::Done(result) => Ok(result),
+            RangedRead::Fallback(location, options) => {
+                self.inner.get_opts(&location, options).await
+            }
+        }
+    }
+
     fn list_inner(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
         self.inner.list(prefix)
     }
@@ -388,6 +581,103 @@ mod tests {
         let s: Arc<dyn ObjectStore> = Arc::new(LocalFileObjectStore::new(dir).unwrap());
         let paths = NamespacePaths::new("", NamespaceId::new("acme").unwrap());
         (s, paths)
+    }
+
+    /// The one-hop ranged read must be indistinguishable from
+    /// `LocalFileSystem`'s: same bytes, same metadata and ETag (the range
+    /// cache pins pages with `If-Match` on it), same precondition outcomes,
+    /// and the cases it does not handle still answered by `LocalFileSystem`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ranged_reads_match_local_file_system() {
+        use object_store::{GetRange, ObjectStoreExt};
+        let dir = tempdir().unwrap();
+        let ours = LocalFileObjectStore::new(dir.path()).unwrap();
+        let reference = LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let p = Path::from("sst/level0/page.bin");
+        let body: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        ours.put_opts(&p, PutPayload::from(body.clone()), PutOptions::default())
+            .await
+            .unwrap();
+
+        for range in [0..1, 10..4096, 99_000..100_000, 5..100_000] {
+            let options = || GetOptions {
+                range: Some(GetRange::Bounded(range.clone())),
+                ..Default::default()
+            };
+            let a = ours.get_opts(&p, options()).await.unwrap();
+            let b = reference.get_opts(&p, options()).await.unwrap();
+            assert_eq!(a.meta, b.meta);
+            assert_eq!(a.range, b.range);
+            let (a, b) = (a.bytes().await.unwrap(), b.bytes().await.unwrap());
+            assert_eq!(a, b);
+            assert_eq!(&a[..], &body[range.start as usize..range.end as usize]);
+        }
+        // Suffix and offset ranges, and a range past the end (clamped).
+        for range in [
+            GetRange::Suffix(10),
+            GetRange::Offset(99_990),
+            GetRange::Bounded(99_990..200_000),
+        ] {
+            let options = || GetOptions {
+                range: Some(range.clone()),
+                ..Default::default()
+            };
+            let a = ours
+                .get_opts(&p, options())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let b = reference
+                .get_opts(&p, options())
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(a, b);
+        }
+
+        // If-Match pinning: the right tag reads, a stale one is a precondition failure.
+        let etag = reference.head(&p).await.unwrap().e_tag.unwrap();
+        let pinned = |tag: &str| GetOptions {
+            range: Some(GetRange::Bounded(0..8)),
+            if_match: Some(tag.to_string()),
+            ..Default::default()
+        };
+        assert!(ours.get_opts(&p, pinned(&etag)).await.is_ok());
+        let stale = ours.get_opts(&p, pinned("0-0-0")).await.unwrap_err();
+        assert!(
+            matches!(stale, object_store::Error::Precondition { .. }),
+            "{stale}"
+        );
+
+        // Missing objects are NotFound; an unsatisfiable range is still an error.
+        let missing = ours
+            .get_opts(
+                &Path::from("sst/level0/missing.bin"),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..8)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing, object_store::Error::NotFound { .. }),
+            "{missing}"
+        );
+        assert!(ours
+            .get_opts(
+                &p,
+                GetOptions {
+                    range: Some(GetRange::Bounded(200_000..200_010)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
