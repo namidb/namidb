@@ -35,7 +35,7 @@ futures = "0.3"
 
 # Filesystem watching (the `--watch` live-sync path; binary crates only)
 notify = "6"
-notify-debouncer-full = "0.3"
+notify-debouncer-full = "0.7"
 
 # Object storage (S3 / GCS / Azure / Local / Memory)
 # 0.13.2 uses Rust syntax newer than its declared 1.85 MSRV. Keep the final
