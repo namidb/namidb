@@ -470,7 +470,34 @@ struct Cli {
     fence_policy: namidb_server::recovery::FencePolicy,
 }
 
+/// mimalloc as the process allocator.
+///
+/// Under concurrent reads glibc's allocator was the bottleneck: the official
+/// image caps it at two arenas (`MALLOC_ARENA_MAX=2`) to bound fragmentation,
+/// so every query thread fought over two arena locks, and the trim threshold
+/// it sets also pins glibc's mmap threshold at 128 KiB, turning every larger
+/// page or posting buffer into an mmap/munmap pair plus page faults under the
+/// process-wide mm lock. Together with the blocking-pool hops of local reads
+/// this kept a 2-CPU server at about one query at a time. mimalloc keeps
+/// per-thread heaps (no shared arena lock on the hot path) and returns freed
+/// pages to the OS on a short delay. Kernel time does not vanish: what
+/// remains is mostly copying range-cache misses out of the page cache.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Memory-governor reclaim hook for mimalloc: return free memory now
+/// instead of after the purge delay. `mi_collect` runs on the calling
+/// (blocking-pool) thread, so it reclaims that thread's heap, abandoned
+/// pages of exited threads and free arena memory; other threads' free pages
+/// still go back on mimalloc's own purge delay.
+fn mimalloc_reclaim() {
+    // SAFETY: `mi_collect` has no preconditions; `force = true` purges what
+    // the calling thread can reach.
+    unsafe { libmimalloc_sys::mi_collect(true) }
+}
+
 fn main() -> anyhow::Result<()> {
+    namidb_server::memory::set_allocator_reclaim(mimalloc_reclaim);
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -547,6 +574,15 @@ fn main() -> anyhow::Result<()> {
         // recurses once per operand, and tokio's 2 MiB default stack
         // overflowed — aborting the whole server — at about a thousand.
         .thread_stack_size(16 * 1024 * 1024)
+        // One async worker per CPU this process may actually use (std reads
+        // the cgroup CPU quota, so a `--cpus 2` container gets two, not the
+        // host's core count).
+        .worker_threads(namidb_server::available_cpus())
+        // Reads run on blocking-pool threads and the local store reads files
+        // there too. The default ten-second keep-alive let a bursty workload
+        // tear threads down and respawn them, and tokio spawns a thread while
+        // holding the pool's queue lock; keep idle threads around longer.
+        .thread_keep_alive(std::time::Duration::from_secs(60))
         .build()?;
     rt.block_on(namidb_server::run_with_memory_limits(
         config,

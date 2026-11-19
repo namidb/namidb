@@ -125,6 +125,10 @@ pub struct ServerBackend {
     /// read-write caller). A `std::sync::Mutex` so the write gate reads it
     /// without an `.await`; per-connection, so never contended.
     principal: Arc<std::sync::Mutex<Option<Principal>>>,
+    /// The admission the last request decode started outside an explicit
+    /// transaction, handed to the auto-commit RUN it decoded so the decode
+    /// headroom wait and the RUN's own waits share one deadline.
+    pending_admission: std::sync::Mutex<Option<crate::RequestAdmission>>,
 }
 
 impl ServerBackend {
@@ -133,6 +137,27 @@ impl ServerBackend {
             state,
             tx: Mutex::new(None),
             principal,
+            pending_admission: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The admission window for this server's read timeout.
+    fn admission_window(&self) -> std::time::Duration {
+        crate::admission_window(self.state.query_timeout)
+    }
+
+    /// The admission of the auto-commit RUN starting now: the one its
+    /// request decode began, when that is still current, else a fresh one.
+    fn take_run_admission(&self) -> crate::RequestAdmission {
+        let window = self.admission_window();
+        let pending = self
+            .pending_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        match pending {
+            Some(admission) if admission.arrived.elapsed() <= window => admission,
+            _ => crate::RequestAdmission::starting_now(window),
         }
     }
 
@@ -1032,8 +1057,17 @@ impl ServerBackend {
             // Read path: borrow a short-lived `Snapshot` from the owned
             // snapshot; the Arc keeps the underlying memtable alive for
             // the duration of the query, no writer lock needed.
+            // The RUN's one admission deadline (set in `run_observed`):
+            // the slot and the execution headroom share it, and the read
+            // timeout counts from the RUN's arrival.
+            let request = crate::RequestAdmission::current_or_now(self.admission_window());
             let admission = tokio::select! {
-                admission = crate::acquire_read_admission(&plan, self.state.query_gate.as_ref()) => admission,
+                admission = crate::acquire_read_admission_with_memory(
+                    &plan,
+                    self.state.query_gate.as_ref(),
+                    Some(&self.state.memory),
+                    request.deadline,
+                ) => admission,
                 _ = cancellation.cancelled() => {
                     return disconnected_observation(started, Some(QueryKind::Read));
                 }
@@ -1042,13 +1076,20 @@ impl ServerBackend {
             // releases the gates only once the query has really stopped.
             let admission = std::sync::Arc::new(match admission {
                 Ok(admission) => admission,
-                Err(gate) => {
+                Err(crate::AdmissionRefused::Queue(gate)) => {
                     return RunObservation {
                         kind: Some(QueryKind::Read),
                         elapsed: started.elapsed(),
                         result: Err(BackendError::Storage(crate::admission_exhausted_message(
                             gate,
                         ))),
+                    };
+                }
+                Err(crate::AdmissionRefused::Memory(pressure)) => {
+                    return RunObservation {
+                        kind: Some(QueryKind::Read),
+                        elapsed: started.elapsed(),
+                        result: Err(memory_pressure_error(pressure)),
                     };
                 }
             });
@@ -1065,7 +1106,7 @@ impl ServerBackend {
             let read = crate::isolate::run_read_isolated({
                 let plan = std::sync::Arc::clone(&plan);
                 let budget = budget.clone();
-                let deadline = self.state.query_deadline();
+                let deadline = request.query_deadline(self.state.query_timeout);
                 let row_cap = self.state.query_row_cap();
                 let admission = std::sync::Arc::clone(&admission);
                 async move {
@@ -1320,7 +1361,11 @@ impl ServerBackend {
                 }
             };
             let admission = tokio::select! {
-                admission = crate::acquire_read_admission(&plan, self.state.query_gate.as_ref()) => admission,
+                admission = crate::acquire_read_admission_until(
+                    &plan,
+                    self.state.query_gate.as_ref(),
+                    tokio::time::Instant::now() + self.admission_window(),
+                ) => admission,
                 _ = cancellation.cancelled() => {
                     return disconnected_observation(started, Some(QueryKind::Read));
                 }
@@ -1385,7 +1430,24 @@ impl ServerBackend {
         cancellation: RunCancellation,
     ) -> std::result::Result<RunOutcome, BackendError> {
         let admission_started = std::time::Instant::now();
-        if let Err(pressure) = self.state.memory.admit_query().await {
+        // An auto-commit RUN holds nothing yet, so it may wait in line for
+        // memory headroom; RESET or a disconnect ends the wait.
+        let request = self.take_run_admission();
+        let admitted = tokio::select! {
+            admitted = self.state.memory.admit_query_until(Some(request.deadline)) => admitted,
+            _ = cancellation.cancelled() => {
+                let obs = disconnected_observation(admission_started, None);
+                self.state.metrics.observe_query(
+                    Protocol::Bolt,
+                    None,
+                    false,
+                    obs.elapsed,
+                    cypher,
+                );
+                return obs.result;
+            }
+        };
+        if let Err(pressure) = admitted {
             let error = memory_pressure_error(pressure);
             self.state.metrics.observe_query(
                 Protocol::Bolt,
@@ -1417,7 +1479,7 @@ impl ServerBackend {
         );
         let obs = namidb_storage::cancel::with_cancel_flag(
             registered.cancel_flag(),
-            self.run_query(cypher, params, &cancellation),
+            request.scope(self.run_query(cypher, params, &cancellation)),
         )
         .await;
         drop(registered);
@@ -1438,6 +1500,10 @@ impl ServerBackend {
         cancellation: RunCancellation,
     ) -> std::result::Result<RunOutcome, BackendError> {
         let admission_started = std::time::Instant::now();
+        // Checked once, never waited for: a write transaction holds the
+        // single writer across its statements, and memory it staged cannot
+        // drop before COMMIT, so waiting here would stall every other writer
+        // only to fail the same way.
         if let Err(pressure) = self.state.memory.admit_query().await {
             let error = memory_pressure_error(pressure);
             self.state.metrics.observe_query(
@@ -1491,12 +1557,28 @@ impl Backend for ServerBackend {
         wire_bytes: usize,
     ) -> std::result::Result<Option<Box<dyn DecodeAdmissionGuard>>, BackendError> {
         let projected = MessageMemoryBudget::estimated_bytes_for_wire(wire_bytes);
+        // Outside an explicit transaction the message may wait in line for
+        // headroom, and the RUN it carries inherits the same deadline.
+        // Inside one (or while a statement of this connection is still
+        // running) it is checked once: an open write transaction holds the
+        // single writer.
+        let in_tx = self
+            .tx
+            .try_lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(true);
+        let request =
+            (!in_tx).then(|| crate::RequestAdmission::starting_now(self.admission_window()));
         let reservation = self
             .state
             .memory
-            .reserve_query_headroom(projected)
+            .reserve_query_headroom_until(projected, request.map(|r| r.deadline))
             .await
             .map_err(memory_pressure_error)?;
+        *self
+            .pending_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = request;
         Ok(Some(Box::new(reservation)))
     }
 
@@ -3018,6 +3100,122 @@ mod tests {
             0,
             "COMMIT/ROLLBACK must not run admission"
         );
+    }
+
+    /// With an admission wait configured, an auto-commit RUN waits in line
+    /// for memory headroom (and RESET ends that wait at once), but a
+    /// statement or request decode inside an explicit write transaction is
+    /// checked once and refused at once: the transaction holds the single
+    /// writer, and the memory it staged cannot drop before COMMIT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bolt_memory_waits_only_outside_write_transactions() {
+        use std::time::{Duration, Instant};
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-memory-wait").unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        // One byte: the process is always over this ceiling. Waits are
+        // capped at 300 ms.
+        let governor = Arc::new(
+            crate::memory::MemoryGovernor::new(1).with_admission_wait(Duration::from_millis(300)),
+        );
+        let state = AppState::new(writer, None, "bolt-memory-wait".into())
+            .with_memory_governor(Arc::clone(&governor));
+        let backend = Arc::new(ServerBackend::new(
+            state.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        // Auto-commit: waits for the whole window, then one refusal.
+        let started = Instant::now();
+        let error = backend
+            .run("RETURN 1 AS one", Params::new())
+            .await
+            .expect_err("over the ceiling for the whole window");
+        assert!(
+            matches!(&error, BackendError::Storage(text) if text.contains("memory pressure")),
+            "got {error:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(governor.rejected_queries(), 1);
+
+        // RESET (cancellation) ends the wait without a refusal.
+        let cancellation = RunCancellation::new();
+        let run = tokio::spawn({
+            let backend = Arc::clone(&backend);
+            let cancellation = cancellation.clone();
+            async move {
+                backend
+                    .run_with_cancellation("RETURN 1 AS one", Params::new(), cancellation)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = Instant::now();
+        cancellation.cancel();
+        let error = run.await.unwrap().expect_err("cancelled");
+        assert!(
+            matches!(&error, BackendError::Other(text) if text.contains("reset")),
+            "got {error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(
+            governor.rejected_queries(),
+            1,
+            "a cancelled wait is not a refusal"
+        );
+
+        // Inside an open write transaction: refused at once, writer kept by
+        // the transaction (not stalled behind a memory wait).
+        let tx_writer = state.writer.clone().lock_owned().await;
+        *backend.tx.lock().await = Some(TxState::Write {
+            writer: tx_writer,
+            staged: false,
+        });
+        let started = Instant::now();
+        let error = backend
+            .run_in_tx("RETURN 1 AS one", Params::new())
+            .await
+            .expect_err("over the ceiling");
+        assert!(
+            matches!(&error, BackendError::Storage(text) if text.contains("memory pressure")),
+            "got {error:?}"
+        );
+        assert!(
+            backend.admit_request_decode(64).await.is_err(),
+            "decode inside a transaction is refused too"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "no memory wait while the transaction holds the writer: {:?}",
+            started.elapsed()
+        );
+        backend.rollback_tx().await.unwrap();
+        assert!(state.writer.try_lock().is_ok());
+
+        // Request decode outside a transaction waits in line for headroom.
+        // A fixed 8 MiB resident set (other tests in this process move the
+        // real one) under a ceiling half a message above it: a message's
+        // projected decode memory does not fit, yet it would fit an empty
+        // ceiling, so it is not refused as hopeless.
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-decode-wait").unwrap();
+        let writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        let projected = MessageMemoryBudget::estimated_bytes_for_wire(64);
+        let crowded = Arc::new(
+            crate::memory::MemoryGovernor::new((8 << 20) + projected / 2)
+                .with_admission_wait(Duration::from_millis(300))
+                .with_resident_sampler(|| Some(8 << 20)),
+        );
+        let backend = ServerBackend::new(
+            AppState::new(writer, None, "bolt-decode-wait".into())
+                .with_memory_governor(Arc::clone(&crowded)),
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+        let started = Instant::now();
+        assert!(backend.admit_request_decode(64).await.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 
     /// BEGIN with access mode `r` (every driver `execute_read`) runs on a

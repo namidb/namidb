@@ -84,6 +84,13 @@ crates.io release will establish and document that API explicitly.
   writer claim, recovery and metadata prefetch happen before the first
   request instead of during it. A name with no data is skipped, never
   created.
+- `bench/mixed_concurrency.py`: a mixed read workload of 18 query shapes
+  (BM25, vector, hybrid, search-then-filter, anchored 1-3 hop traversals,
+  GraphRAG chains) at increasing concurrency, reporting throughput,
+  percentiles, errors, `Retry-After` coverage and peak RSS; it can also
+  write a synthetic corpus of the shape it expects.
+- `bench/rollback_compat.sh`: opens data written by a new server with older
+  release binaries (reads compared, a write accepted) and back.
 
 - **RaBitQ navigation for vector bases.** A vector base now carries a
   1-bit RaBitQ code per row (codes plus three factors: 140 bytes at
@@ -180,6 +187,56 @@ crates.io release will establish and document that API explicitly.
   exactly `k` matching rows or all of them, and are recognised as broad from
   an id-ordered prefix of the label when its node runs overlap (the bounded
   column scan could not stop early there). Results equal the exact scan's.
+- **Concurrent reads run concurrently.** A 2-CPU server ran about one
+  query at a time: four concurrent clients each waited about four times the
+  single-query latency, and from eight clients on the read gate turned
+  queries away with 503 after five seconds. Profiles showed the CPUs mostly
+  idle, the work stuck in four places:
+  - **glibc's allocator.** The official image limited glibc to two arenas
+    (`MALLOC_ARENA_MAX=2`) and set `MALLOC_TRIM_THRESHOLD_`, which also froze
+    glibc's mmap threshold at 128 KiB. Every query thread fought over two
+    arena locks, and every buffer of 128 KiB or more (pages, postings,
+    zstd contexts) became an mmap/munmap pair plus page faults under the
+    process-wide mm lock; system time was about as large as user time. The server
+    binary now allocates through mimalloc (per-thread heaps, freed pages
+    returned on a short delay, `mi_collect` on memory-pressure reclaim), and
+    the image no longer sets `MALLOC_TRIM_THRESHOLD_`.
+  - **The blocking-pool queue lock.** A `file://` store read every range in
+    two blocking-pool hops (open, then read), and each hop takes Tokio's
+    single blocking-pool mutex from an async worker. With a few hundred
+    range reads per query the two async workers of a 2-CPU server spent
+    most of their time waiting for that mutex. Ranged reads are now one
+    `pread` on dedicated I/O threads fed by small per-group queues
+    (`NAMIDB_LOCAL_IO_THREADS`), with metadata, ETag and preconditions
+    identical to `LocalFileSystem`.
+  - **A fixed 256 MiB search workspace.** Every concurrent BM25/vector
+    search reserves its scoring workspace from one shared pool; on an
+    8-CPU server a third or more of the searches queued on it while CPUs
+    were idle. The default now grows with the CPUs: 128 MiB per CPU, at
+    least 256 MiB (unchanged up to two CPUs), at most 2 GiB and an eighth of
+    `NAMIDB_MEMORY_MAX_BYTES`, and the official image no longer pins it to
+    256 MiB. `NAMIDB_SEARCH_WORKSPACE_MAX_BYTES` still overrides it.
+  - **Admission.** At most `max(4, CPUs)` reads ran and the rest were
+    refused after 5 s, without `Retry-After`. Reads now default to two per
+    CPU (counted from the container's CPU quota) and wait in a fair queue
+    for request memory, a slot and then execution memory headroom (the
+    process below its ceiling and room in the shared query working-memory
+    pool) instead of being refused on one resident-set sample. One deadline
+    set when the request arrives covers all of it:
+    `NAMIDB_QUERY_ADMISSION_WAIT_MS` (30 s), capped at half the read
+    timeout (15 s by default). After it: 503 with `code: "overloaded"` or
+    `"memory_pressure"` and `Retry-After`. Every overload refusal now
+    carries `Retry-After`. The read timeout now counts from the request's
+    arrival, so queueing plus execution never exceeds it and a client or
+    proxy that waits for the read timeout hears back first. A Bolt
+    statement inside an explicit transaction checks memory once and never
+    waits (the transaction holds the writer); an auto-commit RUN's wait
+    ends on `RESET` or disconnect.
+  The async runtime uses one worker per CPU the cgroup grants and keeps
+  idle blocking threads for 60 s instead of 10 s. Measured with
+  `bench/mixed_concurrency.py` on a 2-CPU / 6 GiB container over a local
+  store of about 8 GB: at 16 concurrent clients, 1.98 to 8.44 queries/s and
+  31% to 0% errors; at 64 clients, 82% to 0% errors; peak RSS under 2 GiB.
 
 ## [3.5.1] - 2026-11-18
 

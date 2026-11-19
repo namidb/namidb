@@ -68,6 +68,10 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 humantime = "2"
 memory-stats = { workspace = true }
+# Process allocator of the server binary (see `main.rs`). `extended` exposes
+# `mi_collect`, used by the memory governor to return free pages on demand.
+mimalloc = { version = "0.1.49", default-features = false }
+libmimalloc-sys = { version = "0.1.46", default-features = false, features = ["extended"] }
 libc = { workspace = true }
 # TLS on the serving path (rustls, aligned with the versions already in the
 # lock via reqwest/object_store). `ring` avoids the aws-lc-rs C toolchain.
