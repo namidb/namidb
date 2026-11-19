@@ -782,7 +782,13 @@ async fn copy_object_parts(
 ) -> Result<u64> {
     let part = part_size.max(1) as u64;
     if size <= part {
-        let bytes = read_part(src, from, 0..size, e_tag.as_deref()).await?;
+        // An empty object has no range to read (a zero-length range is
+        // invalid on some stores); its HEAD already proved it exists.
+        let bytes = if size == 0 {
+            bytes::Bytes::new()
+        } else {
+            read_part(src, from, 0..size, e_tag.as_deref()).await?
+        };
         let len = bytes.len() as u64;
         dst.put_opts(
             to,
@@ -2139,5 +2145,26 @@ mod tests {
             body.as_slice(),
             "a short leftover is replaced"
         );
+    }
+
+    /// An empty object is copied without a range read: a zero-length range
+    /// is invalid on the local filesystem store.
+    #[tokio::test]
+    async fn an_empty_object_copies_on_a_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let local: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let from = Path::from("src/empty.bin");
+        local
+            .put(&from, PutPayload::from(Vec::<u8>::new()))
+            .await
+            .unwrap();
+        let to = Path::from("dst/empty.bin");
+        let n = copy_object_with_part_size(&local, &local, &from, &to, 1024, false)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let copied = local.get(&to).await.unwrap().bytes().await.unwrap();
+        assert!(copied.is_empty());
     }
 }
