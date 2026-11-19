@@ -5731,8 +5731,13 @@ async fn hybrid_search_procedure(
         ));
     }
 
+    // The two legs are independent reads of the same snapshot: run them
+    // together, so a cold query waits for the slower leg, not for both.
     // Dense leg (vector KNN), best-first.
-    let dense: Vec<(NodeId, f64)> = if dense_configured {
+    let dense_leg = async {
+        if !dense_configured {
+            return Ok::<Vec<(NodeId, f64)>, ExecError>(Vec::new());
+        }
         let qv = map
             .get("query_vector")
             .and_then(runtime_to_f32_vec)
@@ -5760,13 +5765,14 @@ async fn hybrid_search_procedure(
             params,
         )
         .await?;
-        rows_to_id_score(&rows)
-    } else {
-        Vec::new()
+        Ok(rows_to_id_score(&rows))
     };
 
     // Sparse leg (BM25), best-first.
-    let sparse: Vec<(NodeId, f64)> = if sparse_configured {
+    let sparse_leg = async {
+        if !sparse_configured {
+            return Ok::<Vec<(NodeId, f64)>, ExecError>(Vec::new());
+        }
         let qtext = map
             .get("query_text")
             .and_then(proc_str)
@@ -5777,7 +5783,7 @@ async fn hybrid_search_procedure(
         // cap, then falls back to an exact filtered corpus scan if the cap
         // cannot produce `k_sparse` survivors. A cap therefore changes the
         // fast-path cost, never recall.
-        if let Some(filter) = pf.as_ref() {
+        Ok(if let Some(filter) = pf.as_ref() {
             bm25_ranked_filtered(
                 snapshot,
                 &label,
@@ -5790,10 +5796,9 @@ async fn hybrid_search_procedure(
             .await?
         } else {
             bm25_ranked(snapshot, &label, &props, &qtext, Some(k_sparse)).await?
-        }
-    } else {
-        Vec::new()
+        })
     };
+    let (dense, sparse) = futures::future::try_join(dense_leg, sparse_leg).await?;
 
     // Both legs are filtered before fusion. RRF therefore uses ranks within the
     // eligible population, and linear normalization is no longer skewed by

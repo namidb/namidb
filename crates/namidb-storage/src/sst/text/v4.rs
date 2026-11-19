@@ -533,6 +533,14 @@ impl QueryMaskUnionBuilder {
     }
 }
 
+/// Most posting blocks one cursor reads ahead of the block it needs.
+const POSTING_READAHEAD_BLOCKS: usize = 16;
+/// Compressed bytes one cursor may read ahead per fetch.
+const POSTING_READAHEAD_BYTES: usize = 4 * 1024 * 1024;
+/// Compressed bytes all cursors of one fetch may read ahead together (a
+/// prefix query can expand to dozens of terms).
+const POSTING_READAHEAD_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug)]
 struct PostingCursor {
     term: String,
@@ -545,6 +553,10 @@ struct PostingCursor {
     /// When metadata skips a window ending inside the next block, discard
     /// decoded postings through this ordinal after the block is authenticated.
     skip_through: Option<u64>,
+    /// Compressed blocks fetched ahead of `next_block`, by block index.
+    readahead: BTreeMap<usize, Bytes>,
+    /// Blocks the next fetch for this cursor reads (doubling, capped).
+    readahead_window: usize,
 }
 
 impl PostingCursor {
@@ -625,8 +637,11 @@ impl PostingCursor {
     }
 
     fn resident_bytes(&self) -> usize {
-        self.term
-            .capacity()
+        self.readahead
+            .values()
+            .map(Bytes::len)
+            .sum::<usize>()
+            .saturating_add(self.term.capacity())
             .saturating_add(
                 self.blocks
                     .capacity()
@@ -1654,6 +1669,8 @@ impl TextV4Reader {
                     postings: Vec::new(),
                     next_posting: 0,
                     skip_through: None,
+                    readahead: BTreeMap::new(),
+                    readahead_window: 1,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1979,6 +1996,8 @@ impl TextV4Reader {
                     postings: Vec::new(),
                     next_posting: 0,
                     skip_through: None,
+                    readahead: BTreeMap::new(),
+                    readahead_window: 1,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2519,6 +2538,12 @@ impl TextV4Reader {
         }
 
         let mut jobs = Vec::<(usize, PostingBlockRef)>::with_capacity(cursor_indices.len());
+        // Per job: the block's compressed bytes when already read ahead, else
+        // its position in `ranges`. Blocks read ahead for the same cursor
+        // follow in `ahead` as (cursor, block index, position in `ranges`).
+        let mut sources = Vec::<std::result::Result<Bytes, usize>>::with_capacity(jobs.capacity());
+        let mut ranges = Vec::<Range<u64>>::new();
+        let mut ahead = Vec::<(usize, usize, usize)>::new();
         let mut previous = None;
         for &cursor_index in cursor_indices {
             if previous.is_some_and(|previous| previous >= cursor_index) {
@@ -2535,10 +2560,42 @@ impl TextV4Reader {
             // decoded successors at every boundary.
             cursor.postings = Vec::new();
             cursor.next_posting = 0;
-            let Some(reference) = cursor.blocks.get(cursor.next_block).cloned() else {
+            let block_index = cursor.next_block;
+            let Some(reference) = cursor.blocks.get(block_index).cloned() else {
                 continue;
             };
             cursor.next_block += 1;
+            // Blocks skipped by metadata are never decoded.
+            cursor.readahead = cursor.readahead.split_off(&block_index);
+            if let Some(bytes) = cursor.readahead.remove(&block_index) {
+                sources.push(Ok(bytes));
+            } else {
+                sources.push(Err(ranges.len()));
+                ranges.push(reference.wire.range()?);
+                // A cursor that keeps needing blocks reads further ahead each
+                // time, so a long posting list costs a few round trips, not
+                // one per block, while a query that stops early reads little.
+                let mut budget = (POSTING_READAHEAD_TOTAL_BYTES / cursor_indices.len())
+                    .min(POSTING_READAHEAD_BYTES);
+                for next in block_index + 1..block_index + cursor.readahead_window {
+                    let Some(following) = cursor.blocks.get(next) else {
+                        break;
+                    };
+                    if cursor.readahead.contains_key(&next) {
+                        continue;
+                    }
+                    let range = following.wire.range()?;
+                    let len = range.end.saturating_sub(range.start) as usize;
+                    if len > budget {
+                        break;
+                    }
+                    budget -= len;
+                    ahead.push((cursor_index, next, ranges.len()));
+                    ranges.push(range);
+                }
+                cursor.readahead_window =
+                    (cursor.readahead_window * 2).min(POSTING_READAHEAD_BLOCKS);
+            }
             jobs.push((cursor_index, reference));
         }
         if jobs.is_empty() {
@@ -2548,16 +2605,29 @@ impl TextV4Reader {
             .checked_add(jobs.len())
             .ok_or_else(|| Error::invariant("text v4 fetched block count overflows"))?;
 
-        let ranges = jobs
-            .iter()
-            .map(|(_, reference)| reference.wire.range())
-            .collect::<Result<Vec<_>>>()?;
-        let compressed_blocks = self.source.read_ranges(&ranges).await?;
-        if compressed_blocks.len() != jobs.len() {
+        let mut fetched = if ranges.is_empty() {
+            Vec::new()
+        } else {
+            self.source.read_ranges(&ranges).await?
+        };
+        if fetched.len() != ranges.len() {
             return Err(Error::invariant(
                 "text v4 source returned wrong posting block count",
             ));
         }
+        for &(cursor_index, block_index, position) in &ahead {
+            cursors[cursor_index]
+                .readahead
+                .insert(block_index, std::mem::take(&mut fetched[position]));
+        }
+        let compressed_blocks = sources
+            .into_iter()
+            .map(|source| match source {
+                Ok(bytes) => bytes,
+                Err(position) => std::mem::take(&mut fetched[position]),
+            })
+            .collect::<Vec<_>>();
+        drop(fetched);
         let retained_batch_bytes = jobs
             .capacity()
             .saturating_mul(std::mem::size_of::<(usize, PostingBlockRef)>())
