@@ -103,4 +103,120 @@ async fn read_admission_bounds_concurrency_and_rejects_retryably() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     let (status, body) = post(app.clone(), "RETURN 1 AS one").await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Clients that disconnect while queued leave the line: with the slot
+    // held, twenty queued requests are dropped; once the slot frees, a new
+    // read is admitted at once instead of queueing behind dead waiters.
+    let held = namidb_server::acquire_read_admission(&plan, None)
+        .await
+        .unwrap();
+    let abandoned: Vec<_> = (0..20)
+        .map(|_| tokio::spawn(post(app.clone(), "RETURN 1 AS one")))
+        .collect();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    for request in &abandoned {
+        request.abort();
+    }
+    for request in abandoned {
+        assert!(request.await.unwrap_err().is_cancelled());
+    }
+    drop(held);
+    let started = std::time::Instant::now();
+    let (status, body) = post(app.clone(), "RETURN 1 AS one").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(started.elapsed() < Duration::from_millis(100));
+
+    // A read waiting for memory headroom keeps its slot meanwhile (the
+    // line does not move past it) and gives it back when it is refused.
+    let starved = std::sync::Arc::new(
+        namidb_server::memory::MemoryGovernor::new(1).with_admission_wait(Duration::from_secs(5)),
+    );
+    let waiting = tokio::spawn({
+        let plan = plan.clone();
+        let starved = std::sync::Arc::clone(&starved);
+        async move {
+            namidb_server::acquire_read_admission_with_memory(
+                &plan,
+                None,
+                Some(&starved),
+                tokio::time::Instant::now() + Duration::from_millis(300),
+            )
+            .await
+            .map(drop)
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let soon = || tokio::time::Instant::now() + Duration::from_millis(50);
+    assert_eq!(
+        namidb_server::acquire_read_admission_until(&plan, None, soon())
+            .await
+            .map(drop),
+        Err("NAMIDB_MAX_CONCURRENT_QUERIES"),
+        "the slot stays with the read waiting for memory"
+    );
+    assert!(matches!(
+        waiting.await.unwrap(),
+        Err(namidb_server::AdmissionRefused::Memory(_))
+    ));
+    assert!(
+        namidb_server::acquire_read_admission_until(&plan, None, soon())
+            .await
+            .is_ok(),
+        "a memory refusal releases the slot"
+    );
+
+    // The admission window is never more than half the read timeout, and
+    // the read timeout counts from arrival, queueing included.
+    std::env::set_var("NAMIDB_QUERY_ADMISSION_WAIT_MS", "5000");
+    assert_eq!(
+        namidb_server::admission_window(Duration::ZERO),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        namidb_server::admission_window(Duration::from_secs(2)),
+        Duration::from_secs(1)
+    );
+    let (store, paths) = namidb_storage::parse_uri("memory://admission-timeout").unwrap();
+    let writer = namidb_storage::WriterSession::open(store, paths)
+        .await
+        .unwrap();
+    let timed = namidb_server::build_router(
+        namidb_server::AppState::new(writer, None, "admission-timeout".into())
+            .with_query_timeout(Duration::from_secs(2)),
+    );
+    let (status, body) = post(
+        timed.clone(),
+        "UNWIND range(1, 2000) AS i CREATE (:N {i: i})",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let held = namidb_server::acquire_read_admission(&plan, None)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let (status, body, retry_after) = post_full(timed.clone(), "RETURN 1 AS one").await;
+    let waited = started.elapsed();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(retry_after.as_deref(), Some("2"));
+    assert!(
+        waited >= Duration::from_secs(1) && waited < Duration::from_millis(2500),
+        "refused after half the 2 s read timeout, not the 5 s wait: {waited:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let slow = tokio::spawn(post(
+        timed.clone(),
+        "MATCH (a:N), (b:N), (c:N) RETURN count(*) AS n",
+    ));
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    drop(held);
+    let (status, body) = slow.await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert!(
+        elapsed < Duration::from_millis(2700),
+        "900 ms in the queue plus a 2 s timeout from admission would be \
+         2.9 s; from arrival it is 2 s: {elapsed:?}"
+    );
 }

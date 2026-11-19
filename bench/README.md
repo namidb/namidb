@@ -43,7 +43,12 @@ so you can diff the two backends directly.
   refusals carried `Retry-After`, and peak RSS (`--rss-pid`). `--load`
   writes a synthetic Doc/Section corpus of the shape it expects; `--schema`
   maps the shapes onto another graph. Run the server in a container with
-  `--cpus`/`--memory` to measure a sized deployment.
+  `--cpus`/`--memory` to measure a sized deployment. On a corpus larger
+  than RAM the caches fill for minutes, so the run first warms up until
+  throughput is steady (`--steady-warmup`) and measures C=1 first and last
+  (`--levels 1,...,64,1`); speed-ups and the latency budget printed with
+  `BENCH_CPUS=<n>` use the warmer C=1. A cold first C=1 inflates every
+  ratio.
 - `bench/rollback_compat.sh <new server> <old server>...`: writes data with
   the new binary (flushed SSTs, property/full-text/vector indexes, an
   unflushed WAL tail), checks every old binary reads it identically and

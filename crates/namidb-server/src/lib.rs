@@ -1365,7 +1365,7 @@ pub async fn run_with_memory_limits(
     let memory = Arc::new(
         memory::MemoryGovernor::new(memory_max_bytes)
             .with_query_memory_max_bytes(query_memory_max_bytes)
-            .with_admission_wait(read_admission_wait()),
+            .with_admission_wait(admission_window(config.query_timeout)),
     );
     if memory.query_memory_max_bytes() > 0 {
         // `auto` is 50% of the process ceiling (25% of the available memory
@@ -2137,9 +2137,14 @@ async fn wait_for_shutdown_signal() -> ShutdownCause {
 async fn admit_http_cypher_request(
     memory: &Arc<memory::MemoryGovernor>,
     limit: usize,
+    query_timeout: Duration,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // The request's one admission deadline: this headroom wait, the read
+    // slot and the execution headroom below all share it, and the read
+    // timeout counts from here.
+    let admission = RequestAdmission::starting_now(admission_window(query_timeout));
     let wire_bytes = match http_cypher_wire_bytes(&req, limit) {
         Ok(bytes) => bytes,
         Err(HttpBodyAdmissionError::InvalidContentLength) => {
@@ -2166,13 +2171,16 @@ async fn admit_http_cypher_request(
     };
     let started = std::time::Instant::now();
     let reservation = match memory
-        .reserve_query_headroom(estimated_http_request_memory_bytes(wire_bytes))
+        .reserve_query_headroom_until(
+            estimated_http_request_memory_bytes(wire_bytes),
+            Some(admission.deadline),
+        )
         .await
     {
         Ok(reservation) => reservation,
         Err(pressure) => return memory_pressure_observation(started, pressure).response,
     };
-    let response = next.run(req).await;
+    let response = admission.scope(next.run(req)).await;
     // Keep projected JSON/query amplification charged through extraction,
     // planning, execution, response construction, and every early error.
     drop(reservation);
@@ -2184,7 +2192,14 @@ async fn require_memory_admission(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    admit_http_cypher_request(&state.memory, state.http_body_limit, req, next).await
+    admit_http_cypher_request(
+        &state.memory,
+        state.http_body_limit,
+        state.query_timeout,
+        req,
+        next,
+    )
+    .await
 }
 
 /// Multi-tenant twin of [`require_memory_admission`]. It runs before namespace
@@ -2195,7 +2210,14 @@ async fn require_memory_admission_multi(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    admit_http_cypher_request(&shared.memory, shared.http_body_limit, req, next).await
+    admit_http_cypher_request(
+        &shared.memory,
+        shared.http_body_limit,
+        shared.query_timeout,
+        req,
+        next,
+    )
+    .await
 }
 
 async fn require_auth_multi(
@@ -2609,6 +2631,73 @@ pub fn read_admission_wait() -> Duration {
         .unwrap_or(DEFAULT_QUERY_ADMISSION_WAIT)
 }
 
+/// The admission window a statement actually gets: [`read_admission_wait`],
+/// but never more than half the read timeout (`query_timeout`), so a
+/// statement admitted at the very end of its window still has half its
+/// budget to run. Queue time counts against the read timeout (see
+/// [`RequestAdmission`]), so a client or proxy that bounds a request by the
+/// read timeout hears back from the engine, with a 503 and `Retry-After`
+/// when the queue did not drain in time, before its own deadline expires.
+pub fn admission_window(query_timeout: Duration) -> Duration {
+    let wait = read_admission_wait();
+    if query_timeout.is_zero() {
+        wait
+    } else {
+        wait.min(query_timeout / 2)
+    }
+}
+
+/// When a statement arrived and when its admission wait ends.
+///
+/// Set once per request, by the HTTP memory-admission middleware (before
+/// the body is read) or at the start of a Bolt auto-commit RUN, and shared
+/// by every wait that follows (request memory headroom, the concurrency
+/// slot, memory headroom for execution), so the whole queueing phase is
+/// bounded by one deadline rather than one window per stage. The read
+/// timeout is measured from `arrived` too: time spent queueing is part of
+/// the statement's budget.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct RequestAdmission {
+    /// When the statement arrived.
+    pub arrived: std::time::Instant,
+    /// When its admission wait ends.
+    pub deadline: tokio::time::Instant,
+}
+
+impl RequestAdmission {
+    /// A statement arriving now with `window` to be admitted.
+    pub fn starting_now(window: Duration) -> Self {
+        Self {
+            arrived: std::time::Instant::now(),
+            deadline: tokio::time::Instant::now() + window,
+        }
+    }
+
+    /// The read deadline for this statement under `query_timeout`, counted
+    /// from its arrival; `None` when reads are unbounded.
+    pub fn query_deadline(&self, query_timeout: Duration) -> Option<std::time::Instant> {
+        (query_timeout > Duration::ZERO).then(|| self.arrived + query_timeout)
+    }
+
+    /// Run `fut` with this admission as the current request's.
+    pub async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
+        REQUEST_ADMISSION.scope(self, fut).await
+    }
+
+    /// The admission of the request this task is serving, or a fresh one
+    /// starting now (a caller outside any request scope, a test).
+    pub fn current_or_now(window: Duration) -> Self {
+        REQUEST_ADMISSION
+            .try_with(|admission| *admission)
+            .unwrap_or_else(|_| Self::starting_now(window))
+    }
+}
+
+tokio::task_local! {
+    static REQUEST_ADMISSION: RequestAdmission;
+}
+
 /// `Retry-After` (seconds) sent with every overload refusal: the admission
 /// queue's deadline, memory pressure, a full working-memory pool. Short on
 /// purpose: by the time a refusal is sent the queue has already absorbed
@@ -2643,7 +2732,22 @@ pub async fn acquire_read_admission(
     plan: &namidb_query::LogicalPlan,
     namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
 ) -> Result<ReadAdmission, &'static str> {
-    acquire_read_admission_with_memory(plan, namespace_gate, None)
+    acquire_read_admission_until(
+        plan,
+        namespace_gate,
+        tokio::time::Instant::now() + read_admission_wait(),
+    )
+    .await
+}
+
+/// [`acquire_read_admission`] with an explicit admission deadline.
+#[doc(hidden)]
+pub async fn acquire_read_admission_until(
+    plan: &namidb_query::LogicalPlan,
+    namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
+    deadline: tokio::time::Instant,
+) -> Result<ReadAdmission, &'static str> {
+    acquire_read_admission_with_memory(plan, namespace_gate, None, deadline)
         .await
         .map_err(|refusal| match refusal {
             AdmissionRefused::Queue(gate) => gate,
@@ -2661,17 +2765,18 @@ pub enum AdmissionRefused {
     Memory(memory::MemoryPressure),
 }
 
-/// [`acquire_read_admission`] that also waits, holding its place at the
-/// head of the line, for memory headroom ([`memory::MemoryGovernor::await_query_headroom`]):
-/// the process below its ceiling and room in the query working-memory pool.
-/// One deadline covers the whole wait.
+/// [`acquire_read_admission_until`] that also waits, holding its slot, for
+/// memory headroom ([`memory::MemoryGovernor::await_query_headroom`]): the
+/// process below its ceiling and room in the query working-memory pool.
+/// Both waits share `deadline` (the request's [`RequestAdmission`]), and a
+/// statement refused for memory gives its slot back on the way out.
 #[doc(hidden)]
 pub async fn acquire_read_admission_with_memory(
     plan: &namidb_query::LogicalPlan,
     namespace_gate: Option<&Arc<tokio::sync::Semaphore>>,
     memory: Option<&Arc<memory::MemoryGovernor>>,
+    deadline: tokio::time::Instant,
 ) -> Result<ReadAdmission, AdmissionRefused> {
-    let deadline = tokio::time::Instant::now() + read_admission_wait();
     let admission = acquire_read_slots(plan, namespace_gate, deadline)
         .await
         .map_err(AdmissionRefused::Queue)?;
@@ -2714,10 +2819,10 @@ async fn acquire_read_slots(
 /// Message for a read turned away by the gate whose knob is `gate`.
 pub(crate) fn admission_exhausted_message(gate: &str) -> String {
     format!(
-        "too many concurrent queries; waited {}ms in the read admission queue \
-         without a slot — retry (raise {gate} to widen the gate, or \
-         NAMIDB_QUERY_ADMISSION_WAIT_MS to wait longer)",
-        read_admission_wait().as_millis()
+        "too many concurrent queries; no slot freed up within the read \
+         admission window — retry (raise {gate} to widen the gate, or \
+         NAMIDB_QUERY_ADMISSION_WAIT_MS to wait longer; the window is never \
+         more than half the read timeout)"
     )
 }
 
@@ -4766,11 +4871,13 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // its share at once, but the permits stay held until the query has
         // actually stopped, so disconnect churn cannot run more reads than
         // the admission gates allow.
+        let request = RequestAdmission::current_or_now(admission_window(state.query_timeout));
         let admission = Arc::new(
             match acquire_read_admission_with_memory(
                 &plan,
                 state.query_gate.as_ref(),
                 Some(&state.memory),
+                request.deadline,
             )
             .await
             {
@@ -4787,7 +4894,8 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         let result = isolate::run_read_isolated({
             let plan = Arc::clone(&plan);
             let budget = budget.clone();
-            let deadline = state.query_deadline();
+            // Counted from arrival: queueing is part of the read budget.
+            let deadline = request.query_deadline(state.query_timeout);
             let row_cap = state.query_row_cap();
             let admission = Arc::clone(&admission);
             async move {
@@ -6835,11 +6943,13 @@ async fn run_cypher_multi(
         // its share at once, but the permits stay held until the query has
         // actually stopped, so disconnect churn cannot run more reads than
         // the admission gates allow.
+        let request = RequestAdmission::current_or_now(admission_window(shared.query_timeout));
         let admission = Arc::new(
             match acquire_read_admission_with_memory(
                 &plan,
                 ns_state.query_gate.as_ref(),
                 Some(&shared.memory),
+                request.deadline,
             )
             .await
             {
@@ -6856,7 +6966,8 @@ async fn run_cypher_multi(
         let result = isolate::run_read_isolated({
             let plan = Arc::clone(&plan);
             let budget = budget.clone();
-            let deadline = shared.query_deadline();
+            // Counted from arrival: queueing is part of the read budget.
+            let deadline = request.query_deadline(shared.query_timeout);
             let row_cap = shared.query_row_cap();
             let admission = Arc::clone(&admission);
             async move {

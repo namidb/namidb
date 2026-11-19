@@ -477,18 +477,22 @@ struct Cli {
 /// so every query thread fought over two arena locks, and the trim threshold
 /// it sets also pins glibc's mmap threshold at 128 KiB, turning every larger
 /// page or posting buffer into an mmap/munmap pair plus page faults under the
-/// process-wide mm lock. Half the CPU went to the kernel and a 2-CPU server
-/// ran about one query at a time. mimalloc keeps per-thread heaps (no shared
-/// arena lock on the hot path) and returns freed pages to the OS on a short
-/// delay, so both throughput and resident memory improve.
+/// process-wide mm lock. Together with the blocking-pool hops of local reads
+/// this kept a 2-CPU server at about one query at a time. mimalloc keeps
+/// per-thread heaps (no shared arena lock on the hot path) and returns freed
+/// pages to the OS on a short delay. Kernel time does not vanish: what
+/// remains is mostly copying range-cache misses out of the page cache.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// Memory-governor reclaim hook for mimalloc: collect and decommit every
-/// free page now instead of after the purge delay.
+/// Memory-governor reclaim hook for mimalloc: return free memory now
+/// instead of after the purge delay. `mi_collect` runs on the calling
+/// (blocking-pool) thread, so it reclaims that thread's heap, abandoned
+/// pages of exited threads and free arena memory; other threads' free pages
+/// still go back on mimalloc's own purge delay.
 fn mimalloc_reclaim() {
-    // SAFETY: `mi_collect` has no preconditions; `force = true` frees all
-    // abandoned/free pages it can reach.
+    // SAFETY: `mi_collect` has no preconditions; `force = true` purges what
+    // the calling thread can reach.
     unsafe { libmimalloc_sys::mi_collect(true) }
 }
 

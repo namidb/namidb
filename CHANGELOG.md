@@ -168,7 +168,7 @@ crates.io release will establish and document that API explicitly.
     glibc's mmap threshold at 128 KiB. Every query thread fought over two
     arena locks, and every buffer of 128 KiB or more (pages, postings,
     zstd contexts) became an mmap/munmap pair plus page faults under the
-    process-wide mm lock; half the CPU time went to the kernel. The server
+    process-wide mm lock; system time was about as large as user time. The server
     binary now allocates through mimalloc (per-thread heaps, freed pages
     returned on a short delay, `mi_collect` on memory-pressure reclaim), and
     the image no longer sets `MALLOC_TRIM_THRESHOLD_`.
@@ -189,13 +189,20 @@ crates.io release will establish and document that API explicitly.
     256 MiB. `NAMIDB_SEARCH_WORKSPACE_MAX_BYTES` still overrides it.
   - **Admission.** At most `max(4, CPUs)` reads ran and the rest were
     refused after 5 s, without `Retry-After`. Reads now default to two per
-    CPU (counted from the container's CPU quota), wait in a fair queue for
-    up to `NAMIDB_QUERY_ADMISSION_WAIT_MS` (30 s) for a slot and then for
-    memory headroom (the process below its ceiling and room in the shared
-    query working-memory pool) instead of being refused on one resident-set
-    sample, and are refused only when the deadline passes: 503 with
-    `code: "overloaded"` or `"memory_pressure"` and `Retry-After`. Every
-    overload refusal now carries `Retry-After`.
+    CPU (counted from the container's CPU quota) and wait in a fair queue
+    for request memory, a slot and then execution memory headroom (the
+    process below its ceiling and room in the shared query working-memory
+    pool) instead of being refused on one resident-set sample. One deadline
+    set when the request arrives covers all of it:
+    `NAMIDB_QUERY_ADMISSION_WAIT_MS` (30 s), capped at half the read
+    timeout (15 s by default). After it: 503 with `code: "overloaded"` or
+    `"memory_pressure"` and `Retry-After`. Every overload refusal now
+    carries `Retry-After`. The read timeout now counts from the request's
+    arrival, so queueing plus execution never exceeds it and a client or
+    proxy that waits for the read timeout hears back first. A Bolt
+    statement inside an explicit transaction checks memory once and never
+    waits (the transaction holds the writer); an auto-commit RUN's wait
+    ends on `RESET` or disconnect.
   The async runtime uses one worker per CPU the cgroup grants and keeps
   idle blocking threads for 60 s instead of 10 s. Measured with
   `bench/mixed_concurrency.py` on a 2-CPU / 6 GiB container over a local

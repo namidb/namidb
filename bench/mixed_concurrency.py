@@ -14,9 +14,16 @@ synthetic corpus `--load` writes (hubs `:Doc`, leaves `:Section`); pass
 `--schema file.json` to run the same shapes against a dataset with other
 names (every key of `DEFAULT_SCHEMA` may be overridden).
 
+Single-stream baseline: on a corpus larger than RAM the caches keep
+filling for minutes, so a C=1 level measured first is slower than a warm
+one and inflates every "x single" ratio. The run therefore first warms up
+until throughput is steady (`--steady-warmup`, at `--warm-concurrency`), and
+the default levels measure C=1 both first and last; the ratios and the
+latency budget use the faster (warmer) C=1.
+
 Usage:
     mixed_concurrency.py --url http://127.0.0.1:8080/<namespace> \
-        --levels 1,4,8,16,32,64 --duration 60 --rss-pid <server pid>
+        --levels 1,4,8,16,32,64,1 --duration 60 --rss-pid <server pid>
     mixed_concurrency.py --url ... --load --hubs 28000 --leaves 378000
 
 The script only needs the Python standard library.
@@ -370,7 +377,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", required=True, help="base URL of the namespace, e.g. http://127.0.0.1:8080/ns")
     ap.add_argument("--schema", help="JSON file overriding DEFAULT_SCHEMA keys")
-    ap.add_argument("--levels", default="1,4,8,16,32,64")
+    ap.add_argument("--levels", default="1,4,8,16,32,64,1",
+                    help="concurrency levels in order; C=1 may repeat (the warmest is the baseline)")
+    ap.add_argument("--steady-warmup", type=float, default=300.0,
+                    help="max seconds of unmeasured warm-up before the first level (0 = none)")
+    ap.add_argument("--warm-concurrency", type=int, default=4)
+    ap.add_argument("--steady-window", type=float, default=20.0,
+                    help="warm-up window; steady when two consecutive windows differ by under 5%%")
     ap.add_argument("--duration", type=float, default=60.0, help="measured seconds per level")
     ap.add_argument("--warmup", type=float, default=5.0, help="unmeasured seconds per level")
     ap.add_argument("--timeout", type=float, default=120.0, help="client timeout per request")
@@ -398,7 +411,19 @@ def main():
         wanted = set(args.only.split(","))
         qs = [q for q in qs if q[0] in wanted]
     params = Params(schema, args.seed)
-    report = {"label": args.label, "levels": []}
+    report = {"label": args.label, "levels": [], "warmup": []}
+    if args.steady_warmup > 0:
+        warm_args = argparse.Namespace(**{**vars(args), "warmup": 0.0, "duration": args.steady_window})
+        started = time.monotonic()
+        previous = None
+        while time.monotonic() - started < args.steady_warmup:
+            window = run_level(warm_args, url, qs, params, args.warm_concurrency)
+            qps = window["throughput_qps"]
+            report["warmup"].append(qps)
+            print(json.dumps({"warmup_qps": qps, "elapsed_s": round(time.monotonic() - started)}), flush=True)
+            if previous and qps > 0 and abs(qps - previous) / max(qps, previous) < 0.05:
+                break
+            previous = qps
     for level in [int(x) for x in args.levels.split(",")]:
         result = run_level(args, url, qs, params, level)
         report["levels"].append(result)
@@ -406,8 +431,16 @@ def main():
         if args.out:
             with open(args.out, "w") as f:
                 json.dump(report, f, indent=1)
-    base = report["levels"][0]
+    singles = [r for r in report["levels"] if r["concurrency"] == 1] or report["levels"][:1]
+    base = max(singles, key=lambda r: r["throughput_qps"])
+    report["baseline"] = {"throughput_qps": base["throughput_qps"], "p50_ms": base["p50_ms"],
+                          "single_runs_qps": [r["throughput_qps"] for r in singles]}
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=1)
     print()
+    print("baseline (warmest C=1): %.2f q/s, p50 %.0f ms; all C=1 runs: %s"
+          % (base["throughput_qps"], base["p50_ms"], report["baseline"]["single_runs_qps"]))
     print(f"| C | ok | err% | q/s | x single | p50 ms | p95 ms | p99 ms | peak RSS MiB | 503/429 w/ Retry-After |")
     print("|---|---|---|---|---|---|---|---|---|---|")
     for r in report["levels"]:
@@ -417,6 +450,16 @@ def main():
             f"{speedup:.2f} | {r['p50_ms']:.0f} | {r['p95_ms']:.0f} | {r['p99_ms']:.0f} | "
             f"{r['peak_rss_bytes'] / 2**20:.0f} | {r['refusals_with_retry_after']}/{r['refusals']} |"
         )
+    cpus = os.environ.get("BENCH_CPUS")
+    if cpus:
+        cpus = float(cpus)
+        print()
+        for r in report["levels"]:
+            c = r["concurrency"]
+            if c <= cpus:
+                continue
+            budget = (c / cpus) * base["p50_ms"] * 1.3
+            print(f"C={c}: p50 {r['p50_ms']:.0f} ms vs budget (C/CPUs) x p50(C=1) x 1.3 = {budget:.0f} ms")
     if base.get("per_shape_p50_ms"):
         print()
         print("single-stream p50 per shape (ms):", json.dumps(base["per_shape_p50_ms"]))

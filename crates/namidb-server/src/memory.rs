@@ -412,7 +412,7 @@ impl MemoryGovernor {
         self: &Arc<Self>,
         deadline: tokio::time::Instant,
     ) -> Result<(), MemoryPressure> {
-        let deadline = deadline.min(tokio::time::Instant::now() + self.admission_wait);
+        let deadline = self.effective_deadline(Some(deadline));
         let wait_for_pool = !self.admission_wait.is_zero();
         loop {
             let resident = match self.observe_resident() {
@@ -509,14 +509,33 @@ impl MemoryGovernor {
     /// While the hard ceiling remains exceeded, a monotonic one-second
     /// cooldown permits another pass without allowing retry storms to clear
     /// the same caches concurrently.
+    ///
+    /// Checks once and refuses at once: the form for callers that must not
+    /// wait (a statement inside an explicit write transaction holds the
+    /// single writer, and its own staged memory cannot drop before COMMIT).
+    /// Queued work uses [`Self::admit_query_until`].
     pub async fn admit_query(self: &Arc<Self>) -> Result<(), MemoryPressure> {
+        self.admit_query_until(None).await
+    }
+
+    /// [`Self::admit_query`] that waits in line for headroom until
+    /// `deadline` (capped by this governor's [`Self::admission_wait`]),
+    /// re-sampling and reclaiming every few milliseconds, and refuses only
+    /// then: a burst that briefly pushes resident memory to the ceiling
+    /// waits for the running statements to give their memory back instead
+    /// of turning straight into 503s. `None`, or a governor without an
+    /// admission wait, checks once.
+    pub async fn admit_query_until(
+        self: &Arc<Self>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), MemoryPressure> {
         // Keep the ordinary below-threshold path to one cheap RSS sample.
         // Cache destruction and `malloc_trim`, however, can walk millions of
         // allocations and must never run on an async serving worker.
         if self.max_bytes == 0 {
             return Ok(());
         }
-        let deadline = tokio::time::Instant::now() + self.admission_wait;
+        let deadline = self.effective_deadline(deadline);
         loop {
             let Some(initial) = self.observe_resident() else {
                 return Ok(());
@@ -531,6 +550,16 @@ impl MemoryGovernor {
                 return Err(pressure);
             }
             tokio::time::sleep_until(deadline.min(now + ADMISSION_POLL)).await;
+        }
+    }
+
+    /// The caller's admission deadline capped by this governor's own
+    /// admission wait; "now" (check once) when either is absent.
+    fn effective_deadline(&self, deadline: Option<tokio::time::Instant>) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        match deadline {
+            Some(deadline) => deadline.min(now + self.admission_wait),
+            None => now,
         }
     }
 
@@ -674,9 +703,24 @@ impl MemoryGovernor {
     /// The compare/exchange includes reservations held by every concurrent
     /// request, so multiple individually admissible frames cannot all race
     /// past the same remaining process headroom.
+    ///
+    /// Checks once and refuses at once; queued work uses
+    /// [`Self::reserve_query_headroom_until`].
     pub async fn reserve_query_headroom(
         self: &Arc<Self>,
         additional_bytes: usize,
+    ) -> Result<MemoryHeadroomReservation, MemoryPressure> {
+        self.reserve_query_headroom_until(additional_bytes, None)
+            .await
+    }
+
+    /// [`Self::reserve_query_headroom`] that waits in line for headroom
+    /// until `deadline` (capped by [`Self::admission_wait`]); `None` checks
+    /// once. The refusal is counted once, at the deadline.
+    pub async fn reserve_query_headroom_until(
+        self: &Arc<Self>,
+        additional_bytes: usize,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<MemoryHeadroomReservation, MemoryPressure> {
         if self.max_bytes == 0 {
             return Ok(MemoryHeadroomReservation {
@@ -684,7 +728,7 @@ impl MemoryGovernor {
                 bytes: 0,
             });
         }
-        let deadline = tokio::time::Instant::now() + self.admission_wait;
+        let deadline = self.effective_deadline(deadline);
         loop {
             let Some(initial) = self.observe_resident() else {
                 return Ok(MemoryHeadroomReservation {
@@ -1547,36 +1591,62 @@ mod tests {
     }
 
     /// With an admission wait, a statement arriving over the ceiling waits
-    /// in line for the whole window and only then is refused (counted once,
-    /// not once per re-sample); without one it is refused at once.
+    /// in line until its deadline and only then is refused (counted once,
+    /// not once per re-sample); without a deadline, or without a governor
+    /// wait, it is refused at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admission_waits_for_headroom_until_its_deadline() {
         // A few bytes: the process is always over this ceiling.
         let immediate = Arc::new(MemoryGovernor::new(1));
         let started = Instant::now();
         assert!(immediate.admit_query().await.is_err());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(
+            immediate.admit_query_until(Some(deadline)).await.is_err(),
+            "a governor without an admission wait never waits"
+        );
         assert!(started.elapsed() < Duration::from_millis(500));
 
         // 4 KiB: always exceeded, yet larger than the 16-byte request below.
         let waiting =
             Arc::new(MemoryGovernor::new(4096).with_admission_wait(Duration::from_millis(150)));
+        // The no-deadline forms keep failing fast, even with a governor
+        // wait: callers holding the writer must not sleep on memory.
         let started = Instant::now();
         assert!(waiting.admit_query().await.is_err());
+        assert!(waiting.reserve_query_headroom(16).await.is_err());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(waiting.rejected_queries(), 2);
+
+        // A far deadline is capped by the governor's own wait.
+        let far = tokio::time::Instant::now() + Duration::from_secs(30);
+        let started = Instant::now();
+        assert!(waiting.admit_query_until(Some(far)).await.is_err());
         assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(
             waiting.rejected_queries(),
-            1,
+            3,
             "one refusal, not one per poll"
         );
 
+        // A near deadline wins over the governor's wait.
+        let near = tokio::time::Instant::now() + Duration::from_millis(60);
         let started = Instant::now();
-        assert!(waiting.reserve_query_headroom(16).await.is_err());
-        assert!(started.elapsed() >= Duration::from_millis(150));
-        assert_eq!(waiting.rejected_queries(), 2);
+        assert!(waiting
+            .reserve_query_headroom_until(16, Some(near))
+            .await
+            .is_err());
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(waiting.rejected_queries(), 4);
 
         // A request larger than the whole ceiling can never fit: no waiting.
         let started = Instant::now();
-        assert!(waiting.reserve_query_headroom(usize::MAX).await.is_err());
+        assert!(waiting
+            .reserve_query_headroom_until(usize::MAX, Some(far))
+            .await
+            .is_err());
         assert!(started.elapsed() < Duration::from_millis(150));
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
@@ -1602,7 +1672,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let started = Instant::now();
         assert!(open.await_query_headroom(deadline).await.is_ok());
-        assert!(open.admit_query().await.is_ok());
+        assert!(open.admit_query_until(Some(deadline)).await.is_ok());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 

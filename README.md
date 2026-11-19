@@ -835,14 +835,14 @@ The server also takes durability/backpressure knobs for critical workloads:
 | `--memtable-flush-bytes` (`NAMIDB_MEMTABLE_FLUSH_BYTES`) | 64 MiB, at most 1/16 of `NAMIDB_MEMORY_MAX_BYTES` | Flush as soon as a committed write crosses this — bounds the un-flushed working set by bytes, not just the flush interval. |
 | `--memtable-stall-bytes` (`NAMIDB_MEMTABLE_STALL_BYTES`) | 256 MiB, at most 1/8 of `NAMIDB_MEMORY_MAX_BYTES` | Soft write backpressure so a burst loader can't OOM the process between flushes. |
 | `--writer-lock-timeout` (`NAMIDB_WRITER_LOCK_TIMEOUT`) | 30s | Cap how long a foreground write/DDL waits for the writer; a stuck writer returns 503 fast instead of growing an unbounded queue. |
-| `--query-timeout` (`NAMIDB_QUERY_TIMEOUT`) | 30s | Wall-clock budget for a single read query (HTTP and Bolt); a runaway scan aborts with a timeout error instead of pinning a worker. `0s` = unbounded. |
+| `--query-timeout` (`NAMIDB_QUERY_TIMEOUT`) | 30s | Wall-clock budget for a single read query (HTTP and Bolt), counted from when the statement arrived, so time spent in the admission queue is part of it; a runaway scan aborts with a timeout error instead of pinning a worker. `0s` = unbounded. |
 | `--write-timeout` (`NAMIDB_WRITE_TIMEOUT`) | 60s | Wall-clock budget for a single write statement — its own default, deliberately larger than the read budget. For a bulk load, set `NAMIDB_WRITE_TIMEOUT=0s` (unbounded) or chunk the writes into smaller statements. `0s` = unbounded. |
 | `--fence-policy` (`NAMIDB_FENCE_POLICY`) | `steal` | What a writer does when another process claims its namespace. `steal` reopens and takes it back, which suits a single server. `yield` leaves it to the new owner and keeps the writer degraded until the process (or, in multi-tenant mode, the namespace) is opened again; use it when a control plane decides which node owns each namespace. |
 | `--restore-point-retention` (`NAMIDB_RESTORE_POINT_RETENTION`) | 0 (off) | Keep every committed version of this long (e.g. `24h`, `7d`) restorable for a point-in-time backup (`as_of`). Storage grows by what the namespace writes in the window. Needs `NAMIDB_COMPACTION_INTERVAL` above zero. |
 | `--http-max-body-bytes` (`NAMIDB_HTTP_MAX_BODY_BYTES`) | 16 MiB, at most what makes one request reserve 1/4 of `NAMIDB_MEMORY_MAX_BYTES` (never below 2 MiB) | Largest JSON body `/v0/cypher` accepts; larger requests get 413. 16 MiB holds several hundred 1024-dimension embeddings per request. Each request reserves about 16x its size of working memory before its JSON is decoded (16x the limit when it has no `Content-Length`), so with a small `NAMIDB_MEMORY_MAX_BYTES` send fewer large requests at a time. |
 | `NAMIDB_CREATE_ONLY_HEAD_CACHE_MAX_ENTRIES` (env only) | 16384 | How many object-size answers (HEADs) of immutable SST objects the process keeps, so a write or read does not re-HEAD the same SST sidecars after every commit. `0` disables it. |
 | `NAMIDB_MAX_CONCURRENT_QUERIES` (env only) | two per CPU, at least 4 | Reads that execute at once. CPUs are counted from the container's CPU quota, not the host's cores. Reads beyond this wait in a fair (first come, first served) admission queue. `0` disables the gate. |
-| `NAMIDB_QUERY_ADMISSION_WAIT_MS` (env only) | 30000 | How long a statement waits in the admission queue for a slot and for memory headroom (the process below `NAMIDB_MEMORY_MAX_BYTES`, room in the shared query working-memory pool) before it is refused with a retryable 503 (`code: "overloaded"` or `"memory_pressure"`) carrying `Retry-After`. |
+| `NAMIDB_QUERY_ADMISSION_WAIT_MS` (env only) | 30000, capped at half of `--query-timeout` (15 s with the default) | How long a statement waits in the admission queue, in total, for request memory, a slot and execution memory headroom (the process below `NAMIDB_MEMORY_MAX_BYTES`, room in the shared query working-memory pool) before it is refused with a retryable 503 (`code: "overloaded"` or `"memory_pressure"`) carrying `Retry-After`. Never more than half the read timeout, so a statement admitted late still has half its budget. Statements inside a Bolt explicit transaction never wait for memory. |
 | `NAMIDB_LOCAL_IO_THREADS` (env only) | eight per CPU, 8 to 64 | Threads that serve ranged reads of a `file://` store. |
 | `NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE` (env only) | 0 (off) | In `--multi-tenant` mode, cap the concurrent reads of each namespace inside the process-wide read gate (`NAMIDB_MAX_CONCURRENT_QUERIES`), so one busy tenant cannot take every permit. |
 
@@ -854,10 +854,18 @@ A burst of queries queues instead of failing. Each read takes a slot of
 `NAMIDB_MAX_CONCURRENT_QUERIES` (two per CPU by default) and then waits, at
 the head of the line, until the process is below its memory ceiling and the
 shared query working-memory pool has room. Waiters are served in arrival
-order. Only a statement that is still waiting after
-`NAMIDB_QUERY_ADMISSION_WAIT_MS` (30 s) is refused, with a 503 and a
-`Retry-After` header; every overload refusal (`overloaded`,
-`memory_pressure`, a full search workspace) carries `Retry-After`.
+order. One deadline, set when the request arrives, covers every stage of the
+wait: `NAMIDB_QUERY_ADMISSION_WAIT_MS` (30 s), but never more than half of
+`--query-timeout` (so 15 s with the default 30 s timeout). A statement still
+waiting then is refused with a 503 and a `Retry-After` header; every
+overload refusal (`overloaded`, `memory_pressure`, a full search workspace)
+carries `Retry-After`. The read timeout counts from arrival too, so a
+client or proxy that bounds a request by the read timeout always hears back
+from the server before its own deadline: an answer, a 504 for a statement
+that ran out of time, or a 503 to retry. A client that disconnects while
+queued leaves the line at once. Statements inside a Bolt explicit
+transaction check memory once and never wait for it: the transaction holds
+the single writer, and the memory it staged cannot drop before `COMMIT`.
 
 The official server binary uses mimalloc as its allocator, so
 `MALLOC_ARENA_MAX` only affects C libraries that call glibc's `malloc`
