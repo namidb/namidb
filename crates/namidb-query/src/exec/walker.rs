@@ -4138,6 +4138,108 @@ async fn bm25_ranked_flat(
     k: Option<usize>,
     filter: Option<(&Expression, &Params, &[String])>,
 ) -> Result<Vec<(NodeId, f64)>, ExecError> {
+    if k == Some(0) || parsed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // A full-text index that covers this search but is not online yet (an
+    // index created over existing nodes, or one whose catalog changed) makes
+    // this scan the only route until it activates. Bound it instead of
+    // letting it run into the query timeout on a large label.
+    #[cfg(feature = "text-index")]
+    let building = building_text_scan(snapshot, label, props);
+    #[cfg(not(feature = "text-index"))]
+    let building: Option<BuildingTextScan> = None;
+    let result =
+        bm25_ranked_flat_scan(snapshot, label, props, parsed, k, filter, building.as_ref()).await;
+    match (result, building) {
+        (Err(ExecError::Timeout), Some(building)) => Err(ExecError::IndexBuilding(
+            building.message("the query timeout"),
+        )),
+        (result, _) => result,
+    }
+}
+
+/// A BM25 scan standing in for a full-text index that is not online yet.
+#[derive(Debug, Clone)]
+struct BuildingTextScan {
+    index: String,
+    label: String,
+    props: Vec<String>,
+    percent: f64,
+    /// Documents the scan may visit before it fails.
+    max_documents: usize,
+}
+
+impl BuildingTextScan {
+    fn message(&self, exceeded: &str) -> String {
+        format!(
+            "full-text index `{}` on :{}({}) is BUILDING ({:.0}% done) and cannot serve \
+             search.bm25 or search.hybrid yet. Until it is ONLINE a search scans every :{} \
+             node, and that scan exceeded {exceeded}. Retry when SHOW INDEXES reports the \
+             index ONLINE.",
+            self.index,
+            self.label,
+            self.props.join(", "),
+            self.percent,
+            self.label,
+        )
+    }
+}
+
+/// Documents a BM25 scan standing in for a BUILDING full-text index may
+/// visit (`NAMIDB_SEARCH_BUILDING_SCAN_MAX_DOCS`, default 50 000; 0 removes
+/// the bound and leaves only the query timeout).
+#[cfg(feature = "text-index")]
+fn building_text_scan_max_documents() -> usize {
+    const DEFAULT: usize = 50_000;
+    match std::env::var("NAMIDB_SEARCH_BUILDING_SCAN_MAX_DOCS") {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(0) => usize::MAX,
+            Ok(value) => value,
+            Err(_) => DEFAULT,
+        },
+        Err(_) => DEFAULT,
+    }
+}
+
+/// The registered full-text index covering `(label, props)` when it exists
+/// but cannot serve natively yet, with its build progress.
+#[cfg(feature = "text-index")]
+fn building_text_scan(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    props: &[String],
+) -> Option<BuildingTextScan> {
+    use namidb_storage::search_progress::{index_state, IndexState};
+    let manifest = &snapshot.manifest().manifest;
+    let descriptor = manifest
+        .text_indexes
+        .iter()
+        .find(|descriptor| descriptor.matches(label, props))?;
+    let (state, percent) = index_state(
+        manifest,
+        namidb_storage::search_lsm::SearchLsmKind::Text,
+        &descriptor.name,
+    );
+    (state == IndexState::Building).then(|| BuildingTextScan {
+        index: descriptor.name.clone(),
+        label: label.to_string(),
+        props: props.to_vec(),
+        percent,
+        max_documents: building_text_scan_max_documents(),
+    })
+}
+
+async fn bm25_ranked_flat_scan(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    props: &[String],
+    parsed: &crate::exec::text_scoring::TextQuery,
+    k: Option<usize>,
+    filter: Option<(&Expression, &Params, &[String])>,
+    building: Option<&BuildingTextScan>,
+) -> Result<Vec<(NodeId, f64)>, ExecError> {
     use crate::exec::text_scoring::{bm25_idf, bm25_term_score, PREFIX_EXPANSION_LIMIT};
     use namidb_storage::search_workspace::{
         bm25_max_document_bytes, estimated_bm25_document_workspace_bytes,
@@ -4145,10 +4247,6 @@ async fn bm25_ranked_flat(
         search_max_text_result_hits,
     };
     use std::collections::{BTreeMap, HashMap};
-
-    if k == Some(0) || parsed.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let maximum_unbounded_hits = search_max_text_result_hits();
     let retained_limit = k.unwrap_or_else(|| maximum_unbounded_hits.saturating_add(1));
@@ -4180,14 +4278,24 @@ async fn bm25_ranked_flat(
     // affect the query plan.
     let mut expanded_df = vec![BTreeMap::<String, usize>::new(); parsed.prefixes.len()];
     let mut since_check = 0usize;
+    let mut visited = 0usize;
 
     // Pass one: corpus-wide statistics, deliberately before applying `filter`.
+    // It visits every node of the label, so it alone enforces the budget of a
+    // scan standing in for a BUILDING index; pass two visits the same nodes.
     snapshot
         .visit_label_with_projection(label, &projection, |view| -> Result<(), ExecError> {
             since_check += 1;
             if since_check >= 4096 {
                 since_check = 0;
                 crate::exec::limits::check_deadline()?;
+            }
+            visited += 1;
+            if let Some(building) = building.filter(|building| visited > building.max_documents) {
+                return Err(ExecError::IndexBuilding(building.message(&format!(
+                    "its budget of {} documents (NAMIDB_SEARCH_BUILDING_SCAN_MAX_DOCS)",
+                    building.max_documents
+                ))));
             }
             let mut counts: HashMap<String, u32> = HashMap::new();
             let Some(document_len) =

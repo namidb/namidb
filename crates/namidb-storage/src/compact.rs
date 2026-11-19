@@ -1105,7 +1105,7 @@ fn search_state_is_physical(
     match state.status {
         crate::search_lsm::SearchLsmStatus::Active => true,
         crate::search_lsm::SearchLsmStatus::Building => {
-            search_lsm_compact::building_activation_eligible(state)
+            search_lsm_compact::building_activation_plannable(manifest, state)
         }
     }
 }

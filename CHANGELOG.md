@@ -119,6 +119,35 @@ crates.io release will establish and document that API explicitly.
 
 ### Fixed
 
+- **A full-text index built by 3.4.x keeps serving after the upgrade and is
+  migrated in the background.** Such an index can have a base in the format
+  before FT4. The first 3.5 flush that touched its label appended an FT4
+  delta, and no reader accepted that mix: every `search.bm25` and
+  `search.hybrid` scanned the label instead (running into the query timeout
+  on a large one), `SHOW INDEXES` reported the index `BUILDING` at 0%, and
+  the base rebuild that repairs it waited for gigabytes of deltas. Now:
+  - the old base and its FT4 deltas are searched together natively, with
+    BM25 statistics over the whole snapshot, so the answers and scores are
+    exactly those of a rebuilt FT4 base;
+  - every such base (also one with no deltas) is rebuilt as FT4 by the next
+    compaction pass, one base build at a time under the usual memory
+    admission, and any other index generation that only a scan could serve
+    is rebuilt the same way, whatever its delta debt; the rebuilt base is
+    readable by 3.4.x and 3.5.x engines alike;
+  - `SHOW INDEXES` reports such an index `ONLINE` and shows the migration in
+    a new trailing column, `migrationPercent` (null when no migration is
+    pending); `BUILDING` is reported only for an index that cannot serve yet,
+    with a percentage that moves;
+  - an index left `BUILDING` (also after a restart, or with no writes since)
+    is always scheduled for its build, and base builds log their start,
+    every 10%, and their end with the index name and elapsed time;
+    `/v0/health` lists them under `search_builds_in_flight` and `/v0/metrics`
+    exports `namidb_search_index_build_percent`;
+  - a search over an index that is still `BUILDING` scans at most 50 000
+    nodes of the label (`NAMIDB_SEARCH_BUILDING_SCAN_MAX_DOCS`, 0 for no
+    bound) and otherwise fails at once with a retryable `index_building`
+    error (HTTP 503) naming the index, its state and progress, instead of
+    waiting for the query timeout.
 - **Backups of large namespaces no longer fail on long object reads.** A
   snapshot copy read every object as one GET, throttled by the upload behind
   it, so a multi-GB SST kept a single request open for minutes. The object
