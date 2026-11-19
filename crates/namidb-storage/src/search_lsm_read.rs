@@ -110,17 +110,80 @@ struct OpenedVectorGeneration {
 #[derive(Debug)]
 struct OpenedTextSegment {
     segment: SearchSegmentRef,
-    reader: Arc<crate::sst::text::v4::TextV4Reader>,
+    reader: OpenedTextReader,
+}
+
+/// The reader of one text segment. A generation's base may still be the
+/// range-readable V3 object an older engine built (wrapped in place when the
+/// Search-LSM was introduced); every delta, and every base built since, is
+/// FT4. The V3 base has no version table: any delta record for a document
+/// supersedes the base's copy of it.
+#[cfg(feature = "text-index")]
+#[derive(Debug)]
+enum OpenedTextReader {
+    V3Base(Arc<crate::sst::text::TextIndexV3Reader>),
+    V4(Arc<crate::sst::text::v4::TextV4Reader>),
 }
 
 #[cfg(feature = "text-index")]
 impl OpenedTextSegment {
     fn supports_filter_property(&self, property: &str) -> bool {
-        self.segment
-            .complete_filter_properties
-            .binary_search_by(|candidate| candidate.as_str().cmp(property))
-            .is_ok()
-            && self.reader.supports_filter_property(property)
+        match &self.reader {
+            // V3 carries no filter postings: a filtered query widens an
+            // unfiltered ranked prefix instead (still natively).
+            OpenedTextReader::V3Base(_) => false,
+            OpenedTextReader::V4(reader) => {
+                self.segment
+                    .complete_filter_properties
+                    .binary_search_by(|candidate| candidate.as_str().cmp(property))
+                    .is_ok()
+                    && reader.supports_filter_property(property)
+            }
+        }
+    }
+
+    fn v4(&self) -> Option<&Arc<crate::sst::text::v4::TextV4Reader>> {
+        match &self.reader {
+            OpenedTextReader::V3Base(_) => None,
+            OpenedTextReader::V4(reader) => Some(reader),
+        }
+    }
+
+    fn version_reader(&self) -> Option<&SearchVersionTableReader> {
+        self.v4().map(|reader| reader.version_reader())
+    }
+
+    /// Role-relative `df` contribution: absolute for a base, signed for a
+    /// delta.
+    async fn term_df(&self, term: &str) -> Result<i64> {
+        match &self.reader {
+            OpenedTextReader::V3Base(reader) => i64::try_from(reader.term_doc_freq(term).await?)
+                .map_err(|_| Error::invariant("text v3 document frequency overflows i64")),
+            OpenedTextReader::V4(reader) => reader.term_delta_df(term).await,
+        }
+    }
+
+    async fn expand_prefix_terms(&self, prefix: &str, limit: usize) -> Result<Vec<String>> {
+        match &self.reader {
+            OpenedTextReader::V3Base(reader) => reader.expand_prefix_terms(prefix, limit).await,
+            OpenedTextReader::V4(reader) => reader.expand_prefix_terms(prefix, limit).await,
+        }
+    }
+
+    /// Documents physically present in this segment (a V3 base still counts
+    /// the ones newer deltas supersede).
+    fn local_document_count(&self) -> u64 {
+        match &self.reader {
+            OpenedTextReader::V3Base(reader) => reader.doc_count(),
+            OpenedTextReader::V4(reader) => reader.live_document_count(),
+        }
+    }
+
+    fn resident_metadata_bytes(&self) -> usize {
+        match &self.reader {
+            OpenedTextReader::V3Base(reader) => reader.estimated_resident_bytes(),
+            OpenedTextReader::V4(reader) => reader.resident_metadata_bytes(),
+        }
     }
 }
 
@@ -147,6 +210,7 @@ impl OpenedTextGeneration {
             return None;
         }
         let segment = &self.segments[0];
+        let reader = segment.v4()?;
         // A singleton segment holds the whole corpus when it is either the
         // base, or the first delta of the generation (a delta applied to the
         // empty corpus at event 0). Either way its relative statistics are
@@ -195,11 +259,11 @@ impl OpenedTextGeneration {
             || segment.segment.live_payload_count != documents
             || documents != self.document_count
             || total_len != self.total_document_len
-            || segment.reader.live_document_count() != documents
-            || u64::try_from(segment.reader.delta_docs()).ok() != Some(documents)
-            || u64::try_from(segment.reader.delta_total_len()).ok() != Some(total_len)
+            || reader.live_document_count() != documents
+            || u64::try_from(reader.delta_docs()).ok() != Some(documents)
+            || u64::try_from(reader.delta_total_len()).ok() != Some(total_len)
             || self.state.segments.first() != Some(&segment.segment)
-            || segment.reader.segment() != &segment.segment
+            || reader.segment() != &segment.segment
         {
             return None;
         }
@@ -715,13 +779,54 @@ async fn open_text_generation(
     let mut resident_bytes = segments
         .capacity()
         .saturating_mul(std::mem::size_of::<OpenedTextSegment>());
-    for segment in &state.segments {
-        if segment.format != SearchSegmentFormat::TextV4 {
-            return Ok(ActiveSearch::Unavailable);
-        }
+    for (position, segment) in state.segments.iter().enumerate() {
         let Some(descriptor) = unique_descriptor(snapshot, segment.sst_id, &state) else {
             return Ok(ActiveSearch::Unavailable);
         };
+        if segment.format == SearchSegmentFormat::TextV3Base {
+            // Only as the generation's base, bound to the descriptor and
+            // statistics its wrap recorded.
+            if position != 0 || segment.role != SearchSegmentRole::Base {
+                return Ok(ActiveSearch::Unavailable);
+            }
+            let reader = match snapshot.fetch_text_search_index(descriptor).await {
+                Ok(Some(index @ super::TextSearchIndex::Ranged(_)))
+                    if super::active_text_base_matches(&index, descriptor, segment) =>
+                {
+                    match index {
+                        super::TextSearchIndex::Ranged(reader) => reader,
+                        super::TextSearchIndex::Legacy(_) => unreachable!("matched Ranged"),
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        path = %descriptor.path,
+                        "Search-LSM V3 text base does not match its binding; falling back"
+                    );
+                    return Ok(ActiveSearch::Unavailable);
+                }
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    return Ok(ActiveSearch::Unavailable);
+                }
+                Err(error) => return Err(error),
+            };
+            let opened = OpenedTextSegment {
+                segment: segment.clone(),
+                reader: OpenedTextReader::V3Base(reader),
+            };
+            resident_bytes = match resident_bytes.checked_add(opened.resident_metadata_bytes()) {
+                Some(value) => value,
+                None => return Ok(ActiveSearch::Unavailable),
+            };
+            if !metadata_fits_workspace(resident_bytes) {
+                return Ok(ActiveSearch::Unavailable);
+            }
+            segments.push(opened);
+            continue;
+        }
+        if segment.format != SearchSegmentFormat::TextV4 {
+            return Ok(ActiveSearch::Unavailable);
+        }
         let Some(source) = pin_descriptor(snapshot, descriptor).await? else {
             return Ok(ActiveSearch::Unavailable);
         };
@@ -759,7 +864,7 @@ async fn open_text_generation(
         }
         segments.push(OpenedTextSegment {
             segment: segment.clone(),
-            reader,
+            reader: OpenedTextReader::V4(reader),
         });
     }
     if segments.len() != state.segments.len() {
@@ -1379,9 +1484,19 @@ pub(super) async fn vector_search(
 #[derive(Debug, Clone, Copy)]
 struct TextCandidate {
     node_id: [u8; 16],
-    lsn: u64,
-    fingerprint: u64,
+    version: TextCandidateVersion,
     score: f64,
+}
+
+#[cfg(feature = "text-index")]
+#[derive(Debug, Clone, Copy)]
+enum TextCandidateVersion {
+    /// A document of a V3 base: current unless a delta records the node.
+    V3Base,
+    Versioned {
+        lsn: u64,
+        fingerprint: u64,
+    },
 }
 
 #[cfg(feature = "text-index")]
@@ -1511,9 +1626,7 @@ async fn globally_expanded_text_query(
                 .segments
                 .iter()
                 .map(|segment| {
-                    segment
-                        .reader
-                        .expand_prefix_terms(prefix, crate::text::PREFIX_EXPANSION_LIMIT)
+                    segment.expand_prefix_terms(prefix, crate::text::PREFIX_EXPANSION_LIMIT)
                 })
                 .collect::<Vec<_>>(),
         )
@@ -1583,7 +1696,7 @@ async fn reconciled_text_df(generation: &OpenedTextGeneration, term: &str) -> Re
         generation
             .segments
             .iter()
-            .map(|segment| segment.reader.term_delta_df(term))
+            .map(|segment| segment.term_df(term))
             .collect::<Vec<_>>(),
     )
     .buffered(SEARCH_SEGMENT_FANOUT)
@@ -1648,26 +1761,42 @@ async fn text_generation_contains_live(
     generation: &OpenedTextGeneration,
     node_ids: &[[u8; 16]],
 ) -> Result<Option<bool>> {
+    let v3_base = generation
+        .segments
+        .first()
+        .and_then(|segment| match &segment.reader {
+            OpenedTextReader::V3Base(reader) => Some(reader),
+            OpenedTextReader::V4(_) => None,
+        });
     for chunk in node_ids.chunks(WINNER_PROBE_BATCH) {
         let winners = probe_winners(
             generation
                 .segments
                 .iter()
                 .rev()
-                .map(|segment| segment.reader.version_reader()),
+                .filter_map(OpenedTextSegment::version_reader),
             chunk,
         )
         .await?;
         if winners.conflict {
             return Ok(None);
         }
-        if winners
-            .records
-            .into_iter()
-            .flatten()
-            .any(|record| matches!(record.operation, SearchVersionOperation::Live { .. }))
-        {
-            return Ok(Some(true));
+        let mut unversioned = Vec::new();
+        for (node_id, record) in chunk.iter().zip(winners.records) {
+            match record {
+                Some(record) if matches!(record.operation, SearchVersionOperation::Live { .. }) => {
+                    return Ok(Some(true));
+                }
+                Some(_) => {}
+                None => unversioned.push(*node_id),
+            }
+        }
+        // No delta mentions these ids: a V3 base still holds them live if
+        // it contains them at all.
+        if let Some(base) = v3_base {
+            if base.contains_any_doc(&unversioned).await? {
+                return Ok(Some(true));
+            }
         }
     }
     Ok(Some(false))
@@ -1690,7 +1819,7 @@ async fn reconcile_text_candidates(
                 .segments
                 .iter()
                 .rev()
-                .map(|segment| segment.reader.version_reader()),
+                .filter_map(OpenedTextSegment::version_reader),
             &node_ids,
         )
         .await?;
@@ -1703,12 +1832,15 @@ async fn reconcile_text_candidates(
             return Ok(None);
         }
         for (candidate, winner) in chunk.iter().copied().zip(winners.records) {
-            if versioned_candidate_wins(
-                candidate.node_id,
-                candidate.lsn,
-                candidate.fingerprint,
-                winner,
-            ) {
+            let keep = match candidate.version {
+                // Every delta is newer than the base: any record of the node
+                // (an update or a delete) supersedes the base's document.
+                TextCandidateVersion::V3Base => winner.is_none(),
+                TextCandidateVersion::Versioned { lsn, fingerprint } => {
+                    versioned_candidate_wins(candidate.node_id, lsn, fingerprint, winner)
+                }
+            };
+            if keep {
                 accepted.push(candidate);
             }
         }
@@ -1826,9 +1958,11 @@ pub(super) async fn text_search(
         );
         return Ok(ActiveSearch::Unavailable);
     }
-    if let Some(base) = generation.authoritative_single_base(dirty_ids) {
-        let result = match base
-            .reader
+    if let Some((base, base_reader)) = generation
+        .authoritative_single_base(dirty_ids)
+        .and_then(|base| base.v4().map(|reader| (base, reader)))
+    {
+        let result = match base_reader
             .search_query_base_block_max_exact(&expanded, &global, retained, &canonical_groups)
             .await
         {
@@ -1884,8 +2018,7 @@ pub(super) async fn text_search(
     }
     let mut ranked = BoundedTextResults::new(retained);
     for segment in &generation.segments {
-        let local_documents =
-            usize::try_from(segment.reader.live_document_count()).unwrap_or(usize::MAX);
+        let local_documents = usize::try_from(segment.local_document_count()).unwrap_or(usize::MAX);
         if local_documents == 0 {
             continue;
         }
@@ -1902,40 +2035,65 @@ pub(super) async fn text_search(
             .min(segment_ceiling)
             .max(1);
         loop {
-            let result = match segment
-                .reader
-                .search_query_exact(&expanded, &global, segment_limit, &canonical_groups)
-                .await
-            {
-                Ok(result) => result,
+            let searched = match &segment.reader {
+                OpenedTextReader::V4(reader) => reader
+                    .search_query_exact(&expanded, &global, segment_limit, &canonical_groups)
+                    .await
+                    .map(|result| {
+                        if result.applied_filter_groups != canonical_groups.len()
+                            && !(result.hits.is_empty() && result.applied_filter_groups == 0)
+                        {
+                            return None;
+                        }
+                        Some(
+                            result
+                                .hits
+                                .into_iter()
+                                .map(|hit| TextCandidate {
+                                    node_id: hit.node_id,
+                                    version: TextCandidateVersion::Versioned {
+                                        lsn: hit.lsn,
+                                        fingerprint: hit.payload_fingerprint,
+                                    },
+                                    score: hit.score,
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    }),
+                // Filter groups never reach a V3 base: it advertises no
+                // filter property, so a filtered query was refused above.
+                OpenedTextReader::V3Base(reader) if canonical_groups.is_empty() => reader
+                    .search_query_global(&expanded, &global, segment_limit)
+                    .await
+                    .map(|hits| {
+                        Some(
+                            hits.into_iter()
+                                .map(|(node_id, score)| TextCandidate {
+                                    node_id,
+                                    version: TextCandidateVersion::V3Base,
+                                    score,
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    }),
+                OpenedTextReader::V3Base(_) => Ok(None),
+            };
+            let candidates = match searched {
+                Ok(Some(candidates)) => candidates,
+                Ok(None) => return Ok(ActiveSearch::Unavailable),
                 Err(error) if optional_accelerator_fallback(&error) => {
                     tracing::warn!(
                         index = index_name,
                         segment = %segment.segment.sst_id,
                         error = %error,
-                        "Search-LSM FT4 query failed; falling back atomically"
+                        "Search-LSM text segment query failed; falling back atomically"
                     );
                     return Ok(ActiveSearch::Unavailable);
                 }
                 Err(error) => return Err(error),
             };
-            if result.applied_filter_groups != canonical_groups.len()
-                && !(result.hits.is_empty() && result.applied_filter_groups == 0)
-            {
-                return Ok(ActiveSearch::Unavailable);
-            }
             let matching_exhausted =
-                local_documents <= segment_limit || result.hits.len() < segment_limit;
-            let candidates = result
-                .hits
-                .into_iter()
-                .map(|hit| TextCandidate {
-                    node_id: hit.node_id,
-                    lsn: hit.lsn,
-                    fingerprint: hit.payload_fingerprint,
-                    score: hit.score,
-                })
-                .collect::<Vec<_>>();
+                local_documents <= segment_limit || candidates.len() < segment_limit;
             let accepted = match reconcile_text_candidates(&generation, &candidates).await {
                 Ok(Some(accepted)) => accepted,
                 Ok(None) => return Ok(ActiveSearch::Unavailable),
@@ -2731,7 +2889,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                let reader = &generation.segments[0].reader;
+                let reader = generation.segments[0].v4().expect("an FT4 segment");
                 for k in [1, 3, 32] {
                     let fast = reader
                         .search_query_base_block_max_exact(&parsed, &global, k, &[])

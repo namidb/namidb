@@ -8679,6 +8679,109 @@ impl<'mt> Snapshot<'mt> {
         Ok(latest.into_values().filter(|(_, live)| *live).count() as u64)
     }
 
+    /// Every live `(src, dst)` pair of `edge_type` visible at this snapshot,
+    /// in no particular order.
+    ///
+    /// The topology half of [`Self::scan_edge_type`]: the same memtable +
+    /// writer-overlay + forward-SST merge (last writer wins by LSN,
+    /// tombstones pruned) without decoding a single property stream. This is
+    /// what a whole-graph aggregation needs from an edge type — a grouped
+    /// neighbour count or a path count reads every edge exactly once in one
+    /// sequential pass instead of one adjacency probe per node.
+    ///
+    /// Retained pairs are charged to the query's memory hook (32 bytes each),
+    /// so a type larger than the working-memory budget fails the query with
+    /// a memory error instead of growing without bound.
+    #[instrument(skip(self), fields(edge_type = edge_type))]
+    pub async fn live_edge_pairs(&self, edge_type: &str) -> Result<Vec<(NodeId, NodeId)>> {
+        const PAIR_BYTES: usize = 32;
+        let mut retained = crate::cancel::RetainMeter::new();
+        let fwd: Vec<usize> = self
+            .manifest
+            .index
+            .scope_descriptors(SstKind::EdgesFwd, edge_type)
+            .to_vec();
+        let mem_entries = self.edge_mem_entries_for_type(edge_type).count();
+
+        // Steady state: one flushed or compacted forward SST and nothing
+        // newer. A single SST holds one row per `(src, dst)` (the flush and
+        // the compaction merge both key on it, which is also what
+        // `count_edge_type` relies on), so its live rows are the answer.
+        if fwd.len() == 1 && mem_entries == 0 {
+            let desc = &self.manifest.manifest.ssts[fwd[0]];
+            let body = self.get_sst_body(desc).await?;
+            let reader = EdgeSstReader::open(body)?;
+            let rows = reader.scan_all_edges()?;
+            let mut out = Vec::with_capacity(rows.len());
+            for (i, row) in rows.iter().enumerate() {
+                if i % crate::cancel::CHECK_STRIDE == 0 {
+                    crate::cancel::check()?;
+                    if retained.active() {
+                        retained.add(PAIR_BYTES * crate::cancel::CHECK_STRIDE)?;
+                    }
+                }
+                if row.tombstone {
+                    continue;
+                }
+                out.push((
+                    NodeId::from_uuid(Uuid::from_bytes(row.key_id)),
+                    NodeId::from_uuid(Uuid::from_bytes(row.partner_id)),
+                ));
+            }
+            return Ok(out);
+        }
+
+        // General case: several SSTs and/or unflushed edges. Same
+        // last-writer-wins merge as `count_edge_type`, hashed instead of
+        // ordered because the caller does not need an order.
+        let mut latest: HashMap<(NodeId, NodeId), (u64, bool)> = HashMap::new();
+        let merge = |latest: &mut HashMap<(NodeId, NodeId), (u64, bool)>,
+                     key: (NodeId, NodeId),
+                     lsn: u64,
+                     live: bool| match latest.get(&key) {
+            Some((existing, _)) if *existing >= lsn => {}
+            _ => {
+                latest.insert(key, (lsn, live));
+            }
+        };
+        for (mk, entry) in self.edge_mem_entries_for_type(edge_type) {
+            let MemKey::Edge {
+                edge_type: et,
+                src,
+                dst,
+            } = mk
+            else {
+                continue;
+            };
+            if et != edge_type {
+                continue;
+            }
+            let live = !matches!(entry.op, MemOp::Tombstone);
+            merge(&mut latest, (*src, *dst), entry.lsn, live);
+        }
+        for &idx in &fwd {
+            let desc = &self.manifest.manifest.ssts[idx];
+            let body = self.get_sst_body(desc).await?;
+            let reader = EdgeSstReader::open(body)?;
+            let rows = reader.scan_all_edges()?;
+            for (i, row) in rows.iter().enumerate() {
+                if i % crate::cancel::CHECK_STRIDE == 0 {
+                    crate::cancel::check()?;
+                    if retained.active() {
+                        retained.add(PAIR_BYTES * 2 * crate::cancel::CHECK_STRIDE)?;
+                    }
+                }
+                let src = NodeId::from_uuid(Uuid::from_bytes(row.key_id));
+                let dst = NodeId::from_uuid(Uuid::from_bytes(row.partner_id));
+                merge(&mut latest, (src, dst), row.lsn, !row.tombstone);
+            }
+        }
+        Ok(latest
+            .into_iter()
+            .filter_map(|(pair, (_, live))| live.then_some(pair))
+            .collect())
+    }
+
     /// Inverse edges into `dst` along `edge_type` (in-edges).
     #[instrument(skip(self), fields(edge_type = edge_type, dst = %dst))]
     pub async fn in_edges(&self, edge_type: &str, dst: NodeId) -> Result<EdgeListView> {

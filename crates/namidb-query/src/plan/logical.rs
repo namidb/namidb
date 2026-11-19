@@ -457,6 +457,38 @@ pub enum LogicalPlan {
         output: String,
     },
 
+    /// Grouped path count over a linear chain of single hops, answered from
+    /// whole-edge-type topology instead of by enumerating paths. Emitted by
+    /// the `path_count` optimiser pass for an `Aggregate` whose every
+    /// aggregation is a plain `count(*)` / `count(<chain binding>)` over
+    /// `NodeScan(v0) -> Expand(v1) -> ... -> Expand(vk)` and whose grouping
+    /// keys read only ONE chain node, `nodes[group]`.
+    ///
+    /// The executor reads each hop's live `(src, dst)` pairs once and folds
+    /// path counts from both ends of the chain toward the group node
+    /// (`L(v) * R(v)`), proving every endpoint's existence and labels exactly
+    /// as the replaced Expands do. It then emits one row per group-node
+    /// value with a non-zero count — the group node's binding plus `output`
+    /// holding the number of chain matches through it — and the `Aggregate`
+    /// above sums `output` per group. With `group: None` it emits a single
+    /// row holding the total (none when it is zero).
+    ///
+    /// A leaf in [`Self::children`]: it drives its own reads.
+    PathCount {
+        /// Chain nodes `v0..vk`; `nodes.len() == hops.len() + 1`.
+        nodes: Vec<PathCountNode>,
+        /// `hops[i]` connects `nodes[i]` to `nodes[i + 1]`.
+        hops: Vec<PathCountHop>,
+        /// Index into `nodes` of the node each output row binds; `None`
+        /// for a global count.
+        group: Option<usize>,
+        /// Property projection used when the group node is materialised
+        /// (same meaning as `NodeScan::projection`).
+        projection: Option<Vec<String>>,
+        /// Output column holding the per-row match count.
+        output: String,
+    },
+
     /// Approximate-nearest-neighbour lookup over a node-label embedding
     /// property (RFC-030, `vector-index`). A leaf operator: it drives its own
     /// reads — the flat path (`NodeScan` of `label`, per-row distance, sort,
@@ -518,6 +550,27 @@ pub struct NodeBinding {
     pub predicates: Vec<ScanPredicate>,
 }
 
+/// One node of a [`LogicalPlan::PathCount`] chain.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathCountNode {
+    pub alias: String,
+    /// Conjunctive label constraint (`NodeScan::label` for `v0`, the
+    /// Expand's `target_labels` for the rest). Empty = any existing node.
+    pub labels: Vec<String>,
+    /// Scan predicates pushed onto `v0`'s `NodeScan`; always empty for the
+    /// other nodes (the rewrite declines any filter on them).
+    pub predicates: Vec<ScanPredicate>,
+}
+
+/// One hop of a [`LogicalPlan::PathCount`] chain.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PathCountHop {
+    /// `None` = every observed edge type (an untyped single hop).
+    pub edge_type: Option<Vec<String>>,
+    /// Direction of travel from `nodes[i]` to `nodes[i + 1]`.
+    pub direction: RelationshipDirection,
+}
+
 /// One edge constraint in a [`LogicalPlan::MultiwayJoin`]
 /// (RFC-024). `from_idx` and `to_idx` index into
 /// `MultiwayJoin.vars`; for each listed `edge_type` the executor reads
@@ -548,6 +601,7 @@ impl LogicalPlan {
             | LogicalPlan::Argument { .. }
             | LogicalPlan::MultiwayJoin { .. }
             | LogicalPlan::EdgeTypeCount { .. }
+            | LogicalPlan::PathCount { .. }
             | LogicalPlan::VectorSearch { .. }
             | LogicalPlan::CallProcedure { .. } => {
                 vec![]
@@ -600,6 +654,7 @@ impl LogicalPlan {
             | LogicalPlan::Argument { .. }
             | LogicalPlan::MultiwayJoin { .. }
             | LogicalPlan::EdgeTypeCount { .. }
+            | LogicalPlan::PathCount { .. }
             | LogicalPlan::VectorSearch { .. }
             | LogicalPlan::CallProcedure { .. } => vec![],
             LogicalPlan::NodeById { input, .. }
@@ -722,6 +777,7 @@ impl LogicalPlan {
             }
             LogicalPlan::MultiwayJoin { .. } => "MultiwayJoin",
             LogicalPlan::EdgeTypeCount { .. } => "EdgeTypeCount",
+            LogicalPlan::PathCount { .. } => "PathCount",
             LogicalPlan::VectorSearch { .. } => "VectorSearch",
             LogicalPlan::CallProcedure { .. } => "CallProcedure",
         }

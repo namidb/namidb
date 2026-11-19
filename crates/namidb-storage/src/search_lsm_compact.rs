@@ -586,6 +586,18 @@ fn base_rebuild_needed(
     {
         return Ok(true);
     }
+    // A generation no native reader accepts (an unsupported format mix, or
+    // more segments than the protocol ceiling) is served by a corpus scan
+    // for as long as nothing replaces its segments; a full-text base still
+    // in the pre-FT4 V3 format is the migration's input. Both are repaired
+    // by one base rebuild now, whatever the delta debt: waiting for the byte
+    // or staleness threshold left such an index on the scan indefinitely.
+    // The rebuilt base is FT4 and complete, so neither fires again.
+    if crate::search_lsm::legacy_base_migration_due(state)
+        || crate::search_lsm::segment_set_fallback(state).is_some()
+    {
+        return Ok(true);
+    }
     let has_delta = state
         .segments
         .iter()
@@ -933,6 +945,62 @@ pub(super) fn building_activation_eligible(state: &SearchLsmState) -> bool {
         && state.compat_barrier_sst_id.is_some()
 }
 
+/// Whether [`select_search_compactions`] plans the activation of Building
+/// generation `state` from `manifest`: it is eligible, every segment resolves
+/// to its descriptor, its segments and proven-empty ranges own exactly one
+/// contiguous event prefix, all of them are deltas, and there is a corpus to
+/// scan. The Nodes merge treats a Building generation as physical (no logical
+/// rebuild) only under exactly this predicate, so a generation one route
+/// declines is always taken by the other and never left unplanned.
+pub(super) fn building_activation_plannable(manifest: &Manifest, state: &SearchLsmState) -> bool {
+    building_activation_eligible(state)
+        && building_activation_inputs(manifest, state).is_some()
+        && manifest
+            .ssts
+            .iter()
+            .any(|descriptor| descriptor.kind == SstKind::Nodes)
+}
+
+/// The descriptors and the exact event prefix an activation of `state`
+/// replaces, or `None` when its segment set cannot be activated physically.
+fn building_activation_inputs(
+    manifest: &Manifest,
+    state: &SearchLsmState,
+) -> Option<(Vec<SstDescriptor>, Vec<SearchEventRange>)> {
+    let mut descriptors = Vec::with_capacity(state.segments.len());
+    for segment in &state.segments {
+        let matches = manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.id == segment.sst_id)
+            .collect::<Vec<_>>();
+        let [descriptor] = matches.as_slice() else {
+            return None;
+        };
+        if descriptor.kind != state.kind.sst_kind() || descriptor.scope != state.index_name {
+            return None;
+        }
+        descriptors.push((*descriptor).clone());
+    }
+    let ranges = compressed_event_union(
+        state
+            .segments
+            .iter()
+            .flat_map(|segment| segment.event_ranges.iter().copied())
+            .chain(state.proven_empty_event_ranges.iter().copied()),
+    )
+    .ok()?;
+    if ranges.as_slice() != [SearchEventRange::new(0, state.next_event_seq)]
+        || state
+            .segments
+            .iter()
+            .any(|segment| segment.role != SearchSegmentRole::Delta)
+    {
+        return None;
+    }
+    Some((descriptors, ranges))
+}
+
 /// Plan the activation of a Building generation: one authoritative base over
 /// every visible Nodes SST that owns the generation's whole event prefix.
 ///
@@ -947,50 +1015,17 @@ fn select_building_activation(
     state: &SearchLsmState,
     policy: SearchCompactionPolicy,
 ) -> Result<Option<SearchCompactionSelection>> {
-    let mut descriptors = Vec::with_capacity(state.segments.len());
-    for segment in &state.segments {
-        let matches = manifest
-            .ssts
-            .iter()
-            .filter(|descriptor| descriptor.id == segment.sst_id)
-            .collect::<Vec<_>>();
-        let [descriptor] = matches.as_slice() else {
-            return Ok(None);
-        };
-        if descriptor.kind != state.kind.sst_kind() || descriptor.scope != state.index_name {
-            return Ok(None);
-        }
-        descriptors.push((*descriptor).clone());
-    }
-    let Ok(ranges) = compressed_event_union(
-        state
-            .segments
-            .iter()
-            .flat_map(|segment| segment.event_ranges.iter().copied())
-            .chain(state.proven_empty_event_ranges.iter().copied()),
-    ) else {
-        return Ok(None);
-    };
-    if ranges.as_slice() != [SearchEventRange::new(0, state.next_event_seq)]
-        || state
-            .segments
-            .iter()
-            .any(|segment| segment.role != SearchSegmentRole::Delta)
-    {
+    if !building_activation_plannable(manifest, state) {
         tracing::warn!(
             index = %state.index_name,
-            "Building Search-LSM generation does not own one contiguous event prefix; \
+            "Building Search-LSM generation cannot be activated by a physical base build; \
              leaving it to the logical rebuild"
         );
         return Ok(None);
     }
-    if !manifest
-        .ssts
-        .iter()
-        .any(|descriptor| descriptor.kind == SstKind::Nodes)
-    {
+    let Some((descriptors, ranges)) = building_activation_inputs(manifest, state) else {
         return Ok(None);
-    }
+    };
     Ok(Some(SearchCompactionSelection {
         mode: SearchCompactionMode::BasePrefix,
         captured_state: state.clone(),
@@ -4157,9 +4192,12 @@ fn build_search_compactions_blocking(
         .ok_or_else(|| Error::invariant("Search-LSM compaction has no build memory share"))?;
     // `SHOW INDEXES` reports a Building generation's progress from this.
     let progress = crate::search_progress::begin_build(
-        selections
-            .iter()
-            .map(|selection| selection.captured_state.generation_id),
+        selections.iter().map(|selection| {
+            (
+                selection.captured_state.generation_id,
+                selection.captured_state.index_name.clone(),
+            )
+        }),
         plan.iter()
             .fold(0u64, |total, entry| total.saturating_add(entry.row_count)),
     );
@@ -4367,6 +4405,7 @@ fn build_search_compactions_blocking(
     for built in &mut finished {
         built.prepared.metrics.peak_resident_input_bytes = peak_resident_input_bytes;
     }
+    progress.finished();
     Ok(finished)
 }
 

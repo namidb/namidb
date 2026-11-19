@@ -22,11 +22,15 @@ pub fn show_schema_columns() -> Vec<String> {
 
 /// Column order for `SHOW INDEXES`: the schema columns plus `state`
 /// (`ONLINE`, or `BUILDING` while a vector or full-text index cannot serve a
-/// search natively yet) and `populationPercent` (100 when online, otherwise
-/// the progress of the build that will activate it; 0 until one starts).
+/// search natively yet), `populationPercent` (100 when online, otherwise
+/// the progress of the build that will activate it; 0 until one starts) and
+/// `migrationPercent`: null, except for an `ONLINE` index whose base is still
+/// in a legacy format a background rebuild is replacing (a full-text index
+/// built by an engine before FT4), where it is that rebuild's progress (0
+/// until it starts). Such an index serves natively during the migration.
 pub fn show_indexes_columns() -> Vec<String> {
     let mut columns = show_schema_columns();
-    columns.extend(["state", "populationPercent"].map(String::from));
+    columns.extend(["state", "populationPercent", "migrationPercent"].map(String::from));
     columns
 }
 
@@ -83,7 +87,7 @@ pub fn show_constraints_rows(schema: &Schema) -> Vec<Row> {
 /// Sorted by name for a stable result order.
 pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
     use namidb_storage::search_lsm::SearchLsmKind;
-    use namidb_storage::search_progress::index_state;
+    use namidb_storage::search_progress::{index_status, IndexState, IndexStatus};
     let mut entries: Vec<(String, &'static str, String, Vec<String>)> = Vec::new();
     for (label, def) in &manifest.schema.labels {
         for p in &def.properties {
@@ -142,16 +146,22 @@ pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
     entries
         .into_iter()
         .map(|(name, kind, label, props)| {
-            let (state, percent) = match kind {
-                "VECTOR" => index_state(manifest, SearchLsmKind::Vector, &name),
-                "FULLTEXT" => index_state(manifest, SearchLsmKind::Text, &name),
-                _ => (namidb_storage::search_progress::IndexState::Online, 100.0),
+            let status = match kind {
+                "VECTOR" => index_status(manifest, SearchLsmKind::Vector, &name),
+                "FULLTEXT" => index_status(manifest, SearchLsmKind::Text, &name),
+                _ => IndexStatus {
+                    state: IndexState::Online,
+                    percent: 100.0,
+                    migration_percent: None,
+                },
             };
+            let round = |percent: f64| RuntimeValue::Float((percent * 10.0).round() / 10.0);
             schema_row(name, kind, label, &props)
-                .with("state", RuntimeValue::String(state.as_str().into()))
+                .with("state", RuntimeValue::String(status.state.as_str().into()))
+                .with("populationPercent", round(status.percent))
                 .with(
-                    "populationPercent",
-                    RuntimeValue::Float((percent * 10.0).round() / 10.0),
+                    "migrationPercent",
+                    status.migration_percent.map_or(RuntimeValue::Null, round),
                 )
         })
         .collect()

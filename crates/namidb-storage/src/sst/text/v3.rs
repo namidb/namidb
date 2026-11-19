@@ -541,7 +541,7 @@ impl TextIndexV3Reader {
     ) -> Result<Vec<([u8; 16], f64)>, Error> {
         let mut metrics = TextV3QueryMetrics::default();
         let result = self
-            .search_query_inner(query, k, search_max_result_bytes(), &mut metrics)
+            .search_query_inner(query, k, None, search_max_result_bytes(), &mut metrics)
             .await;
         let workspace = shared_search_workspace().metrics();
         tracing::debug!(
@@ -558,10 +558,102 @@ impl TextIndexV3Reader {
         result
     }
 
+    /// Absolute document frequency of `term` in this base (0 when absent).
+    ///
+    /// A multi-segment coordinator folds it with the signed contributions of
+    /// the FT4 deltas stacked on this base to get the snapshot-wide `df`.
+    pub async fn term_doc_freq(&self, term: &str) -> Result<u64, Error> {
+        let workspace = self.dictionary_workspace_bytes(&TextQuery::from_terms(&[term.to_owned()]));
+        let _reservation = shared_search_workspace()
+            .reserve("full-text dictionary lookup", workspace)
+            .await?;
+        let mut cache = HashMap::new();
+        Ok(self
+            .lookup_term(term, &mut cache)
+            .await?
+            .map(|entry| u64::from(entry.doc_freq))
+            .unwrap_or(0))
+    }
+
+    /// Expand one prefix from this base's dictionary, retaining at most
+    /// `limit` (at most [`PREFIX_EXPANSION_LIMIT`]) lexicographically smallest
+    /// terms. Same contract as the FT4 reader's `expand_prefix_terms`.
+    pub async fn expand_prefix_terms(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, Error> {
+        if limit > PREFIX_EXPANSION_LIMIT {
+            return Err(Error::precondition(format!(
+                "text v3 prefix expansion limit {limit} exceeds {PREFIX_EXPANSION_LIMIT}"
+            )));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let query = TextQuery {
+            prefixes: vec![prefix.to_owned()],
+            ..TextQuery::default()
+        };
+        let workspace = self.dictionary_workspace_bytes(&query);
+        let _reservation = shared_search_workspace()
+            .reserve("full-text prefix expansion", workspace)
+            .await?;
+        let mut cache = HashMap::new();
+        let mut terms = self.expand_prefix(prefix, &mut cache).await?;
+        terms.truncate(limit);
+        Ok(terms)
+    }
+
+    /// Exact top-`k` with caller-supplied snapshot-wide BM25 statistics.
+    ///
+    /// This base is the oldest segment of a generation whose newer FT4
+    /// deltas supersede some of its documents and add others, so its own
+    /// footer statistics are not the corpus's. `global` carries the corpus
+    /// document count, total length and the `df` of every scored term; the
+    /// score of each document is then exactly the one an FT4 segment (or the
+    /// flat scan) gives it for the same snapshot: same IDF, same average
+    /// length, same lexicographic per-term summation order, and only
+    /// positive finite scores are ranked. `query` must already be expanded
+    /// (no prefixes): the coordinator expands prefixes across every segment.
+    /// Returned documents may be superseded by a newer delta; the caller
+    /// reconciles them.
+    pub async fn search_query_global(
+        &self,
+        query: &TextQuery,
+        global: &super::v4::TextV4GlobalStats,
+        k: usize,
+    ) -> Result<Vec<([u8; 16], f64)>, Error> {
+        if !query.prefixes.is_empty() {
+            return Err(Error::invariant(
+                "text v3 global scoring requires a prefix-expanded query",
+            ));
+        }
+        if global
+            .document_frequency
+            .values()
+            .any(|df| *df > global.document_count)
+        {
+            return Err(Error::invariant(
+                "global BM25 df exceeds the global document count",
+            ));
+        }
+        let mut metrics = TextV3QueryMetrics::default();
+        self.search_query_inner(
+            query,
+            Some(k),
+            Some(global),
+            search_max_result_bytes(),
+            &mut metrics,
+        )
+        .await
+    }
+
     async fn search_query_inner(
         &self,
         query: &TextQuery,
         k: Option<usize>,
+        global: Option<&super::v4::TextV4GlobalStats>,
         result_limit_bytes: usize,
         metrics: &mut TextV3QueryMetrics,
     ) -> Result<Vec<([u8; 16], f64)>, Error> {
@@ -619,8 +711,20 @@ impl TextIndexV3Reader {
             return Ok(Vec::new());
         }
 
-        let n = self.footer.n_docs as usize;
-        let avgdl = avg_len(self.footer.total_len, n);
+        // Corpus statistics: this object's own, or the snapshot-wide ones a
+        // multi-segment coordinator supplies when newer deltas change them.
+        let (n, avgdl) = match global {
+            None => {
+                let n = self.footer.n_docs as usize;
+                (n, avg_len(self.footer.total_len, n))
+            }
+            Some(global) => {
+                let n = usize::try_from(global.document_count).map_err(|_| {
+                    Error::invariant("global BM25 document count does not fit usize")
+                })?;
+                (n, avg_len(global.total_document_len, n))
+            }
+        };
         let posting_workspace = posting_query_workspace_bytes(
             &entries,
             self.footer.n_docs as usize,
@@ -637,9 +741,23 @@ impl TextIndexV3Reader {
 
         let mut cursors = Vec::with_capacity(entries.len());
         for (term, entry) in entries {
-            let scored_idf = scored_terms
-                .contains(term.as_str())
-                .then(|| bm25_idf(n, entry.doc_freq as usize));
+            let scored_idf = if scored_terms.contains(term.as_str()) {
+                let doc_freq = match global {
+                    None => entry.doc_freq as usize,
+                    Some(global) => {
+                        let df = *global.document_frequency.get(&term).ok_or_else(|| {
+                            Error::invariant(format!(
+                                "global BM25 statistics omit query term {term:?}"
+                            ))
+                        })?;
+                        usize::try_from(df)
+                            .map_err(|_| Error::invariant("global BM25 df does not fit usize"))?
+                    }
+                };
+                Some(bm25_idf(n, doc_freq))
+            } else {
+                None
+            };
             cursors.push(PostingCursor {
                 term,
                 blocks: entry.blocks,
@@ -693,7 +811,9 @@ impl TextIndexV3Reader {
                     score += bm25_term_score(idf, posting.tf, posting.doc_len as usize, avgdl);
                     matched_scored_term = true;
                 }
-                if matched_scored_term {
+                // With corpus-wide statistics, rank exactly what the FT4
+                // scorer ranks: positive finite scores only.
+                if matched_scored_term && (global.is_none() || (score > 0.0 && score.is_finite())) {
                     ranked.push(RankedOrdinal { doc, score })?;
                     metrics.retained_results = metrics.retained_results.max(ranked.len());
                 }
@@ -2048,7 +2168,7 @@ mod tests {
             let expected_hits = expected.search_query(&query, k);
             let mut metrics = TextV3QueryMetrics::default();
             let actual = reader
-                .search_query_inner(&query, k, 4 * 1024 * 1024, &mut metrics)
+                .search_query_inner(&query, k, None, 4 * 1024 * 1024, &mut metrics)
                 .await
                 .unwrap();
             assert_eq!(actual.len(), expected_hits.len(), "{raw_query:?}");
@@ -2105,7 +2225,7 @@ mod tests {
 
         let mut metrics = TextV3QueryMetrics::default();
         let actual = reader
-            .search_query_inner(&query, None, 1024 * 1024, &mut metrics)
+            .search_query_inner(&query, None, None, 1024 * 1024, &mut metrics)
             .await
             .unwrap();
         assert_eq!(actual.len(), expected_hits.len());
@@ -2137,6 +2257,7 @@ mod tests {
             .search_query_inner(
                 &query,
                 None,
+                None,
                 2 * MATERIALISED_RESULT_BYTES_PER_HIT,
                 &mut metrics,
             )
@@ -2156,7 +2277,7 @@ mod tests {
         // explicitly requests top-k.
         let mut metrics = TextV3QueryMetrics::default();
         let hits = reader
-            .search_query_inner(&query, Some(2), 0, &mut metrics)
+            .search_query_inner(&query, Some(2), None, 0, &mut metrics)
             .await
             .unwrap();
         assert_eq!(hits.len(), 2);

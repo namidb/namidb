@@ -72,6 +72,34 @@ crates.io release will establish and document that API explicitly.
   keys with the list of valid ones, like the other `search.*` and `algo.*`
   procedures; giving both `text_property` and `text_properties`, or a
   non-string `fusion`, is an error.
+- **Whole-graph grouped counts no longer enumerate paths.** `count(*)` /
+  `count(x)` grouped by one node of a linear chain (`MATCH (d:Doc)<-[:R]-(x)
+  RETURN d.title, count(x) ORDER BY ... LIMIT 5`, a per-document section
+  count, a three-hop grouped count) is now folded from each edge type's live
+  edge list as path counts per node, instead of building one row per path and
+  grouping them. Endpoint labels and existence are proven exactly as the
+  traversal proved them, so the result is unchanged; property-based
+  differential tests compare it with the naive plan over randomized graphs
+  with deletes, self-loops, multi-label nodes and unflushed edges.
+  `NAMIDB_PATH_COUNT=0` turns the rewrite off. The fold's working state
+  (edge lists, per-node path counts) is charged to the query's memory
+  budget, so a count over a graph larger than the budget fails with a
+  memory error instead of growing past it. Aggregations that only
+  `count`/`sum` now fold each group as rows arrive rather than retaining
+  their input.
+- **Anchor choice no longer depends on how the pattern is written.**
+  `MATCH (x)-[:R]->(d:Doc {code: $c})` plans like
+  `MATCH (d:Doc {code: $c})<-[:R]-(x)`: an unlabelled source is costed as the
+  whole graph, so an indexed pin on the other side anchors the walk. A
+  variable-length hop toward a pinned node (`(x)-[:R*1..2]->(d:Doc {code:
+  $c})`) and a pin on a property without an index (a filtered scan of the
+  pinned label) anchor the same way when cheaper.
+- **`shortestPath` between two bound nodes is faster.** The
+  meet-in-the-middle search expands the side whose next level reads fewer
+  adjacency entries, reads a level's adjacency lists concurrently (order
+  preserved), and hydrates the path's interior nodes in one batched read
+  instead of one uncached point read each — a single interior node of a
+  corpus with large text and embedding properties used to cost seconds.
 
 ### Added
 
@@ -148,6 +176,35 @@ crates.io release will establish and document that API explicitly.
   search version table was probed 64 pages at a time, one batch after
   another; at k=300 that is hundreds of 24 KiB pages. Four batches now run
   at once.
+- **A full-text index built by 3.4.x keeps serving after the upgrade and is
+  migrated in the background.** Such an index can have a base in the format
+  before FT4. The first 3.5 flush that touched its label appended an FT4
+  delta, and no reader accepted that mix: every `search.bm25` and
+  `search.hybrid` scanned the label instead (running into the query timeout
+  on a large one), `SHOW INDEXES` reported the index `BUILDING` at 0%, and
+  the base rebuild that repairs it waited for gigabytes of deltas. Now:
+  - the old base and its FT4 deltas are searched together natively, with
+    BM25 statistics over the whole snapshot, so the answers and scores are
+    exactly those of a rebuilt FT4 base;
+  - every such base (also one with no deltas) is rebuilt as FT4 by the next
+    compaction pass, one base build at a time under the usual memory
+    admission, and any other index generation that only a scan could serve
+    is rebuilt the same way, whatever its delta debt; the rebuilt base is
+    readable by 3.4.x and 3.5.x engines alike;
+  - `SHOW INDEXES` reports such an index `ONLINE` and shows the migration in
+    a new trailing column, `migrationPercent` (null when no migration is
+    pending); `BUILDING` is reported only for an index that cannot serve yet,
+    with a percentage that moves;
+  - an index left `BUILDING` (also after a restart, or with no writes since)
+    is always scheduled for its build, and base builds log their start,
+    every 10%, and their end with the index name and elapsed time;
+    `/v0/health` lists them under `search_builds_in_flight` and `/v0/metrics`
+    exports `namidb_search_index_build_percent`;
+  - a search over an index that is still `BUILDING` scans at most 50 000
+    nodes of the label (`NAMIDB_SEARCH_BUILDING_SCAN_MAX_DOCS`, 0 for no
+    bound) and otherwise fails at once with a retryable `index_building`
+    error (HTTP 503) naming the index, its state and progress, instead of
+    waiting for the query timeout.
 - **Backups of large namespaces no longer fail on long object reads.** A
   snapshot copy read every object as one GET, throttled by the upload behind
   it, so a multi-GB SST kept a single request open for minutes. The object
@@ -266,6 +323,19 @@ crates.io release will establish and document that API explicitly.
   `bench/mixed_concurrency.py` on a 2-CPU / 6 GiB container over a local
   store of about 8 GB: at 16 concurrent clients, 1.98 to 8.44 queries/s and
   31% to 0% errors; at 64 clients, 82% to 0% errors; peak RSS under 2 GiB.
+
+- **`shortestPath` no longer steps through a deleted node.** A dangling
+  edge whose endpoint was deleted (older data, or the embedded
+  `tombstone_node` API) could make the bidirectional search return a path
+  through a node that no longer exists. The returned path's interior is now
+  proven to exist; a dead node is excluded and the search re-run.
+- **Zero-hop variable-length matches read every property they return.** In
+  `MATCH (x)-[:R*0..2]->(d:Doc) WHERE d.k = 3 RETURN x.name`, the zero-hop
+  row binds `d` to `x`'s own node, but `x`'s scan decoded only the columns
+  read through `x`; a property read only through `d` (or the other way
+  round) came back NULL, so filters on it dropped rows or returned NULLs.
+  The two ends of a variable-length hop that can match at zero hops
+  (a minimum of 0 or a parameter) now decode the union of their columns.
 
 ## [3.5.1] - 2026-11-18
 

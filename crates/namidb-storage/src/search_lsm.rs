@@ -1186,15 +1186,8 @@ pub fn select_search_read_plan(
     let Some(barrier_sst_id) = state.compat_barrier_sst_id else {
         return SearchReadPlan::FlatFallback(SearchReadFallback::InvalidGeneration);
     };
-    if state.segments.len() > MAX_ACTIVE_SEARCH_SEGMENTS {
-        return SearchReadPlan::FlatFallback(SearchReadFallback::SegmentLimitExceeded);
-    }
-    if state
-        .segments
-        .iter()
-        .any(|segment| segment.payload != SearchSegmentPayload::Complete)
-    {
-        return SearchReadPlan::FlatFallback(SearchReadFallback::UnsupportedSegmentSet);
+    if let Some(reason) = segment_set_fallback(state) {
+        return SearchReadPlan::FlatFallback(reason);
     }
     if let [base] = state.segments.as_slice() {
         let expected_format = match kind {
@@ -1210,7 +1203,38 @@ pub fn select_search_read_plan(
         }
     }
 
-    let native_set_supported = match kind {
+    SearchReadPlan::ActiveSegments {
+        state: state.clone(),
+        barrier_sst_id,
+    }
+}
+
+/// Why the segment set of a validated Active generation cannot be served
+/// natively, or `None` when a native reader (the legacy single-base path or
+/// the multi-segment coordinator) accepts it. Every reason here is one an
+/// authoritative base rebuild repairs: it replaces the whole set with one
+/// complete base of the current format.
+pub fn segment_set_fallback(state: &SearchLsmState) -> Option<SearchReadFallback> {
+    if state.segments.len() > MAX_ACTIVE_SEARCH_SEGMENTS {
+        return Some(SearchReadFallback::SegmentLimitExceeded);
+    }
+    if state
+        .segments
+        .iter()
+        .any(|segment| segment.payload != SearchSegmentPayload::Complete)
+    {
+        return Some(SearchReadFallback::UnsupportedSegmentSet);
+    }
+    if let [base] = state.segments.as_slice() {
+        let expected_format = match state.kind {
+            SearchLsmKind::Vector => SearchSegmentFormat::VectorV5Base,
+            SearchLsmKind::Text => SearchSegmentFormat::TextV3Base,
+        };
+        if base.role == SearchSegmentRole::Base && base.format == expected_format {
+            return None;
+        }
+    }
+    let native_set_supported = match state.kind {
         SearchLsmKind::Vector => state
             .segments
             .iter()
@@ -1221,22 +1245,36 @@ pub fn select_search_read_plan(
                         && segment.role == SearchSegmentRole::Base
                         && segment.format == SearchSegmentFormat::VectorV5Base)
             }),
-        // V3 cannot yet consume caller-supplied global delta statistics.
-        // Rebuilding that base to FT4 is required before segmented BM25 may
-        // serve; falling back here preserves exact ranking during migration.
+        // A legacy V3 base (built before FT4) may carry FT4 deltas. The
+        // coordinator scores it with caller-supplied snapshot-wide BM25
+        // statistics and lets the deltas suppress the documents they
+        // supersede, exactly like an all-FT4 set, until the background
+        // migration replaces the base with an FT4 one.
         SearchLsmKind::Text => state
             .segments
             .iter()
-            .all(|segment| segment.format == SearchSegmentFormat::TextV4),
+            .enumerate()
+            .all(|(position, segment)| {
+                segment.format == SearchSegmentFormat::TextV4
+                    || (position == 0
+                        && segment.role == SearchSegmentRole::Base
+                        && segment.format == SearchSegmentFormat::TextV3Base)
+            }),
     };
-    if native_set_supported {
-        SearchReadPlan::ActiveSegments {
-            state: state.clone(),
-            barrier_sst_id,
-        }
-    } else {
-        SearchReadPlan::FlatFallback(SearchReadFallback::UnsupportedSegmentSet)
-    }
+    (!native_set_supported).then_some(SearchReadFallback::UnsupportedSegmentSet)
+}
+
+/// Whether an Active generation still has a base in a legacy format that a
+/// background base rebuild migrates: a full-text V3 base (built before FT4)
+/// becomes an FT4 base. Served natively meanwhile; the rebuild runs once,
+/// since its output is FT4.
+pub fn legacy_base_migration_due(state: &SearchLsmState) -> bool {
+    state.status == SearchLsmStatus::Active
+        && state.kind == SearchLsmKind::Text
+        && state
+            .segments
+            .iter()
+            .any(|segment| segment.format == SearchSegmentFormat::TextV3Base)
 }
 
 /// Validate every Search-LSM state using manifest metadata only.
@@ -2814,13 +2852,23 @@ mod tests {
                 && Some(barrier_sst_id) == state.compat_barrier_sst_id
         ));
 
-        // A V3 text base cannot be merged with FT4 delta scores until it can
-        // consume the same reconstructed global statistics as FT4.
+        // A V3 text base under FT4 deltas is served by the coordinator with
+        // reconstructed global statistics, never by a corpus scan.
         let text = active_text_manifest();
-        assert_eq!(
+        assert!(matches!(
             select_search_read_plan(&text, SearchLsmKind::Text, "doc_ft"),
-            SearchReadPlan::FlatFallback(SearchReadFallback::UnsupportedSegmentSet)
-        );
+            SearchReadPlan::ActiveSegments { state, .. }
+                if state.segments.len() == 2
+                    && state.segments[0].format == SearchSegmentFormat::TextV3Base
+        ));
+        // Only as the first (base) segment: a V3 object anywhere else is not a
+        // set any reader can reconcile.
+        let mut misplaced = active_text_manifest();
+        misplaced.search_lsm[0].segments[1].format = SearchSegmentFormat::TextV3Base;
+        assert!(matches!(
+            select_search_read_plan(&misplaced, SearchLsmKind::Text, "doc_ft"),
+            SearchReadPlan::FlatFallback(_)
+        ));
 
         let mut shadow = active_vector_manifest();
         shadow.search_lsm[0].segments[1].payload = SearchSegmentPayload::ShadowOnly;
