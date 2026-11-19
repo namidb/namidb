@@ -12,6 +12,7 @@ pub mod fusion;
 pub mod leapfrog;
 pub mod limits;
 pub mod memory;
+pub mod path_count;
 pub mod row;
 pub mod show;
 pub mod text_scoring;

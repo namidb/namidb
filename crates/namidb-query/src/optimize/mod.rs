@@ -36,6 +36,7 @@ pub mod label_scan;
 pub mod multiway_join;
 pub mod normalize;
 pub mod parquet_pushdown;
+pub mod path_count;
 pub mod projection_pushdown;
 pub mod pushdown;
 mod unique_lookup;
@@ -84,10 +85,16 @@ pub fn optimize(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
     // fixpoint has settled: a scan the lookups turned into an id seek or an
     // index probe (`WHERE id(d) = $x`) is cheaper still and must keep it.
     let split = anchor_choice::apply_bound_endpoint_start(split, catalog);
-    if split == settled {
-        return settled;
-    }
-    optimize_to_fixpoint(split, catalog)
+    let settled = if split == settled {
+        settled
+    } else {
+        optimize_to_fixpoint(split, catalog)
+    };
+    // Grouped counts over a chain of hops fold path counts from whole
+    // edge types instead of enumerating paths. Last, on the final shape:
+    // it needs the settled scan (pushed predicates, projection) and the
+    // final Expand chain, and nothing downstream should reshape it.
+    path_count::apply_path_count(settled, catalog)
 }
 
 fn optimize_to_fixpoint(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
@@ -346,6 +353,17 @@ fn collect_produced(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
     match plan {
         LogicalPlan::Empty => {}
         LogicalPlan::EdgeTypeCount { output, .. } => {
+            out.insert(output.clone());
+        }
+        LogicalPlan::PathCount {
+            nodes,
+            group,
+            output,
+            ..
+        } => {
+            if let Some(g) = group {
+                out.insert(nodes[*g].alias.clone());
+            }
             out.insert(output.clone());
         }
         LogicalPlan::VectorSearch {

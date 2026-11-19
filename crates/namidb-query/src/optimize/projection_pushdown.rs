@@ -256,6 +256,7 @@ fn collect_from_plan(plan: &LogicalPlan, req: &mut RequiredSet) {
         LogicalPlan::Argument { .. }
         | LogicalPlan::Empty
         | LogicalPlan::EdgeTypeCount { .. }
+        | LogicalPlan::PathCount { .. }
         | LogicalPlan::VectorSearch { .. }
         | LogicalPlan::CallProcedure { .. } => {}
         LogicalPlan::MultiwayJoin { vars, .. } => {
@@ -798,6 +799,7 @@ fn rewrite(plan: LogicalPlan, req: &RequiredSet) -> LogicalPlan {
         | LogicalPlan::Empty
         | LogicalPlan::MultiwayJoin { .. }
         | LogicalPlan::EdgeTypeCount { .. }
+        | LogicalPlan::PathCount { .. }
         | LogicalPlan::VectorSearch { .. }
         | LogicalPlan::CallProcedure { .. } => plan,
         LogicalPlan::Create { input, elements } => LogicalPlan::Create {

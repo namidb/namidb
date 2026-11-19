@@ -568,6 +568,45 @@ fn write_header(plan: &LogicalPlan, out: &mut String) {
                 output
             );
         }
+        LogicalPlan::PathCount {
+            nodes,
+            hops,
+            group,
+            output,
+            ..
+        } => {
+            out.push_str("PathCount ");
+            for (i, node) in nodes.iter().enumerate() {
+                if i > 0 {
+                    let hop = &hops[i - 1];
+                    let types = hop
+                        .edge_type
+                        .as_ref()
+                        .map(|ts| format!(":{}", ts.join("|")))
+                        .unwrap_or_default();
+                    let _ = match hop.direction {
+                        RelationshipDirection::Right => write!(out, "-[{types}]->"),
+                        RelationshipDirection::Left => write!(out, "<-[{types}]-"),
+                        RelationshipDirection::Both => write!(out, "-[{types}]-"),
+                    };
+                }
+                let marker = if *group == Some(i) { "*" } else { "" };
+                let _ = write!(out, "({marker}{}", node.alias);
+                for l in &node.labels {
+                    let _ = write!(out, ":{l}");
+                }
+                if !node.predicates.is_empty() {
+                    let rendered: Vec<String> = node
+                        .predicates
+                        .iter()
+                        .map(|p| format_scan_predicate(p, &node.alias))
+                        .collect();
+                    let _ = write!(out, " {{{}}}", rendered.join(", "));
+                }
+                out.push(')');
+            }
+            let _ = write!(out, " => {output}");
+        }
         LogicalPlan::VectorSearch {
             label,
             alias,

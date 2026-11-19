@@ -68,6 +68,31 @@ crates.io release will establish and document that API explicitly.
   existing memory-gated, one-at-a-time base rebuild, after a query first
   opens them. Until the new base installs, the old one serves through its
   int8 pages.
+- **Whole-graph grouped counts no longer enumerate paths.** `count(*)` /
+  `count(x)` grouped by one node of a linear chain (`MATCH (d:Doc)<-[:R]-(x)
+  RETURN d.title, count(x) ORDER BY ... LIMIT 5`, a per-document section
+  count, a three-hop grouped count) is now folded from each edge type's live
+  edge list as path counts per node, instead of building one row per path and
+  grouping them. Endpoint labels and existence are proven exactly as the
+  traversal proved them, so the result is unchanged; property-based
+  differential tests compare it with the naive plan over randomized graphs
+  with deletes, self-loops, multi-label nodes and unflushed edges.
+  `NAMIDB_PATH_COUNT=0` turns the rewrite off. Aggregations that only
+  `count`/`sum` now fold each group as rows arrive rather than retaining
+  their input.
+- **Anchor choice no longer depends on how the pattern is written.**
+  `MATCH (x)-[:R]->(d:Doc {code: $c})` plans like
+  `MATCH (d:Doc {code: $c})<-[:R]-(x)`: an unlabelled source is costed as the
+  whole graph, so an indexed pin on the other side anchors the walk. A
+  variable-length hop toward a pinned node (`(x)-[:R*1..2]->(d:Doc {code:
+  $c})`) and a pin on a property without an index (a filtered scan of the
+  pinned label) anchor the same way when cheaper.
+- **`shortestPath` between two bound nodes is faster.** The
+  meet-in-the-middle search expands the side whose next level reads fewer
+  adjacency entries, reads a level's adjacency lists concurrently (order
+  preserved), and hydrates the path's interior nodes in one batched read
+  instead of one uncached point read each — a single interior node of a
+  corpus with large text and embedding properties used to cost seconds.
 
 ### Added
 
@@ -237,6 +262,12 @@ crates.io release will establish and document that API explicitly.
   `bench/mixed_concurrency.py` on a 2-CPU / 6 GiB container over a local
   store of about 8 GB: at 16 concurrent clients, 1.98 to 8.44 queries/s and
   31% to 0% errors; at 64 clients, 82% to 0% errors; peak RSS under 2 GiB.
+
+- **`shortestPath` no longer steps through a deleted node.** A dangling
+  edge whose endpoint was deleted (older data, or the embedded
+  `tombstone_node` API) could make the bidirectional search return a path
+  through a node that no longer exists. The returned path's interior is now
+  proven to exist; a dead node is excluded and the search re-run.
 
 ## [3.5.1] - 2026-11-18
 

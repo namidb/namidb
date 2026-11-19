@@ -72,6 +72,33 @@ fn estimate_inner(plan: &LogicalPlan, catalog: &StatsCatalog) -> Cardinality {
             b.insert(output.clone(), BindingMeta::default());
             leaf(plan, 1.0, b)
         }
+        // One row per group-node value with a non-zero count: at most the
+        // group node's label size (or a single row for a global count).
+        LogicalPlan::PathCount {
+            nodes,
+            group,
+            output,
+            ..
+        } => {
+            let mut b = BTreeMap::new();
+            b.insert(output.clone(), BindingMeta::default());
+            let rows = match group {
+                None => 1.0,
+                Some(g) => {
+                    let node = &nodes[*g];
+                    b.insert(node.alias.clone(), BindingMeta::default());
+                    node.labels
+                        .iter()
+                        .filter_map(|l| catalog.label(l).map(|s| s.node_count as f64))
+                        .fold(None, |acc: Option<f64>, n| {
+                            Some(acc.map_or(n, |a| a.min(n)))
+                        })
+                        .unwrap_or_else(|| catalog.total_nodes() as f64)
+                        .max(1.0)
+                }
+            };
+            leaf(plan, rows, b)
+        }
         // A vector search emits exactly `k` rows (one per nearest neighbour),
         // binding the hit alias and its score column. `k` may be a `$param`
         // (RowCount::Param); fall back to a small constant so the cost model

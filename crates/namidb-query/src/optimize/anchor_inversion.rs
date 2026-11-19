@@ -65,6 +65,7 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
         | LogicalPlan::NodeScan { .. }
         | LogicalPlan::MultiwayJoin { .. }
         | LogicalPlan::EdgeTypeCount { .. }
+        | LogicalPlan::PathCount { .. }
         | LogicalPlan::VectorSearch { .. }
         | LogicalPlan::CallProcedure { .. } => plan,
         LogicalPlan::NodeById {
@@ -296,6 +297,7 @@ struct Hop<'p> {
     target_alias: &'p String,
     target_labels: &'p Vec<String>,
     unique_rels: &'p Vec<String>,
+    length: &'p Option<crate::parser::RelationshipLength>,
 }
 
 fn try_invert(
@@ -326,7 +328,13 @@ fn try_invert(
                 path_binding,
                 unique_rels,
             } => {
-                if length.is_some()
+                // A variable-length hop inverts only alone and unnamed: its
+                // relationship LIST would come back in reverse order, and a
+                // chain of starred hops is left to the executor. The set of
+                // (source, target) endpoint pairs is the same either way.
+                let starred_ok = length.is_none()
+                    || (hops.is_empty() && rel_alias.is_none() && between.is_empty());
+                if !starred_ok
                     || *optional
                     || *back_reference
                     || !matches!(shortest, crate::plan::ShortestMode::None)
@@ -345,8 +353,13 @@ fn try_invert(
                     target_alias,
                     target_labels,
                     unique_rels,
+                    length,
                 });
                 cursor = expand_input;
+                if length.is_some() {
+                    // Nothing may chain below a starred hop.
+                    break;
+                }
             }
             LogicalPlan::Filter {
                 predicate,
@@ -465,13 +478,24 @@ fn try_invert(
             seek,
             LogicalPlan::Empty,
         ),
-        None => property_anchor(
+        None => match property_anchor(
             predicate,
             target_alias,
             target_labels.first()?,
             source_count,
             catalog,
-        )?,
+        ) {
+            Some(anchor) => anchor,
+            None => filtered_scan_anchor(
+                predicate,
+                target_alias,
+                target_labels.first()?,
+                source_label.is_none() && source_disjunction.is_none(),
+                source_count,
+                &cost_hops,
+                catalog,
+            )?,
+        },
     };
     let mut inverted = anchor;
     for (i, hop) in hops.iter().enumerate() {
@@ -513,7 +537,7 @@ fn try_invert(
             rel_alias: hop.rel_alias.clone(),
             target_alias: hop.source.clone(),
             target_labels: reached_labels,
-            length: None,
+            length: hop.length.clone(),
             optional: false,
             back_reference: false,
             shortest: crate::plan::ShortestMode::None,
@@ -556,10 +580,109 @@ fn source_node_count(
                 .label(label)
                 .map(|stats| total.saturating_add(stats.node_count))
         }),
-        None => source_label
-            .and_then(|label| catalog.label(label))
-            .map(|stats| stats.node_count),
+        None => match source_label {
+            Some(label) => catalog.label(label).map(|stats| stats.node_count),
+            // An unlabelled source scans every node: the catalog's total,
+            // when it has one. Without it a posting-list anchor could never
+            // prove itself cheaper than a scan of the WHOLE graph, so
+            // `(x)-[:R]->(d:Doc {code: $c})` walked every node in the store.
+            None => Some(catalog.total_nodes()).filter(|n| *n > 0),
+        },
     }
+}
+
+/// Inverted plans must beat the source scan by this factor before a
+/// filtered label scan replaces it (estimates are averages).
+const FILTERED_SCAN_MARGIN: f64 = 2.0;
+
+/// A filtered scan of the target's label as the anchor (plus residual), for
+/// a target pinned by predicates no index answers: `MATCH (x)-[:R]->(d:Doc)
+/// WHERE d.title = $t` scans `Doc` and filters it, then walks `R` back,
+/// instead of scanning every node and expanding each one.
+///
+/// Taken when the statistics say the inverted walk is clearly cheaper, or —
+/// without statistics — when the source is an unlabelled scan of the whole
+/// graph: a scan of one label never reads more nodes than that, and the
+/// inverted walk only follows edges of the filtered targets.
+fn filtered_scan_anchor(
+    predicate: &crate::parser::Expression,
+    target_alias: &str,
+    target_label: &str,
+    source_is_whole_graph: bool,
+    source_count: Option<u64>,
+    hops_from_anchor: &[CostHop<'_>],
+    catalog: &StatsCatalog,
+) -> Option<(LogicalPlan, Option<crate::parser::Expression>)> {
+    let (mine, rest): (Vec<_>, Vec<_>) = crate::optimize::split_and_terms(predicate)
+        .into_iter()
+        .partition(|term| {
+            let aliases = crate::optimize::expression_aliases(term);
+            aliases.len() == 1 && aliases.contains(target_alias)
+        });
+    let pin = crate::optimize::and_chain(mine)?;
+    let anchor = LogicalPlan::Filter {
+        input: Box::new(LogicalPlan::NodeScan {
+            label: Some(target_label.to_string()),
+            alias: target_alias.to_owned(),
+            predicates: Vec::new(),
+            projection: None,
+        }),
+        predicate: pin,
+    };
+    let take = match (source_count, catalog.label(target_label)) {
+        (Some(source), Some(target)) => {
+            let pinned_rows = crate::cost::estimate(&anchor, catalog).rows.max(1.0);
+            let inverted = scan_walk_cost(
+                catalog,
+                target.node_count as f64,
+                pinned_rows,
+                hops_from_anchor,
+            );
+            let reversed: Vec<CostHop<'_>> = hops_from_anchor
+                .iter()
+                .rev()
+                .map(|h| CostHop {
+                    edge_type: h.edge_type,
+                    direction_from_anchor: invert(h.direction_from_anchor),
+                })
+                .collect();
+            let naive = scan_walk_cost(catalog, source as f64, source as f64, &reversed);
+            match (inverted, naive) {
+                (Some(inv), Some(naive)) => inv * FILTERED_SCAN_MARGIN <= naive,
+                _ => source_is_whole_graph,
+            }
+        }
+        _ => source_is_whole_graph,
+    };
+    if !take {
+        return None;
+    }
+    Some((anchor, crate::optimize::and_chain(rest)))
+}
+
+/// `scanned` rows read, `start` rows kept, then each hop multiplies by its
+/// known average degree (C_out). `None` when a hop's degree is unknown.
+fn scan_walk_cost(
+    catalog: &StatsCatalog,
+    scanned: f64,
+    start: f64,
+    hops: &[CostHop<'_>],
+) -> Option<f64> {
+    let mut rows = start;
+    let mut cost = scanned;
+    for hop in hops {
+        let types = hop.edge_type.filter(|t| !t.is_empty())?;
+        if types.iter().any(|t| catalog.edge_type(t).is_none()) {
+            return None;
+        }
+        rows *= crate::cost::cardinality::branch_factor(
+            catalog,
+            Some(types),
+            hop.direction_from_anchor,
+        );
+        cost += rows;
+    }
+    Some(cost)
 }
 
 /// The `NodeByPropertyValue` anchor (plus residual) for an index-answerable
@@ -788,6 +911,121 @@ mod tests {
         // Unique target bigger than source: a point lookup still wins.
         let plan = rewrite_query(SLOW_FORM, &catalog(true, false, 5000, 1000));
         assert!(find_inverted(&plan).is_some());
+    }
+
+    /// `(x)-[:R]->(d:Doc {code: $c})` with an UNLABELLED source scans the
+    /// whole graph; a posting-list anchor on `Doc` must win against it once
+    /// the catalog knows the total node count (it used to need a source
+    /// label to compare against, so the whole graph was walked).
+    #[test]
+    fn unlabelled_source_counts_as_the_whole_graph() {
+        let q = "MATCH (x)-[:WORKS_AT]->(c:Company {cid: 0}) RETURN x";
+        let plan = rewrite_query(q, &catalog(false, true, 10, 1000));
+        let (source, direction, target, labels) =
+            find_inverted(&plan).expect("indexed target anchors over a whole-graph scan");
+        assert_eq!(source, "c");
+        assert_eq!(direction, RelationshipDirection::Left);
+        assert_eq!(target, "x");
+        assert!(labels.is_empty(), "an unlabelled source stays unlabelled");
+    }
+
+    /// A starred, unnamed hop toward a pinned node walks from the pin.
+    #[test]
+    fn unnamed_variable_length_hop_inverts() {
+        let cat = catalog(true, false, 10, 1000);
+        let plan = rewrite_query(
+            "MATCH (p:Person)-[:WORKS_AT*1..3]->(c:Company {cid: 0}) RETURN count(DISTINCT p)",
+            &cat,
+        );
+        assert!(!plan_has_node_scan(&plan), "anchored at the unique pin");
+        fn starred(plan: &LogicalPlan) -> Option<(String, RelationshipDirection, Vec<String>)> {
+            if let LogicalPlan::Expand {
+                source,
+                direction,
+                length: Some(_),
+                target_labels,
+                ..
+            } = plan
+            {
+                return Some((source.clone(), *direction, target_labels.clone()));
+            }
+            plan.children().into_iter().find_map(starred)
+        }
+        let (source, direction, labels) = starred(&plan).expect("the starred hop survives");
+        assert_eq!(source, "c");
+        assert_eq!(direction, RelationshipDirection::Left);
+        assert_eq!(labels, vec!["Person".to_string()]);
+        // Named: the relationship list would reverse; stay put.
+        let plan = rewrite_query(
+            "MATCH (p:Person)-[w:WORKS_AT*1..3]->(c:Company {cid: 0}) RETURN w",
+            &cat,
+        );
+        assert!(find_inverted(&plan).is_none());
+    }
+
+    fn scan_anchor(plan: &LogicalPlan) -> Option<(String, String)> {
+        if let LogicalPlan::Expand { input, source, .. } = plan {
+            if let LogicalPlan::Filter { input: scan, .. } = input.as_ref() {
+                if let LogicalPlan::NodeScan {
+                    label: Some(label),
+                    alias,
+                    ..
+                } = scan.as_ref()
+                {
+                    if alias == source {
+                        return Some((alias.clone(), label.clone()));
+                    }
+                }
+            }
+        }
+        plan.children().into_iter().find_map(scan_anchor)
+    }
+
+    /// No index on the pinned property: a filtered scan of the target's
+    /// label replaces a scan of the whole graph.
+    #[test]
+    fn unindexed_pin_anchors_a_filtered_label_scan_over_a_whole_graph_source() {
+        let plan = rewrite_query(
+            "MATCH (x)-[:WORKS_AT]->(c:Company) WHERE c.name = 'acme' AND x.age > 3 RETURN x",
+            &StatsCatalog::empty(),
+        );
+        assert_eq!(
+            scan_anchor(&plan),
+            Some(("c".to_string(), "Company".to_string()))
+        );
+    }
+
+    /// With statistics the filtered scan anchors only when it is clearly
+    /// cheaper than the labelled source scan it replaces.
+    #[test]
+    fn unindexed_pin_follows_the_cost_model_for_a_labelled_source() {
+        let with_edges = |companies: u64, people: u64| {
+            let mut cat = catalog(false, false, companies, people);
+            cat.__test_insert_edge_type(crate::cost::EdgeTypeStats {
+                name: "WORKS_AT".into(),
+                edge_count: people,
+                avg_out_degree: 1.0,
+                max_out_degree: 1,
+                avg_in_degree: people as f64 / companies as f64,
+                max_in_degree: people,
+                src_label: None,
+                dst_label: None,
+            });
+            cat
+        };
+        let q = "MATCH (p:Person)-[:WORKS_AT]->(c:Company) WHERE c.name = 'acme' RETURN p";
+        let plan = rewrite_query(q, &with_edges(100, 100_000));
+        assert_eq!(
+            scan_anchor(&plan),
+            Some(("c".to_string(), "Company".to_string())),
+            "100 companies vs 100k people: start from the companies"
+        );
+        let plan = rewrite_query(q, &with_edges(100_000, 100));
+        assert_eq!(
+            scan_anchor(&plan),
+            None,
+            "a larger target label keeps the source scan"
+        );
     }
 
     /// A single-hop `q = ...` path is assembled STATICALLY from the node/rel

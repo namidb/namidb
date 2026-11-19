@@ -231,7 +231,13 @@ mod tests {
         // count of KNOWS edges FROM Person nodes != all KNOWS edges.
         let plan = optimized("MATCH (a:Person)-[r:KNOWS]->() RETURN count(r) AS n");
         assert!(has_edge_type_count(&plan).is_none());
-        assert!(has_node_scan(&plan));
+        // It is still answered without a per-node walk: the path-count pass
+        // folds it from the KNOWS edge list, keeping the Person filter.
+        fn has_path_count(plan: &LogicalPlan) -> bool {
+            matches!(plan, LogicalPlan::PathCount { .. })
+                || plan.children().iter().any(|c| has_path_count(c))
+        }
+        assert!(has_node_scan(&plan) || has_path_count(&plan));
     }
 
     #[test]

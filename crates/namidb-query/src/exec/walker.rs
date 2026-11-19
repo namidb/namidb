@@ -1220,6 +1220,24 @@ fn execute_operator<'a>(
                 }
             }
 
+            LogicalPlan::PathCount {
+                nodes,
+                hops,
+                group,
+                projection,
+                output,
+            } => {
+                crate::exec::path_count::execute_path_count(
+                    snapshot,
+                    nodes,
+                    hops,
+                    *group,
+                    projection.as_deref(),
+                    output,
+                )
+                .await
+            }
+
             LogicalPlan::EdgeTypeCount { edge_types, output } => {
                 // Sum the live edge count of each listed type. Every edge
                 // belongs to exactly one type, so per-type counts are
@@ -1767,7 +1785,7 @@ fn row_cap_scan_limit(snapshot: &Snapshot<'_>, label: Option<&str>) -> Option<us
 
 /// Leaf `NodeScan`: one row per live node, binding `alias`. With `limit`
 /// the storage scan stops after that many rows (a scan-order prefix).
-async fn scan_nodes(
+pub(crate) async fn scan_nodes(
     snapshot: &Snapshot<'_>,
     label: Option<&str>,
     alias: &str,
@@ -1782,7 +1800,7 @@ async fn scan_nodes(
         .collect())
 }
 
-async fn scan_node_views(
+pub(crate) async fn scan_node_views(
     snapshot: &Snapshot<'_>,
     label: Option<&str>,
     predicates: &[namidb_storage::sst::predicates::ScanPredicate],
@@ -2900,8 +2918,8 @@ fn flip_direction(direction: RelationshipDirection) -> RelationshipDirection {
 }
 
 /// Meet-in-the-middle BFS for one `(src, dst)` pair in `First` mode.
-/// Expands the SMALLER frontier each round (the reverse side flips the
-/// pattern direction), records first-arrival parents per side, and keeps
+/// Expands, each round, the side whose next level reads fewer adjacency
+/// entries (the reverse side flips the pattern direction), records first-arrival parents per side, and keeps
 /// expanding until the classical stopping criterion (`df + db >= best
 /// total`) proves the best meet is exactly shortest. A shortest walk is
 /// necessarily simple, so relationship-uniqueness holds by construction.
@@ -2920,13 +2938,142 @@ async fn bidirectional_first_path(
     src_value: Option<RuntimeValue>,
     dst_value: Option<NodeValue>,
 ) -> Result<Option<(Vec<RuntimeValue>, Vec<RuntimeValue>)>, ExecError> {
+    use std::collections::{HashMap, HashSet};
+
+    // A path only runs through nodes that exist: an edge whose far end was
+    // deleted (a dangling edge left by older data or the embedded
+    // `tombstone_node` API) is not a step. Proving every frontier node
+    // would cost one existence read per reached node; instead the search
+    // proves the interior of the path it returns (a handful of ids, read
+    // in one batch — and read anyway when the trail is materialised). A
+    // dead interior node is excluded and the search re-run, so the answer
+    // is the shortest path over live nodes; each re-run excludes at least
+    // one more node, and the common case runs once.
+    let mut dead: HashSet<NodeId> = HashSet::new();
+    let (nodes, edges, mut hydrated) = loop {
+        let Some((nodes, edges)) = bidirectional_search(
+            snapshot,
+            edge_types,
+            direction,
+            src,
+            dst,
+            max,
+            edge_read_mode,
+            &dead,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        // A shortest walk is simple: the interior never holds src or dst.
+        let interior: Vec<NodeId> = nodes[1..nodes.len() - 1].to_vec();
+        let mut hydrated: HashMap<NodeId, namidb_storage::NodeView> = HashMap::new();
+        let mut newly_dead = Vec::new();
+        if !interior.is_empty() {
+            if materialise_trail {
+                // One batched read through the shared node tier rather than
+                // one uncached point read per node.
+                let views = snapshot.batch_lookup_nodes("", &interior).await?;
+                for (id, view) in interior.iter().zip(views) {
+                    match view {
+                        Some(view) => {
+                            hydrated.insert(*id, view);
+                        }
+                        None => newly_dead.push(*id),
+                    }
+                }
+            } else {
+                match prepare_expand_targets(snapshot, &[], &interior, true, false, false).await? {
+                    ExpandTargets::Membership(live) => {
+                        newly_dead.extend(
+                            interior
+                                .iter()
+                                .copied()
+                                .filter(|id| !live.get(id).copied().unwrap_or(false)),
+                        );
+                    }
+                    _ => {
+                        return Err(ExecError::Runtime(
+                            "shortest path existence proof returned materialised views".into(),
+                        ))
+                    }
+                }
+            }
+        }
+        if newly_dead.is_empty() {
+            break (nodes, edges, hydrated);
+        }
+        dead.extend(newly_dead);
+    };
+
+    let rel_values: Vec<RuntimeValue> = edges
+        .into_iter()
+        .map(|edge| RuntimeValue::Rel(Box::new(RelValue::from(edge))))
+        .collect();
+    let trail = if materialise_trail {
+        let mut trail = Vec::with_capacity(nodes.len() * 2 - 1);
+        for (index, node) in nodes.iter().enumerate() {
+            if index > 0 {
+                trail.push(rel_values[index - 1].clone());
+            }
+            let value = if *node == src {
+                src_value.clone()
+            } else if *node == dst {
+                dst_value.clone().map(|nv| RuntimeValue::Node(Box::new(nv)))
+            } else {
+                hydrated
+                    .remove(node)
+                    .map(|view| RuntimeValue::Node(Box::new(NodeValue::from(view))))
+            };
+            trail.push(value.unwrap_or(RuntimeValue::Null));
+        }
+        trail
+    } else {
+        Vec::new()
+    };
+    Ok(Some((trail, rel_values)))
+}
+
+/// One meet-in-the-middle search for [`bidirectional_first_path`], never
+/// stepping onto a node in `dead`. Returns the path's nodes (src first) and
+/// edges, or `None` when `dst` is unreachable within `max` hops.
+#[allow(clippy::too_many_arguments)]
+async fn bidirectional_search(
+    snapshot: &Snapshot<'_>,
+    edge_types: &[String],
+    direction: RelationshipDirection,
+    src: NodeId,
+    dst: NodeId,
+    max: u32,
+    edge_read_mode: EdgeReadMode,
+    dead: &std::collections::HashSet<NodeId>,
+) -> Result<Option<(Vec<NodeId>, Vec<EdgeView>)>, ExecError> {
     use std::collections::HashMap;
     struct Side {
         depth: u32,
         frontier: Vec<NodeId>,
         visited: HashMap<NodeId, u32>,
         parents: HashMap<NodeId, (NodeId, EdgeView)>,
+        /// Partner reads per expanded node on this side's last level: the
+        /// estimate of what expanding the next level costs.
+        edges_per_node: f64,
     }
+    impl Side {
+        fn new(start: NodeId) -> Self {
+            Side {
+                depth: 0,
+                frontier: vec![start],
+                visited: HashMap::from([(start, 0)]),
+                parents: HashMap::new(),
+                edges_per_node: 1.0,
+            }
+        }
+        /// Estimated adjacency entries the next level reads.
+        fn next_cost(&self) -> f64 {
+            self.frontier.len() as f64 * self.edges_per_node.max(1.0)
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn expand_level(
         side: &mut Side,
         other: &Side,
@@ -2935,17 +3082,32 @@ async fn bidirectional_first_path(
         dir: RelationshipDirection,
         edge_read_mode: EdgeReadMode,
         best: &mut Option<(u32, NodeId)>,
+        dead: &std::collections::HashSet<NodeId>,
     ) -> Result<(), ExecError> {
+        use futures::stream::{self, StreamExt};
         let new_depth = side.depth + 1;
         let mut next = Vec::new();
-        for index in 0..side.frontier.len() {
+        let mut edges_read = 0usize;
+        // The level's adjacency reads run SEED_PREFETCH_CONCURRENCY at a
+        // time (a cold level is I/O-bound: one partner-list read per node
+        // and type); `buffered` hands them back in frontier order, so the
+        // parents recorded — and the path returned — are exactly those of
+        // a one-at-a-time expansion.
+        let frontier = std::mem::take(&mut side.frontier);
+        let mut reads = stream::iter(frontier.iter().copied())
+            .map(|node| async move {
+                neighbours_of_any(snapshot, edge_types, dir, node, edge_read_mode)
+                    .await
+                    .map(|edges| (node, edges))
+            })
+            .buffered(SEED_PREFETCH_CONCURRENCY);
+        while let Some(read) = reads.next().await {
             crate::exec::limits::check_deadline()?;
-            let node = side.frontier[index];
-            let neighbours =
-                neighbours_of_any(snapshot, edge_types, dir, node, edge_read_mode).await?;
+            let (node, neighbours) = read?;
+            edges_read += neighbours.len();
             for edge in neighbours {
                 let partner = partner_id(&edge, dir, node);
-                if side.visited.contains_key(&partner) {
+                if side.visited.contains_key(&partner) || dead.contains(&partner) {
                     continue;
                 }
                 side.visited.insert(partner, new_depth);
@@ -2959,23 +3121,14 @@ async fn bidirectional_first_path(
                 next.push(partner);
             }
         }
+        side.edges_per_node = edges_read as f64 / frontier.len().max(1) as f64;
         side.frontier = next;
         side.depth = new_depth;
         Ok(())
     }
 
-    let mut fwd = Side {
-        depth: 0,
-        frontier: vec![src],
-        visited: HashMap::from([(src, 0)]),
-        parents: HashMap::new(),
-    };
-    let mut bwd = Side {
-        depth: 0,
-        frontier: vec![dst],
-        visited: HashMap::from([(dst, 0)]),
-        parents: HashMap::new(),
-    };
+    let mut fwd = Side::new(src);
+    let mut bwd = Side::new(dst);
     let flipped = flip_direction(direction);
     let mut best: Option<(u32, NodeId)> = None;
     loop {
@@ -2988,7 +3141,10 @@ async fn bidirectional_first_path(
         if reach >= max || fwd.frontier.is_empty() || bwd.frontier.is_empty() {
             break;
         }
-        if fwd.frontier.len() <= bwd.frontier.len() {
+        // Expand the side whose next level reads fewer partner entries:
+        // node count alone hides that one frontier node may be a hub with
+        // thousands of edges while the other side's dozen nodes have a few.
+        if fwd.next_cost() <= bwd.next_cost() {
             expand_level(
                 &mut fwd,
                 &bwd,
@@ -2997,6 +3153,7 @@ async fn bidirectional_first_path(
                 direction,
                 edge_read_mode,
                 &mut best,
+                dead,
             )
             .await?;
         } else {
@@ -3008,6 +3165,7 @@ async fn bidirectional_first_path(
                 flipped,
                 edge_read_mode,
                 &mut best,
+                dead,
             )
             .await?;
         }
@@ -3050,33 +3208,7 @@ async fn bidirectional_first_path(
         cursor = parent;
     }
     debug_assert_eq!(edges.len() as u32, total);
-
-    let rel_values: Vec<RuntimeValue> = edges
-        .into_iter()
-        .map(|edge| RuntimeValue::Rel(Box::new(RelValue::from(edge))))
-        .collect();
-    let trail = if materialise_trail {
-        let mut trail = Vec::with_capacity(nodes.len() * 2 - 1);
-        for (index, node) in nodes.iter().enumerate() {
-            if index > 0 {
-                trail.push(rel_values[index - 1].clone());
-            }
-            let value = if *node == src {
-                src_value.clone()
-            } else if *node == dst {
-                dst_value.clone().map(|nv| RuntimeValue::Node(Box::new(nv)))
-            } else {
-                scan_node_for_id(snapshot, *node)
-                    .await?
-                    .map(|view| RuntimeValue::Node(Box::new(NodeValue::from(view))))
-            };
-            trail.push(value.unwrap_or(RuntimeValue::Null));
-        }
-        trail
-    } else {
-        Vec::new()
-    };
-    Ok(Some((trail, rel_values)))
+    Ok(Some((nodes, edges)))
 }
 
 /// Seed-grouped shortestPath/allShortestPaths execution: one pruned
@@ -3273,12 +3405,24 @@ async fn execute_expand_shortest_grouped(
             let mut level_hit: HashSet<NodeId> = HashSet::new();
             let mut step_neighbours: Vec<(PathState, Vec<EdgeView>)> =
                 Vec::with_capacity(frontier.len());
-            for state in frontier.drain(..) {
-                crate::exec::limits::check_deadline()?;
-                let neighbours =
-                    neighbours_of_any(snapshot, edge_types, direction, state.tail, edge_read_mode)
-                        .await?;
-                step_neighbours.push((state, neighbours));
+            {
+                // Read the level's adjacency with several reads in flight;
+                // `buffered` keeps frontier order, so emission order is
+                // unchanged.
+                use futures::stream::{self, StreamExt};
+                let tails: Vec<NodeId> = frontier.iter().map(|state| state.tail).collect();
+                let mut reads = stream::iter(tails)
+                    .map(|tail| {
+                        neighbours_of_any(snapshot, edge_types, direction, tail, edge_read_mode)
+                    })
+                    .buffered(SEED_PREFETCH_CONCURRENCY);
+                let mut states = frontier.drain(..);
+                while let Some(read) = reads.next().await {
+                    crate::exec::limits::check_deadline()?;
+                    let neighbours = read?;
+                    let state = states.next().expect("one read per frontier state");
+                    step_neighbours.push((state, neighbours));
+                }
             }
             for (state, neighbours) in step_neighbours {
                 for edge in neighbours {
@@ -8159,7 +8303,10 @@ async fn try_index_search(
 /// snapshot (declared schema + memtable + persisted SSTs). Cost grows
 /// linearly with the observed type count — EXPLAIN surfaces this so
 /// users can opt back into typed expansion.
-fn resolve_edge_types(snapshot: &Snapshot<'_>, edge_type: Option<&[String]>) -> Vec<String> {
+pub(crate) fn resolve_edge_types(
+    snapshot: &Snapshot<'_>,
+    edge_type: Option<&[String]>,
+) -> Vec<String> {
     match edge_type {
         Some(types) => types.to_vec(),
         None => snapshot.observed_edge_types(),
@@ -8705,7 +8852,7 @@ fn expand_target_view_budget() -> usize {
         .unwrap_or(250_000)
 }
 
-async fn prepare_expand_targets(
+pub(crate) async fn prepare_expand_targets(
     snapshot: &Snapshot<'_>,
     target_labels: &[String],
     unique_targets: &[NodeId],
@@ -9566,6 +9713,180 @@ async fn try_metadata_node_count(
     ]))
 }
 
+/// Running state of one streamed aggregation (see
+/// [`execute_aggregate_streaming`]).
+enum StreamAcc {
+    Count(i64),
+    Sum {
+        any: bool,
+        is_float: bool,
+        int: i64,
+        float: f64,
+    },
+}
+
+impl StreamAcc {
+    fn new(agg: &AggregateExpr) -> Self {
+        match agg {
+            AggregateExpr::Sum { .. } => StreamAcc::Sum {
+                any: false,
+                is_float: false,
+                int: 0,
+                float: 0.0,
+            },
+            _ => StreamAcc::Count(0),
+        }
+    }
+
+    fn update(&mut self, agg: &AggregateExpr, row: &Row, params: &Params) -> Result<(), ExecError> {
+        match (self, agg) {
+            (StreamAcc::Count(n), AggregateExpr::Count { arg, .. }) => {
+                let counted = match arg {
+                    None => true,
+                    Some(e) => !evaluate_agg_arg(e, row, params)?.is_null(),
+                };
+                if counted {
+                    *n += 1;
+                }
+            }
+            (
+                StreamAcc::Sum {
+                    any,
+                    is_float,
+                    int,
+                    float,
+                },
+                AggregateExpr::Sum { arg, .. },
+            ) => {
+                // Same arithmetic, in the same order, as `sum_values` over
+                // the non-null values.
+                match evaluate_agg_arg(arg, row, params)?.as_ref() {
+                    RuntimeValue::Null => {}
+                    RuntimeValue::Integer(v) => {
+                        *any = true;
+                        if *is_float {
+                            *float += *v as f64;
+                        } else {
+                            *int = int.checked_add(*v).ok_or_else(|| {
+                                ExecError::Runtime(
+                                    "integer overflow in sum(); cast an operand with \
+                                     toFloat() to aggregate beyond 64-bit range"
+                                        .into(),
+                                )
+                            })?;
+                        }
+                    }
+                    RuntimeValue::Float(v) => {
+                        *any = true;
+                        if !*is_float {
+                            *float = *int as f64;
+                            *is_float = true;
+                        }
+                        *float += *v;
+                    }
+                    other => {
+                        return Err(ExecError::Runtime(format!(
+                            "sum/avg requires numeric values, got {}",
+                            other.type_name()
+                        )))
+                    }
+                }
+            }
+            _ => {
+                return Err(ExecError::Runtime(
+                    "streamed aggregate state mismatch".into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> RuntimeValue {
+        match self {
+            StreamAcc::Count(n) => RuntimeValue::Integer(n),
+            StreamAcc::Sum { any: false, .. } => RuntimeValue::Integer(0),
+            StreamAcc::Sum {
+                is_float: true,
+                float,
+                ..
+            } => RuntimeValue::Float(float),
+            StreamAcc::Sum { int, .. } => RuntimeValue::Integer(int),
+        }
+    }
+}
+
+/// `execute_aggregate` for aggregations that fold one row at a time —
+/// non-distinct `count` and `sum`. Each input row is folded into its group's
+/// running state and dropped, so the operator holds one entry per GROUP
+/// instead of every input row: a whole-graph `count(*)` grouped by a key
+/// keeps a few thousand accumulators, not millions of rows. Groups are
+/// emitted in the same fingerprint order as the row-retaining path.
+fn execute_aggregate_streaming(
+    rows: Vec<Row>,
+    group_by: &[(Expression, String)],
+    aggregations: &[(String, AggregateExpr)],
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, (Vec<RuntimeValue>, Vec<StreamAcc>)> = BTreeMap::new();
+    let mut meter = crate::exec::memory::GrowthMeter::new();
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
+    for row in rows {
+        guard.tick()?;
+        let mut key_vals = Vec::with_capacity(group_by.len());
+        let mut fingerprint = String::new();
+        for (expr, _) in group_by {
+            let v = evaluate(expr, &row, params)?;
+            fingerprint.push_str(&fingerprint_value(&v));
+            fingerprint.push('|');
+            key_vals.push(v);
+        }
+        let group = match groups.entry(fingerprint) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                if meter.active() {
+                    meter.add(
+                        entry
+                            .key()
+                            .capacity()
+                            .saturating_add(crate::exec::memory::estimate_values_bytes(&key_vals))
+                            .saturating_add(AGGREGATE_GROUP_OVERHEAD_BYTES),
+                    )?;
+                }
+                let accs = aggregations
+                    .iter()
+                    .map(|(_, a)| StreamAcc::new(a))
+                    .collect();
+                entry.insert((key_vals, accs))
+            }
+        };
+        for (acc, (_, agg)) in group.1.iter_mut().zip(aggregations) {
+            acc.update(agg, &row, params)?;
+        }
+    }
+    if groups.is_empty() && group_by.is_empty() {
+        let mut row = Row::new();
+        for (alias, agg) in aggregations {
+            row.set(alias.clone(), aggregate_over(&[], agg, params)?);
+        }
+        return Ok(vec![row]);
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for (_, (key_vals, accs)) in groups {
+        guard.tick()?;
+        let mut row = Row::new();
+        for ((_, alias), v) in group_by.iter().zip(key_vals) {
+            row.set(alias.clone(), v);
+        }
+        for ((alias, _), acc) in aggregations.iter().zip(accs) {
+            row.set(alias.clone(), acc.finish());
+        }
+        out.push(row);
+    }
+    meter.observe(&out)?;
+    Ok(out)
+}
+
 pub(crate) fn execute_aggregate(
     rows: Vec<Row>,
     group_by: &[(Expression, String)],
@@ -9573,6 +9894,22 @@ pub(crate) fn execute_aggregate(
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
     use std::collections::BTreeMap;
+    if !aggregations.is_empty()
+        && aggregations.iter().all(|(_, a)| {
+            matches!(
+                a,
+                AggregateExpr::Count {
+                    distinct: false,
+                    ..
+                } | AggregateExpr::Sum {
+                    distinct: false,
+                    ..
+                }
+            )
+        })
+    {
+        return execute_aggregate_streaming(rows, group_by, aggregations, params);
+    }
 
     let mut groups: BTreeMap<String, (Vec<RuntimeValue>, Vec<Row>)> = BTreeMap::new();
     // Grouping state on top of the (moved) input rows: one key, its values
@@ -11247,6 +11584,24 @@ fn execute_factor_operator<'a>(
             | LogicalPlan::Foreach { .. } => Err(ExecError::Runtime(
                 "write operators require execute_write(plan, &mut WriterSession, params)"
                     .to_string(),
+            )),
+
+            LogicalPlan::PathCount {
+                nodes,
+                hops,
+                group,
+                projection,
+                output,
+            } => Ok(FactorRowSet::from_flat(
+                crate::exec::path_count::execute_path_count(
+                    snapshot,
+                    nodes,
+                    hops,
+                    *group,
+                    projection.as_deref(),
+                    output,
+                )
+                .await?,
             )),
 
             LogicalPlan::EdgeTypeCount { edge_types, output } => {
@@ -13020,7 +13375,8 @@ fn collect_plan_references(
         | LogicalPlan::Empty
         | LogicalPlan::Argument { .. }
         | LogicalPlan::MultiwayJoin { .. }
-        | LogicalPlan::EdgeTypeCount { .. } => {}
+        | LogicalPlan::EdgeTypeCount { .. }
+        | LogicalPlan::PathCount { .. } => {}
     }
 
     for child in plan.children() {

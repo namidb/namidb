@@ -694,7 +694,7 @@ fn execute_write_inner_mode<'a>(
                 execute_inner_with_routing(plan, &snap, params, None, routing).await
             }
 
-            LogicalPlan::EdgeTypeCount { .. } => {
+            LogicalPlan::EdgeTypeCount { .. } | LogicalPlan::PathCount { .. } => {
                 // Read-only leaf: delegate to the post-write snapshot reader.
                 let snap = snapshot_for_write_read(writer, routing);
                 execute_inner_with_routing(plan, &snap, params, None, routing).await

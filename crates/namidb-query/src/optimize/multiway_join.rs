@@ -438,6 +438,7 @@ fn recurse_children(plan: LogicalPlan, refs: &BTreeMap<String, usize>) -> Logica
         | LogicalPlan::NodeScan { .. }
         | LogicalPlan::MultiwayJoin { .. }
         | LogicalPlan::EdgeTypeCount { .. }
+        | LogicalPlan::PathCount { .. }
         | LogicalPlan::VectorSearch { .. }
         | LogicalPlan::CallProcedure { .. } => plan,
         LogicalPlan::NodeById {
