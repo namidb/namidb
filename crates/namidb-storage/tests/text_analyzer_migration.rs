@@ -1,8 +1,10 @@
 //! Full-text indexes created before accent folding keep their lowercase-only
 //! analyzer, serve queries parsed with it, and are rebuilt with the folding
-//! analyzer off-manifest, then swapped in with one commit. A rebuild outrun
-//! by writes to the index's documents is refused and leaves the old index
-//! serving; writes elsewhere do not hold it back.
+//! analyzer off-manifest, then swapped in with one commit. Writes to the
+//! index's documents during the rebuild are re-tokenized by a catch-up delta
+//! installed with the base; until then the old index keeps serving, and an
+//! install that is not caught up is refused. Writes elsewhere do not hold it
+//! back.
 #![cfg(feature = "text-index")]
 
 use std::collections::BTreeMap;
@@ -197,6 +199,203 @@ async fn legacy_index_serves_its_own_analyzer_until_rebuilt() {
             .expect("reopened index serves")
             .len(),
         1
+    );
+}
+
+/// Every live document's folded hits for `queries`, as `(text, score)`
+/// pairs sorted, so two namespaces with the same documents under different
+/// ids compare equal exactly when postings and BM25 statistics agree.
+async fn scored_texts(
+    writer: &WriterSession,
+    texts: &std::collections::HashMap<NodeId, String>,
+    queries: &[&str],
+) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for query in queries {
+        let hits = search(writer, TextAnalyzer::Folded, query)
+            .await
+            .expect("folded index serves");
+        for (id, score) in hits {
+            out.push((
+                (*query).to_string(),
+                texts.get(&id).cloned().unwrap_or_default(),
+                format!("{score:.9}"),
+            ));
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn writes_during_the_rebuild_are_caught_up_and_installed_with_it() {
+    let (mut writer, ids) = legacy_namespace("text-reanalysis-catch-up").await;
+    let mut texts = std::collections::HashMap::new();
+    for (i, id) in ids.iter().enumerate() {
+        texts.insert(
+            *id,
+            format!("{} r{}", BODIES[i % BODIES.len()], i / BODIES.len()),
+        );
+    }
+    let basis = writer.compaction_basis();
+    let mut prepared = basis
+        .prepare_text_reanalysis("doc_ft")
+        .await
+        .unwrap()
+        .expect("candidate");
+
+    // Three flushes land while the base is built: a new document, an edit,
+    // a delete, and an edit that only changes accents (the same under
+    // folding).
+    let fresh = NodeId::new();
+    writer
+        .upsert_node("Doc", fresh, &doc("Educación y Jubilación anticipada"))
+        .unwrap();
+    texts.insert(fresh, "Educación y Jubilación anticipada".into());
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+    writer
+        .upsert_node("Doc", ids[1], &doc("Indenização revisada pela pensão"))
+        .unwrap();
+    texts.insert(ids[1], "Indenização revisada pela pensão".into());
+    writer.tombstone_node("Doc", ids[0]).unwrap();
+    texts.remove(&ids[0]);
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+
+    // Not caught up: refused, and the old index keeps serving.
+    assert!(!prepared.caught_up_with(writer.current_manifest()).unwrap());
+    writer
+        .compaction_basis()
+        .catch_up_text_reanalysis(&mut prepared)
+        .await
+        .unwrap();
+    assert!(prepared.caught_up_with(writer.current_manifest()).unwrap());
+
+    // One more flush after the catch-up: an accent-only edit.
+    writer
+        .upsert_node(
+            "Doc",
+            ids[4],
+            &doc("PLAIN ascii text about pensión rules r0"),
+        )
+        .unwrap();
+    texts.insert(ids[4], "PLAIN ascii text about pensión rules r0".into());
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+    assert!(!prepared.caught_up_with(writer.current_manifest()).unwrap());
+    assert_eq!(analyzer_of(&writer), None);
+    assert_eq!(
+        search(&writer, TextAnalyzer::Exact, "jubilación")
+            .await
+            .expect("legacy index still serves")
+            .len(),
+        1
+    );
+
+    writer
+        .compaction_basis()
+        .catch_up_text_reanalysis(&mut prepared)
+        .await
+        .unwrap();
+    writer.install_text_reanalysis(prepared).await.unwrap();
+    assert_eq!(analyzer_of(&writer), Some(TextAnalyzer::Folded));
+    let generation = writer
+        .current_manifest()
+        .search_lsm
+        .iter()
+        .find(|state| state.index_name == "doc_ft")
+        .expect("generation");
+    assert_eq!(
+        generation.segments.len(),
+        2,
+        "the base and one catch-up delta"
+    );
+
+    // The same documents indexed folded from scratch score identically.
+    let queries = [
+        "pension",
+        "jubilacion",
+        "educacion",
+        "indenizacao",
+        "acao",
+        "coeur",
+        "strasse",
+        "plain",
+        "revisada",
+    ];
+    let migrated = scored_texts(&writer, &texts, &queries).await;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let paths = NamespacePaths::new("tenants", NamespaceId::new("text-reference").unwrap());
+    let mut reference = WriterSession::open(store, paths).await.unwrap();
+    reference
+        .register_text_index(
+            TextIndexDescriptor::new("doc_ft".into(), "Doc".into(), vec!["body".into()]),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut reference_texts = std::collections::HashMap::new();
+    for text in texts.values() {
+        let id = NodeId::new();
+        reference.upsert_node("Doc", id, &doc(text)).unwrap();
+        reference_texts.insert(id, text.clone());
+    }
+    reference.commit_batch().await.unwrap();
+    reference.flush(schema()).await.unwrap();
+    reference.compact_l0(&schema()).await.unwrap();
+    assert_eq!(
+        migrated,
+        scored_texts(&reference, &reference_texts, &queries).await
+    );
+    assert!(migrated
+        .iter()
+        .any(|(query, text, _)| query == "jubilacion" && text.starts_with("Educación")));
+
+    // Compaction folds the catch-up delta like any other.
+    writer.compact_l0(&schema()).await.unwrap();
+    assert_eq!(scored_texts(&writer, &texts, &queries).await, migrated);
+}
+
+#[tokio::test]
+async fn catch_up_of_accent_only_edits_writes_no_postings() {
+    let (mut writer, ids) = legacy_namespace("text-reanalysis-accent-only").await;
+    let mut prepared = writer
+        .compaction_basis()
+        .prepare_text_reanalysis("doc_ft")
+        .await
+        .unwrap()
+        .expect("candidate");
+    // "pension" -> "pensión": a change for the old analyzer only.
+    writer
+        .upsert_node(
+            "Doc",
+            ids[4],
+            &doc("plain ascii text about pensión rules r0"),
+        )
+        .unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+    writer
+        .compaction_basis()
+        .catch_up_text_reanalysis(&mut prepared)
+        .await
+        .unwrap();
+    writer.install_text_reanalysis(prepared).await.unwrap();
+    assert_eq!(analyzer_of(&writer), Some(TextAnalyzer::Folded));
+    let generation = writer
+        .current_manifest()
+        .search_lsm
+        .iter()
+        .find(|state| state.index_name == "doc_ft")
+        .expect("generation");
+    assert_eq!(generation.segments.len(), 1, "only the base");
+    assert_eq!(
+        search(&writer, TextAnalyzer::Folded, "pension")
+            .await
+            .expect("serves")
+            .len(),
+        16
     );
 }
 

@@ -121,7 +121,7 @@ pub use range_cache::{
 pub use read::VectorFilterSearch;
 pub use read::{
     EdgeListView, EdgeScanCursor, EdgeView, NodeScanCursor, NodeView, OwnedSnapshot,
-    PinnedSnapshot, PrefetchSummary, Snapshot, SnapshotCell, PREFETCH_NODE_SST_LIMIT,
+    PinnedSnapshot, PrefetchSummary, Snapshot, SnapshotCell, VersionPin, PREFETCH_NODE_SST_LIMIT,
 };
 pub use reader::ReaderSession;
 pub use recovery::{

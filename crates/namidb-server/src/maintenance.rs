@@ -52,7 +52,30 @@ pub(crate) struct CompactionScheduler {
     /// guard while it lists and deletes. Tokio's write-preferring FIFO lock
     /// prevents a trigger stream from starving a queued janitor.
     maintenance_gate: RwLock<()>,
+    /// The full-text re-analysis running for this namespace, if any (see
+    /// [`maybe_start_text_reanalysis`]). It runs beside the compaction
+    /// worker, not inside it, and outside `maintenance_gate`.
+    #[cfg(feature = "text-index")]
+    text_reanalysis: StdMutex<Option<TextReanalysisSlot>>,
 }
+
+/// What [`CompactionScheduler::text_reanalysis`] records about the running
+/// re-analysis.
+#[cfg(feature = "text-index")]
+#[derive(Debug)]
+struct TextReanalysisSlot {
+    /// `None` until the task has chosen its index.
+    index: Option<String>,
+    /// Segments of that index the new base replaces.
+    prefix: usize,
+    started: Instant,
+}
+
+/// Extra age a sweep must leave to objects while a re-analysis runs, beyond
+/// its elapsed time: covers clock skew between this host and the object
+/// store's `last_modified`.
+#[cfg(feature = "text-index")]
+const TEXT_REANALYSIS_SWEEP_MARGIN: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
@@ -149,6 +172,84 @@ impl CompactionScheduler {
     /// caller lists and deletes orphaned immutable objects.
     pub(crate) async fn sweep_guard(&self) -> RwLockWriteGuard<'_, ()> {
         self.maintenance_gate.write().await
+    }
+
+    /// `options` for a sweep of this namespace now. A running re-analysis
+    /// uploads its outputs over most of an hour without holding the
+    /// maintenance gate (that would stall every compaction pass behind the
+    /// sweep queued on it), so the sweep keeps every object younger than the
+    /// re-analysis instead. What it reads is held by its retention pin.
+    pub(crate) fn sweep_options(&self, options: SweepOptions) -> SweepOptions {
+        #[cfg(feature = "text-index")]
+        {
+            let mut options = options;
+            if let Some(slot) = self
+                .text_reanalysis
+                .lock()
+                .expect("text re-analysis slot poisoned")
+                .as_ref()
+            {
+                options.min_age = options
+                    .min_age
+                    .max(slot.started.elapsed() + TEXT_REANALYSIS_SWEEP_MARGIN);
+            }
+            options
+        }
+        #[cfg(not(feature = "text-index"))]
+        options
+    }
+
+    /// Search indexes no routine base build may replace from `basis`: the
+    /// one a re-analysis is rebuilding (its basis prefix), and every other
+    /// pre-folding text index still waiting for one (prefix 0, so its delta
+    /// runs keep consolidating). A base rebuilt for them now would be built
+    /// with the old analyzer only to be rebuilt again with the new one.
+    fn reanalysis_protected(
+        &self,
+        basis: &namidb_storage::CompactionBasis,
+        namespace: &str,
+    ) -> SearchKeys {
+        #[cfg_attr(not(feature = "text-index"), allow(unused_mut))]
+        let mut keys = SearchKeys::new();
+        #[cfg(feature = "text-index")]
+        {
+            if !text_reanalysis_enabled() {
+                return keys;
+            }
+            if let Some(TextReanalysisSlot {
+                index: Some(index),
+                prefix,
+                ..
+            }) = self
+                .text_reanalysis
+                .lock()
+                .expect("text re-analysis slot poisoned")
+                .as_ref()
+            {
+                keys.insert(
+                    (
+                        namidb_storage::search_lsm::SearchLsmKind::Text,
+                        index.clone(),
+                    ),
+                    *prefix,
+                );
+            }
+            let retry = TEXT_REANALYSIS_RETRY
+                .lock()
+                .expect("text re-analysis retry map poisoned");
+            for index in basis.legacy_text_indexes() {
+                let given_up = retry
+                    .get(&(namespace.to_owned(), index.clone()))
+                    .is_some_and(|(failures, _)| *failures >= TEXT_REANALYSIS_MAX_FAILURES);
+                if !given_up {
+                    keys.entry((namidb_storage::search_lsm::SearchLsmKind::Text, index))
+                        .or_insert(0);
+                }
+            }
+        }
+        #[cfg(not(feature = "text-index"))]
+        let _ = (basis, namespace);
+        keys
     }
 
     #[cfg(test)]
@@ -447,6 +548,7 @@ async fn run_worker(
         }
         scheduler.pass_started();
         match run_compaction_pass(
+            &scheduler,
             trigger,
             &writer,
             &snapshot,
@@ -580,6 +682,7 @@ pub(crate) async fn drain_compaction(
             return Ok(summary);
         }
         let attempt = run_compaction_pass(
+            scheduler,
             CompactionTrigger::Admin,
             writer,
             snapshot,
@@ -660,6 +763,7 @@ impl DrainSummary {
 /// scheduler and the operator drain call this function.
 #[allow(clippy::too_many_arguments)]
 async fn run_compaction_pass(
+    scheduler: &CompactionScheduler,
     trigger: CompactionTrigger,
     writer: &Mutex<WriterSession>,
     snapshot: &SnapshotCell,
@@ -675,6 +779,7 @@ async fn run_compaction_pass(
     let in_flight = StdMutex::new(SearchKeys::new());
     let mut applied = None;
     match run_scoped_pass(
+        scheduler,
         PassScope::SearchDeltas,
         trigger,
         writer,
@@ -705,6 +810,7 @@ async fn run_compaction_pass(
     let long = async {
         let mut search_applied = None;
         match run_scoped_pass(
+            scheduler,
             PassScope::SearchOnly,
             trigger,
             writer,
@@ -731,6 +837,7 @@ async fn run_compaction_pass(
             }
         }
         let full = run_scoped_pass(
+            scheduler,
             PassScope::WithoutSearch,
             trigger,
             writer,
@@ -757,6 +864,7 @@ async fn run_compaction_pass(
                 return delta_applied;
             }
             match run_scoped_pass(
+                scheduler,
                 PassScope::SearchDeltas,
                 trigger,
                 writer,
@@ -785,13 +893,6 @@ async fn run_compaction_pass(
         (Some(applied), CompactionPass::Noop) => applied,
         (_, full) => full,
     };
-    // Re-tokenize one pre-folding full-text index, only on a periodic tick
-    // that found nothing else to do: the rebuild reads the whole corpus, so it
-    // waits for a quiet window instead of competing with routine maintenance.
-    #[cfg(feature = "text-index")]
-    if trigger == CompactionTrigger::Periodic && matches!(pass, CompactionPass::Noop) {
-        run_text_reanalysis_pass(writer, snapshot, namespace, cancel).await;
-    }
     Ok(pass)
 }
 
@@ -811,8 +912,21 @@ fn text_reanalysis_enabled() -> bool {
     )
 }
 
-/// Retry schedule of an index whose rebuilt base lost its install race
-/// (writes to its documents landed during the rebuild).
+/// Consecutive failed re-analyses of one index after which this process
+/// stops trying (until restart) and lets routine maintenance rebuild the
+/// index with its original analyzer again. A lost race does not count: the
+/// catch-up follows concurrent writes, so only an error or a change of the
+/// index itself fails a re-analysis.
+#[cfg(feature = "text-index")]
+const TEXT_REANALYSIS_MAX_FAILURES: u32 = 5;
+
+/// Catch-up rounds run without the writer lock before the last one runs
+/// under it. Each round only covers the writes of the previous one, so the
+/// locked round is short.
+#[cfg(feature = "text-index")]
+const TEXT_REANALYSIS_UNLOCKED_CATCH_UPS: usize = 3;
+
+/// Retry delay after the `failures`-th failure.
 #[cfg(feature = "text-index")]
 fn text_reanalysis_backoff(failures: u32) -> std::time::Duration {
     const BASE: std::time::Duration = std::time::Duration::from_secs(60);
@@ -828,27 +942,110 @@ type TextReanalysisRetry = std::collections::HashMap<(String, String), (u32, Ins
 static TEXT_REANALYSIS_RETRY: std::sync::LazyLock<StdMutex<TextReanalysisRetry>> =
     std::sync::LazyLock::new(Default::default);
 
-/// Rebuild at most one legacy full-text index of `namespace` with the folding
-/// analyzer and swap it in (see `namidb_storage::PreparedTextReanalysis`).
-/// The index serves with its old analyzer until the swap; a lost race only
-/// schedules a retry.
+/// Releases [`CompactionScheduler::text_reanalysis`] however the task ends.
 #[cfg(feature = "text-index")]
-async fn run_text_reanalysis_pass(
+struct TextReanalysisLease(Arc<CompactionScheduler>);
+
+#[cfg(feature = "text-index")]
+impl Drop for TextReanalysisLease {
+    fn drop(&mut self) {
+        *self
+            .0
+            .text_reanalysis
+            .lock()
+            .expect("text re-analysis slot poisoned") = None;
+    }
+}
+
+/// Start rebuilding one pre-folding full-text index of `namespace` with the
+/// accent-folding analyzer, unless one is already running or none is due.
+///
+/// The rebuild reads the whole corpus and can take most of an hour on a
+/// large index, so it runs in a task of its own beside the compaction
+/// worker: L0 merges, delta consolidations and other base builds go on
+/// meanwhile, and the orphan sweep keeps its outputs through
+/// [`CompactionScheduler::sweep_options`]. The index keeps serving with its
+/// old analyzer until the new base and the catch-up of the writes made
+/// during the build install together (see
+/// `namidb_storage::PreparedTextReanalysis`).
+#[cfg(feature = "text-index")]
+pub(crate) fn maybe_start_text_reanalysis(
+    scheduler: &Arc<CompactionScheduler>,
+    writer: &Arc<Mutex<WriterSession>>,
+    snapshot: &Arc<SnapshotCell>,
+    writer_health: &Arc<WriterHealth>,
+    namespace: &str,
+    cancel: Option<watch::Receiver<bool>>,
+) -> Option<JoinHandle<()>> {
+    if !text_reanalysis_enabled() || is_cancelled(cancel.as_ref()) {
+        return None;
+    }
+    // Cheap check on the published snapshot first: most namespaces have no
+    // pre-folding index, and this runs on every maintenance tick.
+    let any_legacy = snapshot
+        .load()
+        .manifest()
+        .manifest
+        .text_indexes
+        .iter()
+        .any(|descriptor| descriptor.is_legacy_analyzer());
+    if !any_legacy {
+        return None;
+    }
+    {
+        let mut slot = scheduler
+            .text_reanalysis
+            .lock()
+            .expect("text re-analysis slot poisoned");
+        if slot.is_some() {
+            return None;
+        }
+        *slot = Some(TextReanalysisSlot {
+            index: None,
+            prefix: 0,
+            started: Instant::now(),
+        });
+    }
+    let lease = TextReanalysisLease(Arc::clone(scheduler));
+    let writer = Arc::clone(writer);
+    let snapshot = Arc::clone(snapshot);
+    let writer_health = Arc::clone(writer_health);
+    let namespace = namespace.to_owned();
+    Some(tokio::spawn(async move {
+        let _lease = lease;
+        let work = run_text_reanalysis(&_lease.0, &writer, &snapshot, &writer_health, &namespace);
+        match cancel {
+            Some(mut cancel) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.wait_for(|cancelled| *cancelled) => {
+                        info!(namespace, "full-text re-analysis stopped: namespace closing");
+                    }
+                    () = work => {}
+                }
+            }
+            None => work.await,
+        }
+    }))
+}
+
+/// Body of the task [`maybe_start_text_reanalysis`] spawns.
+#[cfg(feature = "text-index")]
+async fn run_text_reanalysis(
+    scheduler: &CompactionScheduler,
     writer: &Mutex<WriterSession>,
     snapshot: &SnapshotCell,
+    writer_health: &WriterHealth,
     namespace: &str,
-    cancel: Option<&watch::Receiver<bool>>,
 ) {
-    if !text_reanalysis_enabled() || is_cancelled(cancel) {
-        return;
-    }
-    let basis = writer.lock().await.compaction_basis();
-    if basis.needs_compaction()
-        || basis.search_delta_compaction_due()
-        || !basis.planned_search_bases().is_empty()
-    {
-        return;
-    }
+    // The catch-up reads the basis documents, so hold the retention horizon
+    // at the basis for the whole rebuild.
+    let (basis, _pin) = {
+        let guard = writer.lock().await;
+        let basis = guard.compaction_basis();
+        let pin = snapshot.pin_version(basis.manifest_version());
+        (basis, pin)
+    };
     let now = Instant::now();
     let candidate = {
         let retry = TEXT_REANALYSIS_RETRY
@@ -857,21 +1054,52 @@ async fn run_text_reanalysis_pass(
         basis.legacy_text_indexes().into_iter().find(|index| {
             retry
                 .get(&(namespace.to_owned(), index.clone()))
-                .is_none_or(|(_, next)| *next <= now)
+                .is_none_or(|(failures, next)| {
+                    *failures < TEXT_REANALYSIS_MAX_FAILURES && *next <= now
+                })
         })
     };
     let Some(index) = candidate else {
         return;
     };
+    let prefix = basis
+        .base_manifest()
+        .search_lsm
+        .iter()
+        .find(|state| {
+            state.kind == namidb_storage::search_lsm::SearchLsmKind::Text
+                && state.index_name == index
+        })
+        .map_or(0, |state| state.segments.len());
+    if let Some(slot) = scheduler
+        .text_reanalysis
+        .lock()
+        .expect("text re-analysis slot poisoned")
+        .as_mut()
+    {
+        slot.index = Some(index.clone());
+        slot.prefix = prefix;
+    }
     let key = (namespace.to_owned(), index.clone());
-    let record_failure = || {
+    let record_failure = |error: &namidb_storage::Error| {
         let mut retry = TEXT_REANALYSIS_RETRY
             .lock()
             .expect("text re-analysis retry map poisoned");
         let entry = retry.entry(key.clone()).or_insert((0, Instant::now()));
         entry.1 = Instant::now() + text_reanalysis_backoff(entry.0);
         entry.0 = entry.0.saturating_add(1);
-        entry.1
+        if entry.0 >= TEXT_REANALYSIS_MAX_FAILURES {
+            error!(
+                namespace,
+                index = %index,
+                failures = entry.0,
+                %error,
+                "full-text re-analysis failed repeatedly; the index keeps its original \
+                 analyzer until the next restart"
+            );
+        } else {
+            warn!(namespace, index = %index, %error, "full-text re-analysis failed; will retry");
+        }
     };
     info!(namespace, index = %index, "rebuilding full-text index with the accent-folding analyzer");
     let started = Instant::now();
@@ -879,27 +1107,33 @@ async fn run_text_reanalysis_pass(
         Ok(Some(prepared)) => prepared,
         Ok(None) => return,
         Err(error) => {
-            record_failure();
-            warn!(namespace, index = %index, %error, "full-text re-analysis build failed; will retry");
+            record_failure(&error);
             return;
         }
     };
-    if is_cancelled(cancel) {
-        return;
+    drop(basis);
+    let (result, uploaded) =
+        catch_up_and_install(prepared, writer, snapshot, writer_health, namespace).await;
+    match &result {
+        Ok(()) => {
+            TEXT_REANALYSIS_RETRY
+                .lock()
+                .expect("text re-analysis retry map poisoned")
+                .remove(&key);
+            info!(
+                namespace,
+                index = %index,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "full-text index now uses the accent-folding analyzer"
+            );
+        }
+        Err(error) => record_failure(error),
     }
-    let uploaded: Vec<String> = {
-        let base = namidb_storage::manifest_object_paths(basis.base_manifest());
-        prepared
-            .uploaded_object_paths()
-            .into_iter()
-            .filter(|path| !base.contains(path))
-            .collect()
-    };
-    tokio::task::yield_now().await;
-    let mut guard = writer.lock().await;
-    let install = guard.install_text_reanalysis(prepared).await;
-    let discard = match &install {
-        Ok(_) | Err(namidb_storage::Error::Precondition(_)) if !uploaded.is_empty() => {
+    // Uploads the manifest does not reference now (a refused install, or
+    // superseded catch-up attempts) are this task's alone: delete them.
+    if !uploaded.is_empty() {
+        let discard = {
+            let guard = writer.lock().await;
             let live = namidb_storage::manifest_object_paths(guard.current_manifest());
             let unreferenced: Vec<String> = uploaded
                 .into_iter()
@@ -917,32 +1151,65 @@ async fn run_text_reanalysis_pass(
                     unreferenced,
                 )
             })
-        }
-        _ => None,
-    };
-    match install {
-        Ok(_) => {
-            snapshot.store(guard.owned_snapshot());
-            TEXT_REANALYSIS_RETRY
-                .lock()
-                .expect("text re-analysis retry map poisoned")
-                .remove(&key);
-            info!(
-                namespace,
-                index = %index,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "full-text index now uses the accent-folding analyzer"
-            );
-        }
-        Err(error) => {
-            record_failure();
-            warn!(namespace, index = %index, %error, "full-text re-analysis not installed; will retry");
+        };
+        if let Some((store, prefix, unreferenced)) = discard {
+            discard_unreferenced_uploads(&store, &prefix, unreferenced, namespace).await;
         }
     }
-    drop(guard);
-    if let Some((store, prefix, unreferenced)) = discard {
-        discard_unreferenced_uploads(&store, &prefix, unreferenced, namespace).await;
+}
+
+/// Catch the prepared rebuild up with the writes made since its basis and
+/// install it. Returns the outcome and every object the rebuild uploaded.
+///
+/// Catch-up rounds run without the writer lock while writes keep landing;
+/// the last one runs under it, so the install covers the last of them. Each
+/// round only re-tokenizes what landed during the previous one.
+#[cfg(feature = "text-index")]
+async fn catch_up_and_install(
+    mut prepared: namidb_storage::PreparedTextReanalysis,
+    writer: &Mutex<WriterSession>,
+    snapshot: &SnapshotCell,
+    writer_health: &WriterHealth,
+    namespace: &str,
+) -> (namidb_storage::Result<()>, Vec<String>) {
+    for round in 0..=TEXT_REANALYSIS_UNLOCKED_CATCH_UPS {
+        let mut guard = writer.lock().await;
+        let caught_up = match prepared.caught_up_with(guard.current_manifest()) {
+            Ok(caught_up) => caught_up,
+            Err(error) => return (Err(error), prepared.uploaded_object_paths()),
+        };
+        if !caught_up {
+            let current = guard.compaction_basis();
+            if round < TEXT_REANALYSIS_UNLOCKED_CATCH_UPS {
+                drop(guard);
+                if let Err(error) = current.catch_up_text_reanalysis(&mut prepared).await {
+                    return (Err(error), prepared.uploaded_object_paths());
+                }
+                continue;
+            }
+            if let Err(error) = current.catch_up_text_reanalysis(&mut prepared).await {
+                return (Err(error), prepared.uploaded_object_paths());
+            }
+        }
+        let uploaded = prepared.uploaded_object_paths();
+        let result = guard.install_text_reanalysis(prepared).await;
+        match &result {
+            Ok(_) => snapshot.store(guard.owned_snapshot()),
+            Err(namidb_storage::Error::Precondition(_)) => {}
+            Err(error) => {
+                recovery::recover_writer_if_needed(
+                    &mut guard,
+                    snapshot,
+                    writer_health,
+                    namespace,
+                    error,
+                )
+                .await;
+            }
+        }
+        return (result.map(|_| ()), uploaded);
     }
+    unreachable!("the last catch-up round always installs or fails")
 }
 
 /// Search indexes a long pass is building a base for, with the segment prefix
@@ -984,6 +1251,7 @@ enum PassScope {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_scoped_pass(
+    scheduler: &CompactionScheduler,
     scope: PassScope,
     trigger: CompactionTrigger,
     writer: &Mutex<WriterSession>,
@@ -1014,10 +1282,13 @@ async fn run_scoped_pass(
     let basis = match scope {
         PassScope::WithoutSearch => basis,
         PassScope::SearchDeltas | PassScope::SearchOnly => {
-            let protected = in_flight
+            let mut protected = in_flight
                 .lock()
                 .expect("in-flight search set poisoned")
                 .clone();
+            for (key, prefix) in scheduler.reanalysis_protected(&basis, namespace) {
+                protected.entry(key).or_insert(prefix);
+            }
             basis.protecting_search_prefixes(protected)
         }
     };
@@ -1384,6 +1655,179 @@ mod tests {
             &state.metrics,
             None,
         )
+    }
+
+    /// A pre-folding full-text index is re-analysed in a task beside the
+    /// compaction worker: while the rebuild is held inside its corpus read,
+    /// flushes keep landing, the worker still merges the L0 backlog, the
+    /// legacy index keeps serving (no routine base rebuild of it), and the
+    /// sweep keeps objects younger than the rebuild. When the rebuild is
+    /// released, the writes made meanwhile are caught up and installed with
+    /// it, and the slot is released.
+    #[cfg(feature = "text-index")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn text_reanalysis_runs_beside_compaction_and_catches_up() {
+        use namidb_storage::manifest::TextIndexDescriptor;
+        use namidb_storage::text::{parse_query_with, TextAnalyzer};
+
+        let (_unused, paths) =
+            namidb_storage::parse_uri("memory://text-reanalysis-beside").unwrap();
+        let blocking_store = Arc::new(BlockFirstSstGet {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            should_block: AtomicBool::new(false),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let store: Arc<dyn ObjectStore> = blocking_store.clone();
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+        writer
+            .register_text_index(
+                TextIndexDescriptor {
+                    analyzer: None,
+                    ..TextIndexDescriptor::new("doc_ft".into(), "Doc".into(), vec!["body".into()])
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let body = |text: &str| NodeWriteRecord {
+            properties: BTreeMap::from([("body".into(), Value::Str(text.into()))]),
+            schema_version: 0,
+            labels: vec![],
+        };
+        for n in 0..20 {
+            writer
+                .upsert_node(
+                    "Doc",
+                    NodeId::new(),
+                    &body(&format!("la pensión número {n}")),
+                )
+                .unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+        writer.flush(Schema::empty()).await.unwrap();
+        writer.compact_l0(&Schema::empty()).await.unwrap();
+        let state = AppState::new(writer, None, "text-reanalysis-beside".into());
+        {
+            let writer = state.writer.lock().await;
+            state.snapshot.store(writer.owned_snapshot());
+        }
+        let analyzer = |state: &AppState| {
+            let state = state.clone();
+            async move {
+                state
+                    .writer
+                    .lock()
+                    .await
+                    .current_manifest()
+                    .text_indexes
+                    .iter()
+                    .find(|descriptor| descriptor.name == "doc_ft")
+                    .and_then(|descriptor| descriptor.analyzer)
+            }
+        };
+        assert_eq!(analyzer(&state).await, None);
+
+        // Hold the rebuild at its first corpus read.
+        blocking_store.should_block.store(true, Ordering::SeqCst);
+        let scheduler = Arc::clone(&state.compaction_scheduler);
+        let reanalysis = maybe_start_text_reanalysis(
+            &scheduler,
+            &state.writer,
+            &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
+            None,
+        )
+        .expect("a legacy index starts a re-analysis");
+        tokio::time::timeout(Duration::from_secs(10), blocking_store.started.notified())
+            .await
+            .expect("the re-analysis reaches its corpus read");
+        assert!(
+            maybe_start_text_reanalysis(
+                &scheduler,
+                &state.writer,
+                &state.snapshot,
+                &state.writer_health,
+                &state.namespace,
+                None,
+            )
+            .is_none(),
+            "one re-analysis per namespace"
+        );
+        let swept = scheduler.sweep_options(SweepOptions {
+            min_age: Duration::ZERO,
+            ..SweepSettings::default().options(0)
+        });
+        assert!(swept.min_age >= TEXT_REANALYSIS_SWEEP_MARGIN);
+
+        // Writes keep landing: an L0 backlog, and a new indexed document.
+        for n in 0..4 {
+            commit_and_flush(&state, NodeId::new(), &format!("p{n}")).await;
+        }
+        let fresh = NodeId::new();
+        {
+            let mut writer = state.writer.lock().await;
+            writer
+                .upsert_node("Doc", fresh, &body("Jubilación anticipada"))
+                .unwrap();
+            writer.commit_batch().await.unwrap();
+            writer.flush(Schema::empty()).await.unwrap();
+            state.snapshot.store(writer.owned_snapshot());
+        }
+        let backlog = state.writer.lock().await.max_l0_bucket_len();
+        assert!(backlog >= 4, "backlog {backlog}");
+
+        // The worker merges it while the rebuild is still held.
+        let worker = request_for_state(&state, &scheduler, CompactionTrigger::Reactive)
+            .expect("worker starts");
+        tokio::time::timeout(Duration::from_secs(30), worker)
+            .await
+            .expect("compaction is not held behind the re-analysis")
+            .unwrap();
+        let after = state.writer.lock().await.max_l0_bucket_len();
+        assert!(after < backlog, "L0 {backlog} -> {after}");
+        assert_eq!(
+            analyzer(&state).await,
+            None,
+            "the legacy index still serves"
+        );
+        assert!(!reanalysis.is_finished());
+
+        blocking_store.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(60), reanalysis)
+            .await
+            .expect("the re-analysis finishes")
+            .unwrap();
+        assert_eq!(analyzer(&state).await, Some(TextAnalyzer::Folded));
+        let hits = state
+            .writer
+            .lock()
+            .await
+            .snapshot()
+            .text_search(
+                "doc_ft",
+                "Doc",
+                &parse_query_with(TextAnalyzer::Folded, "JUBILACION"),
+                Some(10),
+            )
+            .await
+            .unwrap()
+            .expect("the folded index serves");
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![fresh]
+        );
+        assert_eq!(
+            scheduler
+                .sweep_options(SweepOptions {
+                    min_age: Duration::ZERO,
+                    ..SweepSettings::default().options(0)
+                })
+                .min_age,
+            Duration::ZERO,
+            "the slot is released"
+        );
     }
 
     /// Barrier-based fairness and burst-coalescing regression:
@@ -1914,6 +2358,7 @@ mod tests {
     async fn run_nodes_pass(state: &AppState) -> namidb_storage::Result<CompactionPass> {
         let in_flight = StdMutex::new(SearchKeys::new());
         run_scoped_pass(
+            &state.compaction_scheduler,
             PassScope::WithoutSearch,
             CompactionTrigger::Periodic,
             &state.writer,

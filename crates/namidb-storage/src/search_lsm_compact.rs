@@ -1267,6 +1267,13 @@ fn delta_stats_are_zero(stats: SearchSegmentStats) -> bool {
 }
 
 fn verify_output(prepared: &PreparedSearchCompaction) -> Result<()> {
+    verify_output_with(prepared, false)
+}
+
+/// [`verify_output`]; `reanalyzed` marks the catch-up delta of an analyzer
+/// migration (see [`prepare_text_catch_up`]), whose signed statistics are
+/// those of the target analyzer and so differ from the replaced deltas' sum.
+fn verify_output_with(prepared: &PreparedSearchCompaction, reanalyzed: bool) -> Result<()> {
     let state = &prepared.selection.captured_state;
     let Some(output) = &prepared.output else {
         if prepared.empty_proof_digest.is_none_or(|digest| digest == 0) {
@@ -1275,6 +1282,7 @@ fn verify_output(prepared: &PreparedSearchCompaction) -> Result<()> {
             ));
         }
         if prepared.selection.mode == SearchCompactionMode::DeltaRun
+            && !reanalyzed
             && !delta_stats_are_zero(summed_delta_stats(&prepared.selection)?)
         {
             return Err(Error::invariant(
@@ -1326,7 +1334,7 @@ fn verify_output(prepared: &PreparedSearchCompaction) -> Result<()> {
             ));
         }
         SearchCompactionMode::DeltaRun
-            if segment.stats != summed_delta_stats(&prepared.selection)? =>
+            if !reanalyzed && segment.stats != summed_delta_stats(&prepared.selection)? =>
         {
             return Err(Error::invariant(
                 "prepared DeltaRun statistics do not equal the authenticated source sum",
@@ -1347,6 +1355,17 @@ pub(super) fn rebase_prepared_search_compaction(
     prepared: &PreparedSearchCompaction,
     working_state: &SearchLsmState,
 ) -> Result<SearchLsmState> {
+    rebase_prepared_search_compaction_with(manifest, prepared, working_state, false)
+}
+
+/// [`rebase_prepared_search_compaction`]; `reanalyzed` as in
+/// [`verify_output_with`].
+pub(super) fn rebase_prepared_search_compaction_with(
+    manifest: &Manifest,
+    prepared: &PreparedSearchCompaction,
+    working_state: &SearchLsmState,
+    reanalyzed: bool,
+) -> Result<SearchLsmState> {
     let selection = &prepared.selection;
     let captured = &selection.captured_state;
     let current = current_state_for(manifest, selection)?;
@@ -1366,7 +1385,7 @@ pub(super) fn rebase_prepared_search_compaction(
         ));
     }
     verify_selected_descriptors(manifest, prepared)?;
-    verify_output(prepared)?;
+    verify_output_with(prepared, reanalyzed)?;
     if working_state.kind != current.kind
         || working_state.index_name != current.index_name
         || working_state.catalog_signature != current.catalog_signature
@@ -2166,9 +2185,11 @@ struct VersionRunMerge<'a> {
 #[cfg(any(feature = "vector-index", feature = "text-index"))]
 impl<'a> VersionRunMerge<'a> {
     async fn open(readers: Vec<&'a SearchVersionTableReader>) -> Result<Self> {
-        if readers.len() < 2 {
+        // A DeltaRun selects at least two runs; the analyzer catch-up (see
+        // `prepare_text_catch_up`) may read a single one.
+        if readers.is_empty() {
             return Err(Error::invariant(
-                "DeltaRun physical merge requires at least two source runs",
+                "Search-LSM version merge requires at least one source run",
             ));
         }
         let input_rows = readers.iter().try_fold(0u64, |total, reader| {
@@ -2447,7 +2468,7 @@ pub(super) async fn prepare_search_compactions(
     base: &LoadedManifest,
     selections: Vec<SearchCompactionSelection>,
 ) -> Result<Vec<PreparedSearchCompaction>> {
-    prepare_search_compactions_with(store, paths, base, selections, true, true).await
+    prepare_search_compactions_with(store, paths, base, selections, true, true, false).await
 }
 
 /// A BasePrefix over every segment of the Active text generation
@@ -2526,11 +2547,358 @@ pub(super) async fn prepare_text_reanalysis(
     base: &LoadedManifest,
     selection: SearchCompactionSelection,
 ) -> Result<Vec<PreparedSearchCompaction>> {
-    prepare_search_compactions_with(store, paths, base, vec![selection], true, false).await
+    prepare_search_compactions_with(store, paths, base, vec![selection], true, false, true).await
+}
+
+/// Re-tokenize, with the target analyzer, the deltas a flush appended to text
+/// index `index_name` while its re-analysis base was being built.
+///
+/// The base covers the first `basis_segment_count` segments of the basis
+/// generation: the corpus as of `basis`. Every segment `current` holds after
+/// them was written by the old analyzer. They are replaced by one delta of
+/// the target analyzer that moves each document they touch from its state in
+/// `basis` (what the new base indexed) to its state in `current`, exactly as
+/// a flush would have written it had the index been folded all along: same
+/// event ranges, signed statistics derived from the before and after images.
+/// Only the touched documents are read, so the cost is that of the writes
+/// since the basis, never of the corpus.
+///
+/// `source_analyzer` is the analyzer the replaced deltas were written with;
+/// each touched document's current payload must fingerprint, under it, to the
+/// winner those deltas recorded, or the catch-up is refused (the snapshots do
+/// not describe the same documents). `source_state` is the generation as
+/// those deltas were written (before re-signing): their footers name its
+/// lineage.
+#[cfg(feature = "text-index")]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn prepare_text_catch_up(
+    store: Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    basis: &LoadedManifest,
+    current: &LoadedManifest,
+    source_state: &SearchLsmState,
+    index_name: &str,
+    basis_segment_count: usize,
+    source_analyzer: crate::text::TextAnalyzer,
+) -> Result<PreparedSearchCompaction> {
+    const BATCH_ROWS: usize = 512;
+    let started = Instant::now();
+    let manifest = &current.manifest;
+    let policy = SearchCompactionPolicy::for_scheduling();
+    let state = manifest
+        .search_lsm
+        .iter()
+        .find(|state| state.kind == SearchLsmKind::Text && state.index_name == index_name)
+        .ok_or_else(|| Error::precondition("re-analysis catch-up: text generation disappeared"))?
+        .clone();
+    let extra = state
+        .segments
+        .get(basis_segment_count..)
+        .filter(|extra| !extra.is_empty())
+        .ok_or_else(|| Error::invariant("re-analysis catch-up has no segment to replace"))?;
+    let mut selected_descriptors = Vec::with_capacity(extra.len());
+    for segment in extra {
+        if segment.role != SearchSegmentRole::Delta
+            || segment.format != SearchSegmentFormat::TextV4
+            || segment.payload != SearchSegmentPayload::Complete
+        {
+            return Err(Error::precondition(
+                "re-analysis catch-up: a segment after the basis is not a complete FT4 delta",
+            ));
+        }
+        if !source_state.segments.contains(segment) {
+            return Err(Error::invariant(
+                "re-analysis catch-up: source generation lacks a replaced segment",
+            ));
+        }
+        let matches = manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.id == segment.sst_id)
+            .collect::<Vec<_>>();
+        let [descriptor] = matches.as_slice() else {
+            return Err(Error::precondition(
+                "re-analysis catch-up: a delta descriptor is missing or ambiguous",
+            ));
+        };
+        selected_descriptors.push((*descriptor).clone());
+    }
+    let selection = SearchCompactionSelection {
+        mode: SearchCompactionMode::DeltaRun,
+        selected_segment_start: basis_segment_count,
+        selected_event_ranges: compressed_event_union(
+            extra
+                .iter()
+                .flat_map(|segment| segment.event_ranges.iter().copied()),
+        )?,
+        captured_coverage_digest: super::input_coverage_digest(&state.coverage)?,
+        hard_segment_cap: policy.hard_segment_cap,
+        selected_descriptors,
+        captured_state: state.clone(),
+    };
+    let descriptor = manifest
+        .text_indexes
+        .iter()
+        .find(|descriptor| descriptor.name == index_name)
+        .cloned()
+        .ok_or_else(|| Error::precondition("re-analysis catch-up: text index disappeared"))?;
+    let filters = crate::search_lsm::text_native_filter_properties(manifest, &descriptor);
+
+    let mut readers = Vec::with_capacity(extra.len());
+    let mut input_bytes = 0u64;
+    for (segment, source_descriptor) in extra.iter().zip(&selection.selected_descriptors) {
+        input_bytes = input_bytes.saturating_add(source_descriptor.size_bytes);
+        let source = open_compaction_search_source(store.clone(), paths, source_descriptor).await?;
+        let source: Arc<dyn SearchVersionRangeSource> = source;
+        let reader = crate::sst::text::v4::TextV4Reader::open(
+            source,
+            source_descriptor.size_bytes,
+            source_state,
+            segment,
+        )
+        .await
+        .map_err(|error| Error::Corrupted {
+            path: source_descriptor.path.clone(),
+            detail: error.to_string(),
+        })?;
+        readers.push(reader);
+    }
+    let version_readers = readers
+        .iter()
+        .map(|reader| reader.version_reader())
+        .collect::<Vec<_>>();
+    let mut winners_merge = VersionRunMerge::open(version_readers).await?;
+    let input_rows = winners_merge.input_rows();
+
+    let mut config = crate::sst::text::v4::TextV4ExternalBuildConfig::from_env(
+        crate::sst::text::v4::TextV4BuildOptions::default(),
+    )?;
+    config.memory_budget_bytes = super::per_collector_index_build_memory_bytes(1)?
+        .ok_or_else(|| Error::invariant("re-analysis catch-up has no build memory share"))?;
+    let analyzer = descriptor.effective_analyzer();
+    let build_state = state.clone();
+    let build_context = crate::sst::text::v4::TextV4BuildContext {
+        analyzer,
+        sst_id: Uuid::now_v7(),
+        event_ranges: selection.selected_event_ranges.clone(),
+        complete_filter_properties: filters.clone(),
+    };
+    type CatchUpBatch = Vec<crate::sst::text::v4::TextV4Mutation>;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<CatchUpBatch>(2);
+    let builder_handle = crate::background::spawn_blocking(move || {
+        let mut builder = crate::sst::text::v4::TextV4ExternalBuilder::with_config(
+            &build_state,
+            build_context,
+            config,
+        )?;
+        let mut live_total_len = 0u64;
+        while let Some(batch) = receiver.blocking_recv() {
+            for mutation in batch {
+                if mutation.before != mutation.after {
+                    if let Some(after) = &mutation.after {
+                        live_total_len = live_total_len.saturating_add(
+                            crate::text::visit_tokens_with(analyzer, &after.text, |_| {}) as u64,
+                        );
+                    }
+                }
+                builder.push(mutation)?;
+            }
+        }
+        Ok::<_, Error>((builder.finish()?, live_total_len))
+    });
+
+    let empty_memtable = MemtableSnapshot::empty();
+    let before_snapshot =
+        crate::read::Snapshot::new(basis.clone(), &empty_memtable, store.clone(), paths.clone());
+    let after_snapshot = crate::read::Snapshot::new(
+        current.clone(),
+        &empty_memtable,
+        store.clone(),
+        paths.clone(),
+    );
+    let mut digest = Xxh3::new();
+    digest.update(b"NamiDB/TextReanalysisCatchUp/v1");
+    let mut touched_rows = 0u64;
+    let producer_result: Result<()> = async {
+        loop {
+            let winners = winners_merge.next_batch(BATCH_ROWS).await?;
+            if winners.is_empty() {
+                return Ok(());
+            }
+            touched_rows = touched_rows.saturating_add(winners.len() as u64);
+            let ids = winners
+                .iter()
+                .map(|record| NodeId::from_uuid(Uuid::from_bytes(record.node_id)))
+                .collect::<Vec<_>>();
+            let (before, after) = tokio::try_join!(
+                before_snapshot.batch_lookup_nodes("", &ids),
+                after_snapshot.batch_lookup_nodes("", &ids),
+            )?;
+            if before.len() != winners.len() || after.len() != winners.len() {
+                return Err(Error::invariant(
+                    "re-analysis catch-up point-read returned the wrong cardinality",
+                ));
+            }
+            let mut batch = Vec::with_capacity(winners.len());
+            for ((record, before), after) in winners.into_iter().zip(&before).zip(&after) {
+                let before = text_payload_from_node(&descriptor, &filters, before.as_ref());
+                let after_payload = text_payload_from_node(&descriptor, &filters, after.as_ref());
+                let consistent = match (&record.operation, &after_payload) {
+                    (SearchVersionOperation::Live { .. }, Some(payload)) => {
+                        crate::sst::text::v4::text_v4_payload_fingerprint(payload, source_analyzer)?
+                            == record.payload_fingerprint
+                    }
+                    (SearchVersionOperation::Suppress, None) => true,
+                    _ => false,
+                };
+                if !consistent {
+                    return Err(Error::precondition(
+                        "re-analysis catch-up: a document's current payload disagrees with the \
+                         delta that recorded it",
+                    ));
+                }
+                digest.update(&record.node_id);
+                digest.update(&record.lsn.to_le_bytes());
+                batch.push(crate::sst::text::v4::TextV4Mutation {
+                    node_id: record.node_id,
+                    lsn: record.lsn,
+                    before,
+                    after: after_payload,
+                });
+            }
+            sender.send(batch).await.map_err(|_| {
+                Error::precondition("re-analysis catch-up builder stopped before the last batch")
+            })?;
+        }
+    }
+    .await;
+    drop(sender);
+    let built = builder_handle.await.map_err(|error| {
+        Error::invariant(format!("re-analysis catch-up builder panicked: {error}"))
+    })?;
+    producer_result?;
+    let (artifact, live_total_len) = built?;
+    let metrics = |output_bytes: u64, live_rows: u64| SearchCompactionBuildMetrics {
+        input_bytes,
+        output_bytes,
+        input_rows,
+        touched_rows,
+        live_rows,
+        prepare_millis: elapsed_millis(started),
+        ..Default::default()
+    };
+    let Some(artifact) = artifact else {
+        // Every touched document folds to what the base already holds.
+        return Ok(PreparedSearchCompaction {
+            selection,
+            output: None,
+            empty_proof_digest: Some(digest.digest().max(1)),
+            metrics: metrics(0, 0),
+        });
+    };
+    let segment = artifact.output.segment.clone();
+    let file_name = format!(
+        "{}-{}-{}.ft4",
+        segment.sst_id.simple(),
+        SstKind::TextIndex.path_tag(),
+        descriptor.name
+    );
+    let output_descriptor = SstDescriptor {
+        id: segment.sst_id,
+        kind: SstKind::TextIndex,
+        scope: descriptor.name.clone(),
+        level: SstLevel(1),
+        path: super::relative_sst_path(1, &file_name),
+        size_bytes: artifact.len,
+        row_count: segment.mutation_count,
+        created_at: Utc::now(),
+        min_key: artifact.output.version_table.min_node_id,
+        max_key: artifact.output.version_table.max_node_id,
+        min_lsn: segment.min_lsn,
+        max_lsn: segment.max_lsn,
+        schema_version_min: 0,
+        schema_version_max: 0,
+        property_stats: Vec::new(),
+        kind_specific: KindSpecificStats::TextIndex {
+            doc_count: segment.live_payload_count,
+            term_count: 0,
+            total_len: live_total_len,
+        },
+        bloom: None,
+        unique_property_indices: Vec::new(),
+        equality_property_indices: Vec::new(),
+        composite_equality_indices: Vec::new(),
+        label_index: None,
+        node_locator: None,
+        per_label_property_stats: Vec::new(),
+    };
+    let output_bytes = artifact.len;
+    let file_len = artifact.file.metadata()?.len();
+    if file_len != output_bytes {
+        return Err(Error::invariant(
+            "re-analysis catch-up artifact length disagrees with its descriptor",
+        ));
+    }
+    crate::spooled_object::put_spooled_object(
+        store,
+        &descriptor_path(paths, &output_descriptor),
+        crate::spooled_object::SpooledObject::from_file(artifact.file, file_len),
+    )
+    .await?;
+    let live_rows = segment.live_payload_count;
+    Ok(PreparedSearchCompaction {
+        selection,
+        output: Some(PreparedSearchPayload {
+            descriptor: output_descriptor,
+            segment,
+        }),
+        empty_proof_digest: None,
+        metrics: metrics(output_bytes, live_rows),
+    })
 }
 
 /// Serializes Search-LSM base rebuilds across every namespace of a process.
 static BASE_REBUILD_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// One analyzer re-analysis base build at a time per process.
+///
+/// A re-analysis reads the whole node corpus and can run for most of an hour
+/// on a large index, so it does not hold [`BASE_REBUILD_GATE`]: routine base
+/// builds (a vector base rebuild, a new index's activation, the base of
+/// another namespace) keep running beside it. To keep the index-build memory
+/// at one budget in total, it first waits for the routine build in flight,
+/// then both it and every routine build started while it runs take half of
+/// the budget (see [`shared_build_memory`]).
+#[cfg(feature = "text-index")]
+static TEXT_REANALYSIS_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Set while a re-analysis base build runs (see [`TEXT_REANALYSIS_GATE`]).
+static TEXT_REANALYSIS_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Clears [`TEXT_REANALYSIS_ACTIVE`] when the re-analysis build ends, however
+/// it ends.
+#[cfg(feature = "text-index")]
+struct TextReanalysisActive {
+    _gate: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(feature = "text-index")]
+impl Drop for TextReanalysisActive {
+    fn drop(&mut self) {
+        TEXT_REANALYSIS_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The build memory of one base collector: `per_collector`, halved while a
+/// re-analysis runs beside the routine base builds.
+fn shared_build_memory(per_collector: usize) -> usize {
+    if TEXT_REANALYSIS_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        (per_collector / 2).max(super::MIN_INDEX_BUILD_MEMORY_PER_COLLECTOR)
+    } else {
+        per_collector
+    }
+}
 
 /// [`prepare_search_compactions`]; `vector_segment_merge: false` forces every
 /// vector base through the node scan (tests compare the two builds).
@@ -2541,6 +2909,7 @@ async fn prepare_search_compactions_with(
     selections: Vec<SearchCompactionSelection>,
     vector_segment_merge: bool,
     text_segment_merge: bool,
+    reanalysis: bool,
 ) -> Result<Vec<PreparedSearchCompaction>> {
     if selections.is_empty() {
         return Ok(Vec::new());
@@ -2553,7 +2922,21 @@ async fn prepare_search_compactions_with(
     // index-build memory and spool budgets, so several namespaces rebuilding
     // at once (every pre-3.5.1 vector base after an upgrade, say) would
     // multiply both. Delta runs stay concurrent.
+    #[cfg(feature = "text-index")]
+    let mut reanalysis_active = None;
     let base_gate = if base_selections.is_empty() {
+        None
+    } else if reanalysis {
+        #[cfg(feature = "text-index")]
+        {
+            let gate = TEXT_REANALYSIS_GATE.lock().await;
+            // Wait out the routine build in flight (it holds the full
+            // budget); every later one sees the flag and takes half.
+            let routine = BASE_REBUILD_GATE.lock().await;
+            TEXT_REANALYSIS_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(routine);
+            reanalysis_active = Some(TextReanalysisActive { _gate: gate });
+        }
         None
     } else {
         Some(BASE_REBUILD_GATE.lock().await)
@@ -2708,6 +3091,8 @@ async fn prepare_search_compactions_with(
     }
 
     drop(base_gate);
+    #[cfg(feature = "text-index")]
+    drop(reanalysis_active.take());
     for selection in delta_selections {
         built.push(match selection.mode {
             SearchCompactionMode::DeltaRun => {
@@ -4188,8 +4573,10 @@ fn build_search_compactions_blocking(
     input_bytes: u64,
     started: Instant,
 ) -> Result<Vec<BuiltSearchCompaction>> {
-    let per_builder_memory = super::per_collector_index_build_memory_bytes(selections.len())?
-        .ok_or_else(|| Error::invariant("Search-LSM compaction has no build memory share"))?;
+    let per_builder_memory = shared_build_memory(
+        super::per_collector_index_build_memory_bytes(selections.len())?
+            .ok_or_else(|| Error::invariant("Search-LSM compaction has no build memory share"))?,
+    );
     // `SHOW INDEXES` reports a Building generation's progress from this.
     let progress = crate::search_progress::begin_build(
         selections.iter().map(|selection| {

@@ -811,6 +811,22 @@ impl NamespaceRegistry {
                             let _ = handle.await;
                         }
                     }
+                    // A pre-folding full-text index is rebuilt in a task of
+                    // its own, beside the compaction worker.
+                    #[cfg(feature = "text-index")]
+                    if let Some(handle) = crate::maintenance::maybe_start_text_reanalysis(
+                        &s.compaction_scheduler,
+                        &s.writer,
+                        &s.snapshot,
+                        &s.writer_health,
+                        &ns,
+                        Some(s.cancel_tx.subscribe()),
+                    ) {
+                        if let Some(handle) = s.track_maintenance_task(handle) {
+                            handle.abort();
+                            let _ = handle.await;
+                        }
+                    }
                     // Do not sweep immutable compaction outputs while an
                     // active or pending pass can still be between upload and
                     // manifest install.
@@ -833,9 +849,13 @@ impl NamespaceRegistry {
                         .await;
                     }
                     let horizon = s.snapshot.retention_horizon();
-                    if let Err(e) =
-                        crate::maintenance::run_sweep(&ms, sweep.options(horizon), &ns, &metrics)
-                            .await
+                    if let Err(e) = crate::maintenance::run_sweep(
+                        &ms,
+                        s.compaction_scheduler.sweep_options(sweep.options(horizon)),
+                        &ns,
+                        &metrics,
+                    )
+                    .await
                     {
                         error!(namespace = %ns, error = %e, "orphan sweep failed");
                     }

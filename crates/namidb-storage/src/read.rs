@@ -5055,10 +5055,14 @@ impl<'mt> Snapshot<'mt> {
         let mut sorted_pending: Vec<[u8; 16]> = pending.iter().copied().collect();
         sorted_pending.sort_unstable();
         let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
-        // Probe every SST's exact-record index at once: each probe walks its
-        // B+tree one level per round trip, so probing the SSTs one after the
-        // other multiplied a cold hydration's latency by the SST count. The
-        // results are consumed below in the original SST order, unchanged.
+        // Probe the SSTs' exact-record indexes concurrently: each probe walks
+        // its B+tree one level per round trip, so probing the SSTs one after
+        // the other multiplied a cold hydration's latency by the SST count.
+        // At most `EXACT_PROBE_FAN_OUT` run at once, so a deep L0 backlog does
+        // not turn one hydration into a burst of requests. Every overlapping
+        // SST is probed either way (the newest LSN wins across all of them);
+        // the results are consumed below in the original SST order.
+        const EXACT_PROBE_FAN_OUT: usize = 8;
         let mut exact_probes: HashMap<usize, Result<_>> = {
             let probes = sst_idxs.iter().filter_map(|&idx| {
                 let desc = &self.manifest.manifest.ssts[idx];
@@ -5096,10 +5100,18 @@ impl<'mt> Snapshot<'mt> {
                     (idx, probed)
                 })
             });
-            futures::future::join_all(probes)
-                .await
-                .into_iter()
-                .collect()
+            let mut probes = probes.collect::<Vec<_>>().into_iter();
+            let mut probed = HashMap::new();
+            loop {
+                let wave = probes
+                    .by_ref()
+                    .take(EXACT_PROBE_FAN_OUT)
+                    .collect::<Vec<_>>();
+                if wave.is_empty() {
+                    break probed;
+                }
+                probed.extend(futures::future::join_all(wave).await);
+            }
         };
         for idx in sst_idxs {
             let desc = &self.manifest.manifest.ssts[idx];
@@ -13669,6 +13681,26 @@ impl Drop for PinnedSnapshot {
     }
 }
 
+/// A retention hold on one manifest version (see [`SnapshotCell::pin_version`]).
+#[derive(Debug)]
+pub struct VersionPin {
+    registry: Arc<SnapshotRegistry>,
+    version: u64,
+}
+
+impl VersionPin {
+    /// The manifest version held.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl Drop for VersionPin {
+    fn drop(&mut self) {
+        self.registry.release(self.version);
+    }
+}
+
 impl PinnedSnapshot {
     /// Clone the shared `Arc` for callers that need to store or republish
     /// it. The clone is NOT separately registered; the horizon hold lives
@@ -13795,6 +13827,19 @@ impl SnapshotCell {
             .min_live()
             .map(|m| m.min(current))
             .unwrap_or(current)
+    }
+
+    /// Hold the retention horizon at or below `version` until the returned
+    /// pin drops, without retaining a snapshot (its memtable and caches).
+    /// For long background work that reads the objects of an older manifest,
+    /// such as a full-text re-analysis reading its basis documents.
+    pub fn pin_version(&self, version: u64) -> VersionPin {
+        let version = version.min(self.manifest_version());
+        self.registry.acquire(version);
+        VersionPin {
+            registry: Arc::clone(&self.registry),
+            version,
+        }
     }
 
     /// Whether any [`PinnedSnapshot`] from this cell is still alive.
