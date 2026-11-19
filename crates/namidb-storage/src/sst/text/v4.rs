@@ -533,29 +533,47 @@ impl QueryMaskUnionBuilder {
     }
 }
 
-/// Most posting blocks one cursor reads ahead of the block it needs, unless
-/// the rest of its list fits its share of the read-ahead allowance.
-const POSTING_READAHEAD_BLOCKS: usize = 16;
-/// Compressed bytes one cursor may hold read ahead.
+/// Most posting blocks one cursor reads ahead per fetch, unless the rest of
+/// its list fits its read-ahead share.
+const POSTING_READAHEAD_BLOCKS: usize = 64;
+/// Compressed bytes one posting list may hold read ahead.
 const POSTING_READAHEAD_BYTES: usize = 4 * 1024 * 1024;
-/// Compressed bytes all cursors of one query may hold read ahead (a prefix
-/// query can expand to dozens of terms).
-const POSTING_READAHEAD_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+/// Compressed bytes all posting lists of one query may hold read ahead (a
+/// prefix query can expand to dozens of terms).
+const POSTING_READAHEAD_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read-ahead a posting list asks for: its compressed size, capped.
+fn posting_list_readahead(blocks: &[PostingBlockRef]) -> usize {
+    blocks
+        .iter()
+        .fold(0usize, |total, block| {
+            total.saturating_add(block.wire.len as usize)
+        })
+        .min(POSTING_READAHEAD_BYTES)
+}
 
 /// Compressed bytes a query over these posting lists may hold read ahead:
 /// part of its workspace reservation, so read-ahead never outgrows it.
 fn posting_readahead_allowance<'a>(lists: impl Iterator<Item = &'a [PostingBlockRef]>) -> usize {
     lists
-        .map(|blocks| {
-            blocks
-                .iter()
-                .fold(0usize, |total, block| {
-                    total.saturating_add(block.wire.len as usize)
-                })
-                .min(POSTING_READAHEAD_BYTES)
-        })
+        .map(posting_list_readahead)
         .fold(0usize, usize::saturating_add)
         .min(POSTING_READAHEAD_TOTAL_BYTES)
+}
+
+/// One list's share of the query allowance: what it asks for, scaled down
+/// in proportion when the lists together ask for more than the allowance.
+/// Shares never sum above [`posting_readahead_allowance`], and a short list
+/// never starves a long one.
+fn posting_readahead_share(asked: usize, asked_total: usize) -> usize {
+    if asked_total <= POSTING_READAHEAD_TOTAL_BYTES {
+        return asked;
+    }
+    usize::try_from(
+        (asked as u128).saturating_mul(POSTING_READAHEAD_TOTAL_BYTES as u128)
+            / (asked_total as u128).max(1),
+    )
+    .unwrap_or(usize::MAX)
 }
 
 #[derive(Debug)]
@@ -650,6 +668,14 @@ impl PostingCursor {
             .get(self.next_block)
             .filter(|block| block.first_doc <= target)
             .map(|_| target);
+        // Skipped blocks read ahead are never decoded; free their share.
+        if self
+            .readahead
+            .first_key_value()
+            .is_some_and(|(&index, _)| index < self.next_block)
+        {
+            self.readahead = self.readahead.split_off(&self.next_block);
+        }
         Ok(())
     }
 
@@ -2562,16 +2588,11 @@ impl TextV4Reader {
         let mut ranges = Vec::<Range<u64>>::new();
         let mut ahead = Vec::<(usize, usize, usize)>::new();
         // Read-ahead stays inside the allowance the workspace reservation
-        // already counts: each cursor fetching now gets an equal share of
-        // what the query does not hold yet.
-        let readahead_held = cursors
+        // already counts: each list holds at most its share of it.
+        let readahead_asked = cursors
             .iter()
-            .flat_map(|cursor| cursor.readahead.values())
-            .fold(0usize, |total, bytes| total.saturating_add(bytes.len()));
-        let readahead_share =
-            posting_readahead_allowance(cursors.iter().map(|cursor| cursor.blocks.as_slice()))
-                .saturating_sub(readahead_held)
-                / cursor_indices.len().max(1);
+            .map(|cursor| posting_list_readahead(&cursor.blocks))
+            .fold(0usize, usize::saturating_add);
         let mut previous = None;
         for &cursor_index in cursor_indices {
             if previous.is_some_and(|previous| previous >= cursor_index) {
@@ -2603,7 +2624,15 @@ impl TextV4Reader {
                 // A cursor that keeps needing blocks reads further ahead each
                 // time, so a long posting list costs a few round trips, not
                 // one per block, while a query that stops early reads little.
-                let mut budget = readahead_share;
+                let held = cursor
+                    .readahead
+                    .values()
+                    .fold(0usize, |total, bytes| total.saturating_add(bytes.len()));
+                let mut budget = posting_readahead_share(
+                    posting_list_readahead(&cursor.blocks),
+                    readahead_asked,
+                )
+                .saturating_sub(held);
                 // A posting list whose remaining blocks fit the budget is read
                 // whole: block-max pruning decides which blocks it needs one
                 // round trip at a time, which on a cold object store costs far
@@ -4126,6 +4155,33 @@ mod tests {
     use super::*;
     use crate::search_lsm::{SearchLsmStatus, SearchSegmentPayload};
     use crate::text::parse_query;
+
+    #[test]
+    fn readahead_shares_stay_inside_the_reserved_allowance() {
+        const MIB: usize = 1024 * 1024;
+        for asked in [
+            vec![MIB, 2 * MIB],
+            vec![4 * MIB; 10],
+            vec![64 * 1024, 4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB],
+            vec![1; 1000],
+        ] {
+            let total = asked.iter().sum::<usize>();
+            let allowance = total.min(POSTING_READAHEAD_TOTAL_BYTES);
+            let shares = asked
+                .iter()
+                .map(|&list| posting_readahead_share(list, total))
+                .collect::<Vec<_>>();
+            assert!(shares.iter().sum::<usize>() <= allowance, "{asked:?}");
+            // Every list keeps a share in proportion to what it asked for.
+            for (&list, &share) in asked.iter().zip(&shares) {
+                assert!(share <= list);
+                assert!(
+                    share as u128 * total as u128 + total as u128
+                        > list as u128 * allowance as u128
+                );
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct MemorySource {
