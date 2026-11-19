@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.5.1] - 2026-11-18
+
 ### Fixed
 
 - **`search.hybrid` hydrates its fused results in one batch.** It looked up
@@ -83,9 +85,9 @@ crates.io release will establish and document that API explicitly.
   the manifest it just loaded. Base rebuilds run one at a time per process.
 
 - **Vector queries read less and wait less on object storage.** Navigation
-  pages and index pages are cached as whole blocks and the rows of the exact
-  re-rank in 16 KiB pages, instead of rounding every read up to a 256 KiB
-  cache page. A query reads its navigation pages in one wave of up to 64 and
+  pages and the index pages of point lookups are cached as whole blocks and
+  the rows of the exact re-rank in 16 KiB pages, instead of rounding every
+  read up to a 256 KiB cache page. A query reads its navigation pages in one wave of up to 64 and
   its re-rank rows in one wave of up to 64 pages, instead of waves of 16 and
   8. Measured on 386k 1024-dimension embeddings at 6 GiB / 2 CPU with 20 to
   40 ms of injected object-store latency, top-10 with node properties: a
@@ -5269,7 +5271,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.0...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.1...HEAD
+[3.5.1]: https://github.com/namidb/namidb/compare/v3.5.0...v3.5.1
 [3.5.0]: https://github.com/namidb/namidb/compare/v3.4.3...v3.5.0
 [3.4.3]: https://github.com/namidb/namidb/compare/v3.4.2...v3.4.3
 [3.4.2]: https://github.com/namidb/namidb/compare/v3.4.1...v3.4.2
