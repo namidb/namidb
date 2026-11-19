@@ -88,6 +88,47 @@ crates.io release will establish and document that API explicitly.
   retry into the same destination is sent) keeps the destination objects a
   previous attempt already finished, matched by path and size, instead of
   copying the whole snapshot again. Restores still replace everything.
+- **Full-text search uses its block-max scorer on a complete first delta.**
+  A full-text index whose only segment is the generation's first delta (the
+  index built by flushes, never consolidated into a base) was not recognised
+  as holding the whole corpus once any later flush had touched no indexed
+  text (an embedding backfill, writes to other labels). Every `search.bm25`
+  and every sparse leg of `search.hybrid` then took the exhaustive scorer,
+  decoding every posting of every query term, frequent terms included. Such a
+  segment, and a base followed by such proven-empty flushes, now serve from
+  the block-max exact top-k, with identical results.
+- **Full-text dictionary lookups run concurrently.** Each query term's
+  dictionary block was fetched after the previous one, one object-store round
+  trip per term before the first posting was read.
+- **The dense leg of `search.hybrid` no longer loads its candidates.** It
+  loaded every one of its `8 × k` vector candidates in full (properties,
+  text and embedding) although only the fused top `k` are returned and those
+  are loaded again; the cost grew linearly with `k`. Candidates are now
+  carried as identity and score, and only the fused results are loaded.
+- **Filtered search answers selective filters without widening.**
+  `search.bm25` and `search.hybrid` with a `filter` the full-text index cannot
+  apply natively widened a ranked prefix, loading every candidate to test the
+  filter, up to 65,536 candidates and then a scan of the whole corpus; a
+  one-value equality on a property without an index ran into the query
+  timeout on a few hundred thousand documents. A filter that admits at most
+  4,096 nodes (found through a property index, or a scan of the filter's own
+  property columns that stops as soon as the filter proves broad) is now
+  answered by scoring exactly those nodes with the index's corpus-wide
+  statistics; the vector leg and `search.vector` make the same decision before
+  their first filtered round. Broad filters keep the widening route, which
+  still returns exactly `k` matching rows or all of them. Results equal the
+  exact scan's.
+
+### Changed
+
+- **`search.hybrid` fusion options are validated together.** `alpha` (the
+  vector leg's weight in the linear blend, `[0, 1]`) now selects
+  `fusion: 'linear'` when `fusion` is omitted; it was silently ignored by the
+  default RRF before. `alpha` with `fusion: 'rrf'` and `rrf_k` with
+  `fusion: 'linear'` are rejected; a non-string `fusion` is rejected instead
+  of falling back to RRF; and every option error, an unknown `fusion`
+  included, is raised before either leg runs. The README documents both
+  modes, including the per-leg min-max normalisation of `'linear'`.
 
 ## [3.5.1] - 2026-11-18
 
