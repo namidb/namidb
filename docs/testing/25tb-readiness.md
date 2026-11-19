@@ -1442,7 +1442,7 @@ If an exact-answer fast path is ever wanted, it needs a per-label
 sets when it recomputes from survivors. That does not exist today, and
 inventing it is a manifest format change.
 
-### 80. [FIXED for indexed properties in 2.6.15; unindexed ranges remain a missing capability] Filtered scans prune nothing
+### 80. [FIXED for indexed properties in 2.6.15, corrected through 2.6.18; unindexed ranges remain a missing capability] Filtered scans prune nothing
 
 Measured on the same 160,000-node fixture, `idx` declared as an index, one
 projected column:
@@ -1537,6 +1537,50 @@ Order of work from here:
    more than one. That is `Row`/`RuntimeValue` materialisation dominating,
    and it caps every scalar aggregate at ~0.3 s regardless of the column.
    Vectorised aggregation over the decoded Arrow column is the fix.
+
+**THE ROUTE TOOK THREE MORE RELEASES TO GET RIGHT, AND THE SEQUENCE IS THE
+LESSON.** 2.6.15 shipped it; verifying the PUBLISHED WHEEL — not the local
+tree — showed that a range matching a large share of its label had become
+SLOWER than the scan it was supposed to beat. Twice I fixed something real
+that was not the cause:
+
+* **2.6.16** stopped fetching posting BODIES for a window it was about to
+  discard. Real waste (one external read per key on a high-cardinality
+  property), not the dominant one. Re-measuring the published wheel showed
+  the number essentially unchanged.
+* **2.6.17** bounded the leaf WALK in pages, not just in postings, so
+  deciding to decline costs a fixed handful of reads. Also real, also
+  necessary, also not the cause.
+* **2.6.18** found it. The route was never declining expensively — it was
+  SERVING, and hydrating 29,999 nodes to answer a query the scan counts
+  without hydrating anything. Its selectivity budget came from live row
+  counts summed over SST DESCRIPTORS, and before the first flush there are
+  none: the sum was zero, and zero was read as *"no information, allow it"*
+  instead of *"no information, be careful"*. The memtable's own claimant
+  count now bounds it.
+
+Three things worth carrying forward:
+
+1. **An absent estimate must make a heuristic conservative, never
+   permissive.** That single inversion is the whole bug.
+2. **When a reproduction disagrees with a measurement, suspect the
+   reproduction.** Every repro written for 2.6.16 and 2.6.17 called `flush`
+   explicitly, so every one had descriptors to size against and behaved
+   correctly. The harness that showed the regression did not flush. The
+   difference was in the test setup, not the engine.
+3. **Localize before fixing.** Forcing the knob to its extremes
+   (`NAMIDB_NUMERIC_RANGE_MAX_CANDIDATES=1`, then `=0`) established in one
+   run that the fallback scan was innocent and the route was the entire
+   cost. That should have come before the first fix, not after the second.
+
+And the testing gap that let it through twice: the equivalence suites
+compare RESULTS, which were always correct, and the cap test asserted
+`postings <= 7`, which an empty page also satisfies — so it passed
+identically before and after the fix it was meant to guard, and it only
+ever exercised a flushed-and-compacted store. A performance contract needs
+a performance assertion, and a deterministic one: the bounds are now pinned
+as BYTES READ, which is reproducible in CI where timings are not, and the
+un-flushed corpus has its own test.
 
 **A note for whoever picks this up**: the default row group is 128Ki rows,
 so any fixture under ~500k rows has too few row groups to show row-group
