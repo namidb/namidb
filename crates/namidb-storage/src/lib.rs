@@ -14,6 +14,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod adjacency;
+pub mod background;
 pub mod backup;
 pub mod cache;
 pub mod cache_budget;
@@ -61,7 +62,8 @@ pub use adjacency::{
     AdjacencyCache, AdjacencyKey, EdgeAdjacency, EdgeSlice, DEFAULT_ADJACENCY_BUDGET_MIB,
 };
 pub use backup::{
-    copy_namespace_snapshot, delete_namespace_objects, has_manifest_pointer, SnapshotCopyReport,
+    copy_namespace_snapshot, copy_namespace_snapshot_resumable, delete_namespace_objects,
+    has_manifest_pointer, SnapshotCopyReport,
 };
 pub use cache::{
     shared_sst_cache, sst_cache_budget_bytes, sst_cache_enabled, EdgeStreamBundle, SstCache,

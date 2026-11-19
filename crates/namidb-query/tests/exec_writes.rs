@@ -6021,3 +6021,74 @@ async fn write_then_whole_pattern_optional_match() {
         );
     }
 }
+
+/// `SET n.a = ..., n.b = ...` writes each node once: one staged record per
+/// node, not one per assignment. Each right-hand side still sees the
+/// assignments before it (through any alias of the node), the other
+/// properties are kept, and the result is what the assignments say.
+#[tokio::test]
+async fn set_items_on_one_node_write_it_once() {
+    let mut writer = WriterSession::open(store(), paths("w-set-merge"))
+        .await
+        .unwrap();
+    write_q(
+        &mut writer,
+        "CREATE (:Doc {k: 1, body: 'long text', score: 1.5}), \
+         (:Doc {k: 2, body: 'other text', score: 2.5})",
+    )
+    .await;
+    writer.commit_batch().await.unwrap();
+    assert_eq!(writer.pending_len(), 0);
+
+    let plan = lower(
+        &parse(
+            "MATCH (d:Doc) WITH d, d AS same \
+             SET d.a = d.k * 10, d.b = same.a + 1, d.score = null, d.a = d.b + 1 \
+             RETURN d.k AS k, d.a AS a, d.b AS b, same.a AS same_a",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let outcome = execute_write_staged(&plan, &mut writer, &Params::new())
+        .await
+        .unwrap();
+    assert_eq!(writer.pending_len(), 2, "one record per node");
+    assert_eq!(outcome.properties_set, 8);
+    let mut returned: Vec<(i64, i64, i64, i64)> = outcome
+        .rows
+        .iter()
+        .map(|row| {
+            let int = |name: &str| match row.get(name) {
+                Some(RuntimeValue::Integer(v)) => *v,
+                other => panic!("{name}: {other:?}"),
+            };
+            (int("k"), int("a"), int("b"), int("same_a"))
+        })
+        .collect();
+    returned.sort();
+    assert_eq!(returned, vec![(1, 12, 11, 12), (2, 22, 21, 22)]);
+    writer.commit_batch().await.unwrap();
+
+    let snap = writer.snapshot();
+    let mut nodes = snap.scan_label("Doc").await.unwrap();
+    nodes.sort_by_key(|n| match n.properties.get("k") {
+        Some(CoreValue::I64(k)) => *k,
+        _ => 0,
+    });
+    for (node, (k, a, b, body)) in nodes
+        .iter()
+        .zip([(1, 12, 11, "long text"), (2, 22, 21, "other text")])
+    {
+        assert_eq!(node.properties.get("k"), Some(&CoreValue::I64(k)));
+        assert_eq!(node.properties.get("a"), Some(&CoreValue::I64(a)));
+        assert_eq!(node.properties.get("b"), Some(&CoreValue::I64(b)));
+        assert_eq!(
+            node.properties.get("body"),
+            Some(&CoreValue::Str(body.into()))
+        );
+        assert!(
+            matches!(node.properties.get("score"), None | Some(CoreValue::Null)),
+            "score was set to null"
+        );
+    }
+}

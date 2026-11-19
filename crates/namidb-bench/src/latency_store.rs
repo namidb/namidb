@@ -106,6 +106,36 @@ impl StoreCounters {
     }
 }
 
+/// `NAMIDB_BENCH_DETAILED_KEYS=1` splits the `sst` class by object kind.
+fn detailed_sst_classes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NAMIDB_BENCH_DETAILED_KEYS").is_ok_and(|v| v == "1"))
+}
+
+/// The kind of an SST object, from its file name.
+fn sst_class(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if name.ends_with(".bloom") {
+        "sst-bloom"
+    } else if name.contains("-edges-") {
+        if name.ends_with(".epidx") {
+            "sst-edges-epidx"
+        } else if name.ends_with(".ep.csr") {
+            "sst-edges-ep"
+        } else {
+            "sst-edges"
+        }
+    } else if name.contains("-vector-") {
+        "sst-vector"
+    } else if name.contains("-text-") {
+        "sst-text"
+    } else if name.contains("-nodes-") || name.contains("node") {
+        "sst-nodes"
+    } else {
+        "sst-other"
+    }
+}
+
 /// Coarse class of an object key, for the counters.
 pub fn key_class(location: &Path) -> &'static str {
     let path = location.as_ref();
@@ -120,7 +150,11 @@ pub fn key_class(location: &Path) -> &'static str {
     } else if path.contains("/manifest/") || path.starts_with("manifest/") {
         "manifest"
     } else if path.contains("/sst/") || path.starts_with("sst/") {
-        "sst"
+        if detailed_sst_classes() {
+            sst_class(path)
+        } else {
+            "sst"
+        }
     } else if path.contains("memtable") || path.contains("snapshot") {
         "snapshot"
     } else {

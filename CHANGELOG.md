@@ -33,14 +33,64 @@ crates.io release will establish and document that API explicitly.
   disables it. Releases 3.4.3 to 3.5.1 open the new data; they serve a folded
   index by exact scan until their next flush rebuilds it with their own
   analyzer (checked by `tests/compat/old_binaries_open_new_data.sh`).
+- **`search.vector` takes an index name**: `{index: 'name', query, k}` in the map
+  form, or the positional `search.vector(indexName, k, queryVector [, {ef,
+  filter}])` of `db.index.vector.queryNodes`. An unknown option, a missing
+  argument or a wrong argument type answers with the accepted forms, and
+  common spellings from other APIs (`vector`, `top_k`, ...) name the option
+  they mean. The options map of `db.index.vector.queryNodes` rejects unknown
+  keys too.
+- **`CALL search.vector|bm25|hybrid(...) YIELD *`** (and `db.index.vector.queryNodes`) binds `node` and `score`; other procedures answer `YIELD *` with an error asking for the column names.
+- **`NAMIDB_PREOPEN_NAMESPACES`** (multi-tenant): a comma-separated list of
+  namespaces the server opens in the background as it starts, so their
+  writer claim, recovery and metadata prefetch happen before the first
+  request instead of during it. A name with no data is skipped, never
+  created.
 
 ### Changed
 
-- **Procedure options are checked strictly.** `search.bm25` and the options
-  map of `db.index.vector.queryNodes` reject unknown keys with the list of
-  valid ones, like the other `search.*` and `algo.*` procedures; giving both
-  `text_property` and `text_properties`, or a non-string `fusion`, is an
-  error.
+- **Procedure options are checked strictly.** `search.bm25` rejects unknown
+  keys with the list of valid ones, like the other `search.*` and `algo.*`
+  procedures; giving both `text_property` and `text_properties`, or a
+  non-string `fusion`, is an error.
+- **Graph neighbourhood statements answer in about a second.** A statement
+  that expands each of many seed nodes in a correlated subquery
+  (`UNWIND $ids ... CALL { WITH n OPTIONAL MATCH (n)-[r]->(m) ... LIMIT $per }`,
+  the shape a graph explorer issues) ran the subquery for one seed after the
+  other, read the relationship types of an untyped pattern one after the
+  other, and re-opened edge SST readers on every lookup once their fence
+  indexes outgrew the small per-snapshot cache. Over 800 seeds and ten
+  relationship types that took 6 s warm and timed out cold. Now:
+  - correlated subqueries whose per-row work is bounded (single-hop
+    expansions, lookups by id, filters, projections, limits, per-row
+    aggregation) run up to 64 rows at a time (`NAMIDB_APPLY_CONCURRENCY`, 1
+    restores the serial loop); the output is the same rows in the same order;
+  - the relationship types of an untyped pattern are read concurrently;
+  - opened edge SST readers are shared by every snapshot of the process
+    (`NAMIDB_EDGE_READER_CACHE_MAX_BYTES`, by default 1/32 of the cache
+    budget, at most 64 MiB);
+  - a limited single-hop expansion to an unlabelled endpoint that only needs
+    its identity proves the existence of as many endpoints as the limit asks
+    for, then doubles the window only on a shortfall, instead of 512 at once;
+  - that existence proof no longer hydrates every endpoint when node SSTs
+    overlap (any update rewrites nodes into a newer SST) or the memtable
+    holds nodes: each id is resolved at its newest version from the bloom
+    filters, label sidecars and node locators, and only what they cannot
+    settle (an unlabelled node, a tombstone, a node in the memtable) is
+    read.
+- **Faster namespace open.** The writer claim runs alongside the memtable
+  recovery instead of before it, WAL segments are read ahead in parallel,
+  and the metadata prefetch also opens every edge SST reader and bloom
+  filter. Each open logs its phases (`opened namespace writer`).
+- **`SET n.a = ..., n.b = ...` writes the node once.** Consecutive property
+  assignments to one node in a SET clause now produce one full-record write
+  instead of one per assignment, halving the log and memtable bytes of a
+  two-property update of a node that carries large vector or text
+  properties. Each right-hand side still sees the assignments before it.
+- **Maintenance yields the CPU to queries.** Compaction merges and search
+  index builds run on dedicated threads at a lower scheduling priority
+  (`NAMIDB_BACKGROUND_NICE`, default 10; 0 keeps the normal priority), so a
+  query gets the CPU first while a merge or build runs.
 
 ### Fixed
 
@@ -49,6 +99,25 @@ crates.io release will establish and document that API explicitly.
   cache page, sixteen at a time, and probed each node SST's record index one
   after the other. Scattered batches now read their exact ranges
   concurrently, and the SSTs are probed together.
+- **Cold full-text top-k reads posting lists in fewer round trips.** A
+  block-max query fetched the next posting block of a term one round trip at
+  a time. A term's list is now read ahead (whole when it fits a per-query
+  allowance of 8 MiB, counted in the query's workspace reservation), and
+  `search.hybrid` runs its dense and sparse legs concurrently.
+- **Backups of large namespaces no longer fail on long object reads.** A
+  snapshot copy read every object as one GET, throttled by the upload behind
+  it, so a multi-GB SST kept a single request open for minutes. The object
+  store client's per-request timeout cut it every 30 seconds, and the client's
+  body retries share one budget per object, so the object, and the whole
+  backup with it, failed after about three minutes of streaming; the retry
+  then started from zero. Objects larger than one part are now read as 8 MiB
+  ranged requests, each read completely and retried on its own (up to six
+  attempts, pinned to the object's ETag), and a failed object is logged with
+  its path, size and elapsed time.
+- **A retried backup resumes.** `POST /v0/admin/backup` with `force` (how a
+  retry into the same destination is sent) keeps the destination objects a
+  previous attempt already finished, matched by path and size, instead of
+  copying the whole snapshot again. Restores still replace everything.
 
 ## [3.5.1] - 2026-11-18
 

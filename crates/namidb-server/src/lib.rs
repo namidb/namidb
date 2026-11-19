@@ -1516,6 +1516,12 @@ pub async fn run_with_memory_limits(
             }
         });
 
+        // Open the namespaces named by `NAMIDB_PREOPEN_NAMESPACES` now, in
+        // the background, so their writer claim, recovery and metadata
+        // prefetch overlap the server becoming ready instead of the first
+        // request. A request that arrives first simply joins the open.
+        preopen_namespaces(&shared.registry);
+
         // TLS on the serving path.
         let tls_config: Option<Arc<rustls::ServerConfig>> =
             match (&config.tls_cert, &config.tls_key) {
@@ -2508,6 +2514,56 @@ fn read_admission_gate() -> Option<&'static tokio::sync::Semaphore> {
 /// Default `0` (off). Read into [`registry::MaintenanceConfig`]; each
 /// namespace gets its own semaphore when it opens.
 const PER_NAMESPACE_QUERIES_ENV: &str = "NAMIDB_MAX_CONCURRENT_QUERIES_PER_NAMESPACE";
+
+/// Namespaces a multi-tenant server opens at start
+/// (`NAMIDB_PREOPEN_NAMESPACES`, comma-separated; empty by default).
+fn preopen_namespace_list() -> Vec<String> {
+    std::env::var("NAMIDB_PREOPEN_NAMESPACES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Open [`preopen_namespace_list`] in the background, never more than the
+/// registry holds. An open that fails is logged and
+/// left to the first request, which retries it.
+fn preopen_namespaces(registry: &Arc<NamespaceRegistry>) {
+    let mut names = preopen_namespace_list();
+    if names.is_empty() {
+        return;
+    }
+    let capacity = registry.max_namespaces();
+    if capacity > 0 && names.len() > capacity {
+        names.truncate(capacity);
+    }
+    // One task per name: the list is bounded by the registry's capacity,
+    // and each open only makes requests for that same namespace wait.
+    for name in names {
+        let registry = Arc::clone(registry);
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match registry.open_existing(&name).await {
+                Ok(None) => tracing::info!(
+                    namespace = %name,
+                    "pre-open skipped a namespace that does not exist"
+                ),
+                Ok(Some(_)) => tracing::info!(
+                    namespace = %name,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "pre-opened namespace"
+                ),
+                Err(error) => tracing::warn!(
+                    namespace = %name,
+                    %error,
+                    "namespace pre-open failed; the first request opens it"
+                ),
+            }
+        });
+    }
+}
 
 fn max_concurrent_queries_per_namespace() -> usize {
     std::env::var(PER_NAMESPACE_QUERIES_ENV)
@@ -5438,8 +5494,11 @@ async fn run_backup_copy(
                 .into_response();
         }
     };
-    let copied = namidb_storage::copy_namespace_snapshot(
-        src_store, src_paths, dst_store, dst_paths, version, req.force, req.verify,
+    // A forced backup is a retry into the backup's own destination: keep the
+    // objects an earlier attempt already finished instead of copying the
+    // whole snapshot again.
+    let copied = namidb_storage::copy_namespace_snapshot_resumable(
+        src_store, src_paths, dst_store, dst_paths, version, req.force, req.verify, req.force,
     )
     .await;
     snapshot_copy_response(copied, "backup")

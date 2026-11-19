@@ -2476,6 +2476,7 @@ dependencies = [
  "fs2",
  "futures",
  "imbl",
+ "libc",
  "memmap2",
  "namidb-ann",
  "namidb-core",

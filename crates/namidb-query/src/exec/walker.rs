@@ -1530,8 +1530,22 @@ pub(crate) async fn apply_rows(
     routing: &PlanRouting,
     cap: Option<usize>,
 ) -> Result<Vec<Row>, ExecError> {
-    let mut out = Vec::with_capacity(rows.len());
     let correlated = reads_outer_row(subplan);
+    let concurrency = apply_concurrency();
+    if correlated && concurrency > 1 && rows.len() > 1 && bounded_per_row(subplan) {
+        return apply_rows_concurrent(
+            rows,
+            subplan,
+            optional,
+            snapshot,
+            params,
+            routing,
+            cap,
+            concurrency,
+        )
+        .await;
+    }
+    let mut out = Vec::with_capacity(rows.len());
     let mut shared: Option<Vec<Row>> = None;
     // A correlated subquery runs once per input row: release each run's
     // output once it is merged, and meter the merged rows instead (#203).
@@ -1587,6 +1601,138 @@ pub(crate) async fn apply_rows(
             }
             out.push(merged);
         }
+    }
+    Ok(out)
+}
+
+/// Correlated subquery runs in flight at once (`NAMIDB_APPLY_CONCURRENCY`,
+/// default 64; 1 runs them one after the other).
+fn apply_concurrency() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("NAMIDB_APPLY_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(64)
+            .max(1)
+    })
+}
+
+/// Whether one run of a correlated subplan is a bounded amount of work:
+/// only single-hop expansions, lookups by id, filters, projections, limits
+/// and per-row aggregation, with no nested subquery, variable-length or
+/// shortest-path traversal and no write. Only such subplans run
+/// concurrently ([`apply_rows_concurrent`]): their per-row state is small,
+/// so running many at once cannot multiply a large working set.
+fn bounded_per_row(plan: &LogicalPlan) -> bool {
+    let here = match plan {
+        LogicalPlan::Argument { .. }
+        | LogicalPlan::NodeById { .. }
+        | LogicalPlan::Filter { .. }
+        | LogicalPlan::Project { .. }
+        | LogicalPlan::TopN { .. }
+        | LogicalPlan::Distinct { .. }
+        | LogicalPlan::Aggregate { .. } => true,
+        LogicalPlan::Expand {
+            length,
+            shortest,
+            path_binding,
+            ..
+        } => {
+            *shortest == crate::plan::ShortestMode::None
+                && path_binding.is_none()
+                && length
+                    .as_ref()
+                    .is_none_or(|length| length.max <= 1 && length.max_param.is_none())
+        }
+        _ => false,
+    };
+    here && plan.children().into_iter().all(bounded_per_row)
+}
+
+/// [`apply_rows`] for a correlated subplan over several input rows: up to
+/// `concurrency` per-row runs are in flight at once, so their object reads
+/// overlap instead of queuing one row after the other (`UNWIND $ids ...
+/// CALL { WITH n MATCH (n)-[r]->(m) ... LIMIT k }` paid every row's reads in
+/// sequence). Output order is the input order, exactly as the serial loop
+/// produces it.
+#[allow(clippy::too_many_arguments)]
+async fn apply_rows_concurrent(
+    rows: Vec<Row>,
+    subplan: &LogicalPlan,
+    optional: Option<&[String]>,
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+    routing: &PlanRouting,
+    cap: Option<usize>,
+    concurrency: usize,
+) -> Result<Vec<Row>, ExecError> {
+    use futures::stream::{FuturesOrdered, StreamExt};
+
+    let mut out = Vec::with_capacity(rows.len());
+    let mark = crate::exec::memory::frame_base();
+    let mut meter = crate::exec::memory::GrowthMeter::new();
+    let mut guard = crate::exec::limits::DeadlineProbe::new();
+    // A sliding window: a finished row's slot is refilled at once, so one
+    // slow row (a cold read chain) does not hold the other slots idle the
+    // way a fixed chunk does. The rows are merged in input order. Every
+    // `segment` rows the window drains and the transient memory charges of
+    // the finished runs are released, as the serial loop does per row.
+    let segment = concurrency.saturating_mul(4).max(1);
+    let mut next = 0usize;
+    while next < rows.len() {
+        guard.tick()?;
+        if cap.is_some_and(|cap| out.len() >= cap) {
+            break;
+        }
+        meter.observe(&out)?;
+        crate::exec::memory::restore(mark);
+        let end = next.saturating_add(segment).min(rows.len());
+        let mut window: FuturesOrdered<BoxFuture<'_, Result<Vec<Row>, ExecError>>> =
+            FuturesOrdered::new();
+        let mut started = next;
+        let mut consumed = next;
+        while consumed < end {
+            let capped = cap.is_some_and(|cap| out.len() >= cap);
+            while !capped && started < end && started - consumed < concurrency {
+                window.push_back(execute_inner_with_routing(
+                    subplan,
+                    snapshot,
+                    params,
+                    Some(&rows[started]),
+                    routing,
+                ));
+                started += 1;
+            }
+            let Some(sub_rows) = window.next().await else {
+                break;
+            };
+            let row = &rows[consumed];
+            consumed += 1;
+            if cap.is_some_and(|cap| out.len() >= cap) {
+                continue;
+            }
+            let sub_rows = sub_rows?;
+            if sub_rows.is_empty() {
+                if let Some(pad) = optional {
+                    let mut padded = row.clone();
+                    for name in pad {
+                        padded.set(name.clone(), RuntimeValue::Null);
+                    }
+                    out.push(padded);
+                }
+                continue;
+            }
+            for s in &sub_rows {
+                guard.tick()?;
+                let mut merged = row.clone();
+                for (k, v) in &s.bindings {
+                    merged.set(k.clone(), v.clone());
+                }
+                out.push(merged);
+            }
+        }
+        next = end;
     }
     Ok(out)
 }
@@ -2272,10 +2418,18 @@ pub(crate) async fn execute_expand(
                 && shortest == crate::plan::ShortestMode::None
                 && !endpoint_bfs;
             let mut wave_start = 0usize;
-            let mut wave_size = if wave_hydration {
-                cap.map_or(total_edges, |c| c.saturating_mul(4).max(512))
-            } else {
-                total_edges
+            // An identity-only, unlabelled endpoint is only proven to exist,
+            // and is rejected only when it was deleted, so the first window
+            // is exactly the cap: a seed under `LIMIT 4` proves four
+            // endpoints, not 512 (each proof can be a node-record read when
+            // the node SSTs overlap or the memtable holds nodes). A shortfall
+            // doubles the window as usual. Labelled or hydrated endpoints
+            // keep the wider first window, where rejections are common.
+            let identity_endpoints = skip_target_materialize && target_labels.is_empty();
+            let mut wave_size = match cap {
+                Some(cap) if wave_hydration && identity_endpoints => cap.max(1),
+                Some(cap) if wave_hydration => cap.saturating_mul(4).max(512),
+                _ => total_edges,
             };
             while wave_start < total_edges || wave_start == 0 {
                 let wave_end = wave_start.saturating_add(wave_size).min(total_edges);
@@ -5391,20 +5545,62 @@ async fn vector_search_procedure(
     snapshot: &Snapshot<'_>,
     params: &Params,
 ) -> Result<Vec<Row>, ExecError> {
-    let map = proc_single_map(
-        args,
-        params,
-        "search.vector",
-        &["label", "property", "query", "k", "ef", "metric", "filter"],
-    )?;
-    let label = map
-        .get("label")
-        .and_then(proc_str)
-        .ok_or_else(|| proc_unsupported("search.vector requires a `label` string"))?;
-    let property = map
-        .get("property")
-        .and_then(proc_str)
-        .ok_or_else(|| proc_unsupported("search.vector requires a `property` string"))?;
+    // `search.vector(indexName, k, queryVector [, {ef, filter}])` is the
+    // positional form of `db.index.vector.queryNodes`.
+    if args.len() >= 2 {
+        return db_index_vector_call("search.vector", args, yield_items, snapshot, params).await;
+    }
+    let map = match args {
+        [arg] => match evaluate(arg, &Row::new(), params)? {
+            RuntimeValue::Map(m) => m,
+            _ => {
+                return Err(proc_unsupported(format!(
+                    "search.vector expects a map argument; {SEARCH_VECTOR_SIGNATURE}"
+                )))
+            }
+        },
+        _ => {
+            return Err(proc_unsupported(format!(
+                "search.vector needs arguments; {SEARCH_VECTOR_SIGNATURE}"
+            )))
+        }
+    };
+    reject_unknown_vector_keys(&map)?;
+    let (label, property, index_metric) = match map.get("index") {
+        Some(value) => {
+            let index_name = proc_str(value)
+                .ok_or_else(|| proc_unsupported("search.vector `index` must be a string"))?;
+            let (label, property, metric) = resolve_vector_index(snapshot, &index_name)?;
+            // `label`/`property` next to `index` must name the same index.
+            for (key, expected) in [("label", &label), ("property", &property)] {
+                if let Some(given) = map.get(key) {
+                    if proc_str(given).as_ref() != Some(expected) {
+                        return Err(proc_unsupported(format!(
+                            "search.vector: index `{index_name}` is on {label}.{property}, \
+                             which the `{key}` option contradicts; pass either `index` or \
+                             `label` and `property`"
+                        )));
+                    }
+                }
+            }
+            (label, property, Some(metric))
+        }
+        None => {
+            let label = map.get("label").and_then(proc_str).ok_or_else(|| {
+                proc_unsupported(format!(
+                    "search.vector requires a `label` string (or an `index` name); \
+                     {SEARCH_VECTOR_SIGNATURE}"
+                ))
+            })?;
+            let property = map.get("property").and_then(proc_str).ok_or_else(|| {
+                proc_unsupported(format!(
+                    "search.vector requires a `property` string (or an `index` name); \
+                     {SEARCH_VECTOR_SIGNATURE}"
+                ))
+            })?;
+            (label, property, None)
+        }
+    };
     let qv = map
         .get("query")
         .and_then(runtime_to_f32_vec)
@@ -5422,7 +5618,12 @@ async fn vector_search_procedure(
             proc_unsupported("search.vector `ef` must be a non-negative integer")
         })?),
     };
-    let distance = proc_metric(map.get("metric"))?;
+    // An index named by `index` scores with its own metric unless the call
+    // asks for another one.
+    let distance = match (map.get("metric"), index_metric) {
+        (None, Some(metric)) => metric,
+        (given, _) => proc_metric(given)?,
+    };
     let pf = proc_opt_filter(map.get("filter"))?;
     let prefilter = proc_vector_prefilter(map.get("filter"));
 
@@ -5472,19 +5673,117 @@ async fn db_index_vector_procedure(
             "unknown procedure `db.index.vector.{name}` (supported: queryNodes)"
         )));
     }
-    if !(3..=4).contains(&args.len()) {
-        return Err(proc_unsupported(
-            "db.index.vector.queryNodes(indexName, k, queryVector [, {ef: …, filter: {…}}])",
+    db_index_vector_call(
+        "db.index.vector.queryNodes",
+        args,
+        yield_items,
+        snapshot,
+        params,
+    )
+    .await
+}
+
+/// The signatures `search.vector` accepts, quoted by its errors.
+const SEARCH_VECTOR_SIGNATURE: &str = "use search.vector({label: 'L', property: 'p', \
+     query: $vector, k: 10}), search.vector({index: 'name', query: $vector, k: 10}) \
+     (options: ef, metric, filter), or search.vector('index name', 10, $vector \
+     [, {ef: 64, filter: {...}}])";
+
+/// Options of the map form of `search.vector`.
+const SEARCH_VECTOR_OPTIONS: &[&str] = &[
+    "index", "label", "property", "query", "k", "ef", "metric", "filter",
+];
+
+/// Reject an unknown `search.vector` option, naming the option a common
+/// spelling from other vector APIs means.
+fn reject_unknown_vector_keys(
+    map: &std::collections::BTreeMap<String, RuntimeValue>,
+) -> Result<(), ExecError> {
+    let Some(unknown) = map
+        .keys()
+        .find(|key| !SEARCH_VECTOR_OPTIONS.contains(&key.as_str()))
+    else {
+        return Ok(());
+    };
+    let hint = match unknown.to_ascii_lowercase().as_str() {
+        "vector" | "embedding" | "query_vector" | "queryvector" => " (did you mean `query`?)",
+        "top_k" | "topk" | "limit" | "n" | "size" => " (did you mean `k`?)",
+        "index_name" | "indexname" | "name" => " (did you mean `index`?)",
+        "where" | "filters" | "prefilter" => " (did you mean `filter`?)",
+        "similarity" | "distance" | "similarity_function" => " (did you mean `metric`?)",
+        _ => "",
+    };
+    Err(proc_unsupported(format!(
+        "search.vector does not recognise the option `{unknown}`{hint}; allowed options: {}; \
+         {SEARCH_VECTOR_SIGNATURE}",
+        SEARCH_VECTOR_OPTIONS.join(", ")
+    )))
+}
+
+/// A vector index by name: `(label, property, metric)`.
+fn resolve_vector_index(
+    snapshot: &Snapshot<'_>,
+    index_name: &str,
+) -> Result<(String, String, crate::plan::logical::VectorDistance), ExecError> {
+    let indexes = &snapshot.manifest().manifest.vector_indexes;
+    if let Some(d) = indexes.iter().find(|d| d.name == index_name) {
+        return Ok((
+            d.label.clone(),
+            d.property.clone(),
+            storage_metric_to_distance(d.metric),
         ));
+    }
+    let mut names: Vec<&str> = indexes.iter().map(|d| d.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    Err(proc_unsupported(if names.is_empty() {
+        format!("no vector index named `{index_name}` (this database has no vector index)")
+    } else {
+        format!(
+            "no vector index named `{index_name}` (vector indexes: {})",
+            names.join(", ")
+        )
+    }))
+}
+
+/// `queryNodes(indexName, k, queryVector [, {ef, filter}])`, shared by
+/// `db.index.vector.queryNodes` and the positional `search.vector`.
+async fn db_index_vector_call(
+    proc: &str,
+    args: &[Expression],
+    yield_items: &[(String, String)],
+    snapshot: &Snapshot<'_>,
+    params: &Params,
+) -> Result<Vec<Row>, ExecError> {
+    let signature = format!("{proc}(indexName, k, queryVector [, {{ef: 64, filter: {{...}}}}])");
+    if !(3..=4).contains(&args.len()) {
+        return Err(proc_unsupported(if proc == "search.vector" {
+            format!(
+                "search.vector takes one map or three/four arguments; {SEARCH_VECTOR_SIGNATURE}"
+            )
+        } else {
+            format!("expected {signature}")
+        }));
     }
     let index_name = match evaluate(&args[0], &Row::new(), params)? {
         RuntimeValue::String(s) => s,
-        _ => return Err(proc_unsupported("queryNodes `indexName` must be a string")),
+        _ => {
+            return Err(proc_unsupported(format!(
+                "{proc}: the first argument (indexName) must be a string; expected {signature}"
+            )))
+        }
     };
-    let k = as_usize(&evaluate(&args[1], &Row::new(), params)?)
-        .ok_or_else(|| proc_unsupported("queryNodes `k` must be a non-negative integer"))?;
-    let qv = runtime_to_f32_vec(&evaluate(&args[2], &Row::new(), params)?)
-        .ok_or_else(|| proc_unsupported("queryNodes `queryVector` must be a list or vector()"))?;
+    let k = as_usize(&evaluate(&args[1], &Row::new(), params)?).ok_or_else(|| {
+        proc_unsupported(format!(
+            "{proc}: the second argument (k) must be a non-negative integer; expected {signature}"
+        ))
+    })?;
+    let qv = runtime_to_f32_vec(&evaluate(&args[2], &Row::new(), params)?).ok_or_else(|| {
+        proc_unsupported(format!(
+            "{proc}: the third argument (queryVector) must be a list of numbers or vector(); \
+             expected {signature}"
+        ))
+    })?;
     // The optional 4th map carries `ef` (beam width) and/or `filter`. Preserve
     // the runtime map as well as its residual expression: equality/IN terms
     // can be resolved through typed metadata postings after the index name
@@ -5493,10 +5792,13 @@ async fn db_index_vector_procedure(
         None => (None, None, None),
         Some(a) => match evaluate(a, &Row::new(), params)? {
             RuntimeValue::Map(m) => {
-                reject_unknown_keys("db.index.vector.queryNodes", &m, &["ef", "filter"])?;
+                // A misspelt `filter` must not run unfiltered.
+                reject_unknown_keys(proc, &m, &["ef", "filter"])?;
                 let ef = match m.get("ef") {
                     Some(value) => Some(as_usize(value).ok_or_else(|| {
-                        proc_unsupported("queryNodes option `ef` must be a non-negative integer")
+                        proc_unsupported(format!(
+                            "{proc} option `ef` must be a non-negative integer"
+                        ))
                     })?),
                     None => None,
                 };
@@ -5505,29 +5807,14 @@ async fn db_index_vector_procedure(
                 (ef, pf, filter_value)
             }
             _ => {
-                return Err(proc_unsupported(
-                    "queryNodes optional fourth argument must be a map",
-                ));
+                return Err(proc_unsupported(format!(
+                    "{proc}: the optional fourth argument must be a map; expected {signature}"
+                )));
             }
         },
     };
 
-    // Resolve the index by name → (label, property, metric).
-    let resolved = snapshot
-        .manifest()
-        .manifest
-        .vector_indexes
-        .iter()
-        .find(|d| d.name == index_name)
-        .map(|d| {
-            (
-                d.label.clone(),
-                d.property.clone(),
-                storage_metric_to_distance(d.metric),
-            )
-        });
-    let (label, property, distance) = resolved
-        .ok_or_else(|| proc_unsupported(format!("no vector index named `{index_name}`")))?;
+    let (label, property, distance) = resolve_vector_index(snapshot, &index_name)?;
     let prefilter = proc_vector_prefilter(filter_value.as_ref());
 
     let q = RuntimeValue::Vector(qv);
@@ -5556,12 +5843,7 @@ async fn db_index_vector_procedure(
             ]
         })
         .collect();
-    project_proc_rows(
-        "db.index.vector.queryNodes",
-        &["node", "score"],
-        raw,
-        yield_items,
-    )
+    project_proc_rows(proc, &["node", "score"], raw, yield_items)
 }
 
 /// Resolve the sparse leg's text properties from a `search.hybrid` map:
@@ -7622,13 +7904,26 @@ async fn neighbours_of_any(
     if edge_types.len() == 1 {
         return neighbours_of(snapshot, &edge_types[0], direction, node, mode).await;
     }
+    // An untyped pattern reads every relationship type of the namespace:
+    // issue the per-type reads together (in type order, so the result order
+    // is unchanged) instead of one dependent chain of object reads after the
+    // other.
     let mut all = Vec::new();
-    for et in edge_types {
-        let edges = neighbours_of(snapshot, et, direction, node, mode).await?;
-        all.extend(edges);
+    for chunk in edge_types.chunks(EDGE_TYPE_READ_CONCURRENCY) {
+        let mut reads: Vec<BoxFuture<'_, Result<Vec<EdgeView>, ExecError>>> =
+            Vec::with_capacity(chunk.len());
+        for et in chunk {
+            reads.push(neighbours_of(snapshot, et, direction, node, mode).boxed());
+        }
+        for edges in futures::future::try_join_all(reads).await? {
+            all.extend(edges);
+        }
     }
     Ok(all)
 }
+
+/// Per-type adjacency reads of one node in flight at once.
+const EDGE_TYPE_READ_CONCURRENCY: usize = 16;
 
 /// Reads of one Expand's first hop in flight at once.
 const SEED_PREFETCH_CONCURRENCY: usize = 16;

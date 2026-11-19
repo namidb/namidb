@@ -1551,7 +1551,46 @@ impl<'src> Parser<'src> {
             Some(Token::Ident(n)) if n.eq_ignore_ascii_case("YIELD")
         ) {
             self.bump();
-            self.parse_yield_list()?
+            // `YIELD *` binds every output column under its own name. The
+            // columns must be known here so later clauses can use them.
+            if let Some(star) = self.eat(&Token::Star) {
+                let star = star.span;
+                let qualified = match &namespace {
+                    Some(ns) => format!("{ns}.{name}"),
+                    None => name.clone(),
+                };
+                let columns: &[&str] = match qualified.to_ascii_lowercase().as_str() {
+                    "search.vector"
+                    | "search.bm25"
+                    | "search.hybrid"
+                    | "db.index.vector.querynodes" => &["node", "score"],
+                    _ => {
+                        return Err(ParseError::new(
+                            ErrorCode::UnexpectedToken,
+                            format!(
+                                "YIELD * is supported for search.vector, search.bm25, \
+                                 search.hybrid and db.index.vector.queryNodes; name the \
+                                 columns of {qualified} to yield"
+                            ),
+                            star,
+                        ));
+                    }
+                };
+                columns
+                    .iter()
+                    .map(|column| YieldItem {
+                        name: Identifier {
+                            name: (*column).to_string(),
+                            span: star,
+                            quoted: false,
+                        },
+                        alias: None,
+                        span: star,
+                    })
+                    .collect()
+            } else {
+                self.parse_yield_list()?
+            }
         } else {
             Vec::new()
         };

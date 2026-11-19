@@ -1798,7 +1798,7 @@ async fn build_text_segment_merge(
         complete_filter_properties: filters,
     };
     let state = selection.captured_state.clone();
-    let merged = tokio::task::spawn_blocking(move || {
+    let merged = crate::background::spawn_blocking(move || {
         crate::sst::text::v4::merge_text_v4_segments(&state, context, config, stats, &readers)
     })
     .await
@@ -2018,7 +2018,7 @@ async fn build_vector_segment_merge(
     let options = super::vector_v5_build_options();
     let merge_descriptor = descriptor.clone();
     let merge_filters = filters.clone();
-    let merged = tokio::task::spawn_blocking(move || {
+    let merged = crate::background::spawn_blocking(move || {
         crate::sst::vector::base_merge::merge_vector_base(
             crate::sst::vector::base_merge::VectorBaseMergeInput {
                 descriptor: &merge_descriptor,
@@ -2610,7 +2610,7 @@ async fn prepare_search_compactions_with(
             "starting Search-LSM base build; spool scratch scales with input \
              plus the external builders' bounded working sets"
         );
-        let builder_handle = tokio::task::spawn_blocking(move || {
+        let builder_handle = crate::background::spawn_blocking(move || {
             build_search_compactions_blocking(
                 &build_manifest,
                 base_selections,
@@ -2984,7 +2984,7 @@ async fn build_vector_delta_run(
         event_ranges: selection.selected_event_ranges.clone(),
         complete_filter_properties: filters.clone(),
     };
-    let builder_handle = tokio::task::spawn_blocking(move || {
+    let builder_handle = crate::background::spawn_blocking(move || {
         let mut builder = crate::sst::vector::v6::VectorV6ExternalBuilder::with_config_reconciled(
             &build_state,
             &build_descriptor,
@@ -3333,7 +3333,7 @@ async fn build_text_delta_run(
         event_ranges: selection.selected_event_ranges.clone(),
         complete_filter_properties: filters.clone(),
     };
-    let builder_handle = tokio::task::spawn_blocking(move || {
+    let builder_handle = crate::background::spawn_blocking(move || {
         let mut builder = crate::sst::text::v4::TextV4ExternalBuilder::with_config_reconciled(
             &build_state,
             build_context,
