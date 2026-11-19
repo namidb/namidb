@@ -23,7 +23,7 @@
 //! ([`prepare_expand_targets`]), so the result is exactly the naive one:
 //! same groups, same counts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use namidb_core::id::NodeId;
 use namidb_storage::Snapshot;
@@ -36,7 +36,37 @@ use crate::exec::walker::{
 use crate::parser::RelationshipDirection;
 use crate::plan::logical::{PathCountHop, PathCountNode};
 
-type Weights = HashMap<NodeId, u64>;
+/// Node ids are server-generated UUIDs, so a multiply-xor hash over their
+/// 8-byte halves spreads them well; a path count hashes every endpoint of
+/// every edge it folds, and SipHash was a measurable share of that.
+#[derive(Default, Clone, Copy)]
+struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
+                .wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write(&(n as u64).to_le_bytes());
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type IdBuild = std::hash::BuildHasherDefault<IdHasher>;
+type Weights = HashMap<NodeId, u64, IdBuild>;
+
+fn weights_with_capacity(n: usize) -> Weights {
+    Weights::with_capacity_and_hasher(n, IdBuild::default())
+}
 
 fn overflow() -> ExecError {
     ExecError::Runtime("path count overflowed a 64-bit integer".into())
@@ -84,19 +114,21 @@ const SCAN_PROOF_MIN_IDS: usize = 4_096;
 /// where a probe is the expensive side.
 const SCAN_PROOF_RATIO: u64 = 10;
 
-/// Prove `node`'s filter for `ids`: label membership (or plain existence
-/// for an unlabelled node), exactly as `Expand` proves its endpoints.
+/// Keep the entries of `raw` whose node passes `node`'s filter: label
+/// membership (or plain existence for an unlabelled node), exactly as
+/// `Expand` proves its endpoints.
 ///
 /// A large batch scans the node's label (or every node, unlabelled) with an
 /// empty projection — the same read a `NodeScan` makes, so the same live
-/// set — and intersects. A small one probes per id like `Expand` does.
-async fn prove(
+/// set — and keeps the members it meets. A small one probes per id like
+/// `Expand` does.
+async fn keep_members(
     snapshot: &Snapshot<'_>,
     node: &PathCountNode,
-    ids: Vec<NodeId>,
-) -> Result<HashSet<NodeId>, ExecError> {
-    if ids.is_empty() {
-        return Ok(HashSet::new());
+    raw: Weights,
+) -> Result<Weights, ExecError> {
+    if raw.is_empty() {
+        return Ok(raw);
     }
     let scan_label = node.labels.first().map(String::as_str);
     // `NAMIDB_PATH_COUNT_SCAN_PROOF=always|never` pins the strategy (both
@@ -105,7 +137,7 @@ async fn prove(
         Ok("always") => true,
         Ok("never") => false,
         _ => {
-            if ids.len() < SCAN_PROOF_MIN_IDS {
+            if raw.len() < SCAN_PROOF_MIN_IDS {
                 false
             } else {
                 // Exact and cached; with overlapping node files the first
@@ -114,27 +146,29 @@ async fn prove(
                     Some(population) => population,
                     None => snapshot.count_nodes(scan_label).await?,
                 };
-                (ids.len() as u64).saturating_mul(SCAN_PROOF_RATIO) >= population
+                (raw.len() as u64).saturating_mul(SCAN_PROOF_RATIO) >= population
             }
         }
     };
     if scan {
-        let wanted: HashSet<NodeId> = ids.into_iter().collect();
         let views = scan_node_views(snapshot, scan_label, &[], Some(&[]), None).await?;
         let mut probe = crate::exec::limits::DeadlineProbe::new();
-        let mut out = HashSet::with_capacity(wanted.len().min(views.len()));
+        let mut out = weights_with_capacity(raw.len().min(views.len()));
         for view in views {
             probe.tick()?;
-            if wanted.contains(&view.id) && node.labels.iter().all(|l| view.labels.contains(l)) {
-                out.insert(view.id);
+            if let Some(w) = raw.get(&view.id) {
+                if node.labels.iter().all(|l| view.labels.contains(l)) {
+                    out.insert(view.id, *w);
+                }
             }
         }
         return Ok(out);
     }
+    let ids: Vec<NodeId> = raw.keys().copied().collect();
     match prepare_expand_targets(snapshot, &node.labels, &ids, true, false, false).await? {
-        ExpandTargets::Membership(map) => Ok(map
+        ExpandTargets::Membership(live) => Ok(raw
             .into_iter()
-            .filter_map(|(id, ok)| ok.then_some(id))
+            .filter(|(id, _)| live.get(id).copied().unwrap_or(false))
             .collect()),
         _ => Err(ExecError::Runtime(
             "path count endpoint proof returned materialised views".into(),
@@ -157,7 +191,7 @@ async fn scan_multiplicity(
         None,
     )
     .await?;
-    let mut out: Weights = HashMap::new();
+    let mut out = Weights::default();
     for view in views {
         if node.labels.iter().all(|l| view.labels.contains(l)) {
             *out.entry(view.id).or_insert(0) += 1;
@@ -176,7 +210,7 @@ async fn filter_weights(
 ) -> Result<Weights, ExecError> {
     if is_head && !node.predicates.is_empty() {
         let mult = scan_multiplicity(snapshot, node).await?;
-        let mut out = HashMap::with_capacity(raw.len().min(mult.len()));
+        let mut out = weights_with_capacity(raw.len().min(mult.len()));
         for (id, w) in raw {
             if let Some(m) = mult.get(&id) {
                 out.insert(id, w.checked_mul(*m).ok_or_else(overflow)?);
@@ -184,11 +218,7 @@ async fn filter_weights(
         }
         return Ok(out);
     }
-    let keep = prove(snapshot, node, raw.keys().copied().collect()).await?;
-    Ok(raw
-        .into_iter()
-        .filter(|(id, _)| keep.contains(id))
-        .collect())
+    keep_members(snapshot, node, raw).await
 }
 
 /// Fold one hop: `out(near) += w(far)` over `(near, far)` pairs.
@@ -197,7 +227,7 @@ fn fold(
     from_far: &Weights,
     toward_near: bool,
 ) -> Result<Weights, ExecError> {
-    let mut out: Weights = HashMap::new();
+    let mut out = Weights::default();
     let mut probe = crate::exec::limits::DeadlineProbe::new();
     for &(near, far) in pairs {
         probe.tick()?;
@@ -217,7 +247,7 @@ fn fold(
 /// The initial (unfiltered) weight map of the endpoint node on one side:
 /// every id that appears on that side of the adjacent hop, weight 1.
 fn endpoint_ones(pairs: &[(NodeId, NodeId)], far_side: bool) -> Weights {
-    let mut out: Weights = HashMap::new();
+    let mut out = Weights::default();
     for &(near, far) in pairs {
         out.insert(if far_side { far } else { near }, 1);
     }
@@ -278,7 +308,7 @@ pub(crate) async fn execute_path_count(
     let mut weights: Weights = match (left, right) {
         (Some(l), Some(r)) => {
             let (small, big) = if l.len() <= r.len() { (l, r) } else { (r, l) };
-            let mut out = HashMap::with_capacity(small.len());
+            let mut out = weights_with_capacity(small.len());
             for (id, a) in small {
                 if let Some(b) = big.get(&id) {
                     out.insert(id, a.checked_mul(*b).ok_or_else(overflow)?);
