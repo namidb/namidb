@@ -173,13 +173,11 @@ async fn neighbours(
         .collect()
 }
 
-/// Every seed's real out/in adjacency, as `(type, partner elementId)` sets.
-fn adjacency(
-    element_ids: &[String],
-) -> (
-    Vec<BTreeSet<(String, String)>>,
-    Vec<BTreeSet<(String, String)>>,
-) {
+/// Each seed's `(type, partner elementId)` set.
+type Adjacency = Vec<BTreeSet<(String, String)>>;
+
+/// Every seed's real out/in adjacency.
+fn adjacency(element_ids: &[String]) -> (Adjacency, Adjacency) {
     let mut out = vec![BTreeSet::new(); PEOPLE];
     let mut inc = vec![BTreeSet::new(); PEOPLE];
     for (t, src, dst) in edge_list() {
