@@ -382,6 +382,80 @@ async fn hybrid_rejects_alpha_out_of_range() {
     );
 }
 
+async fn hybrid_error(w: &WriterSession, options: &str) -> String {
+    let snap = w.snapshot();
+    let plan = lower(
+        &parse(&format!(
+            "CALL search.hybrid({{ label: 'Doc', query_text: 'quantum', text_property: 'body', \
+             query_vector: $q, vector_property: 'embedding', k: 3, {options} }}) \
+             YIELD node, score RETURN node"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut params = Params::new();
+    params.insert("q".into(), RuntimeValue::Vector(vec![1.0, 0.0, 0.0]));
+    match execute(&plan, &snap, &params).await {
+        Ok(rows) => panic!("`{options}` must be rejected, got {} rows", rows.len()),
+        Err(error) => error.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn hybrid_rejects_inconsistent_fusion_options() {
+    let w = seed("hybrid-fusion-options").await;
+    let error = hybrid_error(&w, "fusion: 'rrf', alpha: 0.3").await;
+    assert!(
+        error.contains("alpha") && error.contains("linear"),
+        "alpha with RRF must name the linear form: {error}"
+    );
+    let error = hybrid_error(&w, "fusion: 'linear', rrf_k: 10").await;
+    assert!(error.contains("rrf_k"), "{error}");
+    let error = hybrid_error(&w, "fusion: 'weighted'").await;
+    assert!(
+        error.contains("'rrf' or 'linear'"),
+        "an unknown fusion names the valid forms: {error}"
+    );
+    let error = hybrid_error(&w, "fusion: 1").await;
+    assert!(error.contains("fusion"), "{error}");
+    let error = hybrid_error(&w, "alpha: -0.1").await;
+    assert!(error.contains("[0, 1]"), "{error}");
+}
+
+#[tokio::test]
+async fn hybrid_alpha_alone_selects_linear_fusion() {
+    let w = seed("hybrid-alpha-implies-linear").await;
+    let call = |options: &str| {
+        format!(
+            "CALL search.hybrid({{ label: 'Doc', query_text: 'quantum', text_property: 'body', \
+             query_vector: $q, vector_property: 'embedding', k: 3, {options} }}) \
+             YIELD node, score RETURN node.title AS title, score"
+        )
+    };
+    let scores = |rows: Vec<namidb_query::Row>| -> Vec<(String, u64)> {
+        rows.iter()
+            .map(|row| match (row.get("title"), row.get("score")) {
+                (Some(RuntimeValue::String(t)), Some(RuntimeValue::Float(s))) => {
+                    (t.clone(), s.to_bits())
+                }
+                other => panic!("unexpected row {other:?}"),
+            })
+            .collect()
+    };
+    let q = vec![0.6, 0.8, 0.0];
+    let implied = scores(run(&w, &call("alpha: 0.9"), q.clone()).await);
+    let explicit = scores(run(&w, &call("fusion: 'linear', alpha: 0.9"), q.clone()).await);
+    let rrf = scores(run(&w, &call("fusion: 'rrf'"), q.clone()).await);
+    assert_eq!(implied, explicit);
+    assert_ne!(implied, rrf, "linear scores are not reciprocal ranks");
+    // Linear scores are weighted min-max normalised leg scores: each lies in
+    // [0, 1] and the dense leg's best hit carries at least alpha.
+    assert!(implied
+        .iter()
+        .all(|(_, bits)| (0.0..=1.0).contains(&f64::from_bits(*bits))));
+    assert!(f64::from_bits(implied[0].1) >= 0.9);
+}
+
 #[tokio::test]
 async fn hybrid_rejects_partial_dense_leg() {
     let w = seed("hybrid-partial").await;
@@ -425,6 +499,7 @@ mod indexed_sparse_filter {
 
     const INDEX_NAME: &str = "doc_ft";
     const CAP_ENV: &str = "NAMIDB_HYBRID_TEXT_FILTER_CANDIDATE_CAP";
+    const SELECTIVE_CAP_ENV: &str = "NAMIDB_HYBRID_TEXT_FILTER_SELECTIVE_CAP";
 
     /// These tests change the process-global candidate cap. Keep their complete
     /// async execution under one lock so each query sees the intended value.
@@ -432,16 +507,27 @@ mod indexed_sparse_filter {
 
     struct CapEnvGuard {
         previous: Option<String>,
+        previous_selective: Option<String>,
         _lock: MutexGuard<'static, ()>,
     }
 
     impl CapEnvGuard {
+        /// Widening-discipline tests: the selective route (which scores a
+        /// small filter-admitted set directly) is disabled so they keep
+        /// exercising the ranked-prefix widening they assert.
         fn set(value: usize) -> Self {
+            Self::with_selective(value, 0)
+        }
+
+        fn with_selective(value: usize, selective: usize) -> Self {
             let lock = CAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let previous = std::env::var(CAP_ENV).ok();
+            let previous_selective = std::env::var(SELECTIVE_CAP_ENV).ok();
             std::env::set_var(CAP_ENV, value.to_string());
+            std::env::set_var(SELECTIVE_CAP_ENV, selective.to_string());
             Self {
                 previous,
+                previous_selective,
                 _lock: lock,
             }
         }
@@ -456,6 +542,10 @@ mod indexed_sparse_filter {
             match &self.previous {
                 Some(value) => std::env::set_var(CAP_ENV, value),
                 None => std::env::remove_var(CAP_ENV),
+            }
+            match &self.previous_selective {
+                Some(value) => std::env::set_var(SELECTIVE_CAP_ENV, value),
+                None => std::env::remove_var(SELECTIVE_CAP_ENV),
             }
         }
     }
@@ -1077,6 +1167,118 @@ mod indexed_sparse_filter {
             vec!["target".to_string()],
             "a swept .ft must use the same exact filtered fallback"
         );
+    }
+
+    /// Rows `(title, score bits)` of a procedure call, for exact parity.
+    async fn titled_scores(writer: &WriterSession, cypher: &str) -> Vec<(String, u64)> {
+        run(writer, cypher, vec![])
+            .await
+            .iter()
+            .map(|row| {
+                let title = match row.get("title") {
+                    Some(RuntimeValue::String(title)) => title.clone(),
+                    other => panic!("title missing: {other:?}"),
+                };
+                let score = match row.get("score") {
+                    Some(RuntimeValue::Float(score)) => score.to_bits(),
+                    other => panic!("score missing: {other:?}"),
+                };
+                (title, score)
+            })
+            .collect()
+    }
+
+    /// A corpus where the filtered tenant is rare and its documents rank far
+    /// below the unfiltered top-k, with varied lengths and term frequencies
+    /// so any statistics drift would change the scores.
+    fn selective_docs() -> Vec<(String, String, String)> {
+        let mut docs = other_docs(40);
+        for index in 0..6 {
+            let filler = (0..index * 3)
+                .map(|word| format!("f{word}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let repeats = vec!["alpha"; index % 3 + 1].join(" ");
+            docs.push((
+                format!("acme-{index}"),
+                "acme".into(),
+                format!("{repeats} beta{index} {filler} gamma"),
+            ));
+        }
+        docs
+    }
+
+    #[tokio::test]
+    async fn filtered_bm25_selective_route_matches_the_exact_scan() {
+        let docs = selective_docs();
+        let borrowed = borrowed_docs(&docs);
+        let (writer, _, probe) = indexed_corpus("bm25-selective", &borrowed).await;
+        // Equality on a property the index cannot filter natively, a
+        // residual (numeric) filter, a prefix query and a phrase query.
+        let calls = [
+            "CALL search.bm25({ label: 'Doc', query: 'alpha gamma', text_property: 'body', \
+             k: 4, filter: { tenant: 'acme' } }) YIELD node, score \
+             RETURN node.title AS title, score",
+            "CALL search.bm25({ label: 'Doc', query: 'alpha gamma', text_property: 'body', \
+             k: 4, filter: { rank: 7 } }) YIELD node, score \
+             RETURN node.title AS title, score",
+            "CALL search.bm25({ label: 'Doc', query: 'alpha bet*', text_property: 'body', \
+             k: 10, filter: { tenant: 'acme' } }) YIELD node, score \
+             RETURN node.title AS title, score",
+            "CALL search.bm25({ label: 'Doc', query: '\"alpha beta2\" gamma', \
+             text_property: 'body', k: 10, filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title, score",
+            "CALL search.hybrid({ label: 'Doc', query_text: 'alpha gamma', \
+             text_property: 'body', k: 3, filter: { tenant: 'acme' } }) \
+             YIELD node, score RETURN node.title AS title, score",
+        ];
+        for call in calls {
+            let selective = {
+                let _cap = CapEnvGuard::with_selective(64, 4096);
+                let before = probe.barrier_pins();
+                let rows = titled_scores(&writer, call).await;
+                assert_eq!(
+                    probe.barrier_pins() - before,
+                    1,
+                    "the selective route reads the corpus statistics once and \
+                     never widens: {call}"
+                );
+                rows
+            };
+            // Candidate cap 0 forces the exact two-pass corpus scan.
+            let exact = {
+                let _cap = CapEnvGuard::with_selective(0, 0);
+                titled_scores(&writer, call).await
+            };
+            assert!(!exact.is_empty(), "the fixture must match: {call}");
+            assert!(
+                exact.iter().all(|(title, _)| title.starts_with("acme-")),
+                "{exact:?}"
+            );
+            assert_eq!(selective, exact, "{call}");
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_bm25_selective_route_respects_the_cap() {
+        let docs = selective_docs();
+        let borrowed = borrowed_docs(&docs);
+        let (writer, _, _) = indexed_corpus("bm25-selective-cap", &borrowed).await;
+        let call = "CALL search.bm25({ label: 'Doc', query: 'alpha', text_property: 'body', \
+             k: 3, filter: { tenant: 'acme' } }) YIELD node, score \
+             RETURN node.title AS title, score";
+        // Six admitted nodes exceed a cap of five: the widening route answers,
+        // with the same rows.
+        let widened = {
+            let _cap = CapEnvGuard::with_selective(64, 5);
+            titled_scores(&writer, call).await
+        };
+        let selective = {
+            let _cap = CapEnvGuard::with_selective(64, 6);
+            titled_scores(&writer, call).await
+        };
+        assert_eq!(widened.len(), 3);
+        assert_eq!(widened, selective);
     }
 }
 
