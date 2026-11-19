@@ -1924,7 +1924,7 @@ async fn mistyped_procedure_options_error_with_the_option_name() {
         (
             "CALL search.hybrid({ label: 'Doc', query_text: 'a', text_property: 'body', \
              fusion: 1 }) YIELD node RETURN node",
-            "`fusion` must be a string",
+            "`fusion` must be the string",
         ),
         (
             "CALL search.hybrid({ label: 'Doc', query_text: 'a', text_property: 'body', \

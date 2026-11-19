@@ -51,6 +51,9 @@ const MAX_PAGE_COUNT: usize = MAX_DIRECTORY_BYTES / DIRECTORY_ENTRY_LEN;
 const MAX_POINT_PROBE_PAGES_PER_BATCH: usize = 64;
 /// Point-probe page batches read at once (each at most 64 pages of 24 KiB).
 const POINT_PROBE_BATCH_CONCURRENCY: usize = 4;
+
+/// A version page and the `(output position, NodeId)` probes that fall in it.
+type PageProbes = (usize, Vec<(usize, [u8; 16])>);
 const MAX_VERIFY_PAGES_PER_BATCH: usize = 32;
 const SUPPRESS_ORDINAL: u64 = u64::MAX;
 const LIVE_TAG: u8 = 1;
@@ -942,7 +945,7 @@ impl SearchVersionTableReader {
 
     async fn probe_page_batch(
         &self,
-        chunk: &[(usize, Vec<(usize, [u8; 16])>)],
+        chunk: &[PageProbes],
     ) -> Result<Vec<(usize, SearchVersionRecord)>> {
         let ranges = chunk
             .iter()
