@@ -1567,12 +1567,7 @@ impl TextV4Reader {
         }
         scored_terms.sort();
         scored_terms.dedup();
-        let mut entries = BTreeMap::<String, TermEntry>::new();
-        for term in &scored_terms {
-            if let Some(entry) = self.lookup_term(term).await? {
-                entries.insert(term.clone(), entry);
-            }
-        }
+        let entries = self.lookup_terms(&scored_terms).await?;
         if query
             .phrases
             .iter()
@@ -1886,12 +1881,7 @@ impl TextV4Reader {
         }
         scored_terms.sort();
         scored_terms.dedup();
-        let mut entries = BTreeMap::<String, TermEntry>::new();
-        for term in &scored_terms {
-            if let Some(entry) = self.lookup_term(term).await? {
-                entries.insert(term.clone(), entry);
-            }
-        }
+        let entries = self.lookup_terms(&scored_terms).await?;
         if query
             .phrases
             .iter()
@@ -2162,23 +2152,49 @@ impl TextV4Reader {
         })
     }
 
+    /// Whether this segment alone holds the corpus `global` describes: the
+    /// base, or the generation's first delta (relative to the empty corpus at
+    /// event 0, so its relative statistics are absolute). The Search-LSM
+    /// coordinator proves that no other segment or unproven event exists
+    /// before it selects this path.
     fn is_authoritative_base_for(&self, global: &TextV4GlobalStats) -> bool {
-        matches!(
-            self.segment().stats,
-            SearchSegmentStats::Text {
-                doc_count: SearchStatValue::Absolute(documents),
-                total_len: SearchStatValue::Absolute(total_len),
-                term_df_violation_count: 0,
-            } if self.segment().role == SearchSegmentRole::Base
-                && self.segment().suppress_count == 0
-                && self.segment().mutation_count == self.segment().live_payload_count
-                && self.segment().live_payload_count == documents
-                && documents == global.document_count
-                && documents == self.footer.doc_table.row_count
-                && total_len == global.total_document_len
-                && u64::try_from(self.footer.delta_docs).ok() == Some(documents)
-                && u64::try_from(self.footer.delta_total_len).ok() == Some(total_len)
-        )
+        let segment = self.segment();
+        let (documents, total_len) = match (segment.role, segment.stats) {
+            (
+                SearchSegmentRole::Base,
+                SearchSegmentStats::Text {
+                    doc_count: SearchStatValue::Absolute(documents),
+                    total_len: SearchStatValue::Absolute(total_len),
+                    term_df_violation_count: 0,
+                },
+            ) => (documents, total_len),
+            (
+                SearchSegmentRole::Delta,
+                SearchSegmentStats::Text {
+                    doc_count: SearchStatValue::Delta(documents),
+                    total_len: SearchStatValue::Delta(total_len),
+                    term_df_violation_count: 0,
+                },
+            ) if segment
+                .event_ranges
+                .first()
+                .is_some_and(|range| range.start == 0) =>
+            {
+                match (u64::try_from(documents), u64::try_from(total_len)) {
+                    (Ok(documents), Ok(total_len)) => (documents, total_len),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        segment.suppress_count == 0
+            && segment.mutation_count == segment.live_payload_count
+            && segment.live_payload_count == documents
+            && documents == global.document_count
+            && documents == self.footer.doc_table.row_count
+            && total_len == global.total_document_len
+            && u64::try_from(self.footer.delta_docs).ok() == Some(documents)
+            && u64::try_from(self.footer.delta_total_len).ok() == Some(total_len)
     }
 
     async fn search_query_exact_with_block_max_fallback(
@@ -2370,6 +2386,28 @@ impl TextV4Reader {
             }
         }
         Ok(())
+    }
+
+    /// Dictionary entries of `terms` (absent terms omitted). Each term's
+    /// dictionary block is an independent ranged read, so they are resolved
+    /// concurrently: one at a time, a cold multi-term query paid one store
+    /// round trip per term before it could fetch a single posting.
+    async fn lookup_terms(&self, terms: &[String]) -> Result<BTreeMap<String, TermEntry>> {
+        use futures::{StreamExt, TryStreamExt};
+        const DICTIONARY_LOOKUP_FANOUT: usize = 16;
+        let found = futures::stream::iter(
+            terms
+                .iter()
+                .map(|term| async move { Ok::<_, Error>((term, self.lookup_term(term).await?)) })
+                .collect::<Vec<_>>(),
+        )
+        .buffered(DICTIONARY_LOOKUP_FANOUT)
+        .try_collect::<Vec<_>>()
+        .await?;
+        Ok(found
+            .into_iter()
+            .filter_map(|(term, entry)| entry.map(|entry| (term.clone(), entry)))
+            .collect())
     }
 
     async fn lookup_term(&self, term: &str) -> Result<Option<TermEntry>> {
