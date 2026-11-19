@@ -106,6 +106,13 @@ crates.io release will establish and document that API explicitly.
   one reused context per thread, positions are kept only for phrase terms,
   and each block's size is measured once when it loads. Scores and results
   are unchanged.
+- **Full-text posting lists are read ahead.** Postings of all query terms
+  are consumed together in document order, so each term fetched its posting
+  list one cache page at a time, each fetch a dependent object-store round
+  trip. A term whose next block is not resident now reads its following
+  contiguous blocks in the same request (up to 1 MiB per term and 8 MiB per
+  query, held in the search workspace reservation); blocks the block-max
+  scorer then skips are dropped unread.
 - **Full-text dictionary lookups run concurrently.** Each query term's
   dictionary block was fetched after the previous one, one object-store round
   trip per term before the first posting was read.

@@ -10,7 +10,7 @@
 //! the already-authenticated posting metadata.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 use std::io::{Cursor, Seek, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -553,6 +553,13 @@ struct PostingCursor {
     /// Other terms decode only their term frequencies: allocating a position
     /// list per posting dominated scoring of long documents.
     keep_positions: bool,
+    /// Compressed successor blocks `(block index, bytes)` read ahead with an
+    /// earlier block, in block order. See [`posting_readahead_bytes`].
+    prefetched: VecDeque<(usize, Bytes)>,
+    /// Bytes held in `prefetched`.
+    prefetched_bytes: usize,
+    /// Contiguous posting bytes this cursor reads per store round trip.
+    readahead_bytes: u64,
     next_posting: usize,
     /// When metadata skips a window ending inside the next block, discard
     /// decoded postings through this ordinal after the block is authenticated.
@@ -560,6 +567,31 @@ struct PostingCursor {
 }
 
 impl PostingCursor {
+    /// The read-ahead bytes of `block`, dropping any earlier (skipped) ones.
+    fn take_prefetched(&mut self, block: usize) -> Option<Bytes> {
+        while let Some((index, _)) = self.prefetched.front() {
+            if *index > block {
+                return None;
+            }
+            let (index, bytes) = self.prefetched.pop_front()?;
+            self.prefetched_bytes = self.prefetched_bytes.saturating_sub(bytes.len());
+            if index == block {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    fn push_prefetched(&mut self, block: usize, bytes: Bytes) {
+        self.prefetched_bytes = self.prefetched_bytes.saturating_add(bytes.len());
+        self.prefetched.push_back((block, bytes));
+    }
+
+    fn clear_prefetched(&mut self) {
+        self.prefetched = VecDeque::new();
+        self.prefetched_bytes = 0;
+    }
+
     fn set_postings(&mut self, postings: Vec<Posting>) {
         self.positions_bytes = postings
             .iter()
@@ -667,6 +699,12 @@ impl PostingCursor {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Posting>())
                     .saturating_add(self.positions_bytes),
+            )
+            .saturating_add(
+                self.prefetched
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, Bytes)>())
+                    .saturating_add(self.prefetched_bytes),
             )
     }
 }
@@ -1642,6 +1680,7 @@ impl TextV4Reader {
             );
         }
 
+        let cursor_count = entries.len();
         let mut cursors = entries
             .into_iter()
             .map(|(term, entry)| {
@@ -1649,6 +1688,7 @@ impl TextV4Reader {
                     .get(&term)
                     .ok_or_else(|| Error::invariant("text v4 IDF cache lost a term"))?;
                 let keep_positions = query.phrases.iter().flatten().any(|word| *word == term);
+                let readahead_bytes = posting_readahead_bytes(cursor_count);
                 Ok(PostingCursor {
                     term,
                     idf,
@@ -1658,6 +1698,9 @@ impl TextV4Reader {
                     postings: Vec::new(),
                     positions_bytes: 0,
                     keep_positions,
+                    prefetched: VecDeque::new(),
+                    prefetched_bytes: 0,
+                    readahead_bytes,
                     next_posting: 0,
                     skip_through: None,
                 })
@@ -1955,6 +1998,7 @@ impl TextV4Reader {
         }
 
         let mut unsafe_bounds = false;
+        let cursor_count = entries.len();
         let mut cursors = entries
             .into_iter()
             .map(|(term, entry)| {
@@ -1972,6 +2016,7 @@ impl TextV4Reader {
                     .collect::<Vec<_>>();
                 unsafe_bounds |= block_upper_bounds.is_empty();
                 let keep_positions = query.phrases.iter().flatten().any(|word| *word == term);
+                let readahead_bytes = posting_readahead_bytes(cursor_count);
                 Ok(PostingCursor {
                     term,
                     idf,
@@ -1981,6 +2026,9 @@ impl TextV4Reader {
                     postings: Vec::new(),
                     positions_bytes: 0,
                     keep_positions,
+                    prefetched: VecDeque::new(),
+                    prefetched_bytes: 0,
+                    readahead_bytes,
                     next_posting: 0,
                     skip_through: None,
                 })
@@ -2571,6 +2619,11 @@ impl TextV4Reader {
         }
 
         let mut jobs = Vec::<(usize, PostingBlockRef)>::with_capacity(cursor_indices.len());
+        let mut compressed_blocks = Vec::<Option<Bytes>>::with_capacity(cursor_indices.len());
+        // `(job, first block, last block, byte range)` of every cursor whose
+        // next block was not read ahead: one contiguous read each, all in
+        // one store round.
+        let mut reads = Vec::<(usize, usize, usize, Range<u64>)>::new();
         let mut previous = None;
         for &cursor_index in cursor_indices {
             if previous.is_some_and(|previous| previous >= cursor_index) {
@@ -2587,11 +2640,33 @@ impl TextV4Reader {
             // decoded successors at every boundary.
             cursor.set_postings(Vec::new());
             cursor.next_posting = 0;
-            let Some(reference) = cursor.blocks.get(cursor.next_block).cloned() else {
+            let block = cursor.next_block;
+            let Some(reference) = cursor.blocks.get(block).cloned() else {
+                cursor.clear_prefetched();
                 continue;
             };
             cursor.next_block += 1;
+            // Read-ahead blocks the block-max planner skipped are dropped.
+            let prefetched = cursor.take_prefetched(block);
+            if prefetched.is_none() {
+                let start = reference.wire.offset;
+                let mut range = reference.wire.range()?;
+                let mut last = block;
+                while let Some(next) = cursor.blocks.get(last + 1) {
+                    let next_range = next.wire.range()?;
+                    if next_range.start != range.end
+                        || next_range.end - start > cursor.readahead_bytes
+                        || last - block + 1 >= MAX_READAHEAD_BLOCKS
+                    {
+                        break;
+                    }
+                    range.end = next_range.end;
+                    last += 1;
+                }
+                reads.push((jobs.len(), block, last, range));
+            }
             jobs.push((cursor_index, reference));
+            compressed_blocks.push(prefetched);
         }
         if jobs.is_empty() {
             return Ok(0);
@@ -2600,16 +2675,47 @@ impl TextV4Reader {
             .checked_add(jobs.len())
             .ok_or_else(|| Error::invariant("text v4 fetched block count overflows"))?;
 
-        let ranges = jobs
+        let ranges = reads
             .iter()
-            .map(|(_, reference)| reference.wire.range())
-            .collect::<Result<Vec<_>>>()?;
-        let compressed_blocks = self.source.read_ranges(&ranges).await?;
-        if compressed_blocks.len() != jobs.len() {
+            .map(|(_, _, _, range)| range.clone())
+            .collect::<Vec<_>>();
+        let fetched = if ranges.is_empty() {
+            Vec::new()
+        } else {
+            self.source.read_ranges(&ranges).await?
+        };
+        if fetched.len() != ranges.len() {
             return Err(Error::invariant(
                 "text v4 source returned wrong posting block count",
             ));
         }
+        for ((job, first, last, range), bytes) in reads.into_iter().zip(fetched) {
+            if bytes.len() as u64 != range.end - range.start {
+                return Err(Error::invariant(
+                    "text v4 source returned a short posting read-ahead",
+                ));
+            }
+            let cursor_index = jobs[job].0;
+            let cursor = &mut cursors[cursor_index];
+            for block in first..=last {
+                let block_range = cursor.blocks[block].wire.range()?;
+                let slice = bytes.slice(
+                    (block_range.start - range.start) as usize
+                        ..(block_range.end - range.start) as usize,
+                );
+                if block == first {
+                    compressed_blocks[job] = Some(slice);
+                } else {
+                    cursor.push_prefetched(block, slice);
+                }
+            }
+        }
+        let compressed_blocks = compressed_blocks
+            .into_iter()
+            .map(|bytes| {
+                bytes.ok_or_else(|| Error::invariant("text v4 posting block was not read"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let retained_batch_bytes = jobs
             .capacity()
             .saturating_mul(std::mem::size_of::<(usize, PostingBlockRef)>())
@@ -2623,6 +2729,8 @@ impl TextV4Reader {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Bytes>()),
             )
+            // A read-ahead buffer is held by its slices: the current blocks
+            // here, the rest in their cursors' queues (counted there).
             .saturating_add(compressed_blocks.iter().map(Bytes::len).sum::<usize>());
         let mut largest_raw_bytes = 0usize;
         for ((cursor_index, reference), compressed) in jobs.into_iter().zip(compressed_blocks) {
@@ -3590,12 +3698,34 @@ fn phrases_match_cursors(doc: u64, phrases: &[Vec<String>], cursors: &[PostingCu
     })
 }
 
+/// Contiguous posting bytes one cursor reads per store round trip at most.
+/// Postings are consumed in document order across every query term, so
+/// without read-ahead each term paid one dependent round trip per cache page
+/// of its posting list.
+const POSTING_READAHEAD_MAX_BYTES: u64 = 1 << 20;
+/// Read-ahead budget shared by all cursors of one query.
+const POSTING_READAHEAD_TOTAL_BYTES: u64 = 8 << 20;
+/// Blocks one read-ahead covers at most (bounds the per-cursor queue).
+const MAX_READAHEAD_BLOCKS: usize = 64;
+
+fn posting_readahead_bytes(cursors: usize) -> u64 {
+    (POSTING_READAHEAD_TOTAL_BYTES / cursors.max(1) as u64).min(POSTING_READAHEAD_MAX_BYTES)
+}
+
 fn estimate_exact_search_workspace(
     entries: &BTreeMap<String, TermEntry>,
     groups: &[(String, Vec<SearchFilterValue>)],
     filters: &[FilterBlockRef],
     k: usize,
 ) -> Result<usize> {
+    // A cursor holds at most one read-ahead window beyond its current block.
+    let readahead = usize::try_from(posting_readahead_bytes(entries.len()))
+        .unwrap_or(usize::MAX)
+        .saturating_add(
+            MAX_READAHEAD_BLOCKS
+                .next_power_of_two()
+                .saturating_mul(std::mem::size_of::<(usize, Bytes)>()),
+        );
     let posting_bytes = entries.values().fold(0usize, |total, entry| {
         let largest = entry
             .blocks
@@ -3614,6 +3744,7 @@ fn estimate_exact_search_workspace(
             .unwrap_or(0);
         total
             .saturating_add(largest)
+            .saturating_add(readahead)
             .saturating_add(std::mem::size_of::<PostingCursor>())
             .saturating_add(std::mem::size_of::<usize>())
             .saturating_add(std::mem::size_of::<(usize, PostingBlockRef)>())
