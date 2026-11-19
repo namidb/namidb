@@ -924,6 +924,7 @@ fn build_text_segments(
         bytes[0] = 0x74;
         bytes[8..].copy_from_slice(&(segment_no as u64 + 1).to_be_bytes());
         let context = TextV4BuildContext {
+            analyzer: namidb_storage::text::TextAnalyzer::default(),
             sst_id: Uuid::from_bytes(bytes),
             event_ranges: vec![SearchEventRange::new(
                 segment_no as u64,
