@@ -515,18 +515,44 @@ impl WriterSession {
         let manifest_store = ManifestStore::new(store.clone(), paths.clone());
         let wal_store = WalStore::new(store.clone(), paths.clone());
 
-        let (current, fence) = match manifest_store.load_current().await {
+        let started = std::time::Instant::now();
+        let mut load_ms = 0u128;
+        let mut recovered_early = None;
+        let ((current, fence), listed) = match manifest_store.load_current().await {
             Ok(loaded) => {
-                crate::format::check_upgrade(&store, &paths, &loaded.manifest, upgrade).await?;
-                manifest_store
-                    .claim_writer_from(yield_above, Some(loaded))
-                    .await?
+                load_ms = started.elapsed().as_millis();
+                // The claim (a manifest commit) and the memtable recovery
+                // (snapshot and WAL reads) only share the manifest's WAL
+                // closure, so they run together on the loaded manifest. A
+                // claim that had to retry over a newer commit may carry a
+                // different closure; recovery then runs again on it below.
+                // The WAL listing stays behind the claim: only once this
+                // writer has fenced the previous one is the highest
+                // segment final.
+                let loaded_manifest = loaded.manifest.clone();
+                let claim = async {
+                    crate::format::check_upgrade(&store, &paths, &loaded.manifest, upgrade).await?;
+                    let claimed = manifest_store
+                        .claim_writer_from(yield_above, Some(loaded))
+                        .await?;
+                    let listed = wal_store.list_segments().await?;
+                    Ok::<_, Error>((claimed, listed))
+                };
+                let recover =
+                    recover_memtable_with_snapshot(&loaded_manifest, &wal_store, Some(&store));
+                let (claimed, recovered) = futures::join!(claim, recover);
+                let claimed = claimed?;
+                if claimed.0 .0.manifest.wal_segments == loaded_manifest.wal_segments {
+                    recovered_early = Some(recovered?);
+                }
+                claimed
             }
             Err(Error::ObjectStore(object_store::Error::NotFound { .. })) => {
                 let writer_id = Uuid::now_v7();
                 let loaded = manifest_store.bootstrap(writer_id).await?;
                 let fence = WriterFence::new(loaded.manifest.epoch);
-                (loaded, fence)
+                let listed = wal_store.list_segments().await?;
+                ((loaded, fence), listed)
             }
             Err(other) => return Err(other),
         };
@@ -534,8 +560,21 @@ impl WriterSession {
         // Cold-start fast path: if a memtable snapshot is present at
         // `paths.memtable_snapshot()`, seed the in-process memtable
         // from it and skip every WAL record it already covers.
-        let recovered =
-            recover_memtable_with_snapshot(&current.manifest, &wal_store, Some(&store)).await?;
+        let recovered = match recovered_early {
+            Some(recovered) => recovered,
+            None => {
+                recover_memtable_with_snapshot(&current.manifest, &wal_store, Some(&store)).await?
+            }
+        };
+        tracing::info!(
+            namespace = %paths.namespace(),
+            load_ms = load_ms as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            wal_segments = current.manifest.wal_segments.len(),
+            records_replayed = recovered.records_replayed,
+            used_snapshot = recovered.used_snapshot,
+            "opened namespace writer"
+        );
         // Rebase the LSN counter past the highest LSN durably held in any
         // SST, not just what recovery saw in the WAL + memtable snapshot.
         // Once a namespace flushes all its WAL into SSTs, `recovered.max_lsn`
@@ -558,7 +597,6 @@ impl WriterSession {
         // in the object store, not just those the manifest references.
         // Orphan segments (PUT but never committed) must not be
         // re-used because `PutMode::Create` would still refuse them.
-        let listed = wal_store.list_segments().await?;
         let next_wal_seq = listed.last().map(|r| r.seq.saturating_add(1)).unwrap_or(1);
 
         let SessionCaches {

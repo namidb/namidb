@@ -2033,7 +2033,7 @@ fn pinned_range_cache_error(location: &ObjectPath, error: RangeCacheError) -> cr
 /// a per-process counter. Any other store (`InMemory`, whose e_tags are
 /// per-instance counters, or a wrapper that does not show its backend) keeps
 /// a per-instance scope.
-fn cache_store_token(store: &Arc<dyn ObjectStore>) -> String {
+pub(crate) fn cache_store_token(store: &Arc<dyn ObjectStore>) -> String {
     const DURABLE_BACKENDS: [&str; 5] = [
         "AmazonS3",
         "LocalFileSystem",

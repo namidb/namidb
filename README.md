@@ -279,8 +279,19 @@ All three metrics are served from the index — `cosine` and `dot_product` (rank
 
 ```cypher
 CALL search.vector({label: 'Doc', property: 'embedding', query: $q, k: 5, ef: 200}) YIELD node, score;
+CALL search.vector({index: 'doc_emb', query: $q, k: 5}) YIELD node, score;
+CALL search.vector('doc_emb', 5, $q) YIELD node, score;
 CALL db.index.vector.queryNodes('doc_emb', 5, $q) YIELD node, score;
 ```
+
+The map form names the vectors either by `label` and `property` or by the
+index name in `index` (which also supplies the index's metric unless `metric`
+is given). Its options are `index`, `label`, `property`, `query`, `k`
+(default 10), `ef`, `metric` and `filter`; any other key is rejected with the
+accepted forms in the error, so a misspelt `filter` never runs unfiltered. The
+positional form `search.vector(indexName, k, queryVector [, {ef, filter}])` is
+the same call as `db.index.vector.queryNodes`. `YIELD *` binds every output
+column (`node`, `score`) under its own name; the search procedures and `db.index.vector.queryNodes` accept it.
 
 `search.vector`, `search.bm25`, `search.hybrid`, and
 `db.index.vector.queryNodes` all take an optional `filter` map. This is the
@@ -589,6 +600,10 @@ cache, and admission guarantees are specified in the
 | `NAMIDB_CACHE_MAX_BYTES` | `1073741824` (1 GiB) | Process-wide admission ceiling for cache-accounted payloads and metadata shared by SST, decoded, object-range page, node-view, and adjacency caches. `0` disables all shared caches; malformed values fail server startup. |
 | `NAMIDB_SEARCH_INDEX_CACHE_MAX_BYTES` | unset (proportional) | Exact-byte reservation, carved out of `NAMIDB_CACHE_MAX_BYTES`, for one shared decoded `.vg`/`.ft` eviction pool. Empty means unset; malformed values fail server startup. |
 | `NAMIDB_CACHE_PATH_REGISTRY_BUDGET_MIB` | `32` | Requested ceiling for SST path/admission metadata, including resident-path tracking and authoritative manifest rules. It is scaled inside `NAMIDB_CACHE_MAX_BYTES`; natural Foyer evictions remove their metadata synchronously, and exhaustion fails cache admission closed. |
+| `NAMIDB_EDGE_READER_CACHE_MAX_BYTES` | 1/32 of the cache budget, at most 64 MiB | Process-wide byte bound of opened edge-SST readers (footer and fence index) shared by every snapshot. `0` disables the shared cache. |
+| `NAMIDB_APPLY_CONCURRENCY` | `64` | Correlated subquery runs (`CALL { WITH ... }`) in flight at once, for subqueries whose per-row work is bounded (single-hop expansions, lookups by id, filters, projections, limits, per-row aggregation). `1` runs them one after the other. |
+| `NAMIDB_BACKGROUND_NICE` | `10` | Nice increment (0–19) of the threads that run compaction merges and search index builds, so queries get the CPU first. `0` keeps the normal priority. Linux only. |
+| `NAMIDB_PREOPEN_NAMESPACES` | unset | Multi-tenant only: comma-separated namespaces the server opens in the background at start (writer claim, recovery, metadata prefetch). Names without data are skipped, never created. |
 | `NAMIDB_RAM_PAGE_CACHE_MAX_BYTES` | `536870912` (512 MiB) requested, fitted proportionally into `NAMIDB_CACHE_MAX_BYTES` with the other tiers (about 15% of it) | Requested RAM assignment for immutable object-range pages, carved out of `NAMIDB_CACHE_MAX_BYTES` rather than added to it. Every paged read path — vector, full-text, property index and edge adjacency — serves point lookups from small ranges and benefits from this tier. In hybrid mode this includes both Foyer write buffers and a conservative bound for its persistent hash index; only the remainder is resident page capacity. |
 | `NAMIDB_NVME_CACHE_PATH` | unset | Enables the persistent local range-cache tier. Must be paired with `NAMIDB_NVME_CACHE_MAX_BYTES`; the directory is process-exclusive and reconstructible from object storage. |
 | `NAMIDB_NVME_CACHE_MAX_BYTES` | unset | Exact Foyer filesystem-device capacity. It is independent of the RAM ceiling and never defaults to a percentage of the filesystem. |

@@ -27,6 +27,7 @@ namidb-ann = { workspace = true, optional = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+libc = { workspace = true }
 object_store = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

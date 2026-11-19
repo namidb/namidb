@@ -278,6 +278,32 @@ impl NamespaceRegistry {
         state
     }
 
+    /// The registry's namespace limit (0 = unlimited).
+    pub fn max_namespaces(&self) -> usize {
+        self.max_namespaces
+    }
+
+    /// Open `namespace` only when it already holds a manifest: unlike
+    /// [`Self::get_or_open`], an unknown name is never bootstrapped.
+    /// `Ok(None)` when there is nothing to open.
+    pub async fn open_existing(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<Arc<NamespaceState>>, RegistryError> {
+        let ns_id = NamespaceId::new(namespace)
+            .map_err(|e| RegistryError::InvalidNamespace(e.to_string()))?;
+        let paths = NamespacePaths::new(&self.root, ns_id);
+        let listing = self
+            .store
+            .list_with_delimiter(Some(&paths.manifest_dir()))
+            .await
+            .map_err(|error| RegistryError::OpenFailed(error.to_string()))?;
+        if listing.objects.is_empty() && listing.common_prefixes.is_empty() {
+            return Ok(None);
+        }
+        self.get_or_open(namespace).await.map(Some)
+    }
+
     /// Get or create a `NamespaceState` for `namespace`. Returns an error
     /// if the namespace ID is invalid.
     ///
@@ -1170,6 +1196,7 @@ fn spawn_metadata_prefetch(state: &Arc<NamespaceState>) {
                 Ok(summary) => tracing::info!(
                     namespace = %namespace,
                     node_ssts = summary.node_ssts,
+                    edge_ssts = summary.edge_ssts,
                     node_record_pages = summary.node_record_pages,
                     vector_indexes = summary.vector_indexes,
                     text_indexes = summary.text_indexes,
