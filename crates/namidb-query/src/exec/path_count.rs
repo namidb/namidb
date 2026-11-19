@@ -68,6 +68,61 @@ fn weights_with_capacity(n: usize) -> Weights {
     Weights::with_capacity_and_hasher(n, IdBuild::default())
 }
 
+/// Heap bytes of a weight map: a `(NodeId, u64)` slot plus a control byte
+/// per bucket at the 7/8 load factor, rounded up.
+fn weights_bytes(w: &Weights) -> usize {
+    w.capacity().saturating_mul(32)
+}
+
+const PAIR_BYTES: usize = std::mem::size_of::<(NodeId, NodeId)>();
+
+/// The fold's working state (oriented edge lists beyond what storage
+/// already charged, weight maps, id batches), charged to the query's memory
+/// budget. The check counts the storage-retained edge pairs as well, so a
+/// grouped count over a graph larger than the budget fails with a memory
+/// error instead of growing past it. Inactive (free) without a budget.
+struct StateMeter {
+    active: bool,
+    bytes: usize,
+    checked: usize,
+}
+
+impl StateMeter {
+    fn new() -> Self {
+        Self {
+            active: crate::exec::memory::memory_scoped(),
+            bytes: 0,
+            checked: 0,
+        }
+    }
+
+    fn add(&mut self, bytes: usize) -> Result<(), ExecError> {
+        if !self.active {
+            return Ok(());
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes - self.checked >= crate::exec::memory::METER_FLUSH_BYTES {
+            self.checked = self.bytes;
+            crate::exec::memory::check_transient_over_storage(self.bytes)?;
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_sub(bytes);
+        self.checked = self.checked.min(self.bytes);
+    }
+
+    /// Account `w` growing from `before` bytes to its current size.
+    fn grew(&mut self, before: usize, w: &Weights) -> Result<usize, ExecError> {
+        let now = weights_bytes(w);
+        if now > before {
+            self.add(now - before)?;
+        }
+        Ok(now)
+    }
+}
+
 fn overflow() -> ExecError {
     ExecError::Runtime("path count overflowed a 64-bit integer".into())
 }
@@ -76,20 +131,32 @@ fn overflow() -> ExecError {
 /// `nodes[i]` (near) to `nodes[i + 1]` (far). An undirected hop yields each
 /// edge in both orientations except a self-loop, which the undirected
 /// `Expand` also yields once.
+///
+/// Storage charges the pairs it returns while it reads them; the meter is
+/// charged for the second orientation of an undirected hop as it is built.
+/// The caller then moves the whole edge lists' charge onto the meter.
 async fn hop_pairs(
     snapshot: &Snapshot<'_>,
     hop: &PathCountHop,
+    meter: &mut StateMeter,
 ) -> Result<Vec<(NodeId, NodeId)>, ExecError> {
     let types = resolve_edge_types(snapshot, hop.edge_type.as_deref());
-    let mut out = Vec::new();
+    let mut out: Vec<(NodeId, NodeId)> = Vec::new();
     let mut probe = crate::exec::limits::DeadlineProbe::new();
     for et in &types {
         let pairs = snapshot.live_edge_pairs(et).await?;
         match hop.direction {
+            RelationshipDirection::Right if out.is_empty() => out = pairs,
             RelationshipDirection::Right => out.extend(pairs),
+            RelationshipDirection::Left if out.is_empty() => {
+                // Same layout, so the collect reuses the buffer in place.
+                out = pairs.into_iter().map(|(s, d)| (d, s)).collect();
+            }
             RelationshipDirection::Left => out.extend(pairs.into_iter().map(|(s, d)| (d, s))),
             RelationshipDirection::Both => {
+                let before = out.capacity();
                 out.reserve(pairs.len() * 2);
+                meter.add((out.capacity() - before).saturating_mul(PAIR_BYTES))?;
                 for (s, d) in pairs {
                     probe.tick()?;
                     out.push((s, d));
@@ -126,6 +193,7 @@ async fn keep_members(
     snapshot: &Snapshot<'_>,
     node: &PathCountNode,
     raw: Weights,
+    meter: &mut StateMeter,
 ) -> Result<Weights, ExecError> {
     if raw.is_empty() {
         return Ok(raw);
@@ -154,6 +222,7 @@ async fn keep_members(
         let views = scan_node_views(snapshot, scan_label, &[], Some(&[]), None).await?;
         let mut probe = crate::exec::limits::DeadlineProbe::new();
         let mut out = weights_with_capacity(raw.len().min(views.len()));
+        meter.add(weights_bytes(&out))?;
         for view in views {
             probe.tick()?;
             if let Some(w) = raw.get(&view.id) {
@@ -162,14 +231,36 @@ async fn keep_members(
                 }
             }
         }
+        // The scanned views are gone; only `out` (charged above) remains.
+        crate::exec::memory::release_storage_rows();
         return Ok(out);
     }
     let ids: Vec<NodeId> = raw.keys().copied().collect();
-    match prepare_expand_targets(snapshot, &node.labels, &ids, true, false, false).await? {
-        ExpandTargets::Membership(live) => Ok(raw
-            .into_iter()
-            .filter(|(id, _)| live.get(id).copied().unwrap_or(false))
-            .collect()),
+    let ids_bytes = ids.capacity().saturating_mul(std::mem::size_of::<NodeId>());
+    meter.add(ids_bytes)?;
+    let proven = prepare_expand_targets(snapshot, &node.labels, &ids, true, false, false).await?;
+    drop(ids);
+    meter.release(ids_bytes);
+    // Whatever the proof read is dropped; its membership map is charged
+    // below.
+    crate::exec::memory::release_storage_rows();
+    match proven {
+        ExpandTargets::Membership(live) => {
+            // The membership map is as large as the batch; it lives until
+            // the filter below has run.
+            let live_bytes = live.capacity().saturating_mul(32);
+            meter.add(live_bytes)?;
+            let mut out = weights_with_capacity(0);
+            let mut held = 0usize;
+            for (id, w) in raw {
+                if live.get(&id).copied().unwrap_or(false) {
+                    out.insert(id, w);
+                    held = meter.grew(held, &out)?;
+                }
+            }
+            meter.release(live_bytes);
+            Ok(out)
+        }
         _ => Err(ExecError::Runtime(
             "path count endpoint proof returned materialised views".into(),
         )),
@@ -182,6 +273,7 @@ async fn keep_members(
 async fn scan_multiplicity(
     snapshot: &Snapshot<'_>,
     node: &PathCountNode,
+    meter: &mut StateMeter,
 ) -> Result<Weights, ExecError> {
     let views = scan_node_views(
         snapshot,
@@ -192,42 +284,61 @@ async fn scan_multiplicity(
     )
     .await?;
     let mut out = Weights::default();
+    let mut held = 0usize;
     for view in views {
         if node.labels.iter().all(|l| view.labels.contains(l)) {
             *out.entry(view.id).or_insert(0) += 1;
+            held = meter.grew(held, &out)?;
         }
     }
+    crate::exec::memory::release_storage_rows();
     Ok(out)
 }
 
 /// Apply node `i`'s filter to a weight map (drop failing ids). Node 0 with
 /// predicates multiplies by its scan multiplicity instead.
+///
+/// The input map's bytes are released once it is consumed; the result's
+/// stay charged (the caller releases them when it drops the map).
 async fn filter_weights(
     snapshot: &Snapshot<'_>,
     node: &PathCountNode,
     is_head: bool,
     raw: Weights,
+    meter: &mut StateMeter,
 ) -> Result<Weights, ExecError> {
-    if is_head && !node.predicates.is_empty() {
-        let mult = scan_multiplicity(snapshot, node).await?;
+    let raw_bytes = weights_bytes(&raw);
+    let out = if is_head && !node.predicates.is_empty() {
+        let mult = scan_multiplicity(snapshot, node, meter).await?;
+        let mult_bytes = weights_bytes(&mult);
         let mut out = weights_with_capacity(raw.len().min(mult.len()));
+        meter.add(weights_bytes(&out))?;
         for (id, w) in raw {
             if let Some(m) = mult.get(&id) {
                 out.insert(id, w.checked_mul(*m).ok_or_else(overflow)?);
             }
         }
-        return Ok(out);
-    }
-    keep_members(snapshot, node, raw).await
+        meter.release(mult_bytes);
+        out
+    } else {
+        keep_members(snapshot, node, raw, meter).await?
+    };
+    meter.release(raw_bytes);
+    Ok(out)
 }
 
 /// Fold one hop: `out(near) += w(far)` over `(near, far)` pairs.
+///
+/// The result's bytes are charged to `meter` as it grows (a rehash is the
+/// only growth), so an oversized fold stops mid-flight.
 fn fold(
     pairs: &[(NodeId, NodeId)],
     from_far: &Weights,
     toward_near: bool,
+    meter: &mut StateMeter,
 ) -> Result<Weights, ExecError> {
     let mut out = Weights::default();
+    let mut held = 0usize;
     let mut probe = crate::exec::limits::DeadlineProbe::new();
     for &(near, far) in pairs {
         probe.tick()?;
@@ -239,6 +350,9 @@ fn fold(
         if let Some(w) = from_far.get(&src) {
             let slot = out.entry(dst).or_insert(0);
             *slot = slot.checked_add(*w).ok_or_else(overflow)?;
+            if out.capacity() * 32 != held {
+                held = meter.grew(held, &out)?;
+            }
         }
     }
     Ok(out)
@@ -246,12 +360,20 @@ fn fold(
 
 /// The initial (unfiltered) weight map of the endpoint node on one side:
 /// every id that appears on that side of the adjacent hop, weight 1.
-fn endpoint_ones(pairs: &[(NodeId, NodeId)], far_side: bool) -> Weights {
+fn endpoint_ones(
+    pairs: &[(NodeId, NodeId)],
+    far_side: bool,
+    meter: &mut StateMeter,
+) -> Result<Weights, ExecError> {
     let mut out = Weights::default();
+    let mut held = 0usize;
     for &(near, far) in pairs {
         out.insert(if far_side { far } else { near }, 1);
+        if out.capacity() * 32 != held {
+            held = meter.grew(held, &out)?;
+        }
     }
-    out
+    Ok(out)
 }
 
 /// Execute a `PathCount` leaf. See the module docs.
@@ -270,21 +392,35 @@ pub(crate) async fn execute_path_count(
     }
     // Every hop's topology, read once. Hop type sets are disjoint (the
     // rewrite requires it for chains), so no type is read twice.
+    let mut meter = StateMeter::new();
     let mut pairs: Vec<Vec<(NodeId, NodeId)>> = Vec::with_capacity(k);
     for hop in hops {
-        pairs.push(hop_pairs(snapshot, hop).await?);
+        pairs.push(hop_pairs(snapshot, hop, &mut meter).await?);
     }
+    // Storage charged the edge lists while it read them, and keeps that
+    // charge until the operator settles. Move it onto the meter (which
+    // releases as the fold drops state) so later reads (endpoint proofs)
+    // are not charged on top of lists they replaced.
+    meter.release(meter.bytes);
+    crate::exec::memory::release_storage_rows();
+    let held: usize = pairs
+        .iter()
+        .map(|p| p.capacity().saturating_mul(PAIR_BYTES))
+        .sum();
+    meter.add(held)?;
     let g = group.unwrap_or(0);
 
     // Right fold: tail (node k) back to node g. `right` ends as the
     // UNFILTERED sum at node g (g's filter is applied at emission).
     let right: Option<Weights> = if g < k {
-        let mut w = endpoint_ones(&pairs[k - 1], true);
-        w = filter_weights(snapshot, &nodes[k], k == 0, w).await?;
+        let mut w = endpoint_ones(&pairs[k - 1], true, &mut meter)?;
+        w = filter_weights(snapshot, &nodes[k], k == 0, w, &mut meter).await?;
         for i in (g..k).rev() {
-            w = fold(&pairs[i], &w, true)?;
+            let prev = weights_bytes(&w);
+            w = fold(&pairs[i], &w, true, &mut meter)?;
+            meter.release(prev);
             if i > g {
-                w = filter_weights(snapshot, &nodes[i], i == 0, w).await?;
+                w = filter_weights(snapshot, &nodes[i], i == 0, w, &mut meter).await?;
             }
         }
         Some(w)
@@ -293,12 +429,14 @@ pub(crate) async fn execute_path_count(
     };
     // Left fold: head (node 0) forward to node g, same convention.
     let left: Option<Weights> = if g > 0 {
-        let mut w = endpoint_ones(&pairs[0], false);
-        w = filter_weights(snapshot, &nodes[0], true, w).await?;
+        let mut w = endpoint_ones(&pairs[0], false, &mut meter)?;
+        w = filter_weights(snapshot, &nodes[0], true, w, &mut meter).await?;
         for (i, hop_pairs) in pairs.iter().enumerate().take(g) {
-            w = fold(hop_pairs, &w, false)?;
+            let prev = weights_bytes(&w);
+            w = fold(hop_pairs, &w, false, &mut meter)?;
+            meter.release(prev);
             if i + 1 < g {
-                w = filter_weights(snapshot, &nodes[i + 1], false, w).await?;
+                w = filter_weights(snapshot, &nodes[i + 1], false, w, &mut meter).await?;
             }
         }
         Some(w)
@@ -309,6 +447,7 @@ pub(crate) async fn execute_path_count(
         (Some(l), Some(r)) => {
             let (small, big) = if l.len() <= r.len() { (l, r) } else { (r, l) };
             let mut out = weights_with_capacity(small.len());
+            meter.add(weights_bytes(&out))?;
             for (id, a) in small {
                 if let Some(b) = big.get(&id) {
                     out.insert(id, a.checked_mul(*b).ok_or_else(overflow)?);
@@ -324,7 +463,7 @@ pub(crate) async fn execute_path_count(
 
     let Some(g) = group else {
         // Global count: node 0's filter, then the total.
-        let filtered = filter_weights(snapshot, group_node, true, weights).await?;
+        let filtered = filter_weights(snapshot, group_node, true, weights, &mut meter).await?;
         let mut total: u64 = 0;
         for w in filtered.values() {
             total = total.checked_add(*w).ok_or_else(overflow)?;

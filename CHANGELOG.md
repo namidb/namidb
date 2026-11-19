@@ -77,7 +77,10 @@ crates.io release will establish and document that API explicitly.
   traversal proved them, so the result is unchanged; property-based
   differential tests compare it with the naive plan over randomized graphs
   with deletes, self-loops, multi-label nodes and unflushed edges.
-  `NAMIDB_PATH_COUNT=0` turns the rewrite off. Aggregations that only
+  `NAMIDB_PATH_COUNT=0` turns the rewrite off. The fold's working state
+  (edge lists, per-node path counts) is charged to the query's memory
+  budget, so a count over a graph larger than the budget fails with a
+  memory error instead of growing past it. Aggregations that only
   `count`/`sum` now fold each group as rows arrive rather than retaining
   their input.
 - **Anchor choice no longer depends on how the pattern is written.**
@@ -268,6 +271,13 @@ crates.io release will establish and document that API explicitly.
   `tombstone_node` API) could make the bidirectional search return a path
   through a node that no longer exists. The returned path's interior is now
   proven to exist; a dead node is excluded and the search re-run.
+- **Zero-hop variable-length matches read every property they return.** In
+  `MATCH (x)-[:R*0..2]->(d:Doc) WHERE d.k = 3 RETURN x.name`, the zero-hop
+  row binds `d` to `x`'s own node, but `x`'s scan decoded only the columns
+  read through `x`; a property read only through `d` (or the other way
+  round) came back NULL, so filters on it dropped rows or returned NULLs.
+  The two ends of a variable-length hop that can match at zero hops
+  (a minimum of 0 or a parameter) now decode the union of their columns.
 
 ## [3.5.1] - 2026-11-18
 

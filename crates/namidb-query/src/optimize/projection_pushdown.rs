@@ -61,6 +61,38 @@ impl RequiredSet {
             .or_insert(RequiredProps::All);
     }
 
+    /// Give every alias in each `(a, b)` pair the union of both aliases'
+    /// requirements, to a fixpoint (pairs can chain: `a*0..`b`*0..`c`).
+    fn unify(&mut self, pairs: &[(String, String)]) {
+        if pairs.is_empty() {
+            return;
+        }
+        loop {
+            let mut changed = false;
+            for (a, b) in pairs {
+                let merged = match (self.by_alias.get(a), self.by_alias.get(b)) {
+                    (None, None) => continue,
+                    (Some(x), None) | (None, Some(x)) => x.clone(),
+                    (Some(RequiredProps::All), _) | (_, Some(RequiredProps::All)) => {
+                        RequiredProps::All
+                    }
+                    (Some(RequiredProps::Set(x)), Some(RequiredProps::Set(y))) => {
+                        RequiredProps::Set(x.union(y).cloned().collect())
+                    }
+                };
+                for alias in [a, b] {
+                    if self.by_alias.get(alias) != Some(&merged) {
+                        self.by_alias.insert(alias.clone(), merged.clone());
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     /// The binding is used, but only through structural columns (its id
     /// and labels), which every scan decodes regardless of the projection.
     fn record_touch(&mut self, alias: &str) {
@@ -81,7 +113,34 @@ pub fn apply_projection_pushdown(plan: LogicalPlan) -> LogicalPlan {
 fn compute_required(plan: &LogicalPlan) -> RequiredSet {
     let mut req = RequiredSet::default();
     collect_from_plan(plan, &mut req);
+    let mut shared = Vec::new();
+    collect_zero_hop_aliases(plan, &mut shared);
+    req.unify(&shared);
     req
+}
+
+/// `(source, target)` alias pairs of every variable-length Expand that may
+/// match at zero hops (`*0..n`, or a parameter minimum). The zero-hop row
+/// binds the target to the source's own node value, so whatever projection
+/// the source's scan decoded is all the target can read: the two aliases
+/// must share one requirement set. A back-reference target is bound
+/// upstream and keeps its own value.
+fn collect_zero_hop_aliases(plan: &LogicalPlan, out: &mut Vec<(String, String)>) {
+    if let LogicalPlan::Expand {
+        source,
+        target_alias,
+        length: Some(length),
+        back_reference: false,
+        ..
+    } = plan
+    {
+        if length.min == 0 || length.min_param.is_some() {
+            out.push((source.clone(), target_alias.clone()));
+        }
+    }
+    for child in plan.children() {
+        collect_zero_hop_aliases(child, out);
+    }
 }
 
 /// Walk the entire plan, harvesting every expression's property
@@ -932,6 +991,44 @@ mod tests {
         assert_eq!(
             scan_projection("MATCH (n:L) RETURN id(n) AS i, n.name AS name", "n"),
             Some(vec!["name".to_string()])
+        );
+    }
+
+    #[test]
+    fn zero_hop_var_length_shares_one_projection() {
+        // At zero hops `x` is `d`'s own value, so `d`'s scan must decode
+        // what either alias reads.
+        let cols = |v: &[&str]| Some(v.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            scan_projection(
+                "MATCH (d:B) WHERE d.k = 4 MATCH (d)-[:R*0..1]-(x) RETURN x.name AS x",
+                "d"
+            ),
+            cols(&["id", "k", "name"])
+        );
+        assert_eq!(
+            scan_projection(
+                "MATCH (x)-[:R*0..2]->(d:A) WHERE d.k = 3 RETURN x.name AS x",
+                "x"
+            ),
+            cols(&["id", "k", "name"])
+        );
+        assert_eq!(
+            scan_projection("MATCH (d:B)-[:R*$lo..1]-(x) RETURN x.name AS x", "d"),
+            cols(&["id", "name"])
+        );
+        // A bare far alias needs every column of the near scan.
+        assert_eq!(
+            scan_projection("MATCH (d:B)-[:R*0..1]-(x) RETURN d.k AS k, x", "d"),
+            None
+        );
+        // One or more hops: the far end is fetched on its own.
+        assert_eq!(
+            scan_projection(
+                "MATCH (d:B)-[:R*1..2]-(x) RETURN d.k AS k, x.name AS n",
+                "d"
+            ),
+            cols(&["id", "k"])
         );
     }
 

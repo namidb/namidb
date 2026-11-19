@@ -359,11 +359,35 @@ async fn anchored_patterns_match_naive() {
         "MATCH (x)-[:R]->(d) WHERE elementId(d) = $hub RETURN x.name AS x",
         "MATCH (x)-[:R*1..2]->(d) WHERE elementId(d) = $hub RETURN count(DISTINCT x) AS c",
         "MATCH (d) WHERE elementId(d) = $hub MATCH (d)<-[:R*1..2]-(x) RETURN count(DISTINCT x) AS c",
+        // Zero-hop rows bind the far alias to the near node's own value, so
+        // both aliases must decode the union of their read properties.
+        "MATCH (x)-[:R*0..1]-(d:B) WHERE d.k = 4 RETURN x.name AS x",
+        "MATCH (d:B) WHERE d.k = 4 MATCH (d)-[:R*0..1]-(x) RETURN x.name AS x",
+        "MATCH (x)-[:R*0..2]->(d:A) WHERE d.k = 3 RETURN x.name AS x",
+        "MATCH (x:B)-[:R*0..2]->(d:A) WHERE x.k > 0 RETURN d.name AS d",
+        "MATCH (x)-[:R*0..1]->(y)-[:S*0..1]->(d:C) WHERE d.k = 0 RETURN x.name AS x",
+        "MATCH (x)-[:R*$lo..1]-(d:B) WHERE d.k = 4 RETURN x.name AS x",
+        // Further anchored shapes: exact length, left starred, path-bound
+        // starred (never inverted), filtered far side, OR / IN / param pins,
+        // DISTINCT and OPTIONAL.
+        "MATCH (x)-[:R*2..2]->(d:A {k: 1}) RETURN x.name AS x, d.name AS d",
+        "MATCH (x)<-[:R*1..3]-(d:A {k: 2}) RETURN x.name AS x",
+        "MATCH p=(x)-[:R*1..2]->(d:A {k: 2}) RETURN length(p) AS l, [n IN nodes(p) | n.name] AS ns",
+        "MATCH (x)-[:R*1..2]->(d:A {k: 2}) WHERE x.k > 1 RETURN x.name AS x",
+        "MATCH (y:C)-[:S]->(x)-[:R*1..2]->(d:A {k: 2}) RETURN y.name AS y, x.name AS x",
+        "MATCH (x)-[:R]->(d:A) WHERE d.name = 'ley' OR d.k = 1 RETURN x.name AS x, d.name AS d",
+        "MATCH (x)-[:R]->(d:A) WHERE d.name = $n RETURN x.name AS x",
+        "MATCH (x)-[:R]->(d:A) WHERE d.k = x.k RETURN x.name AS x",
+        "MATCH (x)-[:R]->(d:A) WHERE d.k IN [1, 2] RETURN x.name AS x, d.k AS dk",
+        "MATCH (x)-[:R]->(d:A) WHERE d.k = 2 RETURN DISTINCT x.k AS x",
+        "OPTIONAL MATCH (x)-[:R]->(d:A {k: 9}) RETURN x, d",
     ];
     for seed in 0..SEEDS {
         let g = graph(seed).await;
         let mut params = Params::new();
         params.insert("hub".into(), RuntimeValue::String(g.hub.to_string()));
+        params.insert("lo".into(), RuntimeValue::Integer(0));
+        params.insert("n".into(), RuntimeValue::String("decreto".into()));
         for q in cases {
             check(&g, seed, q, &params, Order::Any).await;
         }

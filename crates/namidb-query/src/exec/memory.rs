@@ -561,6 +561,24 @@ pub(crate) fn check_transient(extra: usize) -> Result<(), ExecError> {
     }
 }
 
+/// [`check_transient`] for an operator whose working state sits beside rows
+/// a storage read kept for it (an edge list it folds, say): the check counts
+/// those storage bytes too, so neither tally can hide the other.
+pub(crate) fn check_transient_over_storage(extra: usize) -> Result<(), ExecError> {
+    match with_budget(|budget| {
+        let storage = budget.storage_bytes.load(Ordering::Acquire);
+        budget.ensure(
+            budget
+                .used_bytes()
+                .saturating_add(storage)
+                .saturating_add(extra),
+        )
+    }) {
+        Some(Err(exceeded)) => Err(ExecError::MemoryLimit(exceeded)),
+        _ => Ok(()),
+    }
+}
+
 /// How an operator's output relates to its inputs, for [`settle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputKind {
