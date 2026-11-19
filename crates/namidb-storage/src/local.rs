@@ -721,7 +721,7 @@ mod tests {
     /// suffix get exactly `LocalFileSystem`'s outcome (they fall back).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn edge_ranges_match_local_file_system() {
-        use object_store::{GetRange, ObjectStoreExt};
+        use object_store::GetRange;
         let dir = tempdir().unwrap();
         let ours = LocalFileObjectStore::new(dir.path()).unwrap();
         let reference = LocalFileSystem::new_with_prefix(dir.path()).unwrap();

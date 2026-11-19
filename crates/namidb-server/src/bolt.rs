@@ -3194,25 +3194,20 @@ mod tests {
         assert!(state.writer.try_lock().is_ok());
 
         // Request decode outside a transaction waits in line for headroom.
-        // Pressure here comes from other requests' reservations: a ceiling
-        // a little above what is resident, almost all of it reserved, so a
-        // message's projected decode memory does not fit (but would fit an
-        // empty ceiling, so it is not refused as hopeless).
+        // A fixed 8 MiB resident set (other tests in this process move the
+        // real one) under a ceiling half a message above it: a message's
+        // projected decode memory does not fit, yet it would fit an empty
+        // ceiling, so it is not refused as hopeless.
         let (store, paths) = namidb_storage::parse_uri("memory://bolt-decode-wait").unwrap();
         let writer = namidb_storage::WriterSession::open(store, paths)
             .await
             .unwrap();
         let projected = MessageMemoryBudget::estimated_bytes_for_wire(64);
-        let resident = namidb_query::process_resident_bytes().expect("resident sample");
-        let ceiling = resident + 64 * projected;
         let crowded = Arc::new(
-            crate::memory::MemoryGovernor::new(ceiling)
-                .with_admission_wait(Duration::from_millis(300)),
+            crate::memory::MemoryGovernor::new((8 << 20) + projected / 2)
+                .with_admission_wait(Duration::from_millis(300))
+                .with_resident_sampler(|| Some(8 << 20)),
         );
-        let _others = crowded
-            .reserve_query_headroom(63 * projected + projected / 2)
-            .await
-            .expect("room for the other requests");
         let backend = ServerBackend::new(
             AppState::new(writer, None, "bolt-decode-wait".into())
                 .with_memory_governor(Arc::clone(&crowded)),

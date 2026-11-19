@@ -301,6 +301,9 @@ pub struct MemoryGovernor {
     /// straight into 503s even though the running queries were about to
     /// finish and give their memory back; queued work now waits for that.
     admission_wait: Duration,
+    /// How resident memory is sampled; a fixed value in tests, where other
+    /// tests sharing the process move the real resident set at random.
+    resident_sampler: fn() -> Option<usize>,
 }
 
 /// RAII reservation against [`MemoryGovernor`]'s total-memory ceiling.
@@ -351,6 +354,7 @@ impl MemoryGovernor {
             query_memory_pool: None,
             query_memory_process_stops: AtomicU64::new(0),
             admission_wait: Duration::ZERO,
+            resident_sampler: sample_resident_bytes,
         }
         .with_query_memory_max_bytes(percent(max_bytes, AUTO_QUERY_MEMORY_PERCENT))
     }
@@ -378,6 +382,14 @@ impl MemoryGovernor {
     /// refused on the first over-ceiling sample (builder style).
     pub fn with_admission_wait(mut self, wait: Duration) -> Self {
         self.admission_wait = wait;
+        self
+    }
+
+    /// Sample resident memory with `sampler` instead of the process's real
+    /// resident set (tests in a shared process need a stable value).
+    #[doc(hidden)]
+    pub fn with_resident_sampler(mut self, sampler: fn() -> Option<usize>) -> Self {
+        self.resident_sampler = sampler;
         self
     }
 
@@ -479,7 +491,7 @@ impl MemoryGovernor {
     /// Resident-memory probe for a running query: `Some((resident, max))`
     /// when the process is at or above its ceiling.
     fn probe_running_query(&self) -> Option<(usize, usize)> {
-        let resident = sample_resident_bytes()?;
+        let resident = (self.resident_sampler)()?;
         self.resident_bytes.store(resident, Ordering::Relaxed);
         if resident < self.max_bytes {
             return None;
@@ -821,7 +833,7 @@ impl MemoryGovernor {
     }
 
     fn observe_resident(&self) -> Option<usize> {
-        let resident = sample_resident_bytes()?;
+        let resident = (self.resident_sampler)()?;
         self.resident_bytes.store(resident, Ordering::Relaxed);
         if resident <= self.resume_bytes {
             self.pressure_active.store(false, Ordering::Release);
@@ -1060,7 +1072,7 @@ impl MemoryGovernor {
 
     /// Refresh the resident-byte gauge without applying admission/reclaim.
     pub fn sample(&self) -> Option<usize> {
-        let resident = sample_resident_bytes()?;
+        let resident = (self.resident_sampler)()?;
         self.resident_bytes.store(resident, Ordering::Relaxed);
         Some(resident)
     }
