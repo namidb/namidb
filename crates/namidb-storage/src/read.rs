@@ -10536,14 +10536,18 @@ impl<'mt> Snapshot<'mt> {
         result
     }
 
+    /// Freshness gate shared by every read served from full-text index
+    /// `index_name`: `None` when the memtable/overlay holds a live document
+    /// delta for the indexed corpus (only the exact scan is correct then),
+    /// otherwise the ids of fresh rows that may shadow an indexed document
+    /// (tombstones and possible relabels), which the index must prove absent.
     #[cfg(feature = "text-index")]
-    async fn text_search_inner(
+    async fn text_index_dirty_ids(
         &self,
         index_name: &str,
         label: &str,
-        query: &crate::text::TextQuery,
-        k: Option<usize>,
-    ) -> Result<Option<Vec<(NodeId, f64)>>> {
+        analyzer: crate::text::TextAnalyzer,
+    ) -> Result<Option<Vec<[u8; 16]>>> {
         // The index answers only queries analyzed the way it was built: a
         // query parsed with another analyzer takes the exact flat scan.
         if !self
@@ -10554,7 +10558,7 @@ impl<'mt> Snapshot<'mt> {
             .any(|descriptor| {
                 descriptor.name == index_name
                     && descriptor.label == label
-                    && descriptor.effective_analyzer() == query.analyzer
+                    && descriptor.effective_analyzer() == analyzer
             })
         {
             return Ok(None);
@@ -10600,6 +10604,56 @@ impl<'mt> Snapshot<'mt> {
             }
         }
 
+        Ok(Some(dirty))
+    }
+
+    /// Corpus-wide BM25 statistics of `query` from full-text index
+    /// `index_name`, under the same freshness gate as [`Self::text_search`]:
+    /// the query with its prefixes expanded exactly as the index expands
+    /// them, plus the document count, total length and per-term document
+    /// frequencies. Lets the executor score a small candidate set exactly as
+    /// the index would without scanning the corpus for statistics. `None`
+    /// when the index cannot serve the query (stale, legacy layout, corrupt).
+    #[cfg(feature = "text-index")]
+    pub async fn text_query_corpus_stats(
+        &self,
+        index_name: &str,
+        label: &str,
+        query: &crate::text::TextQuery,
+    ) -> Result<
+        Option<(
+            crate::text::TextQuery,
+            crate::sst::text::v4::TextV4GlobalStats,
+        )>,
+    > {
+        let Some(dirty) = self
+            .text_index_dirty_ids(index_name, label, query.analyzer)
+            .await?
+        else {
+            return Ok(None);
+        };
+        match search_lsm_read::text_query_stats(self, index_name, query, &dirty).await {
+            Ok(search_lsm_read::ActiveSearch::Ready(stats)) => Ok(Some(stats)),
+            Ok(_) => Ok(None),
+            Err(error) if optional_accelerator_fallback(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "text-index")]
+    async fn text_search_inner(
+        &self,
+        index_name: &str,
+        label: &str,
+        query: &crate::text::TextQuery,
+        k: Option<usize>,
+    ) -> Result<Option<Vec<(NodeId, f64)>>> {
+        let Some(dirty) = self
+            .text_index_dirty_ids(index_name, label, query.analyzer)
+            .await?
+        else {
+            return Ok(None);
+        };
         match search_lsm_read::text_search(self, index_name, query, k, &[], &dirty).await? {
             search_lsm_read::ActiveSearch::Ready(hits) => return Ok(Some(hits)),
             search_lsm_read::ActiveSearch::Unavailable => return Ok(None),

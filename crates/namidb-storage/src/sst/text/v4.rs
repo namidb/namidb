@@ -10,8 +10,8 @@
 //! the already-authenticated posting metadata.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
-use std::io::{Cursor, Read, Seek, Write};
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::io::{Cursor, Seek, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -303,6 +303,11 @@ struct EffectiveMutation {
 struct Posting {
     doc: u64,
     doc_len: u32,
+    /// Term frequency: the number of positions on the wire.
+    tf: u32,
+    /// Token positions. Always present on the build side; on the read side
+    /// only for terms a phrase constraint checks (see
+    /// `PostingCursor::keep_positions`). Scoring needs only `tf`.
     positions: Vec<u32>,
 }
 
@@ -533,49 +538,6 @@ impl QueryMaskUnionBuilder {
     }
 }
 
-/// Most posting blocks one cursor reads ahead per fetch, unless the rest of
-/// its list fits its read-ahead share.
-const POSTING_READAHEAD_BLOCKS: usize = 64;
-/// Compressed bytes one posting list may hold read ahead.
-const POSTING_READAHEAD_BYTES: usize = 4 * 1024 * 1024;
-/// Compressed bytes all posting lists of one query may hold read ahead (a
-/// prefix query can expand to dozens of terms).
-const POSTING_READAHEAD_TOTAL_BYTES: usize = 16 * 1024 * 1024;
-
-/// Read-ahead a posting list asks for: its compressed size, capped.
-fn posting_list_readahead(blocks: &[PostingBlockRef]) -> usize {
-    blocks
-        .iter()
-        .fold(0usize, |total, block| {
-            total.saturating_add(block.wire.len as usize)
-        })
-        .min(POSTING_READAHEAD_BYTES)
-}
-
-/// Compressed bytes a query over these posting lists may hold read ahead:
-/// part of its workspace reservation, so read-ahead never outgrows it.
-fn posting_readahead_allowance<'a>(lists: impl Iterator<Item = &'a [PostingBlockRef]>) -> usize {
-    lists
-        .map(posting_list_readahead)
-        .fold(0usize, usize::saturating_add)
-        .min(POSTING_READAHEAD_TOTAL_BYTES)
-}
-
-/// One list's share of the query allowance: what it asks for, scaled down
-/// in proportion when the lists together ask for more than the allowance.
-/// Shares never sum above [`posting_readahead_allowance`], and a short list
-/// never starves a long one.
-fn posting_readahead_share(asked: usize, asked_total: usize) -> usize {
-    if asked_total <= POSTING_READAHEAD_TOTAL_BYTES {
-        return asked;
-    }
-    usize::try_from(
-        (asked as u128).saturating_mul(POSTING_READAHEAD_TOTAL_BYTES as u128)
-            / (asked_total as u128).max(1),
-    )
-    .unwrap_or(usize::MAX)
-}
-
 #[derive(Debug)]
 struct PostingCursor {
     term: String,
@@ -583,18 +545,70 @@ struct PostingCursor {
     blocks: Vec<PostingBlockRef>,
     block_upper_bounds: Vec<f64>,
     next_block: usize,
+    /// The decoded current block. Replace it only through
+    /// [`PostingCursor::set_postings`], which keeps `positions_bytes` exact.
     postings: Vec<Posting>,
+    /// Heap bytes of the position lists in `postings`, measured once when the
+    /// block is installed. The workspace model is evaluated after every
+    /// scored document; re-summing every posting of every cursor there made
+    /// scoring quadratic in the block size.
+    positions_bytes: usize,
+    /// Whether a phrase constraint of the query reads this term's positions.
+    /// Other terms decode only their term frequencies: allocating a position
+    /// list per posting dominated scoring of long documents.
+    keep_positions: bool,
+    /// Compressed successor blocks `(block index, bytes)` read ahead with an
+    /// earlier block, in block order. See [`posting_readahead_bytes`].
+    prefetched: VecDeque<(usize, Bytes)>,
+    /// Bytes held in `prefetched`.
+    prefetched_bytes: usize,
+    /// Contiguous posting bytes this cursor reads per store round trip.
+    readahead_bytes: u64,
     next_posting: usize,
     /// When metadata skips a window ending inside the next block, discard
     /// decoded postings through this ordinal after the block is authenticated.
     skip_through: Option<u64>,
-    /// Compressed blocks fetched ahead of `next_block`, by block index.
-    readahead: BTreeMap<usize, Bytes>,
-    /// Blocks the next fetch for this cursor reads (doubling, capped).
-    readahead_window: usize,
 }
 
 impl PostingCursor {
+    /// The read-ahead bytes of `block`, dropping any earlier (skipped) ones.
+    fn take_prefetched(&mut self, block: usize) -> Option<Bytes> {
+        while let Some((index, _)) = self.prefetched.front() {
+            if *index > block {
+                return None;
+            }
+            let (index, bytes) = self.prefetched.pop_front()?;
+            self.prefetched_bytes = self.prefetched_bytes.saturating_sub(bytes.len());
+            if index == block {
+                return Some(bytes);
+            }
+        }
+        None
+    }
+
+    fn push_prefetched(&mut self, block: usize, bytes: Bytes) {
+        self.prefetched_bytes = self.prefetched_bytes.saturating_add(bytes.len());
+        self.prefetched.push_back((block, bytes));
+    }
+
+    fn clear_prefetched(&mut self) {
+        self.prefetched = VecDeque::new();
+        self.prefetched_bytes = 0;
+    }
+
+    fn set_postings(&mut self, postings: Vec<Posting>) {
+        self.positions_bytes = postings
+            .iter()
+            .map(|posting| {
+                posting
+                    .positions
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>())
+            })
+            .fold(0usize, usize::saturating_add);
+        self.postings = postings;
+    }
+
     fn current(&self) -> Option<&Posting> {
         self.postings.get(self.next_posting)
     }
@@ -640,7 +654,7 @@ impl PostingCursor {
             .next_posting
             .saturating_add(remaining.partition_point(|posting| posting.doc <= target));
         if self.next_posting == self.postings.len() {
-            self.postings = Vec::new();
+            self.set_postings(Vec::new());
             self.next_posting = 0;
         }
     }
@@ -668,23 +682,12 @@ impl PostingCursor {
             .get(self.next_block)
             .filter(|block| block.first_doc <= target)
             .map(|_| target);
-        // Skipped blocks read ahead are never decoded; free their share.
-        if self
-            .readahead
-            .first_key_value()
-            .is_some_and(|(&index, _)| index < self.next_block)
-        {
-            self.readahead = self.readahead.split_off(&self.next_block);
-        }
         Ok(())
     }
 
     fn resident_bytes(&self) -> usize {
-        self.readahead
-            .values()
-            .map(Bytes::len)
-            .sum::<usize>()
-            .saturating_add(self.term.capacity())
+        self.term
+            .capacity()
             .saturating_add(
                 self.blocks
                     .capacity()
@@ -699,17 +702,13 @@ impl PostingCursor {
                 self.postings
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Posting>())
-                    .saturating_add(
-                        self.postings
-                            .iter()
-                            .map(|posting| {
-                                posting
-                                    .positions
-                                    .capacity()
-                                    .saturating_mul(std::mem::size_of::<u32>())
-                            })
-                            .sum::<usize>(),
-                    ),
+                    .saturating_add(self.positions_bytes),
+            )
+            .saturating_add(
+                self.prefetched
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, Bytes)>())
+                    .saturating_add(self.prefetched_bytes),
             )
     }
 }
@@ -1390,6 +1389,8 @@ fn write_doc_table_and_collect_postings<W: Write + Seek>(
             entry.postings.push(Posting {
                 doc: ordinal,
                 doc_len,
+                tf: u32::try_from(positions.len())
+                    .map_err(|_| Error::invariant("text v4 term frequency exceeds u32"))?,
                 positions,
             });
         }
@@ -1638,12 +1639,7 @@ impl TextV4Reader {
         }
         scored_terms.sort();
         scored_terms.dedup();
-        let mut entries = BTreeMap::<String, TermEntry>::new();
-        for term in &scored_terms {
-            if let Some(entry) = self.lookup_term(term).await? {
-                entries.insert(term.clone(), entry);
-            }
-        }
+        let entries = self.lookup_terms(&scored_terms).await?;
         if query
             .phrases
             .iter()
@@ -1697,12 +1693,15 @@ impl TextV4Reader {
             );
         }
 
+        let cursor_count = entries.len();
         let mut cursors = entries
             .into_iter()
             .map(|(term, entry)| {
                 let idf = *idfs
                     .get(&term)
                     .ok_or_else(|| Error::invariant("text v4 IDF cache lost a term"))?;
+                let keep_positions = query.phrases.iter().flatten().any(|word| *word == term);
+                let readahead_bytes = posting_readahead_bytes(cursor_count);
                 Ok(PostingCursor {
                     term,
                     idf,
@@ -1710,10 +1709,13 @@ impl TextV4Reader {
                     block_upper_bounds: Vec::new(),
                     next_block: 0,
                     postings: Vec::new(),
+                    positions_bytes: 0,
+                    keep_positions,
+                    prefetched: VecDeque::new(),
+                    prefetched_bytes: 0,
+                    readahead_bytes,
                     next_posting: 0,
                     skip_through: None,
-                    readahead: BTreeMap::new(),
-                    readahead_window: 1,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1803,7 +1805,7 @@ impl TextV4Reader {
                     debug_assert_eq!(posting.doc, doc);
                     score += bm25_term_score(
                         cursor.idf,
-                        posting.positions.len() as u32,
+                        posting.tf,
                         posting.doc_len as usize,
                         corpus_avg_len,
                     );
@@ -1959,12 +1961,7 @@ impl TextV4Reader {
         }
         scored_terms.sort();
         scored_terms.dedup();
-        let mut entries = BTreeMap::<String, TermEntry>::new();
-        for term in &scored_terms {
-            if let Some(entry) = self.lookup_term(term).await? {
-                entries.insert(term.clone(), entry);
-            }
-        }
+        let entries = self.lookup_terms(&scored_terms).await?;
         if query
             .phrases
             .iter()
@@ -2014,6 +2011,7 @@ impl TextV4Reader {
         }
 
         let mut unsafe_bounds = false;
+        let cursor_count = entries.len();
         let mut cursors = entries
             .into_iter()
             .map(|(term, entry)| {
@@ -2030,6 +2028,8 @@ impl TextV4Reader {
                     })
                     .collect::<Vec<_>>();
                 unsafe_bounds |= block_upper_bounds.is_empty();
+                let keep_positions = query.phrases.iter().flatten().any(|word| *word == term);
+                let readahead_bytes = posting_readahead_bytes(cursor_count);
                 Ok(PostingCursor {
                     term,
                     idf,
@@ -2037,10 +2037,13 @@ impl TextV4Reader {
                     block_upper_bounds,
                     next_block: 0,
                     postings: Vec::new(),
+                    positions_bytes: 0,
+                    keep_positions,
+                    prefetched: VecDeque::new(),
+                    prefetched_bytes: 0,
+                    readahead_bytes,
                     next_posting: 0,
                     skip_through: None,
-                    readahead: BTreeMap::new(),
-                    readahead_window: 1,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2154,7 +2157,7 @@ impl TextV4Reader {
                     debug_assert_eq!(posting.doc, doc);
                     score += bm25_term_score(
                         cursor.idf,
-                        posting.positions.len() as u32,
+                        posting.tf,
                         posting.doc_len as usize,
                         corpus_avg_len,
                     );
@@ -2172,7 +2175,7 @@ impl TextV4Reader {
                 let cursor = &mut cursors[cursor_index];
                 cursor.next_posting += 1;
                 if cursor.next_posting == cursor.postings.len() {
-                    cursor.postings = Vec::new();
+                    cursor.set_postings(Vec::new());
                     cursor.next_posting = 0;
                     crossed_block_boundary = true;
                 } else if let Some(posting) = cursor.current() {
@@ -2237,23 +2240,49 @@ impl TextV4Reader {
         })
     }
 
+    /// Whether this segment alone holds the corpus `global` describes: the
+    /// base, or the generation's first delta (relative to the empty corpus at
+    /// event 0, so its relative statistics are absolute). The Search-LSM
+    /// coordinator proves that no other segment or unproven event exists
+    /// before it selects this path.
     fn is_authoritative_base_for(&self, global: &TextV4GlobalStats) -> bool {
-        matches!(
-            self.segment().stats,
-            SearchSegmentStats::Text {
-                doc_count: SearchStatValue::Absolute(documents),
-                total_len: SearchStatValue::Absolute(total_len),
-                term_df_violation_count: 0,
-            } if self.segment().role == SearchSegmentRole::Base
-                && self.segment().suppress_count == 0
-                && self.segment().mutation_count == self.segment().live_payload_count
-                && self.segment().live_payload_count == documents
-                && documents == global.document_count
-                && documents == self.footer.doc_table.row_count
-                && total_len == global.total_document_len
-                && u64::try_from(self.footer.delta_docs).ok() == Some(documents)
-                && u64::try_from(self.footer.delta_total_len).ok() == Some(total_len)
-        )
+        let segment = self.segment();
+        let (documents, total_len) = match (segment.role, segment.stats) {
+            (
+                SearchSegmentRole::Base,
+                SearchSegmentStats::Text {
+                    doc_count: SearchStatValue::Absolute(documents),
+                    total_len: SearchStatValue::Absolute(total_len),
+                    term_df_violation_count: 0,
+                },
+            ) => (documents, total_len),
+            (
+                SearchSegmentRole::Delta,
+                SearchSegmentStats::Text {
+                    doc_count: SearchStatValue::Delta(documents),
+                    total_len: SearchStatValue::Delta(total_len),
+                    term_df_violation_count: 0,
+                },
+            ) if segment
+                .event_ranges
+                .first()
+                .is_some_and(|range| range.start == 0) =>
+            {
+                match (u64::try_from(documents), u64::try_from(total_len)) {
+                    (Ok(documents), Ok(total_len)) => (documents, total_len),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        segment.suppress_count == 0
+            && segment.mutation_count == segment.live_payload_count
+            && segment.live_payload_count == documents
+            && documents == global.document_count
+            && documents == self.footer.doc_table.row_count
+            && total_len == global.total_document_len
+            && u64::try_from(self.footer.delta_docs).ok() == Some(documents)
+            && u64::try_from(self.footer.delta_total_len).ok() == Some(total_len)
     }
 
     async fn search_query_exact_with_block_max_fallback(
@@ -2447,6 +2476,28 @@ impl TextV4Reader {
         Ok(())
     }
 
+    /// Dictionary entries of `terms` (absent terms omitted). Each term's
+    /// dictionary block is an independent ranged read, so they are resolved
+    /// concurrently: one at a time, a cold multi-term query paid one store
+    /// round trip per term before it could fetch a single posting.
+    async fn lookup_terms(&self, terms: &[String]) -> Result<BTreeMap<String, TermEntry>> {
+        use futures::{StreamExt, TryStreamExt};
+        const DICTIONARY_LOOKUP_FANOUT: usize = 16;
+        let found = futures::stream::iter(
+            terms
+                .iter()
+                .map(|term| async move { Ok::<_, Error>((term, self.lookup_term(term).await?)) })
+                .collect::<Vec<_>>(),
+        )
+        .buffered(DICTIONARY_LOOKUP_FANOUT)
+        .try_collect::<Vec<_>>()
+        .await?;
+        Ok(found
+            .into_iter()
+            .filter_map(|(term, entry)| entry.map(|entry| (term.clone(), entry)))
+            .collect())
+    }
+
     async fn lookup_term(&self, term: &str) -> Result<Option<TermEntry>> {
         let mut low = 0usize;
         let mut high = self.footer.dictionary.len();
@@ -2550,7 +2601,7 @@ impl TextV4Reader {
         for reference in &entry.blocks {
             let compressed = self.source.read_range(reference.wire.range()?).await?;
             let raw = decode_block(&compressed, &reference.wire, "posting block")?;
-            let postings = decode_posting_block(&raw, reference)?;
+            let postings = decode_posting_block(&raw, reference, true)?;
             if previous_doc.is_some_and(|previous| previous >= postings[0].doc) {
                 return Err(Error::invariant(
                     "text v4 postings are not sorted across blocks",
@@ -2581,18 +2632,11 @@ impl TextV4Reader {
         }
 
         let mut jobs = Vec::<(usize, PostingBlockRef)>::with_capacity(cursor_indices.len());
-        // Per job: the block's compressed bytes when already read ahead, else
-        // its position in `ranges`. Blocks read ahead for the same cursor
-        // follow in `ahead` as (cursor, block index, position in `ranges`).
-        let mut sources = Vec::<std::result::Result<Bytes, usize>>::with_capacity(jobs.capacity());
-        let mut ranges = Vec::<Range<u64>>::new();
-        let mut ahead = Vec::<(usize, usize, usize)>::new();
-        // Read-ahead stays inside the allowance the workspace reservation
-        // already counts: each list holds at most its share of it.
-        let readahead_asked = cursors
-            .iter()
-            .map(|cursor| posting_list_readahead(&cursor.blocks))
-            .fold(0usize, usize::saturating_add);
+        let mut compressed_blocks = Vec::<Option<Bytes>>::with_capacity(cursor_indices.len());
+        // `(job, first block, last block, byte range)` of every cursor whose
+        // next block was not read ahead: one contiguous read each, all in
+        // one store round.
+        let mut reads = Vec::<(usize, usize, usize, Range<u64>)>::new();
         let mut previous = None;
         for &cursor_index in cursor_indices {
             if previous.is_some_and(|previous| previous >= cursor_index) {
@@ -2607,70 +2651,35 @@ impl TextV4Reader {
             // Release the previous block before fetching/decompressing the
             // next; `Vec::clear` would retain it beside compressed + raw +
             // decoded successors at every boundary.
-            cursor.postings = Vec::new();
+            cursor.set_postings(Vec::new());
             cursor.next_posting = 0;
-            let block_index = cursor.next_block;
-            let Some(reference) = cursor.blocks.get(block_index).cloned() else {
+            let block = cursor.next_block;
+            let Some(reference) = cursor.blocks.get(block).cloned() else {
+                cursor.clear_prefetched();
                 continue;
             };
             cursor.next_block += 1;
-            // Blocks skipped by metadata are never decoded.
-            cursor.readahead = cursor.readahead.split_off(&block_index);
-            if let Some(bytes) = cursor.readahead.remove(&block_index) {
-                sources.push(Ok(bytes));
-            } else {
-                sources.push(Err(ranges.len()));
-                ranges.push(reference.wire.range()?);
-                // A cursor that keeps needing blocks reads further ahead each
-                // time, so a long posting list costs a few round trips, not
-                // one per block, while a query that stops early reads little.
-                let held = cursor
-                    .readahead
-                    .values()
-                    .fold(0usize, |total, bytes| total.saturating_add(bytes.len()));
-                let mut budget = posting_readahead_share(
-                    posting_list_readahead(&cursor.blocks),
-                    readahead_asked,
-                )
-                .saturating_sub(held);
-                // A posting list whose remaining blocks fit the budget is read
-                // whole: block-max pruning decides which blocks it needs one
-                // round trip at a time, which on a cold object store costs far
-                // more than the blocks it skips.
-                let mut remaining = 0usize;
-                for following in &cursor.blocks[block_index + 1..] {
-                    let range = following.wire.range()?;
-                    remaining =
-                        remaining.saturating_add(range.end.saturating_sub(range.start) as usize);
-                    if remaining > budget {
+            // Read-ahead blocks the block-max planner skipped are dropped.
+            let prefetched = cursor.take_prefetched(block);
+            if prefetched.is_none() {
+                let start = reference.wire.offset;
+                let mut range = reference.wire.range()?;
+                let mut last = block;
+                while let Some(next) = cursor.blocks.get(last + 1) {
+                    let next_range = next.wire.range()?;
+                    if next_range.start != range.end
+                        || next_range.end - start > cursor.readahead_bytes
+                        || last - block + 1 >= MAX_READAHEAD_BLOCKS
+                    {
                         break;
                     }
+                    range.end = next_range.end;
+                    last += 1;
                 }
-                let window = if remaining <= budget {
-                    cursor.blocks.len() - block_index
-                } else {
-                    cursor.readahead_window
-                };
-                for next in block_index + 1..block_index + window {
-                    let Some(following) = cursor.blocks.get(next) else {
-                        break;
-                    };
-                    if cursor.readahead.contains_key(&next) {
-                        continue;
-                    }
-                    let range = following.wire.range()?;
-                    let len = range.end.saturating_sub(range.start) as usize;
-                    if len > budget {
-                        break;
-                    }
-                    budget -= len;
-                    ahead.push((cursor_index, next, ranges.len()));
-                    ranges.push(range);
-                }
-                cursor.readahead_window =
-                    (cursor.readahead_window * 2).min(POSTING_READAHEAD_BLOCKS);
+                reads.push((jobs.len(), block, last, range));
             }
             jobs.push((cursor_index, reference));
+            compressed_blocks.push(prefetched);
         }
         if jobs.is_empty() {
             return Ok(0);
@@ -2679,7 +2688,11 @@ impl TextV4Reader {
             .checked_add(jobs.len())
             .ok_or_else(|| Error::invariant("text v4 fetched block count overflows"))?;
 
-        let mut fetched = if ranges.is_empty() {
+        let ranges = reads
+            .iter()
+            .map(|(_, _, _, range)| range.clone())
+            .collect::<Vec<_>>();
+        let fetched = if ranges.is_empty() {
             Vec::new()
         } else {
             self.source.read_ranges(&ranges).await?
@@ -2689,19 +2702,33 @@ impl TextV4Reader {
                 "text v4 source returned wrong posting block count",
             ));
         }
-        for &(cursor_index, block_index, position) in &ahead {
-            cursors[cursor_index]
-                .readahead
-                .insert(block_index, std::mem::take(&mut fetched[position]));
+        for ((job, first, last, range), bytes) in reads.into_iter().zip(fetched) {
+            if bytes.len() as u64 != range.end - range.start {
+                return Err(Error::invariant(
+                    "text v4 source returned a short posting read-ahead",
+                ));
+            }
+            let cursor_index = jobs[job].0;
+            let cursor = &mut cursors[cursor_index];
+            for block in first..=last {
+                let block_range = cursor.blocks[block].wire.range()?;
+                let slice = bytes.slice(
+                    (block_range.start - range.start) as usize
+                        ..(block_range.end - range.start) as usize,
+                );
+                if block == first {
+                    compressed_blocks[job] = Some(slice);
+                } else {
+                    cursor.push_prefetched(block, slice);
+                }
+            }
         }
-        let compressed_blocks = sources
+        let compressed_blocks = compressed_blocks
             .into_iter()
-            .map(|source| match source {
-                Ok(bytes) => bytes,
-                Err(position) => std::mem::take(&mut fetched[position]),
+            .map(|bytes| {
+                bytes.ok_or_else(|| Error::invariant("text v4 posting block was not read"))
             })
-            .collect::<Vec<_>>();
-        drop(fetched);
+            .collect::<Result<Vec<_>>>()?;
         let retained_batch_bytes = jobs
             .capacity()
             .saturating_mul(std::mem::size_of::<(usize, PostingBlockRef)>())
@@ -2715,16 +2742,19 @@ impl TextV4Reader {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Bytes>()),
             )
+            // A read-ahead buffer is held by its slices: the current blocks
+            // here, the rest in their cursors' queues (counted there).
             .saturating_add(compressed_blocks.iter().map(Bytes::len).sum::<usize>());
         let mut largest_raw_bytes = 0usize;
         for ((cursor_index, reference), compressed) in jobs.into_iter().zip(compressed_blocks) {
             let raw = decode_block(&compressed, &reference.wire, "posting block")?;
             largest_raw_bytes = largest_raw_bytes.max(raw.capacity());
-            let decoded = decode_posting_block(&raw, &reference)?;
+            let decoded =
+                decode_posting_block(&raw, &reference, cursors[cursor_index].keep_positions)?;
             *postings_decoded = postings_decoded
                 .checked_add(decoded.len())
                 .ok_or_else(|| Error::invariant("text v4 decoded posting count overflows"))?;
-            cursors[cursor_index].postings = decoded;
+            cursors[cursor_index].set_postings(decoded);
             if let Some(target) = cursors[cursor_index].skip_through.take() {
                 cursors[cursor_index].next_posting = cursors[cursor_index]
                     .postings
@@ -3460,7 +3490,14 @@ fn encode_posting_block(postings: &[Posting]) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
-fn decode_posting_block(raw: &[u8], reference: &PostingBlockRef) -> Result<Vec<Posting>> {
+/// Decode one posting block. Positions are always validated; they are kept
+/// only when `keep_positions` (a phrase reads them), otherwise each posting
+/// carries just its term frequency.
+fn decode_posting_block(
+    raw: &[u8],
+    reference: &PostingBlockRef,
+    keep_positions: bool,
+) -> Result<Vec<Posting>> {
     if raw.len() < POSTING_HEADER_LEN || read_u32(raw, 0)? != reference.posting_count {
         return Err(Error::invariant(
             "text v4 posting block header is inconsistent",
@@ -3490,23 +3527,29 @@ fn decode_posting_block(raw: &[u8], reference: &PostingBlockRef) -> Result<Vec<P
         if positions_end > raw.len() {
             return Err(Error::invariant("text v4 posting positions are truncated"));
         }
-        let mut positions = Vec::with_capacity(tf as usize);
+        let mut positions = if keep_positions {
+            Vec::with_capacity(tf as usize)
+        } else {
+            Vec::new()
+        };
+        let mut previous: Option<u32> = None;
         while cursor < positions_end {
-            positions.push(read_u32(raw, cursor)?);
+            let position = read_u32(raw, cursor)?;
+            if previous.is_some_and(|previous| previous >= position) || position >= doc_len {
+                return Err(Error::invariant(
+                    "text v4 posting positions are inconsistent",
+                ));
+            }
+            previous = Some(position);
+            if keep_positions {
+                positions.push(position);
+            }
             cursor += 4;
-        }
-        if positions.windows(2).any(|pair| pair[0] >= pair[1])
-            || positions
-                .last()
-                .is_some_and(|position| *position >= doc_len)
-        {
-            return Err(Error::invariant(
-                "text v4 posting positions are inconsistent",
-            ));
         }
         postings.push(Posting {
             doc,
             doc_len,
+            tf,
             positions,
         });
     }
@@ -3514,11 +3557,7 @@ fn decode_posting_block(raw: &[u8], reference: &PostingBlockRef) -> Result<Vec<P
         || postings.first().map(|posting| posting.doc) != Some(reference.first_doc)
         || postings.last().map(|posting| posting.doc) != Some(reference.last_doc)
         || postings.windows(2).any(|pair| pair[0].doc >= pair[1].doc)
-        || postings
-            .iter()
-            .map(|posting| posting.positions.len() as u32)
-            .max()
-            != Some(reference.max_tf)
+        || postings.iter().map(|posting| posting.tf).max() != Some(reference.max_tf)
         || postings.iter().map(|posting| posting.doc_len).min() != Some(reference.min_doc_len)
     {
         return Err(Error::invariant(
@@ -3672,12 +3711,34 @@ fn phrases_match_cursors(doc: u64, phrases: &[Vec<String>], cursors: &[PostingCu
     })
 }
 
+/// Contiguous posting bytes one cursor reads per store round trip at most.
+/// Postings are consumed in document order across every query term, so
+/// without read-ahead each term paid one dependent round trip per cache page
+/// of its posting list.
+const POSTING_READAHEAD_MAX_BYTES: u64 = 1 << 20;
+/// Read-ahead budget shared by all cursors of one query.
+const POSTING_READAHEAD_TOTAL_BYTES: u64 = 8 << 20;
+/// Blocks one read-ahead covers at most (bounds the per-cursor queue).
+const MAX_READAHEAD_BLOCKS: usize = 64;
+
+fn posting_readahead_bytes(cursors: usize) -> u64 {
+    (POSTING_READAHEAD_TOTAL_BYTES / cursors.max(1) as u64).min(POSTING_READAHEAD_MAX_BYTES)
+}
+
 fn estimate_exact_search_workspace(
     entries: &BTreeMap<String, TermEntry>,
     groups: &[(String, Vec<SearchFilterValue>)],
     filters: &[FilterBlockRef],
     k: usize,
 ) -> Result<usize> {
+    // A cursor holds at most one read-ahead window beyond its current block.
+    let readahead = usize::try_from(posting_readahead_bytes(entries.len()))
+        .unwrap_or(usize::MAX)
+        .saturating_add(
+            MAX_READAHEAD_BLOCKS
+                .next_power_of_two()
+                .saturating_mul(std::mem::size_of::<(usize, Bytes)>()),
+        );
     let posting_bytes = entries.values().fold(0usize, |total, entry| {
         let largest = entry
             .blocks
@@ -3696,6 +3757,7 @@ fn estimate_exact_search_workspace(
             .unwrap_or(0);
         total
             .saturating_add(largest)
+            .saturating_add(readahead)
             .saturating_add(std::mem::size_of::<PostingCursor>())
             .saturating_add(std::mem::size_of::<usize>())
             .saturating_add(std::mem::size_of::<(usize, PostingBlockRef)>())
@@ -3715,9 +3777,6 @@ fn estimate_exact_search_workspace(
             )
             .saturating_add(entry.term.capacity())
     });
-    let posting_bytes = posting_bytes.saturating_add(posting_readahead_allowance(
-        entries.values().map(|entry| entry.blocks.as_slice()),
-    ));
     let mut combined_bytes = 0usize;
     let mut filter_peak = 0usize;
     for (property, alternatives) in groups {
@@ -3845,6 +3904,11 @@ fn write_compressed_block<W: Write + Seek>(
     })
 }
 
+thread_local! {
+    static BLOCK_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn decode_block(compressed: &[u8], reference: &BlockRef, what: &str) -> Result<Vec<u8>> {
     require_len(compressed, reference.len as usize, what)?;
     if crc32fast::hash(compressed) != reference.compressed_crc32 {
@@ -3853,12 +3917,21 @@ fn decode_block(compressed: &[u8], reference: &BlockRef, what: &str) -> Result<V
         )));
     }
     validate_block_limits(reference)?;
-    let decoder = zstd::stream::read::Decoder::new(compressed)
-        .map_err(|error| Error::invariant(format!("text v4 {what} decoder failed: {error}")))?;
+    // One-shot decompression into a buffer of exactly the declared raw length
+    // (a frame that decodes to more fails as too small for its destination),
+    // with one decompression context reused per thread. A streaming decoder
+    // per block allocated and released its context and window for every
+    // posting block, which dominated full-text scoring.
     let mut raw = Vec::with_capacity(reference.raw_len as usize);
-    decoder
-        .take(u64::from(reference.raw_len) + 1)
-        .read_to_end(&mut raw)
+    BLOCK_DECOMPRESSOR
+        .with(|slot| -> std::io::Result<usize> {
+            let mut slot = slot.borrow_mut();
+            let decompressor = match slot.as_mut() {
+                Some(decompressor) => decompressor,
+                None => slot.insert(zstd::bulk::Decompressor::new()?),
+            };
+            decompressor.decompress_to_buffer(compressed, &mut raw)
+        })
         .map_err(|error| Error::invariant(format!("text v4 {what} decode failed: {error}")))?;
     require_len(&raw, reference.raw_len as usize, what)?;
     if non_zero_xxh3(&raw) != reference.raw_xxh3 {
@@ -4155,33 +4228,6 @@ mod tests {
     use super::*;
     use crate::search_lsm::{SearchLsmStatus, SearchSegmentPayload};
     use crate::text::parse_query;
-
-    #[test]
-    fn readahead_shares_stay_inside_the_reserved_allowance() {
-        const MIB: usize = 1024 * 1024;
-        for asked in [
-            vec![MIB, 2 * MIB],
-            vec![4 * MIB; 10],
-            vec![64 * 1024, 4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB, 4 * MIB],
-            vec![1; 1000],
-        ] {
-            let total = asked.iter().sum::<usize>();
-            let allowance = total.min(POSTING_READAHEAD_TOTAL_BYTES);
-            let shares = asked
-                .iter()
-                .map(|&list| posting_readahead_share(list, total))
-                .collect::<Vec<_>>();
-            assert!(shares.iter().sum::<usize>() <= allowance, "{asked:?}");
-            // Every list keeps a share in proportion to what it asked for.
-            for (&list, &share) in asked.iter().zip(&shares) {
-                assert!(share <= list);
-                assert!(
-                    share as u128 * total as u128 + total as u128
-                        > list as u128 * allowance as u128
-                );
-            }
-        }
-    }
 
     #[derive(Debug)]
     struct MemorySource {
