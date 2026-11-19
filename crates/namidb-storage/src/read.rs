@@ -372,8 +372,12 @@ impl crate::sst::vector::v5::VectorV5RangeSource for SearchObjectRangeSource {
 
     async fn prime_blocks(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         // 8 MiB spans, four at a time: a 50 MB code tier is about seven
-        // requests in two round trips instead of one request per page.
-        self.pinned.prime_blocks(ranges, 8 * 1024 * 1024, 4).await
+        // requests in two round trips instead of one request per page. On
+        // an NVMe tier each span (capped at its largest entry) is also kept
+        // on the device, so a restart warms the codes locally.
+        self.pinned
+            .prime_blocks_persistent(ranges, 8 * 1024 * 1024, 64 * 1024, 4)
+            .await
     }
 }
 
@@ -386,6 +390,17 @@ impl crate::sst::search_delta::SearchVersionRangeSource for SearchObjectRangeSou
 
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
         self.pinned.read_ranges(ranges).await
+    }
+
+    async fn read_blocks_coalesced(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        // Posting blocks of one term are adjacent in the object: cached
+        // blocks are served from the range cache, the rest go out as a few
+        // large GETs and are admitted as exact block entries.
+        self.pinned.read_blocks_coalesced(ranges).await
+    }
+
+    async fn read_blocks_warm(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.pinned.read_blocks_warm(ranges).await
     }
 }
 
@@ -1045,6 +1060,25 @@ impl<'mt> Snapshot<'mt> {
     /// consult alongside the committed `memtable`. Built by
     /// [`crate::ingest::WriterSession::overlay_snapshot`]. See the
     /// [`Self::overlay`] field for the merge semantics.
+    /// Identity of the node data this snapshot reads, for caches of values
+    /// derived from it across statements: the namespace, the writer session
+    /// (process-unique, so neither another store nor a dropped and recreated
+    /// namespace of the same name can match), the manifest version and the
+    /// writer's logical node generation (advanced by every committed node
+    /// mutation). `None` when the snapshot cannot state one: a standalone
+    /// snapshot, or one carrying staged, uncommitted writes.
+    pub fn node_data_identity(&self) -> Option<NodeDataIdentity> {
+        if self.overlay.is_some() || self.transactional_property_index.is_some() {
+            return None;
+        }
+        Some((
+            self.cache_namespace.clone(),
+            self.property_index_cache.as_ref()?.instance(),
+            self.manifest.manifest.version,
+            self.property_index_generation?,
+        ))
+    }
+
     pub fn with_overlay(mut self, overlay: MemtableSnapshot) -> Self {
         self.overlay = Some(overlay);
         self
@@ -6202,95 +6236,28 @@ impl<'mt> Snapshot<'mt> {
 
         let dict = &self.manifest.manifest.label_dict;
         let requested_projection: BTreeSet<&str> = projection.iter().map(String::as_str).collect();
-        for idx in descriptors {
-            if !node_sst_can_contain_label(&self.manifest.manifest, idx, label) {
+        let idxs: Vec<usize> = descriptors
+            .into_iter()
+            .filter(|idx| node_sst_can_contain_label(&self.manifest.manifest, *idx, label))
+            .collect();
+        // The SSTs' projected columns are fetched a few at a time and visited
+        // in SST order: a column-only scan of a label spread over many SSTs
+        // waits on one store round trip per SST group instead of per SST.
+        use futures::StreamExt as _;
+        let mut projected = futures::stream::iter(idxs.into_iter().map(|idx| async move {
+            (idx, self.projected_sst_views(idx, label, projection).await)
+        }))
+        .buffered(projection_scan_fanout());
+        while let Some((idx, views)) = projected.next().await {
+            if let Some(views) = views.map_err(E::from)? {
+                for view in views {
+                    visitor(view)?;
+                }
                 continue;
             }
             let desc = &self.manifest.manifest.ssts[idx];
             let sst_label_def = self.label_def_for_node_sst(desc);
             let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
-            if let Some(reader) = self.node_property_reader(desc).await.map_err(E::from)? {
-                match reader.verify_properties(projection).await {
-                    Ok(_) => {
-                        let cached_metadata = self
-                            .cache
-                            .as_ref()
-                            .and_then(|cache| cache.get_metadata(&absolute));
-                        let metadata_was_cached = cached_metadata.is_some();
-                        let (mut stream, metadata) = node_scan_limited_async(
-                            self.store.clone(),
-                            Path::from(absolute.clone()),
-                            desc.size_bytes,
-                            &sst_label_def,
-                            &[],
-                            Some(&[]),
-                            cached_metadata,
-                        )
-                        .await
-                        .map_err(E::from)?;
-                        if !metadata_was_cached {
-                            if let Some(cache) = &self.cache {
-                                cache.insert_metadata(absolute.clone(), metadata);
-                            }
-                        }
-                        let mut next_ordinal = 0_u64;
-                        while let Some(batches) = stream.next_row_group().await.map_err(E::from)? {
-                            for batch in batches {
-                                let batch = batch.map_err(|error| {
-                                    E::from(Error::invariant(format!(
-                                        "projected Parquet visitor read: {error}"
-                                    )))
-                                })?;
-                                let Some(candidates) = self
-                                    .project_node_property_batch(
-                                        reader.as_ref(),
-                                        desc,
-                                        projection,
-                                        &batch,
-                                        next_ordinal,
-                                        Some(label),
-                                    )
-                                    .await
-                                    .map_err(E::from)?
-                                else {
-                                    return Err(E::from(Error::invariant(
-                                        "validated node property pages became unreadable",
-                                    )));
-                                };
-                                next_ordinal = next_ordinal
-                                    .checked_add(batch.num_rows() as u64)
-                                    .ok_or_else(|| {
-                                        E::from(Error::invariant(
-                                            "node property ordinal exceeds u64",
-                                        ))
-                                    })?;
-                                for (_, _, view) in candidates {
-                                    let Some(view) = view else {
-                                        continue;
-                                    };
-                                    if view.labels.contains(label) {
-                                        visitor(view)?;
-                                    }
-                                }
-                            }
-                        }
-                        if next_ordinal != desc.row_count {
-                            return Err(E::from(Error::invariant(
-                                "node property/Parquet row-count mismatch",
-                            )));
-                        }
-                        continue;
-                    }
-                    Err(error) if optional_accelerator_fallback(&error) => {
-                        tracing::warn!(
-                            sst_id = %desc.id,
-                            %error,
-                            "node property projection scrub failed; using exact Parquet fallback"
-                        );
-                    }
-                    Err(error) => return Err(E::from(error)),
-                }
-            }
             let context = LimitedNodeBatchContext {
                 sst_label_def: &sst_label_def,
                 desc,
@@ -6366,6 +6333,96 @@ impl<'mt> Snapshot<'mt> {
             }
         }
         Ok(())
+    }
+
+    /// The live `label` rows of node SST `idx` with only `projection`
+    /// decoded, read through its node property pages. `None` when the SST
+    /// has no usable property pages and the caller must read it exactly.
+    async fn projected_sst_views(
+        &self,
+        idx: usize,
+        label: &str,
+        projection: &[String],
+    ) -> Result<Option<Vec<NodeView>>> {
+        let desc = &self.manifest.manifest.ssts[idx];
+        let sst_label_def = self.label_def_for_node_sst(desc);
+        let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+        if let Some(reader) = self.node_property_reader(desc).await? {
+            match reader.verify_properties(projection).await {
+                Ok(_) => {
+                    let cached_metadata = self
+                        .cache
+                        .as_ref()
+                        .and_then(|cache| cache.get_metadata(&absolute));
+                    let metadata_was_cached = cached_metadata.is_some();
+                    let (mut stream, metadata) = node_scan_limited_async(
+                        self.store.clone(),
+                        Path::from(absolute.clone()),
+                        desc.size_bytes,
+                        &sst_label_def,
+                        &[],
+                        Some(&[]),
+                        cached_metadata,
+                    )
+                    .await?;
+                    if !metadata_was_cached {
+                        if let Some(cache) = &self.cache {
+                            cache.insert_metadata(absolute.clone(), metadata);
+                        }
+                    }
+                    let mut views = Vec::new();
+                    let mut next_ordinal = 0_u64;
+                    while let Some(batches) = stream.next_row_group().await? {
+                        for batch in batches {
+                            let batch = batch.map_err(|error| {
+                                Error::invariant(format!("projected Parquet visitor read: {error}"))
+                            })?;
+                            let Some(candidates) = self
+                                .project_node_property_batch(
+                                    reader.as_ref(),
+                                    desc,
+                                    projection,
+                                    &batch,
+                                    next_ordinal,
+                                    Some(label),
+                                )
+                                .await?
+                            else {
+                                return Err(Error::invariant(
+                                    "validated node property pages became unreadable",
+                                ));
+                            };
+                            next_ordinal = next_ordinal
+                                .checked_add(batch.num_rows() as u64)
+                                .ok_or_else(|| {
+                                    Error::invariant("node property ordinal exceeds u64")
+                                })?;
+                            for (_, _, view) in candidates {
+                                let Some(view) = view else {
+                                    continue;
+                                };
+                                if view.labels.contains(label) {
+                                    views.push(view);
+                                }
+                            }
+                        }
+                    }
+                    if next_ordinal != desc.row_count {
+                        return Err(Error::invariant("node property/Parquet row-count mismatch"));
+                    }
+                    return Ok(Some(views));
+                }
+                Err(error) if optional_accelerator_fallback(&error) => {
+                    tracing::warn!(
+                        sst_id = %desc.id,
+                        %error,
+                        "node property projection scrub failed; using exact Parquet fallback"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
     }
 
     /// Exact prefix scan used by an order-insensitive Cypher LIMIT.
@@ -10310,9 +10367,13 @@ impl<'mt> Snapshot<'mt> {
         };
         #[cfg(feature = "vector-index")]
         let mut vector_bases = Vec::new();
+        #[cfg(feature = "text-index")]
+        let mut text_segments = Vec::new();
         let search = self.prefetch_search_indexes(
             #[cfg(feature = "vector-index")]
             &mut vector_bases,
+            #[cfg(feature = "text-index")]
+            &mut text_segments,
         );
         let (node_ssts, node_record_pages, (vector_indexes, text_indexes), edge_ssts) =
             futures::try_join!(node_ssts, node_records, search, edges)?;
@@ -10321,6 +10382,11 @@ impl<'mt> Snapshot<'mt> {
         let vector_code_bytes = self.prefetch_vector_codes(&vector_bases).await?;
         #[cfg(not(feature = "vector-index"))]
         let vector_code_bytes = 0;
+        #[cfg(feature = "text-index")]
+        let (text_meta_bytes, text_head_bytes) =
+            self.prefetch_text_metadata(&text_segments).await?;
+        #[cfg(not(feature = "text-index"))]
+        let (text_meta_bytes, text_head_bytes) = (0, 0);
         Ok(PrefetchSummary {
             node_ssts,
             edge_ssts,
@@ -10328,6 +10394,8 @@ impl<'mt> Snapshot<'mt> {
             vector_indexes,
             text_indexes,
             vector_code_bytes,
+            text_meta_bytes,
+            text_head_bytes,
             elapsed: metadata_elapsed,
             total_elapsed: started.elapsed(),
         })
@@ -10361,12 +10429,64 @@ impl<'mt> Snapshot<'mt> {
         Ok(loaded)
     }
 
+    /// Warm each opened FT4 segment's read metadata (term dictionary,
+    /// document table, version table) into the shared range cache, after the
+    /// vector codes, so a new full-text query reads only its posting blocks
+    /// and records, then the heads of their posting lists (see
+    /// `TextV4Reader::prefetch_posting_heads`). Bounded to a quarter of the
+    /// range cache's RAM budget across all segments; a segment whose
+    /// metadata does not fit in what is left is skipped.
+    /// `NAMIDB_TEXT_METADATA_PREFETCH=0` turns it off. Returns the metadata
+    /// and head bytes loaded.
+    #[cfg(feature = "text-index")]
+    async fn prefetch_text_metadata(
+        &self,
+        segments: &[Arc<crate::sst::text::v4::TextV4Reader>],
+    ) -> Result<(u64, u64)> {
+        if matches!(
+            std::env::var("NAMIDB_TEXT_METADATA_PREFETCH")
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Ok("0" | "false" | "off" | "no")
+        ) {
+            return Ok((0, 0));
+        }
+        let Some(range_cache) = crate::range_cache::shared_range_cache_snapshot() else {
+            return Ok((0, 0));
+        };
+        let mut remaining = (range_cache.ram_budget_bytes as u64) / 4;
+        let mut loaded = 0u64;
+        let mut seen = std::collections::HashSet::new();
+        let segments = segments
+            .iter()
+            .filter(|reader| seen.insert(Arc::as_ptr(reader) as usize))
+            .collect::<Vec<_>>();
+        for reader in &segments {
+            crate::cancel::check()?;
+            let bytes = reader.prefetch_read_metadata(remaining).await?;
+            remaining = remaining.saturating_sub(bytes);
+            loaded = loaded.saturating_add(bytes);
+        }
+        // Then the heads of the posting lists, with what is left.
+        let mut heads = 0u64;
+        for reader in &segments {
+            crate::cancel::check()?;
+            let bytes = reader.prefetch_posting_heads(remaining).await?;
+            remaining = remaining.saturating_sub(bytes);
+            heads = heads.saturating_add(bytes);
+        }
+        Ok((loaded, heads))
+    }
+
     /// Open every active search generation's readers (see
     /// [`Self::prefetch_read_metadata`]); `(vector, text)` indexes opened.
     async fn prefetch_search_indexes(
         &self,
         #[cfg(feature = "vector-index")] vector_bases: &mut Vec<
             Arc<crate::sst::vector::v5::VectorV5Reader>,
+        >,
+        #[cfg(feature = "text-index")] text_segments: &mut Vec<
+            Arc<crate::sst::text::v4::TextV4Reader>,
         >,
     ) -> Result<(usize, usize)> {
         #[cfg(any(feature = "text-index", feature = "vector-index"))]
@@ -10375,6 +10495,8 @@ impl<'mt> Snapshot<'mt> {
                 self,
                 #[cfg(feature = "vector-index")]
                 vector_bases,
+                #[cfg(feature = "text-index")]
+                text_segments,
             )
             .await?;
             // A generation compacted to one base is read through the base
@@ -12709,10 +12831,14 @@ fn equality_sidecar_key(
 /// lookup, measured against everything the snapshot can see — SSTs and
 /// memtable together.
 ///
-/// The index route reads postings AND hydrates every candidate; the scan
-/// reads each row once. So the index wins only while the window is small
-/// relative to the population, and this is the line.
-const RANGE_POPULATION_FRACTION: u64 = 8;
+/// The index route reads postings AND hydrates every candidate by id; the
+/// scan reads each row once, column by column. So the index wins only while
+/// the window is small relative to the population, and this is the line. On
+/// an object store a hydrated candidate costs about a hundred scanned rows:
+/// over a 386k-node label with 20–40 ms store latency, one value matching
+/// 38k nodes (a tenth of the label) took over 30 s through the index and
+/// 2–6 s through the column scan.
+const RANGE_POPULATION_FRACTION: u64 = 100;
 
 /// Floor under every derived candidate budget, so a tiny label (or a tiny
 /// memtable) does not make the route decline windows it would answer in
@@ -12894,6 +13020,46 @@ fn string_property_sidecar<'a>(
 ///
 /// Excluding tombstone-only coverage is safe: sidecar winners are re-confirmed
 /// through `lookup_node`, which resolves last-LSN-wins across EVERY SST.
+/// Share of the `label` node SSTs that already carry a complete equality
+/// sidecar for `property` (`1.0` when there are none: the memtable answers
+/// alone). The single-property index serves lookups only at `1.0`; below it
+/// the readers scan, so this is the index's population for listings.
+pub fn property_index_population(manifest: &Manifest, label: &str, property: &str) -> f64 {
+    let mut total = 0usize;
+    let mut covered = 0usize;
+    for (idx, descriptor) in manifest.ssts.iter().enumerate() {
+        if descriptor.kind != SstKind::Nodes || !node_sst_can_contain_label(manifest, idx, label) {
+            continue;
+        }
+        total += 1;
+        if descriptor
+            .equality_property_indices
+            .iter()
+            .any(|desc| desc.property == property && desc.mixed_type_complete)
+        {
+            covered += 1;
+        }
+    }
+    if total == 0 {
+        1.0
+    } else {
+        covered as f64 / total as f64
+    }
+}
+
+/// Node SSTs whose projected columns a label visit fetches concurrently
+/// (`NAMIDB_PROJECTION_SCAN_FANOUT`, default 8, at least 1).
+fn projection_scan_fanout() -> usize {
+    static FANOUT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FANOUT.get_or_init(|| {
+        std::env::var("NAMIDB_PROJECTION_SCAN_FANOUT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1)
+    })
+}
+
 fn node_sst_can_contain_label(manifest: &Manifest, idx: usize, label: &str) -> bool {
     let desc = &manifest.ssts[idx];
     if !desc.scope.is_empty() {
@@ -13681,6 +13847,10 @@ impl Drop for PinnedSnapshot {
     }
 }
 
+/// See [`Snapshot::node_data_identity`]: namespace, writer session, manifest
+/// version, node generation.
+pub type NodeDataIdentity = (Arc<str>, u64, u64, u64);
+
 /// A retention hold on one manifest version (see [`SnapshotCell::pin_version`]).
 #[derive(Debug)]
 pub struct VersionPin {
@@ -13736,6 +13906,10 @@ pub struct PrefetchSummary {
     /// RaBitQ code and id blocks of opened vector bases loaded into the
     /// range cache.
     pub vector_code_bytes: u64,
+    /// FT4 read metadata warmed into the range cache.
+    pub text_meta_bytes: u64,
+    /// FT4 posting-list heads warmed into the range cache.
+    pub text_head_bytes: u64,
     /// Time to warm the metadata above.
     pub elapsed: std::time::Duration,
     /// Including the vector code tier, which is read after the metadata.

@@ -723,6 +723,7 @@ async fn open_vector_generation(
 pub(super) async fn prefetch_search_metadata(
     snapshot: &Snapshot<'_>,
     #[cfg(feature = "vector-index")] bases: &mut Vec<Arc<crate::sst::vector::v5::VectorV5Reader>>,
+    #[cfg(feature = "text-index")] text_segments: &mut Vec<Arc<crate::sst::text::v4::TextV4Reader>>,
 ) -> Result<(usize, usize, Vec<(SearchLsmKind, String)>)> {
     #[allow(unused_mut)]
     let mut not_active = Vec::new();
@@ -750,7 +751,14 @@ pub(super) async fn prefetch_search_metadata(
     for index in &snapshot.manifest.manifest.text_indexes {
         crate::cancel::check()?;
         match open_text_generation(snapshot, &index.name).await? {
-            ActiveSearch::Ready(_) => texts += 1,
+            ActiveSearch::Ready(generation) => {
+                texts += 1;
+                for segment in &generation.segments {
+                    if let OpenedTextReader::V4(reader) = &segment.reader {
+                        text_segments.push(reader.clone());
+                    }
+                }
+            }
             ActiveSearch::NotActive => not_active.push((SearchLsmKind::Text, index.name.clone())),
             ActiveSearch::Unavailable => {}
         }
@@ -2036,8 +2044,16 @@ pub(super) async fn text_search(
             .max(1);
         loop {
             let searched = match &segment.reader {
+                // Block-max / MaxScore over this segment's own blocks: the
+                // same local top-`segment_limit` as the exhaustive scorer,
+                // without reading the posting blocks that cannot reach it.
                 OpenedTextReader::V4(reader) => reader
-                    .search_query_exact(&expanded, &global, segment_limit, &canonical_groups)
+                    .search_query_segment_block_max_exact(
+                        &expanded,
+                        &global,
+                        segment_limit,
+                        &canonical_groups,
+                    )
                     .await
                     .map(|result| {
                         if result.applied_filter_groups != canonical_groups.len()

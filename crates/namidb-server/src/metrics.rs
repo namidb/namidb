@@ -639,6 +639,27 @@ impl Metrics {
             );
         }
 
+        let auto = crate::auto_index::counters();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_auto_index_total Automatic property index decisions, by outcome."
+        );
+        let _ = writeln!(out, "# TYPE namidb_auto_index_total counter");
+        for (outcome, value) in [
+            ("created", &auto.created),
+            ("online", &auto.online),
+            ("skipped_search_rebuild", &auto.skipped_search_rebuild),
+            ("skipped_cap", &auto.skipped_cap),
+            ("skipped_other", &auto.skipped_other),
+            ("failed", &auto.failed),
+        ] {
+            let _ = writeln!(
+                out,
+                "namidb_auto_index_total{{outcome=\"{outcome}\"}} {}",
+                value.load(Ordering::Relaxed)
+            );
+        }
+
         let _ = writeln!(
             out,
             "# HELP namidb_queries_total Cypher queries executed, by protocol and status."

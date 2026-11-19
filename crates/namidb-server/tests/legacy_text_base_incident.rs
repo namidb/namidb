@@ -622,7 +622,8 @@ async fn until_online_on_ft4(base: &str, manifests: &ManifestStore, step: &str) 
             health["search_builds_in_flight"].is_array(),
             "{step}: /v0/health lacks search_builds_in_flight: {health}"
         );
-        let answers = searches_match_show(base, step).await;
+        // Every poll checks each search against what SHOW INDEXES says.
+        searches_match_show(base, step).await;
         let shown = show_fulltext(base).await;
         let loaded = manifests.load_current().await.unwrap();
         let migrated = ["art_ft", "note_ft"].iter().all(|index| {
@@ -632,7 +633,10 @@ async fn until_online_on_ft4(base: &str, manifests: &ManifestStore, step: &str) 
                     .is_some_and(|format| *format == SearchSegmentFormat::TextV4)
         });
         if migrated {
-            return answers;
+            // The answers above may predate the swap (a search that ran
+            // while the index was still BUILDING); ask again now that both
+            // are ONLINE, which they stay.
+            return searches_match_show(base, step).await;
         }
         assert!(
             Instant::now() < deadline,

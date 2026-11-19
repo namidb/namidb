@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod authz;
+mod auto_index;
 pub mod bolt;
 mod introspect;
 mod isolate;
@@ -749,6 +750,18 @@ impl AppState {
 
     /// Deadline for a read query starting now, or `None` when the timeout
     /// is disabled. Computed per query so each read gets the full budget.
+    /// This namespace's handles for automatic index builds.
+    pub(crate) fn auto_index_target(&self) -> auto_index::Target {
+        auto_index::Target {
+            namespace: self.namespace.clone(),
+            writer: Arc::clone(&self.writer),
+            snapshot: Arc::clone(&self.snapshot),
+            compaction_scheduler: Arc::clone(&self.compaction_scheduler),
+            writer_health: Arc::clone(&self.writer_health),
+            metrics: Arc::clone(&self.metrics),
+        }
+    }
+
     pub(crate) fn query_deadline(&self) -> Option<std::time::Instant> {
         (self.query_timeout > Duration::ZERO)
             .then(|| std::time::Instant::now() + self.query_timeout)
@@ -4933,6 +4946,7 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
         // On a thread of its own: a client that disconnects (or the request
         // timeout) drops this future, which cancels the query.
         let plan = Arc::new(plan);
+        let hints = namidb_query::AutoIndexHints::new();
         let result = isolate::run_read_isolated({
             let plan = Arc::clone(&plan);
             let budget = budget.clone();
@@ -4940,18 +4954,23 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
             let deadline = request.query_deadline(state.query_timeout);
             let row_cap = state.query_row_cap();
             let admission = Arc::clone(&admission);
+            let hints = hints.clone();
             async move {
                 let _admission = admission;
                 let snap = owned.borrow();
-                namidb_query::with_query_memory(
-                    budget,
-                    execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                namidb_query::with_auto_index_hints(
+                    hints,
+                    namidb_query::with_query_memory(
+                        budget,
+                        execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                    ),
                 )
                 .await
             }
         })
         .await
         .and_then(|rows| charge_json_response(budget.as_deref(), rows));
+        auto_index::offer(&state.auto_index_target(), hints.take());
         let elapsed = started.elapsed();
         match result {
             Ok(rows) => {
@@ -7005,6 +7024,7 @@ async fn run_cypher_multi(
         // On a thread of its own: a client that disconnects (or the request
         // timeout) drops this future, which cancels the query.
         let plan = Arc::new(plan);
+        let hints = namidb_query::AutoIndexHints::new();
         let result = isolate::run_read_isolated({
             let plan = Arc::clone(&plan);
             let budget = budget.clone();
@@ -7012,18 +7032,33 @@ async fn run_cypher_multi(
             let deadline = request.query_deadline(shared.query_timeout);
             let row_cap = shared.query_row_cap();
             let admission = Arc::clone(&admission);
+            let hints = hints.clone();
             async move {
                 let _admission = admission;
                 let snap = owned.borrow();
-                namidb_query::with_query_memory(
-                    budget,
-                    execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                namidb_query::with_auto_index_hints(
+                    hints,
+                    namidb_query::with_query_memory(
+                        budget,
+                        execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                    ),
                 )
                 .await
             }
         })
         .await
         .and_then(|rows| charge_json_response(budget.as_deref(), rows));
+        auto_index::offer(
+            &auto_index::Target {
+                namespace: ns_state.namespace.clone(),
+                writer: Arc::clone(&ns_state.writer),
+                snapshot: Arc::clone(&ns_state.snapshot),
+                compaction_scheduler: Arc::clone(&ns_state.compaction_scheduler),
+                writer_health: Arc::clone(&ns_state.writer_health),
+                metrics: Arc::clone(&shared.metrics),
+            },
+            hints.take(),
+        );
         let elapsed = started.elapsed();
         match result {
             Ok(rows) => {

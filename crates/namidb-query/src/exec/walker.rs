@@ -1800,6 +1800,36 @@ pub(crate) async fn scan_nodes(
         .collect())
 }
 
+/// Record the equality/range columns a label scan filters on for automatic
+/// indexing (see [`super::auto_index`]).
+fn note_scanned_predicates(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    predicates: &[namidb_storage::sst::predicates::ScanPredicate],
+) {
+    use namidb_storage::sst::predicates::ScanPredicate;
+    for predicate in predicates {
+        if matches!(
+            predicate,
+            ScanPredicate::Eq { .. }
+                | ScanPredicate::In { .. }
+                | ScanPredicate::Lt { .. }
+                | ScanPredicate::LtEq { .. }
+                | ScanPredicate::Gt { .. }
+                | ScanPredicate::GtEq { .. }
+        ) {
+            super::auto_index::note_unindexed(snapshot, label, predicate.column());
+        }
+    }
+}
+
+/// Record a search filter's equality groups for automatic indexing.
+fn note_filter_groups(snapshot: &Snapshot<'_>, label: &str, groups: &[(String, Vec<CoreValue>)]) {
+    for (property, _) in groups {
+        super::auto_index::note_unindexed(snapshot, label, property);
+    }
+}
+
 pub(crate) async fn scan_node_views(
     snapshot: &Snapshot<'_>,
     label: Option<&str>,
@@ -1807,6 +1837,9 @@ pub(crate) async fn scan_node_views(
     projection: Option<&[String]>,
     limit: Option<usize>,
 ) -> Result<Vec<namidb_storage::NodeView>, ExecError> {
+    if let Some(label) = label {
+        note_scanned_predicates(snapshot, label, predicates);
+    }
     Ok(match (label, limit) {
         (Some(label), Some(limit)) => {
             snapshot
@@ -4661,6 +4694,10 @@ async fn bm25_ranked_filtered(
     use crate::exec::text_scoring::parse_query_with;
 
     let (filter, params, filter_properties) = filter;
+    // `filter_properties` are the keys of the procedure's equality map.
+    for property in filter_properties {
+        super::auto_index::note_unindexed(snapshot, label, property);
+    }
     if target == 0 {
         return Ok(Vec::new());
     }
@@ -4682,15 +4719,26 @@ async fn bm25_ranked_filtered(
             .find(|descriptor| descriptor.matches(label, &props))
             .map(|descriptor| descriptor.name.clone());
         let candidate_cap = hybrid_text_filter_candidate_cap();
-        if let Some(index_name) = index_name.filter(|_| candidate_cap >= target) {
+        // A BUILDING index goes straight to the bounded exact scan below:
+        // no membership scan of the whole label before a budgeted refusal.
+        let building = building_text_scan(snapshot, label, &props).is_some();
+        if let Some(index_name) = index_name.filter(|_| candidate_cap >= target && !building) {
             const OVERFETCH_BASE: usize = 8;
             const WIDEN_GROWTH: usize = 4;
             const HYDRATE_BATCH: usize = 256;
 
-            let mut fetch = target
-                .saturating_mul(OVERFETCH_BASE)
-                .max(target)
-                .min(candidate_cap);
+            // A property-only filter is checked against its membership set
+            // (read once from the filter's columns, shared and cached), so a
+            // candidate costs a lookup, not a record hydration; the set's
+            // selectivity sizes the first round so one round usually does.
+            let membership = filter_membership(snapshot, label, "node", "", filter, params).await?;
+            let first_round = match membership.as_ref() {
+                Some(membership) => {
+                    ((target as f64 / membership.selectivity()) * 1.5).ceil() as usize
+                }
+                None => target.saturating_mul(OVERFETCH_BASE),
+            };
+            let mut fetch = first_round.max(target).min(candidate_cap);
             let mut processed_prefix = 0usize;
             let mut survivors = Vec::with_capacity(query_initial_capacity(target, candidate_cap));
             let mut use_groups = !native_groups.is_empty();
@@ -4770,7 +4818,22 @@ async fn bm25_ranked_filtered(
                     break;
                 }
                 let exhausted = hits.len() < fetch;
-                for chunk in hits[processed_prefix..].chunks(HYDRATE_BATCH) {
+                if let Some(membership) = membership.as_ref() {
+                    for (id, score) in &hits[processed_prefix..] {
+                        if membership.contains(id) {
+                            survivors.push((*id, *score));
+                            if survivors.len() == target {
+                                return Ok(survivors);
+                            }
+                        }
+                    }
+                }
+                let hydrate_from = if membership.is_some() {
+                    hits.len()
+                } else {
+                    processed_prefix
+                };
+                for chunk in hits[hydrate_from..].chunks(HYDRATE_BATCH) {
                     crate::exec::limits::check_deadline()?;
                     let ids: Vec<NodeId> = chunk.iter().map(|(id, _)| *id).collect();
                     let hydrated = snapshot.batch_lookup_nodes(label, &ids).await?;
@@ -6325,19 +6388,39 @@ fn hybrid_text_props(
     }
 }
 
+/// Default per-leg depth of `search.hybrid`.
+///
+/// RRF scores a document by its rank in each leg, so a document ranked low
+/// in both legs cannot climb into the fused top `k`. On a 386k-document
+/// corpus, against an `8k` depth: depth 40 kept the whole fused top-20 (as
+/// did 20 and 100), depth `k` kept 0.9975 of the top-40 and 0.986 of the
+/// top-200. `max(k, 40)` is the shallowest depth that met 0.98 at every
+/// measured `k`, with margin at small `k`. Linear fusion min-max normalises
+/// each leg over its own hits, so the depth moves every normalised score;
+/// it needed `8k` for the same overlap and keeps it.
+fn hybrid_default_depth(fusion_mode: &str, k: usize) -> usize {
+    const RRF_MIN_DEPTH: usize = 40;
+    const LINEAR_OVERFETCH: usize = 8;
+    if fusion_mode == "linear" {
+        k.saturating_mul(LINEAR_OVERFETCH).max(k)
+    } else {
+        k.max(RRF_MIN_DEPTH)
+    }
+}
+
+/// Fewest fused candidates `search.hybrid` hydrates per batch: a filter that
+/// rejects some of the first `k` then costs one more batch, not one per miss.
+const HYBRID_HYDRATE_MIN_BATCH: usize = 16;
+
 /// `CALL search.hybrid({label, query_text?, text_property(ies)?, query_vector?,
-/// vector_property?, k?, ef?, fusion?, rrf_k?, alpha?, metric?, filter?}) YIELD node,
-/// score` — fuse a dense (vector KNN) and a sparse (BM25) retrieval into one
+/// vector_property?, k?, depth?, k_dense?, k_sparse?, ef?, fusion?, rrf_k?, alpha?, metric?,
+/// filter?}) YIELD node, score` — fuse a dense (vector KNN) and a sparse (BM25) retrieval into one
 /// ranking. Default fusion is Reciprocal Rank Fusion (rank-based, needs no score
 /// calibration across the two scales); `fusion: 'linear'` does a weighted
 /// min-max blend (`alpha` on the dense leg). Each leg independently serves from
 /// its index or falls back to its exact flat scan, so hybrid is
 /// freshness-equivalent to running the two separately and fusing. At least one
 /// leg must be configured.
-/// Fewest fused candidates `search.hybrid` hydrates per batch: a filter that
-/// rejects some of the first `k` then costs one more batch, not one per miss.
-const HYBRID_HYDRATE_MIN_BATCH: usize = 16;
-
 async fn hybrid_search_procedure(
     args: &[Expression],
     yield_items: &[(String, String)],
@@ -6360,6 +6443,7 @@ async fn hybrid_search_procedure(
             "k",
             "k_dense",
             "k_sparse",
+            "depth",
             "ef",
             "fusion",
             "rrf_k",
@@ -6458,11 +6542,16 @@ async fn hybrid_search_procedure(
              `fusion: 'linear'`; 1 = vector only, 0 = BM25 only), got {alpha}"
         )));
     }
-    // Per-leg candidate depth before fusion: over-fetch so a node ranked well in
-    // one leg but just outside the other's window still contributes.
-    const OVERFETCH: usize = 8;
-    let k_dense = opt_usize("k_dense")?.unwrap_or_else(|| k.saturating_mul(OVERFETCH).max(k));
-    let k_sparse = opt_usize("k_sparse")?.unwrap_or_else(|| k.saturating_mul(OVERFETCH).max(k));
+    // Per-leg depth: how many hits each leg retrieves before fusion. `depth`
+    // sets both legs, `k_dense` / `k_sparse` set one; anything deeper than
+    // the default only matters for the few documents ranked near the
+    // fusion cutoff.
+    let depth = match opt_usize("depth")? {
+        Some(depth) => depth.max(k),
+        None => hybrid_default_depth(&fusion_mode, k),
+    };
+    let k_dense = opt_usize("k_dense")?.unwrap_or(depth);
+    let k_sparse = opt_usize("k_sparse")?.unwrap_or(depth);
 
     // A dense leg needs BOTH keys; supplying exactly one is a mistake, not a
     // silently-disabled leg.
@@ -6482,12 +6571,9 @@ async fn hybrid_search_procedure(
         ));
     }
 
-    let started = std::time::Instant::now();
-    // Dense leg (vector KNN), best-first.
-    let dense_leg = async {
-        if !dense_configured {
-            return Ok::<Vec<(NodeId, f64)>, ExecError>(Vec::new());
-        }
+    // Parse both legs' inputs before running either, so a malformed option
+    // fails before any I/O.
+    let dense_input = if dense_configured {
         let qv = map
             .get("query_vector")
             .and_then(runtime_to_f32_vec)
@@ -6498,13 +6584,34 @@ async fn hybrid_search_procedure(
             .get("vector_property")
             .and_then(proc_str)
             .ok_or_else(|| proc_unsupported("search.hybrid `vector_property` must be a string"))?;
-        let q = RuntimeValue::Vector(qv);
+        Some((RuntimeValue::Vector(qv), vprop))
+    } else {
+        None
+    };
+    let sparse_input = if sparse_configured {
+        let qtext = map
+            .get("query_text")
+            .and_then(proc_str)
+            .ok_or_else(|| proc_unsupported("search.hybrid `query_text` must be a string"))?;
+        Some((qtext, hybrid_text_props(&map)?))
+    } else {
+        None
+    };
+
+    let started = std::time::Instant::now();
+    // The legs are independent: run them concurrently, so a new query waits
+    // for the slower leg's store round trips rather than for their sum.
+    // Dense leg (vector KNN), best-first.
+    let dense_leg = async {
+        let Some((q, vprop)) = dense_input.as_ref() else {
+            return Ok::<_, ExecError>((Vec::new(), std::time::Duration::ZERO));
+        };
         let rows = vector_search_rows(
             snapshot,
             Some(&label),
             "node",
-            &vprop,
-            &q,
+            vprop,
+            q,
             SourceSpan::point(0),
             k_dense,
             distance,
@@ -6516,43 +6623,38 @@ async fn hybrid_search_procedure(
             VectorRowMaterialization::IdentityOnly,
         )
         .await?;
-        Ok(rows_to_id_score(&rows))
+        Ok((rows_to_id_score(&rows), started.elapsed()))
     };
-
-    let dense_done = std::time::Instant::now();
     // Sparse leg (BM25), best-first.
     let sparse_leg = async {
-        if !sparse_configured {
-            return Ok::<Vec<(NodeId, f64)>, ExecError>(Vec::new());
-        }
-        let qtext = map
-            .get("query_text")
-            .and_then(proc_str)
-            .ok_or_else(|| proc_unsupported("search.hybrid `query_text` must be a string"))?;
-        let props = hybrid_text_props(&map)?;
+        let Some((qtext, props)) = sparse_input.as_ref() else {
+            return Ok::<_, ExecError>((Vec::new(), std::time::Duration::ZERO));
+        };
         // Apply the residual predicate before the sparse leg's own top-k.
         // Indexed retrieval widens adaptively under a configurable candidate
         // cap, then falls back to an exact filtered corpus scan if the cap
         // cannot produce `k_sparse` survivors. A cap therefore changes the
         // fast-path cost, never recall.
-        Ok(if let Some(filter) = pf.as_ref() {
+        let hits = if let Some(filter) = pf.as_ref() {
             bm25_ranked_filtered(
                 snapshot,
                 &label,
-                &props,
-                &qtext,
+                props,
+                qtext,
                 k_sparse,
                 (filter, params, &filter_properties),
                 &prefilter.groups,
             )
             .await?
         } else {
-            bm25_ranked(snapshot, &label, &props, &qtext, Some(k_sparse)).await?
-        })
+            bm25_ranked(snapshot, &label, props, qtext, Some(k_sparse)).await?
+        };
+        Ok((hits, started.elapsed()))
     };
-    let (dense, sparse) = futures::future::try_join(dense_leg, sparse_leg).await?;
+    let ((dense, dense_elapsed), (sparse, sparse_elapsed)) =
+        with_eligibility_memo(futures::future::try_join(dense_leg, sparse_leg)).await?;
 
-    let sparse_done = std::time::Instant::now();
+    let legs_done = std::time::Instant::now();
     // Both legs are filtered before fusion. RRF therefore uses ranks within the
     // eligible population, and linear normalization is no longer skewed by
     // high-scoring ineligible sparse documents.
@@ -6605,9 +6707,9 @@ async fn hybrid_search_procedure(
         k_sparse,
         dense_hits = dense.len(),
         sparse_hits = sparse.len(),
-        dense_ms = dense_done.duration_since(started).as_secs_f64() * 1e3,
-        sparse_ms = sparse_done.duration_since(dense_done).as_secs_f64() * 1e3,
-        hydrate_ms = sparse_done.elapsed().as_secs_f64() * 1e3,
+        dense_ms = dense_elapsed.as_secs_f64() * 1e3,
+        sparse_ms = sparse_elapsed.as_secs_f64() * 1e3,
+        hydrate_ms = legs_done.elapsed().as_secs_f64() * 1e3,
         "search.hybrid timing"
     );
     project_proc_rows("search.hybrid", &["node", "score"], raw, yield_items)
@@ -7349,6 +7451,9 @@ async fn vector_search_rows(
     materialize: VectorRowMaterialization,
 ) -> Result<Vec<Row>, ExecError> {
     use crate::exec::expr::vector_score;
+    if let (Some(label), Some(plan)) = (label, prefilter) {
+        note_filter_groups(snapshot, label, &plan.groups);
+    }
 
     // A non-finite query component makes every distance undefined; NaN
     // ordering would silently produce garbage ranking on the flat route and
@@ -7659,7 +7764,431 @@ fn filter_property_projection(filter: &Expression, alias: &str) -> Option<BTreeS
 /// property indexes (a superset of the admitted nodes, since the groups are
 /// conjuncts of the filter), then by evaluating a property-only filter on its
 /// own columns. The caller re-evaluates the whole filter on each node.
+/// Eligibility sets computed once per statement and shared by the legs of a
+/// hybrid search: both legs ask for the same `(label, filter)` set, and
+/// without the memo each would read the filter's columns on its own.
+type EligibilityMemo =
+    Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Option<Arc<Vec<NodeId>>>>>>>>;
+
+tokio::task_local! {
+    static ELIGIBILITY_MEMO: EligibilityMemo;
+}
+
+/// Run `fut` with a fresh eligibility memo in scope (see [`EligibilityMemo`]).
+async fn with_eligibility_memo<F: std::future::Future>(fut: F) -> F::Output {
+    let fut = MEMBERSHIP_MEMO.scope(MembershipMemo::default(), fut);
+    ELIGIBILITY_MEMO
+        .scope(EligibilityMemo::default(), fut)
+        .await
+}
+
 async fn selective_filter_eligible(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    alias: &str,
+    vector_property: &str,
+    filter: &Expression,
+    groups: &[(String, Vec<CoreValue>)],
+    params: &Params,
+) -> Result<Option<Vec<NodeId>>, ExecError> {
+    note_filter_groups(snapshot, label, groups);
+    // A filter on the vector property is declined by one leg and not the
+    // other, so it never shares a memo entry.
+    let shareable = filter_property_projection(filter, alias)
+        .is_some_and(|properties| !properties.contains(vector_property));
+    // The key is the resolved filter: procedure filters arrive as literal
+    // values already; a `$param` the expression still references is keyed by
+    // its bound value, so one statement shape with other values is another
+    // entry.
+    let key = shareable.then(|| {
+        let mut key = format!("{label}\u{0}{alias}\u{0}{filter:?}\u{0}{groups:?}");
+        if key.contains("Parameter(") {
+            let bound: Vec<String> = params
+                .iter()
+                .filter(|(name, _)| key.contains(&format!("Parameter({name:?})")))
+                .map(|(name, value)| format!("{name:?}={value:?}"))
+                .collect();
+            for value in bound {
+                key.push('\u{0}');
+                key.push_str(&value);
+            }
+        }
+        key
+    });
+    // Across statements only when the snapshot names its node data (no
+    // staged writes in front of the search).
+    let snapshot_key = key.as_ref().and_then(|key| {
+        snapshot
+            .node_data_identity()
+            .map(|identity| (identity, key.clone()))
+    });
+    if let Some(snapshot_key) = &snapshot_key {
+        if let Some(shared) = eligibility_cache_get(snapshot_key) {
+            return Ok(shared.map(|ids| ids.as_ref().clone()));
+        }
+    }
+    let cell = key.and_then(|key| {
+        ELIGIBILITY_MEMO
+            .try_with(|memo| {
+                memo.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(key)
+                    .or_default()
+                    .clone()
+            })
+            .ok()
+    });
+    let Some(cell) = cell else {
+        let ids = selective_filter_eligible_uncached(
+            snapshot,
+            label,
+            alias,
+            vector_property,
+            filter,
+            groups,
+            params,
+        )
+        .await?;
+        if let Some(snapshot_key) = snapshot_key {
+            eligibility_cache_put(snapshot_key, ids.clone().map(Arc::new));
+        }
+        return Ok(ids);
+    };
+    let shared = cell
+        .get_or_try_init(|| async {
+            selective_filter_eligible_uncached(
+                snapshot,
+                label,
+                alias,
+                vector_property,
+                filter,
+                groups,
+                params,
+            )
+            .await
+            .map(|ids| ids.map(Arc::new))
+        })
+        .await?;
+    if let Some(snapshot_key) = snapshot_key {
+        eligibility_cache_put(snapshot_key, shared.clone());
+    }
+    Ok(shared.as_ref().map(|ids| ids.as_ref().clone()))
+}
+
+/// `((namespace, manifest version, node generation), filter key)`.
+type EligibilityCacheKey = (namidb_storage::NodeDataIdentity, String);
+
+/// Eligibility sets of recent statements, reused by a later statement over
+/// the same node data with the same literal filter. A few dozen entries of
+/// at most [`FILTERED_FLAT_ELIGIBLE_CAP`] ids each.
+const ELIGIBILITY_CACHE_ENTRIES: usize = 64;
+
+#[allow(clippy::type_complexity)]
+fn eligibility_cache() -> &'static std::sync::Mutex<
+    std::collections::VecDeque<(EligibilityCacheKey, Option<Arc<Vec<NodeId>>>)>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::VecDeque<(EligibilityCacheKey, Option<Arc<Vec<NodeId>>>)>,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+static ELIGIBILITY_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Statements that reused a cached filter eligibility set (process total).
+#[doc(hidden)]
+pub fn eligibility_cache_hits() -> u64 {
+    ELIGIBILITY_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn eligibility_cache_get(key: &EligibilityCacheKey) -> Option<Option<Arc<Vec<NodeId>>>> {
+    let mut cache = eligibility_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let position = cache.iter().position(|(cached, _)| cached == key)?;
+    ELIGIBILITY_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let entry = cache.remove(position)?;
+    let value = entry.1.clone();
+    cache.push_back(entry);
+    Some(value)
+}
+
+fn eligibility_cache_put(key: EligibilityCacheKey, value: Option<Arc<Vec<NodeId>>>) {
+    let mut cache = eligibility_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(position) = cache.iter().position(|(cached, _)| *cached == key) {
+        cache.remove(position);
+    }
+    cache.push_back((key, value));
+    while cache.len() > ELIGIBILITY_CACHE_ENTRIES {
+        cache.pop_front();
+    }
+}
+
+/// The `label` nodes a property-only filter admits, read once from the
+/// filter's own columns (never whole records), in id order. Residual filter
+/// checks of search candidates become a lookup in it instead of a node
+/// hydration, and its size gives the filter's selectivity.
+pub(crate) struct FilterMembership {
+    ids: Arc<Vec<NodeId>>,
+    /// Live `label` nodes the scan visited.
+    #[cfg_attr(
+        not(any(feature = "vector-index", feature = "text-index")),
+        allow(dead_code)
+    )]
+    visited: usize,
+}
+
+// Only the index-backed search legs consult the set by id.
+#[cfg_attr(
+    not(any(feature = "vector-index", feature = "text-index")),
+    allow(dead_code)
+)]
+impl FilterMembership {
+    fn contains(&self, id: &NodeId) -> bool {
+        self.ids.binary_search(id).is_ok()
+    }
+
+    /// Admitted share of the label, at least one node's worth.
+    fn selectivity(&self) -> f64 {
+        (self.ids.len().max(1) as f64 / self.visited.max(1) as f64).min(1.0)
+    }
+
+    fn bytes(&self) -> usize {
+        self.ids.len().saturating_mul(std::mem::size_of::<NodeId>()) + 64
+    }
+}
+
+type MembershipMemo = Arc<
+    std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Option<Arc<FilterMembership>>>>>>,
+>;
+
+tokio::task_local! {
+    static MEMBERSHIP_MEMO: MembershipMemo;
+}
+
+/// Largest membership set kept (`NAMIDB_FILTER_MEMBERSHIP_MAX_IDS`, default
+/// 4M ids = 64 MiB); a filter admitting more falls back to hydrating.
+fn filter_membership_max_ids() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("NAMIDB_FILTER_MEMBERSHIP_MAX_IDS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(4 << 20)
+    })
+}
+
+/// Bytes the cross-statement membership cache holds at most
+/// (`NAMIDB_FILTER_CACHE_MAX_BYTES`, default 64 MiB; 0 disables it).
+fn filter_cache_max_bytes() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("NAMIDB_FILTER_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(64 << 20)
+    })
+}
+
+/// Resolved key of a property-only filter: label, alias, the expression
+/// and the bound value of every `$param` it references.
+fn resolved_filter_key(label: &str, alias: &str, filter: &Expression, params: &Params) -> String {
+    let mut key = format!("{label}\u{0}{alias}\u{0}{filter:?}");
+    if key.contains("Parameter(") {
+        let bound: Vec<String> = params
+            .iter()
+            .filter(|(name, _)| key.contains(&format!("Parameter({name:?})")))
+            .map(|(name, value)| format!("{name:?}={value:?}"))
+            .collect();
+        for value in bound {
+            key.push('\u{0}');
+            key.push_str(&value);
+        }
+    }
+    key
+}
+
+type MembershipCacheKey = (namidb_storage::NodeDataIdentity, String);
+
+#[allow(clippy::type_complexity)]
+fn membership_cache() -> &'static std::sync::Mutex<(
+    std::collections::VecDeque<(MembershipCacheKey, Option<Arc<FilterMembership>>)>,
+    usize,
+)> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<(
+            std::collections::VecDeque<(MembershipCacheKey, Option<Arc<FilterMembership>>)>,
+            usize,
+        )>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn membership_entry_bytes(
+    value: &Option<Arc<FilterMembership>>,
+    key: &MembershipCacheKey,
+) -> usize {
+    value.as_ref().map_or(0, |m| m.bytes()) + key.1.len() + 64
+}
+
+fn membership_cache_get(key: &MembershipCacheKey) -> Option<Option<Arc<FilterMembership>>> {
+    let mut guard = membership_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (entries, _) = &mut *guard;
+    let position = entries.iter().position(|(cached, _)| cached == key)?;
+    let entry = entries.remove(position)?;
+    let value = entry.1.clone();
+    entries.push_back(entry);
+    ELIGIBILITY_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(value)
+}
+
+fn membership_cache_put(key: MembershipCacheKey, value: Option<Arc<FilterMembership>>) {
+    let budget = filter_cache_max_bytes();
+    let bytes = membership_entry_bytes(&value, &key);
+    if bytes > budget {
+        return;
+    }
+    let mut guard = membership_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (entries, used) = &mut *guard;
+    if let Some(position) = entries.iter().position(|(cached, _)| *cached == key) {
+        if let Some((old_key, old)) = entries.remove(position) {
+            *used = used.saturating_sub(membership_entry_bytes(&old, &old_key));
+        }
+    }
+    *used += bytes;
+    entries.push_back((key, value));
+    while *used > budget {
+        let Some((old_key, old)) = entries.pop_front() else {
+            break;
+        };
+        *used = used.saturating_sub(membership_entry_bytes(&old, &old_key));
+    }
+}
+
+/// [`FilterMembership`] of a property-only `filter` over `label`: shared by
+/// the legs of one statement, and cached across statements over the same
+/// node data (see [`Snapshot::node_data_identity`]). `None` when the filter
+/// reads more than node properties (or the vector property) or admits more
+/// than [`filter_membership_max_ids`] nodes.
+async fn filter_membership(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    alias: &str,
+    vector_property: &str,
+    filter: &Expression,
+    params: &Params,
+) -> Result<Option<Arc<FilterMembership>>, ExecError> {
+    let Some(properties) = filter_property_projection(filter, alias)
+        .filter(|properties| vector_property.is_empty() || !properties.contains(vector_property))
+    else {
+        return Ok(None);
+    };
+    let key = resolved_filter_key(label, alias, filter, params);
+    let snapshot_key = snapshot
+        .node_data_identity()
+        .map(|identity| (identity, key.clone()));
+    if let Some(snapshot_key) = &snapshot_key {
+        if let Some(cached) = membership_cache_get(snapshot_key) {
+            return Ok(cached);
+        }
+    }
+    let compute = || async {
+        compute_filter_membership(snapshot, label, alias, &properties, filter, params).await
+    };
+    let cell = MEMBERSHIP_MEMO
+        .try_with(|memo| {
+            memo.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key)
+                .or_default()
+                .clone()
+        })
+        .ok();
+    let membership = match cell {
+        Some(cell) => cell.get_or_try_init(compute).await?.clone(),
+        None => compute().await?,
+    };
+    if let Some(snapshot_key) = snapshot_key {
+        membership_cache_put(snapshot_key, membership.clone());
+    }
+    Ok(membership)
+}
+
+async fn compute_filter_membership(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    alias: &str,
+    properties: &BTreeSet<String>,
+    filter: &Expression,
+    params: &Params,
+) -> Result<Option<Arc<FilterMembership>>, ExecError> {
+    enum Visit {
+        Overflow,
+        Failed(ExecError),
+    }
+    impl From<namidb_storage::Error> for Visit {
+        fn from(error: namidb_storage::Error) -> Self {
+            Visit::Failed(error.into())
+        }
+    }
+    let started = std::time::Instant::now();
+    let projection: Vec<String> = properties.iter().cloned().collect();
+    let max_ids = filter_membership_max_ids();
+    let mut admitted: Vec<NodeId> = Vec::new();
+    let mut visited = 0usize;
+    let result = snapshot
+        .visit_label_with_projection::<_, Visit>(label, &projection, |view| {
+            crate::exec::limits::check_deadline().map_err(Visit::Failed)?;
+            visited += 1;
+            let id = view.id;
+            let mut row = Row::new();
+            row.set(
+                alias.to_string(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            if evaluate(filter, &row, params)
+                .map_err(|e| Visit::Failed(e.into()))?
+                .as_bool()
+                == Some(true)
+            {
+                if admitted.len() == max_ids {
+                    return Err(Visit::Overflow);
+                }
+                admitted.push(id);
+            }
+            Ok(())
+        })
+        .await;
+    match result {
+        Ok(()) => {}
+        Err(Visit::Overflow) => return Ok(None),
+        Err(Visit::Failed(error)) => return Err(error),
+    }
+    admitted.sort_unstable();
+    admitted.dedup();
+    tracing::debug!(
+        target: "namidb::search_timing",
+        label,
+        visited,
+        admitted = admitted.len(),
+        ms = started.elapsed().as_secs_f64() * 1e3,
+        "filter membership"
+    );
+    Ok(Some(Arc::new(FilterMembership {
+        ids: Arc::new(admitted),
+        visited,
+    })))
+}
+
+async fn selective_filter_eligible_uncached(
     snapshot: &Snapshot<'_>,
     label: &str,
     alias: &str,
@@ -7675,6 +8204,16 @@ async fn selective_filter_eligible(
                 return Ok(Some(ids.into_iter().collect()));
             }
         }
+    }
+    // One read of the filter's own columns answers both the selective case
+    // (few ids) and, kept as a membership set, the broad one.
+    if let Some(membership) =
+        filter_membership(snapshot, label, alias, vector_property, filter, params).await?
+    {
+        return Ok((membership.ids.len() <= FILTERED_FLAT_ELIGIBLE_CAP)
+            .then(|| membership.ids.as_ref().clone()));
+    }
+    if !groups.is_empty() {
         if let Some(predicates) = string_group_predicates(groups) {
             // Storage evaluates the conjuncts on their columns and returns ids
             // only; no node is decoded for the filter.
@@ -8055,7 +8594,27 @@ async fn try_index_search(
     let q_rv = RuntimeValue::Vector(qv.clone());
     let mut delta_candidates_materialized_completely = true;
     let mut delta_scored: Vec<(f64, NodeId)> = Vec::with_capacity(delta.len());
-    if let Some(filter) = source_filter {
+    // A property-only residual filter is decided by its membership set (read
+    // once from the filter's columns): candidates are filtered before the
+    // int8 rescore and never hydrated just to test the predicate.
+    let membership = match source_filter {
+        Some(filter) => filter_membership(snapshot, label, alias, property, filter, params).await?,
+        None => None,
+    };
+    if let (Some(_), Some(membership)) = (source_filter, membership.as_ref()) {
+        for (id, embedding) in delta
+            .into_iter()
+            .filter_map(|(id, embedding)| embedding.map(|embedding| (id, embedding)))
+        {
+            if !membership.contains(&id) {
+                continue;
+            }
+            let emb_rv = RuntimeValue::Vector(embedding);
+            if let Some((score, _higher)) = vector_score(distance, &emb_rv, &q_rv, span)? {
+                delta_scored.push((score, id));
+            }
+        }
+    } else if let Some(filter) = source_filter {
         // A fresh vector has not necessarily reached the persisted index and
         // therefore cannot benefit from its metadata postings. Hydrate it
         // first and apply the source predicate before vector_score, matching
@@ -8122,7 +8681,14 @@ async fn try_index_search(
     const INT8_RESCORE_POOL: usize = 4;
     let widen = source_filter.is_some();
     let max_rounds = if widen { MAX_WIDEN_ROUNDS } else { 1 };
-    let mut mult = if widen {
+    let mut mult = if let Some(membership) = membership.as_ref().filter(|_| widen) {
+        // A known selectivity sizes the first round (`k / selectivity`, half
+        // again as margin) instead of the blind ×8; an under-filled round
+        // still widens below.
+        let sized = (1.5 / membership.selectivity().max(f64::MIN_POSITIVE)).ceil();
+        let floor = if index_int8 { INT8_RESCORE_POOL } else { 1 };
+        (sized.min(OVERFETCH_BASE as f64) as usize).max(floor)
+    } else if widen {
         OVERFETCH_BASE
     } else if index_int8 {
         INT8_RESCORE_POOL
@@ -8278,6 +8844,13 @@ async fn try_index_search(
         // membership then match the flat scan, and a node scores identically
         // before vs after compaction folds it into the index. The materialise
         // loop below reuses the fetched views, so the lookups are not wasted.
+        let raw_hits = match membership.as_ref() {
+            Some(membership) => raw_hits
+                .into_iter()
+                .filter(|(id, _)| membership.contains(id))
+                .collect::<Vec<_>>(),
+            None => raw_hits,
+        };
         let mut candidates_materialized_completely = delta_candidates_materialized_completely;
         let mut rescored_views: std::collections::HashMap<NodeId, NodeValue> =
             std::collections::HashMap::new();
@@ -8345,7 +8918,9 @@ async fn try_index_search(
         // leg, which hydrates its fused top-k itself) skips hydration when no
         // residual predicate has to read the node: the hits already carry
         // exact scores (an int8 index was rescored from hydrated views above).
-        if materialize == VectorRowMaterialization::IdentityOnly && source_filter.is_none() {
+        if materialize == VectorRowMaterialization::IdentityOnly
+            && (source_filter.is_none() || membership.is_some())
+        {
             for &(score, id) in scored.iter().take(k) {
                 let mut row = Row::new();
                 row.set(alias.to_string(), node_runtime(id));
@@ -12464,6 +13039,7 @@ fn descend_multiway<'a>(
                     var.alias
                 ))
             })?;
+            note_scanned_predicates(snapshot, label, &var.predicates);
             let nodes = snapshot
                 .scan_label_with_predicates_and_projection(label, &var.predicates, None)
                 .await?;

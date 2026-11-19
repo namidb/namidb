@@ -693,10 +693,27 @@ fn roll_forward(value: u64, delta: i64) -> Option<u64> {
     }
 }
 
+/// Process-unique id of one [`PropertyIndexCache`], i.e. of one writer
+/// session. Generations are seeded from the manifest version, which restarts
+/// when a namespace is dropped and created again, so a key that must never
+/// match another session's data (another store, or an earlier incarnation of
+/// the same namespace in this process) carries this id too.
+#[derive(Debug)]
+struct CacheInstance(u64);
+
+impl Default for CacheInstance {
+    fn default() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Shared cache that lives at `WriterSession` scope and is cloned (as
 /// an `Arc`) into every `Snapshot` the session emits.
 #[derive(Debug, Default)]
 pub struct PropertyIndexCache {
+    /// Which session this cache belongs to; see [`CacheInstance`].
+    instance: CacheInstance,
     /// `(label_name, property_name) → Arc<value_string → NodeId>`.
     /// `Arc` on the inner so readers can release the outer lock as
     /// soon as they have the per-(label, prop) handle.
@@ -786,6 +803,11 @@ pub struct PropertyIndexCache {
 impl PropertyIndexCache {
     pub fn new() -> Self {
         Self::new_at_generation(0)
+    }
+
+    /// Process-unique id of this cache (one per writer session).
+    pub fn instance(&self) -> u64 {
+        self.instance.0
     }
 
     /// Start a writer-local cache at a namespace-safe generation floor.

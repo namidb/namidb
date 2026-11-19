@@ -3574,6 +3574,18 @@ impl WriterSession {
             .and_then(|l| l.properties.iter().find(|p| p.name == property))
             .is_some_and(|p| p.indexed);
         if already {
+            // An explicit CREATE INDEX adopts an automatic index: it becomes
+            // an ordinary user index (same sidecar, no rebuild).
+            let mut schema = self.current.manifest.schema.clone();
+            if let Some(p) = schema
+                .labels
+                .get_mut(label)
+                .and_then(|l| l.properties.iter_mut().find(|p| p.name == property))
+                .filter(|p| p.auto_indexed)
+            {
+                p.auto_indexed = false;
+                return self.commit_schema(schema).await;
+            }
             if if_not_exists {
                 return Ok(self.current.manifest.version);
             }
@@ -3583,6 +3595,81 @@ impl WriterSession {
         }
         self.alter_property_for_ddl(label, property, false, true)
             .await
+    }
+
+    /// Mark `(label, property)` indexed on the engine's own initiative, in the
+    /// ordinary equality-sidecar format, flagged
+    /// [`PropertyDef::auto_indexed`]. The sidecars themselves are written by
+    /// the compaction the caller requests afterwards.
+    ///
+    /// Declines (without committing) when the property is already indexed or
+    /// unique, has no live value to type it from, has a type the equality
+    /// sidecar does not cover, or when indexing it would change the catalog
+    /// signature of a vector or full-text index: that retires the search
+    /// generation and rebuilds it, which no query should trigger implicitly.
+    pub async fn create_auto_property_index(
+        &mut self,
+        label: &str,
+        property: &str,
+    ) -> Result<AutoIndexOutcome> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        let existing = self
+            .current
+            .manifest
+            .schema
+            .label(label)
+            .and_then(|l| l.properties.iter().find(|p| p.name == property));
+        if existing.is_some_and(|p| p.indexed || p.unique) {
+            return Ok(AutoIndexOutcome::AlreadyIndexed);
+        }
+        let declared = existing
+            .filter(|p| !p.type_pending)
+            .map(|p| p.data_type.clone());
+        let dtype = match declared {
+            Some(dtype) => dtype,
+            None => {
+                // One projected row is enough to type the property; this
+                // never decodes whole nodes.
+                let projection = [property.to_string()];
+                let rows = self
+                    .snapshot()
+                    .scan_label_with_predicates_and_projection_limited(
+                        label,
+                        &[crate::sst::predicates::ScanPredicate::IsNotNull {
+                            column: property.to_string(),
+                        }],
+                        Some(&projection),
+                        1,
+                    )
+                    .await?;
+                match rows
+                    .iter()
+                    .find_map(|row| row.properties.get(property))
+                    .and_then(value_datatype)
+                {
+                    Some(dtype) => dtype,
+                    None => return Ok(AutoIndexOutcome::NoValues),
+                }
+            }
+        };
+        if !crate::flush::equality_indexable(&dtype) {
+            return Ok(AutoIndexOutcome::UnsupportedType);
+        }
+        let mut schema = self.current.manifest.schema.clone();
+        upsert_property_flags(&mut schema, label, property, dtype, false, false, true)?;
+        if let Some(p) = schema
+            .labels
+            .get_mut(label)
+            .and_then(|l| l.properties.iter_mut().find(|p| p.name == property))
+        {
+            p.auto_indexed = true;
+        }
+        let rebuilt = search_indexes_resigned_by(&self.current.manifest, &schema);
+        if !rebuilt.is_empty() {
+            return Ok(AutoIndexOutcome::WouldRebuildSearch(rebuilt));
+        }
+        let version = self.commit_schema_ddl(schema).await?;
+        Ok(AutoIndexOutcome::Created { version })
     }
 
     /// Shared body of the index DDL: scan the label to infer the property type
@@ -4282,6 +4369,57 @@ impl PendingTypes {
 /// Committing the placeholder as a
 /// real `Utf8` would read as a String declaration forever and keep every
 /// numeric equality lookup on the scan route.
+/// Result of [`WriterSession::create_auto_property_index`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoIndexOutcome {
+    /// Committed as manifest `version`; the sidecars come with the next
+    /// compaction.
+    Created { version: u64 },
+    /// An index or unique constraint already covers the property.
+    AlreadyIndexed,
+    /// No live value to infer the property's type from.
+    NoValues,
+    /// The property's type has no equality sidecar (lists, vectors, dates…).
+    UnsupportedType,
+    /// Indexing it would change these search indexes' catalog signatures
+    /// and so rebuild them; left to an explicit `CREATE INDEX`.
+    WouldRebuildSearch(Vec<String>),
+}
+
+/// Names of the vector/full-text indexes whose catalog signature `schema`
+/// would change relative to `manifest` (a change retires and rebuilds the
+/// search generation).
+fn search_indexes_resigned_by(manifest: &Manifest, schema: &Schema) -> Vec<String> {
+    #[cfg(any(feature = "vector-index", feature = "text-index"))]
+    {
+        use crate::search_lsm::{catalog_signature, SearchLsmKind};
+        let mut next = manifest.clone();
+        next.schema = schema.clone();
+        let mut changed = Vec::new();
+        let names = manifest
+            .vector_indexes
+            .iter()
+            .map(|d| (SearchLsmKind::Vector, d.name.clone()))
+            .chain(
+                manifest
+                    .text_indexes
+                    .iter()
+                    .map(|d| (SearchLsmKind::Text, d.name.clone())),
+            );
+        for (kind, name) in names {
+            if catalog_signature(manifest, kind, &name) != catalog_signature(&next, kind, &name) {
+                changed.push(name);
+            }
+        }
+        changed
+    }
+    #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+    {
+        let _ = (manifest, schema);
+        Vec::new()
+    }
+}
+
 fn ddl_property_type(declared: Option<DataType>, inferred: Option<DataType>) -> (DataType, bool) {
     match declared.or(inferred) {
         Some(dtype) => (dtype, false),

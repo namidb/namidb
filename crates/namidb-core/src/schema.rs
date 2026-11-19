@@ -128,6 +128,14 @@ pub struct PropertyDef {
     /// Defaults to `false` and is omitted from the wire when `false`, so
     /// existing manifests round-trip byte-identically.
     pub type_pending: bool,
+    /// When `true`, `indexed` was set by the engine's automatic indexing
+    /// (a search filter or a `WHERE` equality/range on this unindexed
+    /// property), not by `CREATE INDEX`. The index itself is the ordinary
+    /// equality sidecar; this only names it `auto_index_*` in listings.
+    ///
+    /// Omitted from the wire when `false`. Older engines ignore the field
+    /// (unknown fields are not rejected) and keep the index as a normal one.
+    pub auto_indexed: bool,
 }
 
 /// Wire-level representation used only by serde. The public type validates
@@ -144,6 +152,8 @@ struct PropertyDefRepr {
     indexed: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     type_pending: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    auto_indexed: bool,
 }
 
 impl TryFrom<PropertyDefRepr> for PropertyDef {
@@ -153,6 +163,7 @@ impl TryFrom<PropertyDefRepr> for PropertyDef {
         p.unique = r.unique;
         p.indexed = r.indexed;
         p.type_pending = r.type_pending;
+        p.auto_indexed = r.auto_indexed && r.indexed;
         Ok(p)
     }
 }
@@ -166,6 +177,7 @@ impl From<PropertyDef> for PropertyDefRepr {
             unique: p.unique,
             indexed: p.indexed,
             type_pending: p.type_pending,
+            auto_indexed: p.auto_indexed && p.indexed,
         }
     }
 }
@@ -199,6 +211,7 @@ impl PropertyDef {
             unique: false,
             indexed: false,
             type_pending: false,
+            auto_indexed: false,
         })
     }
 

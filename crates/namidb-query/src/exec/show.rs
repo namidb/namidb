@@ -85,6 +85,10 @@ pub fn show_constraints_rows(schema: &Schema) -> Vec<Row> {
 /// Rows for `SHOW INDEXES`, built from the full manifest: equality (property)
 /// indexes from the schema, plus the named vector and full-text descriptors.
 /// Sorted by name for a stable result order.
+/// Name prefix of the indexes the engine creates on its own
+/// (`auto_index_<label>_<property>`).
+pub const AUTO_INDEX_PREFIX: &str = "auto_index_";
+
 pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
     use namidb_storage::search_lsm::SearchLsmKind;
     use namidb_storage::search_progress::{index_status, IndexState, IndexStatus};
@@ -107,6 +111,11 @@ pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
                         Constraint::default_name(label, &props, ConstraintKind::Unique)
                     });
                 entries.push((name, "RANGE", label.clone(), props));
+            } else if p.indexed && p.auto_indexed {
+                // Created by the engine for a filter that scanned without
+                // an index: same sidecar, named so listings tell them apart.
+                let name = format!("{AUTO_INDEX_PREFIX}{label}_{}", p.name);
+                entries.push((name, "RANGE", label.clone(), vec![p.name.clone()]));
             } else if p.indexed {
                 let name = format!("index_{label}_{}", p.name);
                 entries.push((name, "RANGE", label.clone(), vec![p.name.clone()]));
@@ -149,6 +158,22 @@ pub fn show_indexes_rows(manifest: &Manifest) -> Vec<Row> {
             let status = match kind {
                 "VECTOR" => index_status(manifest, SearchLsmKind::Vector, &name),
                 "FULLTEXT" => index_status(manifest, SearchLsmKind::Text, &name),
+                // An automatic index serves lookups once every SST of the
+                // label carries its sidecar; until then it is still being
+                // built by compaction.
+                "RANGE" if name.starts_with(AUTO_INDEX_PREFIX) && props.len() == 1 => {
+                    let population =
+                        namidb_storage::property_index_population(manifest, &label, &props[0]);
+                    IndexStatus {
+                        state: if population >= 1.0 {
+                            IndexState::Online
+                        } else {
+                            IndexState::Building
+                        },
+                        percent: (population * 100.0).min(100.0),
+                        migration_percent: None,
+                    }
+                }
                 _ => IndexStatus {
                     state: IndexState::Online,
                     percent: 100.0,

@@ -35,13 +35,14 @@ pub use cost::{
     estimate, BindingMeta, Cardinality, EdgeTypeStats, LabelStats, PropStats, StatsCatalog,
 };
 pub use exec::{
-    current_query_memory, enforce_node_unique_constraints, evaluate, execute, execute_factor_path,
-    execute_flat_path, execute_with_limits, execute_write, execute_write_checked_with_deadline,
-    execute_write_staged, execute_write_staged_with_deadline, execute_write_with_deadline,
-    factorize_enabled, process_resident_bytes, resident_memory_probe, show_constraints_rows,
-    show_indexes_columns, show_indexes_rows, show_schema_columns, system_memory_bytes,
-    with_query_memory, EvalError, ExecError, MemoryProbe, Params, QueryMemoryBudget,
-    QueryMemoryExceeded, QueryMemoryPool, QueryMemoryScope, Row, RuntimeValue, WriteOutcome,
+    current_query_memory, eligibility_cache_hits, enforce_node_unique_constraints, evaluate,
+    execute, execute_factor_path, execute_flat_path, execute_with_limits, execute_write,
+    execute_write_checked_with_deadline, execute_write_staged, execute_write_staged_with_deadline,
+    execute_write_with_deadline, factorize_enabled, process_resident_bytes, resident_memory_probe,
+    show_constraints_rows, show_indexes_columns, show_indexes_rows, show_schema_columns,
+    system_memory_bytes, with_auto_index_hints, with_query_memory, AutoIndexHints, EvalError,
+    ExecError, MemoryProbe, Params, QueryMemoryBudget, QueryMemoryExceeded, QueryMemoryPool,
+    QueryMemoryScope, Row, RuntimeValue, WriteOutcome,
 };
 pub use optimize::{convert_cross_to_hash, normalize_filters, optimize, predicate_pushdown};
 pub use parser::{parse, ParseError, ParseResult, Query};
