@@ -2087,7 +2087,13 @@ pub(crate) async fn execute_expand(
     let mut meter = crate::exec::memory::GrowthMeter::new();
     let mut exact_memo_bytes = 0usize;
     let mut rows = rows;
+    // Endpoints of the current seed window, resolved once for all of its
+    // seeds; see `window_expand_targets`.
+    let mut window_targets: Option<(std::collections::HashSet<NodeId>, ExpandTargets)> = None;
     for row_index in 0..rows.len() {
+        if row_index >= prefetched_until {
+            window_targets = None;
+        }
         if row_index >= prefetched_until && (exact_prefetch || seed_prefetch) {
             let window_end = row_index
                 .saturating_add(SEED_PREFETCH_WINDOW)
@@ -2128,6 +2134,18 @@ pub(crate) async fn execute_expand(
                     &mut meter,
                 )
                 .await?;
+                if seed_prefetch && max == 1 && !back_reference {
+                    window_targets = window_expand_targets(
+                        window,
+                        source,
+                        direction,
+                        snapshot,
+                        &neighbour_memo,
+                        target_labels,
+                        skip_target_materialize,
+                    )
+                    .await?;
+                }
             }
             prefetched_until = window_end;
         }
@@ -2465,15 +2483,28 @@ pub(crate) async fn execute_expand(
                 // prewarm the ordinary point cache for this window. This
                 // keeps work proportional to touched endpoints and avoids
                 // hydrating large vectors solely to evaluate `(:Label)`.
-                let target_membership = prepare_expand_targets(
-                    snapshot,
-                    target_labels,
-                    &unique_targets,
-                    skip_target_materialize,
-                    true,
-                    max > 1,
-                )
-                .await?;
+                let window_hit = window_targets.as_ref().and_then(|(covered, targets)| {
+                    unique_targets
+                        .iter()
+                        .all(|id| covered.contains(id))
+                        .then_some(targets)
+                });
+                let own_targets;
+                let target_membership = match window_hit {
+                    Some(targets) => targets,
+                    None => {
+                        own_targets = prepare_expand_targets(
+                            snapshot,
+                            target_labels,
+                            &unique_targets,
+                            skip_target_materialize,
+                            true,
+                            max > 1,
+                        )
+                        .await?;
+                        &own_targets
+                    }
+                };
                 // Flattened so a window is a plain slice of the (step, edge)
                 // sequence. `shortest == First` breaking out of this loop is
                 // what the per-step break did before: once a hit is found in
@@ -2560,7 +2591,7 @@ pub(crate) async fn execute_expand(
                         let target_view_opt = if back_reference {
                             None
                         } else if skip_target_materialize {
-                            if !match &target_membership {
+                            if !match target_membership {
                                 ExpandTargets::Membership(membership) => {
                                     membership.get(&target_id).copied().unwrap_or(false)
                                 }
@@ -2569,7 +2600,7 @@ pub(crate) async fn execute_expand(
                                 continue;
                             }
                             None
-                        } else if let ExpandTargets::Views(views, rejected) = &target_membership {
+                        } else if let ExpandTargets::Views(views, rejected) = target_membership {
                             // The hop's own materialisation answers directly, so a
                             // large fan-out no longer depends on cache retention.
                             // The batch resolves by id across every descriptor, so
@@ -2611,7 +2642,7 @@ pub(crate) async fn execute_expand(
                                     None => continue,
                                 },
                             }
-                        } else if matches!(&target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
+                        } else if matches!(target_membership, ExpandTargets::Cold(rejected) if rejected.contains(&target_id))
                         {
                             // Proven not to carry the label (single hop, over budget).
                             continue;
@@ -8280,6 +8311,69 @@ async fn prefetch_seed_neighbours(
         memo.insert(id, Arc::new(edges));
     }
     Ok(true)
+}
+
+/// Endpoints resolved together for one seed window at most. Beyond it each
+/// seed resolves its own endpoints as before.
+const SEED_WINDOW_TARGETS_MAX: usize = 4_096;
+
+/// Resolve the endpoints of a whole seed window of a single hop at once.
+///
+/// [`prepare_expand_targets`] ran per seed, so a low-degree hop over many
+/// seeds (every row of a ranked search joined to its parent, say) paid its
+/// label-membership proof or node hydration as a few dependent reads per
+/// seed. The window's partner lists are already memoised by
+/// [`prefetch_seed_neighbours`]; their union is resolved here in one call
+/// with the hop's own arguments. Every answer [`ExpandTargets`] gives is per
+/// endpoint id, so each seed reads the shared result exactly as it would its
+/// own. Returns the ids covered with the result, or `None` when the window
+/// has fewer than two seeds or more than [`SEED_WINDOW_TARGETS_MAX`]
+/// endpoints.
+async fn window_expand_targets(
+    rows: &[Row],
+    source: &str,
+    direction: RelationshipDirection,
+    snapshot: &Snapshot<'_>,
+    memo: &HashMap<NodeId, Arc<Vec<EdgeView>>>,
+    target_labels: &[String],
+    skip_target_materialize: bool,
+) -> Result<Option<(std::collections::HashSet<NodeId>, ExpandTargets)>, ExecError> {
+    let mut seeds = std::collections::HashSet::new();
+    let mut covered = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+    for row in rows {
+        let Some(RuntimeValue::Node(seed)) = row.get(source) else {
+            continue;
+        };
+        if !seeds.insert(seed.id) {
+            continue;
+        }
+        let Some(edges) = memo.get(&seed.id) else {
+            continue;
+        };
+        for edge in edges.iter() {
+            let target = partner_id(edge, direction, seed.id);
+            if covered.insert(target) {
+                if targets.len() == SEED_WINDOW_TARGETS_MAX {
+                    return Ok(None);
+                }
+                targets.push(target);
+            }
+        }
+    }
+    if seeds.len() < 2 || targets.is_empty() {
+        return Ok(None);
+    }
+    let resolved = prepare_expand_targets(
+        snapshot,
+        target_labels,
+        &targets,
+        skip_target_materialize,
+        true,
+        false,
+    )
+    .await?;
+    Ok(Some((covered, resolved)))
 }
 
 /// Estimated heap footprint of a memoised partner list, for the query's

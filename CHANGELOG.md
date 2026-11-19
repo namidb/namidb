@@ -106,6 +106,14 @@ crates.io release will establish and document that API explicitly.
   one reused context per thread, positions are kept only for phrase terms,
   and each block's size is measured once when it loads. Scores and results
   are unchanged.
+- **A low-degree hop over many rows resolves its endpoints together.** An
+  Expand proved the target label of, or hydrated, each input row's
+  endpoints on their own, so joining every row of a ranked search to its
+  parent node (`CALL search.hybrid(...) YIELD node MATCH (p:P)-[:R]->(node)`)
+  paid a few dependent store reads per row. For a single hop whose
+  adjacency is already read ahead per window of input rows, the endpoints of
+  the whole window (up to 4,096) are now resolved in one call; the rows are
+  unchanged.
 - **Full-text posting lists are read ahead.** Postings of all query terms
   are consumed together in document order, so each term fetched its posting
   list one cache page at a time, each fetch a dependent object-store round
