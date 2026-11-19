@@ -56,6 +56,15 @@ crates.io release will establish and document that API explicitly.
   (`NAMIDB_BACKGROUND_NICE`, default 10; 0 keeps the normal priority), so a
   query gets the CPU first while a merge or build runs.
 
+- **`search.hybrid` fusion options are validated together.** `alpha` (the
+  vector leg's weight in the linear blend, `[0, 1]`) now selects
+  `fusion: 'linear'` when `fusion` is omitted; it was silently ignored by the
+  default RRF before. `alpha` with `fusion: 'rrf'` and `rrf_k` with
+  `fusion: 'linear'` are rejected; a non-string `fusion` is rejected instead
+  of falling back to RRF; and every option error, an unknown `fusion`
+  included, is raised before either leg runs. The README documents both
+  modes, including the per-leg min-max normalisation of `'linear'`.
+
 ### Added
 
 - **`search.vector` takes an index name**: `{index: 'name', query, k}` in the map
@@ -142,17 +151,6 @@ crates.io release will establish and document that API explicitly.
   exactly `k` matching rows or all of them, and are recognised as broad from
   an id-ordered prefix of the label when its node runs overlap (the bounded
   column scan could not stop early there). Results equal the exact scan's.
-
-### Changed
-
-- **`search.hybrid` fusion options are validated together.** `alpha` (the
-  vector leg's weight in the linear blend, `[0, 1]`) now selects
-  `fusion: 'linear'` when `fusion` is omitted; it was silently ignored by the
-  default RRF before. `alpha` with `fusion: 'rrf'` and `rrf_k` with
-  `fusion: 'linear'` are rejected; a non-string `fusion` is rejected instead
-  of falling back to RRF; and every option error, an unknown `fusion`
-  included, is raised before either leg runs. The README documents both
-  modes, including the per-leg min-max normalisation of `'linear'`.
 
 ## [3.5.1] - 2026-11-18
 
