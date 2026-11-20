@@ -980,7 +980,13 @@ impl VectorV5Reader {
             .max(k)
             .min(point_count);
         let final_k = k.min(rerank_k);
-        let workspace_plan = vector_workspace_plan(&self.footer, rerank_k, final_k, groups)?;
+        let workspace_plan = vector_workspace_plan(
+            &self.footer,
+            rerank_k,
+            final_k,
+            groups,
+            rabitq::search_planning_budget(),
+        )?;
         let _workspace = shared_search_workspace()
             .reserve("vector v5 search", workspace_plan.required_bytes)
             .await?;
@@ -1643,6 +1649,7 @@ fn vector_workspace_plan(
     rerank_k: usize,
     final_k: usize,
     groups: &[(String, Vec<Value>)],
+    budget: usize,
 ) -> Result<VectorWorkspacePlan, Error> {
     let candidate_bytes = checked_mul(
         rerank_k,
@@ -1716,7 +1723,10 @@ fn vector_workspace_plan(
         })
         .max()
         .unwrap_or(0);
-    let capacity = shared_search_workspace().capacity_bytes();
+    // Batches beyond one page are read-ahead: they are sized against
+    // `budget`, this search's share of the workspace, not the whole pool.
+    // One page of each (the fallback below) is admitted whenever it fits
+    // the pool.
 
     let maximum_batch = MAX_NAV_BATCH_PAGES.min(footer.pages.len()).max(1);
     let mut fallback_required = usize::MAX;
@@ -1745,7 +1755,7 @@ fn vector_workspace_plan(
         let transient_peak = nav_peak.max(exact_page_peak);
         let required = checked_add(base, transient_peak, "vector v5 total query workspace")?;
         fallback_required = fallback_required.min(required);
-        if required <= capacity {
+        if required <= budget {
             // Rerank pages are independent range reads: fetch as many at once
             // as the workspace holds (one round trip per wave instead of one
             // per page), never fewer than the single page already admitted.
@@ -1761,7 +1771,7 @@ fn vector_workspace_plan(
                     nav_peak.max(exact_peak),
                     "vector v5 total query workspace",
                 )?;
-                if wave_required <= capacity {
+                if wave_required <= budget {
                     exact_batch_pages = wave;
                     break;
                 }

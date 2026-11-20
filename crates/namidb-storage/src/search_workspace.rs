@@ -52,6 +52,12 @@ pub(crate) fn default_search_workspace_bytes(
         _ => by_cpu,
     }
 }
+/// Searches the workspace is shared between when one plans its batches: the
+/// server's default read concurrency (two per CPU, at least four), so every
+/// admitted read can hold its share at once.
+pub(crate) fn planned_concurrent_searches(cpus: usize) -> usize {
+    cpus.saturating_mul(2).max(4)
+}
 /// Default materialised-result allowance for an unbounded search: 64 MiB.
 pub(crate) const DEFAULT_SEARCH_MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 /// Default exact-fallback document ceiling: 1 MiB of configured string fields.
@@ -105,6 +111,7 @@ pub(crate) struct SearchWorkspacePool {
     successful_reservations: Arc<AtomicU64>,
     contended_reservations: Arc<AtomicU64>,
     rejected_reservations: Arc<AtomicU64>,
+    planned_searches: usize,
 }
 
 static SHARED_SEARCH_WORKSPACE: OnceLock<SearchWorkspacePool> = OnceLock::new();
@@ -124,11 +131,31 @@ impl SearchWorkspacePool {
             successful_reservations: Arc::new(AtomicU64::new(0)),
             contended_reservations: Arc::new(AtomicU64::new(0)),
             rejected_reservations: Arc::new(AtomicU64::new(0)),
+            planned_searches: 1,
         }
+    }
+
+    /// Plan each search against `1 / searches` of the pool
+    /// ([`Self::planning_budget_bytes`]).
+    pub(crate) fn with_planned_searches(mut self, searches: usize) -> Self {
+        self.planned_searches = searches.max(1);
+        self
     }
 
     pub(crate) fn capacity_bytes(&self) -> usize {
         self.capacity_bytes
+    }
+
+    /// What one search may plan to hold for read-ahead it can do without:
+    /// navigation batches beyond one page and rerank waves beyond one page.
+    /// It is an equal share of the pool for every read the server runs at
+    /// once by default ([`planned_concurrent_searches`]). A search that
+    /// sized those batches against the whole pool reserved all of it (or a
+    /// quarter, once the 64-page cap bound), so searches ran one or a few at
+    /// a time however many CPUs the process had. The minimal plan (one page
+    /// of each) is still admitted up to the whole capacity.
+    pub(crate) fn planning_budget_bytes(&self) -> usize {
+        self.capacity_bytes / self.planned_searches.max(1)
     }
 
     /// Reserve enough 4-KiB units for `required_bytes`.
@@ -240,11 +267,13 @@ pub(crate) fn shared_search_workspace() -> &'static SearchWorkspacePool {
             SEARCH_WORKSPACE_MAX_BYTES_ENV,
             default_search_workspace_bytes(cpus, memory_max_bytes),
         );
-        let pool = SearchWorkspacePool::new(configured);
+        let pool = SearchWorkspacePool::new(configured)
+            .with_planned_searches(planned_concurrent_searches(cpus));
         tracing::info!(
             configured_bytes = configured,
             effective_bytes = pool.capacity_bytes(),
             unit_bytes = SEARCH_WORKSPACE_UNIT_BYTES,
+            planning_budget_bytes = pool.planning_budget_bytes(),
             "resolved process-wide search workspace"
         );
         pool
@@ -457,5 +486,28 @@ mod tests {
             write!(&mut short_unique, "t{i:x} ").unwrap();
         }
         assert_model_fits(&short_unique);
+    }
+
+    /// Every read the server admits by default (two per CPU, at least four)
+    /// can hold a planning share of the pool at the same time.
+    #[test]
+    fn planning_shares_cover_the_default_read_concurrency() {
+        assert_eq!(planned_concurrent_searches(1), 4);
+        assert_eq!(planned_concurrent_searches(2), 4);
+        assert_eq!(planned_concurrent_searches(8), 16);
+        for cpus in [1, 2, 8, 16] {
+            let capacity = default_search_workspace_bytes(cpus, None);
+            let pool = SearchWorkspacePool::new(capacity)
+                .with_planned_searches(planned_concurrent_searches(cpus));
+            let reads = planned_concurrent_searches(cpus);
+            assert!(pool.planning_budget_bytes() * reads <= pool.capacity_bytes());
+            assert!(
+                pool.planning_budget_bytes() >= 16 * 1024 * 1024,
+                "{cpus} CPUs"
+            );
+        }
+        // A pool built without a share plans against all of it, as before.
+        let pool = SearchWorkspacePool::new(64 * 1024 * 1024);
+        assert_eq!(pool.planning_budget_bytes(), pool.capacity_bytes());
     }
 }

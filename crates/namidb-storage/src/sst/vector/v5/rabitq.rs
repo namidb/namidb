@@ -123,6 +123,24 @@ thread_local! {
     pub(crate) static SKIP_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: plan searches on this thread against this budget instead
+    /// of the shared workspace's planning share.
+    pub(crate) static PLANNING_BUDGET: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The workspace one search plans its read-ahead against: its share of the
+/// shared pool (`SearchWorkspacePool::planning_budget_bytes`).
+pub(crate) fn search_planning_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = PLANNING_BUDGET.with(|budget| budget.get()) {
+        return budget;
+    }
+    shared_search_workspace().planning_budget_bytes()
+}
+
 /// Whether builders write the section (always, outside tests that need a
 /// base as earlier releases wrote it).
 pub(crate) fn section_enabled() -> bool {
@@ -1241,6 +1259,7 @@ fn rabitq_plan(
     cap: usize,
     groups: &[(String, Vec<Value>)],
     filtered: bool,
+    budget: usize,
 ) -> RabitqPlan {
     let dim = footer.dim as usize;
     let group_bytes = groups
@@ -1274,13 +1293,14 @@ fn rabitq_plan(
         })
         .max()
         .unwrap_or(0);
-    let capacity = shared_search_workspace().capacity_bytes();
+    // Batches beyond one page are read-ahead: they are sized against
+    // `budget`, this search's share of the workspace, not the whole pool.
     let mut code_batch_pages = 1;
     let mut code_peak = reads.first().copied().unwrap_or(0);
     let mut sum = 0usize;
     for (count, bytes) in reads.iter().take(MAX_NAV_BATCH_PAGES).enumerate() {
         sum = sum.saturating_add(*bytes);
-        if base.saturating_add(sum.max(exact_page_peak)) <= capacity {
+        if base.saturating_add(sum.max(exact_page_peak)) <= budget {
             code_batch_pages = count + 1;
             code_peak = sum;
         } else {
@@ -1289,7 +1309,7 @@ fn rabitq_plan(
     }
     let mut exact_batch_pages = 1;
     for wave in (2..=MAX_EXACT_BATCH_PAGES).rev() {
-        if base.saturating_add(code_peak.max(exact_page_peak.saturating_mul(wave))) <= capacity {
+        if base.saturating_add(code_peak.max(exact_page_peak.saturating_mul(wave))) <= budget {
             exact_batch_pages = wave;
             break;
         }
@@ -1393,7 +1413,15 @@ impl VectorV5Reader {
         let supported_groups = prepare_groups(&self.footer.filter_properties, groups);
         let applied_filter_groups = supported_groups.len();
         let filtered = applied_filter_groups > 0;
-        let plan = rabitq_plan(&self.footer, index, final_k, cap, groups, filtered);
+        let plan = rabitq_plan(
+            &self.footer,
+            index,
+            final_k,
+            cap,
+            groups,
+            filtered,
+            search_planning_budget(),
+        );
         let _workspace = shared_search_workspace()
             .reserve("vector v5 rabitq search", plan.required_bytes)
             .await?;
@@ -2606,6 +2634,99 @@ mod tests {
                 .hits;
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].0, id(1));
+        }
+    }
+
+    /// A search plans its read-ahead (code batches and rerank waves beyond
+    /// one page) against the budget it is given, its share of the shared
+    /// workspace, and still gets the one-page plan when the share is
+    /// smaller than that. Planned against the whole pool, one search's plan
+    /// was many times the one-page plan and filled the pool by itself.
+    #[tokio::test]
+    async fn plans_fit_the_share_they_are_given() {
+        let members = clustered(3_000, 96, 12, 21);
+        let body = build(
+            VectorMetric::Cosine,
+            &members,
+            true,
+            VectorFilterPostings::new(),
+        );
+        let reader = open(&body).await;
+        let RabitqState::Present(index) = &reader.rabitq else {
+            panic!("the base carries a RaBitQ section");
+        };
+        let plan = |budget: usize| rabitq_plan(&reader.footer, index, 10, 400, &[], false, budget);
+
+        let minimal = plan(0);
+        assert_eq!(
+            (minimal.code_batch_pages, minimal.exact_batch_pages),
+            (1, 1)
+        );
+        let whole_pool = plan(usize::MAX);
+        assert!(whole_pool.required_bytes > 3 * minimal.required_bytes);
+
+        let share = 3 * minimal.required_bytes;
+        let shared = plan(share);
+        assert!(shared.required_bytes <= share);
+        assert!(shared.exact_batch_pages > 1 && shared.code_batch_pages > 1);
+        // Batches only grow with the share.
+        assert!(shared.required_bytes >= minimal.required_bytes);
+        assert!(shared.required_bytes <= whole_pool.required_bytes);
+    }
+
+    /// The planning share changes how many pages a search reads per round
+    /// trip, never what it finds: the hits, their order and their exact
+    /// scores are the same whether batches are sized for the whole pool, a
+    /// share of it, or one page at a time, on both navigation paths.
+    #[tokio::test]
+    async fn the_planning_share_changes_waves_never_results() {
+        let members = clustered(3_000, 96, 12, 21);
+        let body = build(
+            VectorMetric::Cosine,
+            &members,
+            true,
+            VectorFilterPostings::new(),
+        );
+        let reader = open(&body).await;
+        assert!(reader.has_rabitq());
+        let RabitqState::Present(index) = &reader.rabitq else {
+            panic!("the base carries a RaBitQ section");
+        };
+        let one_page = rabitq_plan(&reader.footer, index, 10, 400, &[], false, 0).required_bytes;
+        let budgets = [usize::MAX, 3 * one_page, 0];
+        // The fixture is large enough for the budgets to split the waves.
+        let waves: Vec<usize> = budgets
+            .iter()
+            .map(|budget| {
+                rabitq_plan(&reader.footer, index, 10, 400, &[], false, *budget).exact_batch_pages
+            })
+            .collect();
+        assert!(waves[0] > waves[1] && waves[1] > waves[2], "{waves:?}");
+
+        let pages = reader.page_count();
+        let options = VectorV5SearchOptions {
+            nprobe: (pages / 3).max(1),
+            max_nprobe: pages,
+            rerank_factor: 4,
+        };
+        for (_, query) in members.iter().step_by(97) {
+            let mut seen = Vec::new();
+            for budget in budgets {
+                PLANNING_BUDGET.with(|cell| cell.set(Some(budget)));
+                let rabitq = reader
+                    .search_filter_groups(query, 10, options, &[])
+                    .await
+                    .unwrap();
+                let int8 = reader
+                    .search_filter_groups_int8(query, 10, options, &[])
+                    .await
+                    .unwrap();
+                PLANNING_BUDGET.with(|cell| cell.set(None));
+                seen.push((rabitq.hits, int8.hits));
+            }
+            assert_eq!(seen[0], seen[1]);
+            assert_eq!(seen[0], seen[2]);
+            assert_eq!(seen[0].0.len(), 10);
         }
     }
 }
