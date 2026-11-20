@@ -319,12 +319,20 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
             keys,
             skip,
             limit,
-        } => LogicalPlan::TopN {
-            input: Box::new(rewrite(*input, catalog)),
-            keys,
-            skip,
-            limit,
-        },
+        } => {
+            // A bare LIMIT over a filtered scan stops after its first rows,
+            // and a posting lookup confirms only that prefix, so a wide
+            // posting is still the cheaper source there.
+            let limited_scan = keys.is_empty() && is_filtered_scan(&input);
+            LogicalPlan::TopN {
+                input: Box::new(with_wide_postings(limited_scan, || {
+                    rewrite(*input, catalog)
+                })),
+                keys,
+                skip,
+                limit,
+            }
+        }
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(rewrite(*input, catalog)),
         },
@@ -449,16 +457,60 @@ fn rewrite(plan: LogicalPlan, catalog: &StatsCatalog) -> LogicalPlan {
 /// use their posting list (`true`). `None` means the property has no lookup
 /// index and the caller must preserve the scan/filter plan.
 fn property_lookup_mode(catalog: &StatsCatalog, label: &str, property: &str) -> Option<bool> {
-    let stats = catalog
-        .label(label)
-        .and_then(|l| l.properties.get(property))?;
+    let label_stats = catalog.label(label)?;
+    let stats = label_stats.properties.get(property)?;
     if stats.unique {
         Some(false)
-    } else if stats.indexed {
+    } else if stats.indexed
+        && (WIDE_POSTINGS_ALLOWED.get() || !posting_too_wide(label_stats.node_count, stats.ndv))
+    {
         Some(true)
     } else {
         None
     }
+}
+
+thread_local! {
+    /// Set while rewriting the filtered scan under a bare LIMIT, where a wide
+    /// posting is consumed lazily and only its first rows are confirmed.
+    static WIDE_POSTINGS_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with wide postings allowed when `allow` is set.
+fn with_wide_postings<T>(allow: bool, f: impl FnOnce() -> T) -> T {
+    let previous = WIDE_POSTINGS_ALLOWED.replace(allow);
+    let result = f();
+    WIDE_POSTINGS_ALLOWED.set(previous);
+    result
+}
+
+/// `Filter(NodeScan)` under any number of projections: the only input whose
+/// rewrite a bare LIMIT lets take a wide posting.
+fn is_filtered_scan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Project { input, .. } => is_filtered_scan(input),
+        LogicalPlan::Filter { input, .. } => matches!(input.as_ref(), LogicalPlan::NodeScan { .. }),
+        _ => false,
+    }
+}
+
+/// Expected rows per value at most that a posting lookup is taken for
+/// regardless of the label size.
+const POSTING_LOOKUP_MIN_ROWS: u64 = 256;
+
+/// Whether an equality posting on a property with `ndv` distinct values over
+/// `node_count` nodes is expected to match more than 1% of the label (and
+/// more than [`POSTING_LOOKUP_MIN_ROWS`]) per value. The lookup resolves
+/// every posted node by id, which on an object store costs about a hundred
+/// times a row of the label scan's column-only predicate pass; past that
+/// share the scan is cheaper (the same line as the storage numeric range
+/// route). Unknown cardinality keeps the lookup.
+fn posting_too_wide(node_count: u64, ndv: Option<u64>) -> bool {
+    let Some(ndv) = ndv.filter(|ndv| *ndv > 0) else {
+        return false;
+    };
+    let expected = node_count / ndv;
+    expected > POSTING_LOOKUP_MIN_ROWS && expected > node_count / 100
 }
 
 /// Whether id-primary node SSTs carry (or legacy storage can lazily build) a
@@ -1016,6 +1068,61 @@ mod tests {
         let parsed = parse(q).unwrap();
         let plan = lower(&parsed).unwrap();
         apply_unique_property_lookup(plan, cat)
+    }
+
+    #[test]
+    fn wide_posting_keeps_the_scan() {
+        // 386k nodes over 10 values: ~38k rows per value is a scan.
+        assert!(posting_too_wide(386_000, Some(10)));
+        // Selective, small, or unknown cardinality keeps the lookup; an
+        // id-like property (ndv about the row count) is one row per value.
+        assert!(!posting_too_wide(386_000, Some(386_000)));
+        assert!(!posting_too_wide(28_000, Some(27_990)));
+        assert!(!posting_too_wide(386_000, Some(1_000)));
+        assert!(!posting_too_wide(200, Some(1)));
+        assert!(!posting_too_wide(386_000, None));
+    }
+
+    #[test]
+    fn low_cardinality_index_scans_and_id_like_index_seeks() {
+        let mut cat = StatsCatalog::empty();
+        let mut props = BTreeMap::new();
+        for (name, ndv) in [("level", 10), ("code", 386_000)] {
+            props.insert(
+                name.to_string(),
+                PropStats {
+                    indexed: true,
+                    ndv: Some(ndv),
+                    ..Default::default()
+                },
+            );
+        }
+        cat.__test_insert_label(LabelStats {
+            name: "Doc".into(),
+            node_count: 386_000,
+            properties: props,
+        });
+        let wide = rewrite_query("MATCH (d:Doc {level: 3}) RETURN d", &cat);
+        assert_eq!(find_lookup(&wide), None, "38.6k rows per value: scan");
+        let narrow = rewrite_query("MATCH (d:Doc {code: 'c1'}) RETURN d", &cat);
+        assert_eq!(find_lookup(&narrow), Some(true), "one row per value: seek");
+        let limited = rewrite_query("MATCH (d:Doc) WHERE d.level = 3 RETURN d LIMIT 5", &cat);
+        assert_eq!(
+            find_lookup(&limited),
+            Some(true),
+            "a bare LIMIT confirms only a prefix of the posting: seek"
+        );
+        let ordered = rewrite_query(
+            "MATCH (d:Doc) WHERE d.level = 3 RETURN d ORDER BY d.code LIMIT 5",
+            &cat,
+        );
+        assert_eq!(
+            find_lookup(&ordered),
+            None,
+            "ORDER BY reads every row: scan"
+        );
+        let counted = rewrite_query("MATCH (d:Doc {level: 3}) RETURN count(*) AS c", &cat);
+        assert_eq!(find_lookup(&counted), None, "a count reads every row: scan");
     }
 
     #[test]

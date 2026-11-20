@@ -837,14 +837,14 @@ mod indexed_sparse_filter {
         .await;
         assert_eq!(titles(&rows), vec!["target".to_string()]);
         // Barrier pins count coordinator invocations exactly and only on the
-        // native route (a flat fallback pins no barrier), so the original
-        // probe discipline is asserted verbatim: one probe at fetch=8, one
-        // more at the widened fetch=32, nothing else.
+        // native route (a flat fallback pins no barrier). The filter's
+        // membership (1 of 17 documents) sizes the first fetch at
+        // ceil(1.5 * 17) = 26, past the target's rank, so a single probe
+        // finds it: no blind fetch=8 round followed by a widened one.
         assert_eq!(
             probe.barrier_pins() - before,
-            2,
-            "cache-free execution must probe the generation at fetch=8 and \
-             once more at the widened fetch=32"
+            1,
+            "a membership-sized first round must reach the target in one probe"
         );
     }
 
@@ -1266,8 +1266,9 @@ mod indexed_sparse_filter {
         let docs = selective_docs();
         let borrowed = borrowed_docs(&docs);
         let (writer, _, probe) = indexed_corpus("bm25-selective-rounds", &borrowed).await;
-        // Every `other` document outranks every `acme` one for `alpha`, so
-        // the ranked-prefix route must widen past the first 40 hits.
+        // Every `other` document outranks every `acme` one for `alpha`. A
+        // blind ranked prefix would have to widen past the first 40 hits;
+        // the filter's membership sizes the first round instead.
         let call = "CALL search.bm25({ label: 'Doc', query: 'alpha', text_property: 'body', \
              k: 4, filter: { tenant: 'acme' } }) YIELD node, score \
              RETURN node.title AS title, score";
@@ -1286,8 +1287,9 @@ mod indexed_sparse_filter {
         assert_eq!(selective.len(), 4);
         assert_eq!(selective, widened);
         assert!(
-            widening_pins >= 3,
-            "the fixture must force widening rounds ({widening_pins} pins)"
+            widening_pins <= 2,
+            "the membership-sized ranked prefix needs no widening rounds \
+             ({widening_pins} pins)"
         );
         assert!(
             selective_pins <= 2,
@@ -1365,47 +1367,53 @@ async fn hybrid_hydrates_the_fused_ranking_of_its_legs() {
 
     let k = 25;
     let q = vec![0.2, 0.8, 0.1];
-    let dense = ids_scores(
-        &run(
+    // The default RRF depth is max(k, 40) per leg; an explicit `depth`
+    // overrides it. Each must hydrate exactly the fused ranking of legs
+    // fetched at that depth.
+    for (depth, option) in [
+        (k.max(40), String::new()),
+        (k * 8, format!(", depth: {}", k * 8)),
+    ] {
+        let dense = ids_scores(
+            &run(
+                &writer,
+                &format!(
+                    "CALL search.vector({{label: 'Doc', property: 'embedding', query: $q, k: {depth}}}) \
+                     YIELD node, score RETURN node, score"
+                ),
+                q.clone(),
+            )
+            .await,
+        );
+        let sparse = ids_scores(
+            &run(
+                &writer,
+                &format!(
+                    "CALL search.bm25({{label: 'Doc', text_properties: ['body'], query: 'quantum', k: {depth}}}) \
+                     YIELD node, score RETURN node, score"
+                ),
+                vec![],
+            )
+            .await,
+        );
+        assert!(!dense.is_empty() && !sparse.is_empty());
+        let mut expected = namidb_query::exec::fusion::rrf(
+            &[&dense, &sparse],
+            namidb_query::exec::fusion::DEFAULT_RRF_K,
+        );
+        expected.truncate(k);
+
+        let rows = run(
             &writer,
             &format!(
-                "CALL search.vector({{label: 'Doc', property: 'embedding', query: $q, k: {}}}) \
-                 YIELD node, score RETURN node, score",
-                k * 8
+                "CALL search.hybrid({{label: 'Doc', query_text: 'quantum', text_property: 'body', \
+                 query_vector: $q, vector_property: 'embedding', k: {k}{option}}}) \
+                 YIELD node, score RETURN node, score, node.title AS title"
             ),
             q.clone(),
         )
-        .await,
-    );
-    let sparse = ids_scores(
-        &run(
-            &writer,
-            &format!(
-                "CALL search.bm25({{label: 'Doc', text_properties: ['body'], query: 'quantum', k: {}}}) \
-                 YIELD node, score RETURN node, score",
-                k * 8
-            ),
-            vec![],
-        )
-        .await,
-    );
-    assert!(!dense.is_empty() && !sparse.is_empty());
-    let mut expected = namidb_query::exec::fusion::rrf(
-        &[&dense, &sparse],
-        namidb_query::exec::fusion::DEFAULT_RRF_K,
-    );
-    expected.truncate(k);
-
-    let rows = run(
-        &writer,
-        &format!(
-            "CALL search.hybrid({{label: 'Doc', query_text: 'quantum', text_property: 'body', \
-             query_vector: $q, vector_property: 'embedding', k: {k}}}) \
-             YIELD node, score RETURN node, score, node.title AS title"
-        ),
-        q,
-    )
-    .await;
-    assert_eq!(ids_scores(&rows), expected);
-    assert_eq!(titles(&rows).len(), k, "every fused hit is hydrated");
+        .await;
+        assert_eq!(ids_scores(&rows), expected, "depth {depth}");
+        assert_eq!(titles(&rows).len(), k, "every fused hit is hydrated");
+    }
 }

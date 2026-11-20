@@ -490,12 +490,21 @@ form):
   errors if no index is named.
 - `CALL search.hybrid({ label, query_text?, text_property(ies)?, query_vector?,
   vector_property?, k?=10, ef?, fusion?='rrf', rrf_k?, alpha?=0.5, metric?,
-  filter?, k_dense?, k_sparse? }) YIELD node, score` — fuses a dense leg
+  filter?, depth?, k_dense?, k_sparse? }) YIELD node, score` — fuses a dense leg
   (vector KNN via `vector_search_rows`) and a sparse leg (BM25 via
   `bm25_ranked`). Default fusion is Reciprocal Rank Fusion (rank-based, needs no
   cross-scale calibration); `fusion: 'linear'` is a min-max blend weighted by
-  `alpha` on the dense leg. Each leg over-fetches `k·8` candidates by default
-  (`k_dense`/`k_sparse`). The dense leg requires **both** `query_vector` and
+  `alpha` on the dense leg. Each leg retrieves `depth` candidates before
+  fusion: by default `max(k, 40)` for RRF and `8·k` for linear fusion
+  (3.5.2; earlier releases used `8·k` for both). On a 386k-document corpus,
+  measured as overlap with the fused top-k of an `8·k` depth: RRF kept 1.0
+  at k = 20 for depths 20–160, 0.9975 at k = 40 with depth 40, and 0.986 at
+  k = 200 with depth 200 (0.995 at 1000, 1.0 at 1600); `max(k, 40)` is the
+  shallowest depth meeting 0.98 at every measured k. Linear fusion — whose
+  min-max normalisation depends on the depth — kept 0.78 at depth k, 0.977
+  at 5·k and 1.0 at 8·k for k = 20, so it keeps `8·k`. Pass `depth` for a
+  deeper RRF candidate pool (e.g. `depth: 8 * k` restores the old default). `depth` sets both legs explicitly
+  (raised to at least `k`); `k_dense`/`k_sparse` override one leg. The dense leg requires **both** `query_vector` and
   `vector_property` (supplying exactly one is an error). A `filter` applies to
   the dense leg as the same native eligibility/residual filter and to BM25
   before the sparse top-k. An authoritative FTS prefix widens geometrically up
@@ -504,6 +513,62 @@ form):
   two-pass flat scorer. The fused output rechecks the predicate defensively.
   Thus the cap bounds indexed hydration but cannot shorten a result through
   post-filter under-fill.
+- **Filter membership (3.5.2).** A `filter` (or any residual source
+  predicate) that reads only node properties is evaluated once per statement
+  over the filter's own columns — a column-only visit of the label, a few
+  SSTs at a time (`NAMIDB_PROJECTION_SCAN_FANOUT`, default 8) — into the
+  sorted id set it admits. Both hybrid legs share it; later statements over
+  the same node data (same namespace, manifest version and writer node
+  generation, no staged writes) with the same resolved filter — `$param`
+  values included — reuse it from a byte-bounded cache
+  (`NAMIDB_FILTER_CACHE_MAX_BYTES`, default 64 MiB). A candidate is then
+  checked by a set lookup instead of a record hydration: the dense leg drops
+  non-members before its int8 rescore, the sparse leg keeps members of its
+  ranked prefix without hydrating any, and the set's selectivity sizes the
+  sparse leg's first round (`k / selectivity · 1.5`). A set larger than
+  `NAMIDB_FILTER_MEMBERSHIP_MAX_IDS` (default 4M) is not kept; those
+  filters hydrate as before. The first computation is the cost floor of an
+  unindexed filter: on the 386k-node label it read ~25 MB (the filter
+  columns, not full node pages) and took 6–7 s, almost all of it CPU in the
+  row merge that builds a view per row — about the same with two
+  overlapping node SSTs as after compacting the label into one. A projected
+  merge that compares row keys and versions without materialising views,
+  or the in-segment columns below, would remove most of it.
+
+##### Proposed for 3.6: in-segment low-cardinality filter columns
+
+Filters on low-cardinality properties that are not part of a search
+index's catalog (a bool `active` flag, a small integer level, a short
+status enum) could be evaluated inside the FT4 and vector segments like the
+catalog's native filters, with no membership scan. Recording them as plain
+`complete_filter_properties` is **not** rollback-safe: an older reader applies
+a filter natively whenever every segment advertises the property, while an
+older writer emits a search mutation only when the catalog payload changes —
+after a rollback, `SET n.flag = false` would leave the segment's value stale
+and the old reader would answer from it. The safe variant:
+
+1. **Reserved names.** Extra columns are written under an engine-private
+   prefix (e.g. `__lc.<property>`) that no released reader matches against a
+   query's filter group, and that older merges drop (they copy only catalog
+   filters). The catalog signature is unchanged, so adding or dropping an
+   extra column never retires a generation.
+2. **Writer-side choice, per segment.** At build/merge time the writer keeps
+   a property when its distinct values in the segment fit the filter
+   directory (4096 values) and the property is scalar; the choice is recorded
+   per segment. A segment without the column falls back to the membership
+   set for that segment only.
+3. **Mutations follow the extras.** The search payload of a node includes the
+   extra columns, so a write that changes only such a property still emits a
+   search mutation (a delta that supersedes the older segment's entry).
+4. **Trust marker.** Each search state carries an optional
+   `extra_filters_trusted_since` manifest field written by aware engines.
+   Older engines drop unknown fields when they rewrite the manifest, so any
+   commit by a pre-3.6 engine revokes the marker; an aware reader uses the
+   extra columns only while the marker is present and covers every segment's
+   LSN range, and the next base rebuild or merge re-establishes it.
+5. **Rollback proof.** Before release: open, query, flush, compact and sweep
+   a store with such segments under 3.5.1, 3.5.0 and 3.4.3 and compare their
+   answers with the aware engine's before and after.
 
 #### 9. Write-time dimension enforcement (`namidb-query/src/exec/writer.rs`)
 

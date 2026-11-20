@@ -6,6 +6,7 @@
 //! See [`docs/rfc/008-logical-plan-ir.md`](../../../../docs/rfc/008-logical-plan-ir.md)
 //! §"API del executor".
 
+pub mod auto_index;
 pub mod expr;
 pub mod factor;
 pub mod fusion;
@@ -20,6 +21,7 @@ pub mod value;
 pub mod walker;
 pub mod writer;
 
+pub use auto_index::{with_auto_index_hints, AutoIndexHints};
 pub use expr::{evaluate, EvalError, Params};
 pub use factor::{
     factorize_enabled, FactorArena, FactorIdx, FactorNode, FactorRowSet, Slot, FACTOR_ROOT,
@@ -35,7 +37,10 @@ pub use show::{
     show_constraints_rows, show_indexes_columns, show_indexes_rows, show_schema_columns,
 };
 pub use value::{NodeValue, RelValue, RuntimeValue};
-pub use walker::{execute, execute_factor_path, execute_flat_path, execute_with_limits, ExecError};
+pub use walker::{
+    eligibility_cache_hits, execute, execute_factor_path, execute_flat_path, execute_with_limits,
+    ExecError,
+};
 pub use writer::{
     enforce_node_unique_constraints, execute_write, execute_write_checked_with_deadline,
     execute_write_staged, execute_write_staged_with_deadline, execute_write_with_deadline,

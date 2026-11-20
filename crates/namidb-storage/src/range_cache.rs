@@ -63,6 +63,12 @@ pub const MAX_PINNED_OBJECT_RANGE_READS: usize = 16;
 /// navigation reads cost one round trip instead of several waves of 16.
 pub const MAX_PINNED_OBJECT_SMALL_READS: usize = 128;
 
+/// Span cap of [`PinnedObjectRangeSource::read_blocks_coalesced`].
+const COALESCED_SPAN_BYTES: u64 = 8 * 1024 * 1024;
+/// Largest gap a coalesced span reads through: at object-store bandwidth
+/// half a MiB costs a few milliseconds, one more dependent request tens.
+const COALESCED_MAX_GAP_BYTES: u64 = 512 * 1024;
+
 /// Page of [`ReadGranularity::Fine`] reads.
 pub const FINE_RANGE_PAGE_BYTES: u64 = 16 * 1024;
 
@@ -1940,6 +1946,59 @@ impl PinnedObjectRangeSource {
         span_bytes: u64,
         parallel: usize,
     ) -> crate::error::Result<Vec<Bytes>> {
+        // A gap larger than a small read would be wasted bytes, so it starts
+        // a new span.
+        self.prime_blocks_with_gap(blocks, span_bytes, 64 * 1024, parallel)
+            .await
+    }
+
+    /// [`Self::prime_blocks`] reading through gaps of up to `max_gap` bytes
+    /// between neighbouring blocks: on an object store one more round trip
+    /// costs far more than a few hundred KiB of unused bytes in a span.
+    pub async fn prime_blocks_with_gap(
+        &self,
+        blocks: &[Range<u64>],
+        span_bytes: u64,
+        max_gap: u64,
+        parallel: usize,
+    ) -> crate::error::Result<Vec<Bytes>> {
+        self.prime_blocks_spans(blocks, span_bytes, max_gap, parallel, false)
+            .await
+    }
+
+    /// [`Self::prime_blocks_with_gap`] that, on a hybrid (NVMe) cache, also
+    /// keeps each span as one entry of its own and looks it up before
+    /// reading the store. Small blocks stay in the memory tier only (see
+    /// [`DISK_MIN_ENTRY_BYTES`]), so without this a restart reads them all
+    /// again; a span is large enough for the device, so the same warm-up
+    /// after a restart is a few local reads. Spans are capped at the largest
+    /// entry the cache admits. On a memory-only cache this is
+    /// [`Self::prime_blocks_with_gap`].
+    pub async fn prime_blocks_persistent(
+        &self,
+        blocks: &[Range<u64>],
+        span_bytes: u64,
+        max_gap: u64,
+        parallel: usize,
+    ) -> crate::error::Result<Vec<Bytes>> {
+        let (persist, span_bytes) = match &self.range_cache {
+            Some(cache) if cache.is_hybrid() => {
+                (true, span_bytes.min(cache.config().max_entry_bytes as u64))
+            }
+            _ => (false, span_bytes),
+        };
+        self.prime_blocks_spans(blocks, span_bytes, max_gap, parallel, persist)
+            .await
+    }
+
+    async fn prime_blocks_spans(
+        &self,
+        blocks: &[Range<u64>],
+        span_bytes: u64,
+        max_gap: u64,
+        parallel: usize,
+        persist_spans: bool,
+    ) -> crate::error::Result<Vec<Bytes>> {
         for block in blocks {
             self.validate_range(block)?;
         }
@@ -1949,14 +2008,13 @@ impl PinnedObjectRangeSource {
                 detail: "primed blocks must be sorted and must not overlap".into(),
             });
         }
-        // Group consecutive blocks into spans; a gap larger than a small
-        // read would be wasted bytes, so it starts a new span.
-        const MAX_SPAN_GAP: u64 = 64 * 1024;
+        // Group consecutive blocks into spans; a gap above `max_gap` starts
+        // a new span.
         let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
         let mut start = 0usize;
         for index in 1..=blocks.len() {
             let split = index == blocks.len()
-                || blocks[index].start.saturating_sub(blocks[index - 1].end) > MAX_SPAN_GAP
+                || blocks[index].start.saturating_sub(blocks[index - 1].end) > max_gap
                 || blocks[index].end - blocks[start].start > span_bytes.max(1);
             if split {
                 if start < index {
@@ -1983,7 +2041,28 @@ impl PinnedObjectRangeSource {
                 async move {
                     let members = &blocks[group];
                     let span = members[0].start..members[members.len() - 1].end;
-                    let wire = self.direct_read(span.clone()).await?;
+                    let cached_span = match (&self.range_cache, &token) {
+                        (Some(cache), Some(token)) if persist_spans => cache
+                            .get(path, token, span.clone())
+                            .await
+                            .ok()
+                            .flatten()
+                            .filter(|bytes| bytes.len() as u64 == span.end - span.start),
+                        _ => None,
+                    };
+                    let wire = match cached_span {
+                        Some(bytes) => bytes,
+                        None => {
+                            let wire = self.direct_read(span.clone()).await?;
+                            if let (Some(cache), Some(token)) = (&self.range_cache, &token) {
+                                if persist_spans {
+                                    // Refused by admission: only a later miss.
+                                    let _ = cache.insert(path, token, span.clone(), wire.clone());
+                                }
+                            }
+                            wire
+                        }
+                    };
                     let mut out = Vec::with_capacity(members.len());
                     for block in members {
                         let start = usize::try_from(block.start - span.start)
@@ -2008,6 +2087,118 @@ impl PinnedObjectRangeSource {
             .try_collect()
             .await?;
         Ok(spans.into_iter().flatten().collect())
+    }
+
+    /// Many small blocks of this object, in any order and possibly repeated:
+    /// blocks already cached (as exact Block entries) are served from the
+    /// cache, the rest are fetched as spans of up to 8 MiB that read through
+    /// gaps of up to 512 KiB, many spans in flight, and admitted. Returns the
+    /// blocks in input order.
+    pub async fn read_blocks_coalesced(
+        &self,
+        blocks: &[Range<u64>],
+    ) -> crate::error::Result<Vec<Bytes>> {
+        self.read_blocks_coalesced_with(blocks, false).await
+    }
+
+    /// [`Self::read_blocks_coalesced`] for an open-time warm-up: the spans
+    /// it reads are kept on a hybrid cache's device too (see
+    /// [`Self::prime_blocks_persistent`]), so a restart re-warms locally.
+    pub async fn read_blocks_warm(
+        &self,
+        blocks: &[Range<u64>],
+    ) -> crate::error::Result<Vec<Bytes>> {
+        self.read_blocks_coalesced_with(blocks, true).await
+    }
+
+    async fn read_blocks_coalesced_with(
+        &self,
+        blocks: &[Range<u64>],
+        persist_spans: bool,
+    ) -> crate::error::Result<Vec<Bytes>> {
+        for block in blocks {
+            self.validate_range(block)?;
+        }
+        let mut unique: Vec<Range<u64>> = blocks.to_vec();
+        unique.sort_by_key(|range| (range.start, range.end));
+        unique.dedup();
+        if unique.windows(2).any(|pair| pair[1].start < pair[0].end) {
+            // Overlapping requests are not a block layout; read them as is.
+            return self.read_ranges(blocks).await;
+        }
+        let mut values: Vec<Option<Bytes>> = vec![None; unique.len()];
+        if let Some(cache) = &self.range_cache {
+            let token = format!(
+                "{}@{}",
+                self.generation
+                    .cache_token()
+                    .map_err(|error| pinned_range_cache_error(&self.meta.location, error))?,
+                cache_store_token(&self.store)
+            );
+            let path = self.meta.location.to_string();
+            for (slot, block) in values.iter_mut().zip(&unique) {
+                if block.is_empty() || block.end - block.start > MAX_BLOCK_READ_BYTES {
+                    continue;
+                }
+                // A local cache failure is only a miss here.
+                if let Ok(Some(bytes)) = cache.get(&path, &token, block.clone()).await {
+                    if bytes.len() as u64 == block.end - block.start {
+                        self.counters
+                            .logical_requests
+                            .fetch_add(1, Ordering::Relaxed);
+                        *slot = Some(bytes);
+                    }
+                }
+            }
+        }
+        let missing = unique
+            .iter()
+            .zip(&values)
+            .filter(|(_, value)| value.is_none())
+            .map(|(block, _)| block.clone())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let fetched = if persist_spans {
+                self.prime_blocks_persistent(
+                    &missing,
+                    COALESCED_SPAN_BYTES,
+                    COALESCED_MAX_GAP_BYTES,
+                    MAX_PINNED_OBJECT_SMALL_READS,
+                )
+                .await?
+            } else {
+                self.prime_blocks_with_gap(
+                    &missing,
+                    COALESCED_SPAN_BYTES,
+                    COALESCED_MAX_GAP_BYTES,
+                    MAX_PINNED_OBJECT_SMALL_READS,
+                )
+                .await?
+            };
+            let mut fetched = fetched.into_iter();
+            for slot in values.iter_mut().filter(|value| value.is_none()) {
+                *slot = fetched.next();
+            }
+        }
+        blocks
+            .iter()
+            .map(|block| {
+                let index = unique
+                    .binary_search_by(|probe| {
+                        (probe.start, probe.end).cmp(&(block.start, block.end))
+                    })
+                    .map_err(|_| crate::error::Error::Corrupted {
+                        path: self.meta.location.to_string(),
+                        detail: "coalesced block read lost a range".into(),
+                    })?;
+                values[index]
+                    .clone()
+                    .ok_or_else(|| crate::error::Error::Corrupted {
+                        path: self.meta.location.to_string(),
+                        detail: "coalesced block read returned too few blocks".into(),
+                    })
+            })
+            .collect()
     }
 
     fn validate_range(&self, range: &Range<u64>) -> crate::error::Result<()> {
@@ -2809,6 +3000,107 @@ mod tests {
             .prime_blocks(&[20..30, 10..25], 1024, 1)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn coalesced_block_reads_hit_cached_blocks_and_fetch_only_misses() {
+        let mut config = memory_config(8 * 1024 * 1024);
+        config.page_size_bytes = DEFAULT_RANGE_CACHE_PAGE_BYTES;
+        let cache = ImmutableRangeCache::open(config).await.unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = ObjectPath::from("objects/coalesced");
+        let body = Bytes::from(
+            (0..1024 * 1024u32)
+                .map(|value| (value % 239) as u8)
+                .collect::<Vec<_>>(),
+        );
+        store
+            .put(&location, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        let meta = store.head(&location).await.unwrap();
+        let source =
+            PinnedObjectRangeSource::from_meta_with_cache(store, meta, Some(cache)).unwrap();
+        let blocks: Vec<Range<u64>> = (0..32u64)
+            .map(|i| 50_000 + i * 2_000..50_000 + (i + 1) * 2_000)
+            .collect();
+        // Unordered, with a repeat: results follow the input order.
+        let request = vec![
+            blocks[7].clone(),
+            blocks[0].clone(),
+            blocks[7].clone(),
+            blocks[3].clone(),
+        ];
+        let first = source.read_blocks_coalesced(&request).await.unwrap();
+        for (range, bytes) in request.iter().zip(&first) {
+            assert_eq!(bytes, &body.slice(range.start as usize..range.end as usize));
+        }
+        assert_eq!(
+            source.stats().remote_requests,
+            1,
+            "one span for nearby blocks"
+        );
+        // Cached blocks are not fetched again; only the new ones are.
+        let all = source.read_blocks_coalesced(&blocks).await.unwrap();
+        for (range, bytes) in blocks.iter().zip(&all) {
+            assert_eq!(bytes, &body.slice(range.start as usize..range.end as usize));
+        }
+        let after = source.stats().remote_requests;
+        assert!(after <= 3, "misses go out as spans: {after}");
+        source.read_blocks_coalesced(&blocks).await.unwrap();
+        assert_eq!(source.stats().remote_requests, after, "all blocks now hit");
+    }
+
+    #[tokio::test]
+    async fn warm_block_reads_survive_a_hybrid_restart_as_spans() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = hybrid_config(directory.path());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let location = ObjectPath::from("objects/warm");
+        let body = Bytes::from(
+            (0..1024 * 1024u32)
+                .map(|value| (value % 241) as u8)
+                .collect::<Vec<_>>(),
+        );
+        store
+            .put(&location, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        let meta = store.head(&location).await.unwrap();
+        // Blocks below the device floor: on their own they live in memory
+        // only and are gone after a restart.
+        let blocks: Vec<Range<u64>> = (0..32u64)
+            .map(|i| 50_000 + i * 2_000..50_000 + (i + 1) * 2_000)
+            .collect();
+
+        let cache = ImmutableRangeCache::open(config.clone()).await.unwrap();
+        let source = PinnedObjectRangeSource::from_meta_with_cache(
+            store.clone(),
+            meta.clone(),
+            Some(cache.clone()),
+        )
+        .unwrap();
+        source.read_blocks_warm(&blocks).await.unwrap();
+        assert!(source.stats().remote_requests > 0);
+        cache.close().await.unwrap();
+        drop(source);
+        drop(cache);
+
+        let reopened = ImmutableRangeCache::open(config).await.unwrap();
+        let source =
+            PinnedObjectRangeSource::from_meta_with_cache(store, meta, Some(reopened)).unwrap();
+        let again = source.read_blocks_warm(&blocks).await.unwrap();
+        for (range, bytes) in blocks.iter().zip(&again) {
+            assert_eq!(bytes, &body.slice(range.start as usize..range.end as usize));
+        }
+        assert_eq!(
+            source.stats().remote_requests,
+            0,
+            "the warm-up span is read back from the device"
+        );
+        // And its blocks are now exact entries again.
+        source.read_blocks_coalesced(&blocks).await.unwrap();
+        assert_eq!(source.stats().remote_requests, 0);
     }
 
     #[tokio::test]

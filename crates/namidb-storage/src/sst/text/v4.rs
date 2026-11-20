@@ -10,7 +10,7 @@
 //! the already-authenticated posting metadata.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
 use std::io::{Cursor, Seek, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -63,6 +63,8 @@ const MAX_FOOTER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_COMPRESSED_BLOCK_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_RAW_BLOCK_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DOC_BATCH: usize = 512;
+/// Records per doc-table read unit (40 KiB): one cached block each.
+const DOC_TABLE_CHUNK_RECORDS: u64 = 1024;
 const MAX_FILTER_RANGE_BATCH: usize = 64;
 const CONTENT_DOMAIN: &[u8] = b"NamiDB/TextV4Content/v1";
 const PAYLOAD_FINGERPRINT_DOMAIN: &[u8] = b"NamiDB/TextV4Payload/v1";
@@ -1774,6 +1776,12 @@ impl TextV4Reader {
             documents_evaluated = documents_evaluated.saturating_add(1);
             if documents_evaluated & (crate::cancel::CHECK_STRIDE - 1) == 0 {
                 crate::cancel::check()?;
+                // Hand the thread back now and then: a hybrid search polls its
+                // other leg in the same task, and its reads would otherwise
+                // wait out this whole scoring loop.
+                if documents_evaluated & (SCORING_YIELD_STRIDE - 1) == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
             let doc = head.doc;
             matched_cursors.clear();
@@ -1938,6 +1946,27 @@ impl TextV4Reader {
                 )
                 .await;
         }
+        self.search_query_segment_block_max_exact(query, global, k, groups)
+            .await
+    }
+
+    /// Exact local top-k of any FT4 segment (base or delta) under the
+    /// generation's reconciled `global` statistics, pruned by block-max /
+    /// MaxScore like [`Self::search_query_base_block_max_exact`].
+    ///
+    /// The bounds need only the global IDF and average length plus this
+    /// segment's own block metadata, and a delta's postings cover only its
+    /// live payloads (suppressions carry none), so the result equals
+    /// [`Self::search_query_exact`] on the same arguments; reconciling
+    /// several segments' results stays the caller's job, exactly as for the
+    /// exhaustive scorer.
+    pub async fn search_query_segment_block_max_exact(
+        &self,
+        query: &TextQuery,
+        global: &TextV4GlobalStats,
+        k: usize,
+        groups: &[(String, Vec<SearchFilterValue>)],
+    ) -> Result<TextV4SearchResult> {
         if k == 0 || query.is_empty() || self.footer.doc_table.row_count == 0 {
             return Ok(TextV4SearchResult {
                 hits: Vec::new(),
@@ -2069,8 +2098,23 @@ impl TextV4Reader {
                 .await;
         }
 
+        // MaxScore needs no positions, and keeps one bit per term per pending
+        // candidate.
+        let use_maxscore = query.phrases.is_empty()
+            && cursors.len() > 1
+            && cursors.len() <= MAXSCORE_MAX_TERMS
+            && maxscore_enabled();
+        let workspace_bytes = if use_maxscore {
+            workspace_bytes.saturating_add(maxscore_workspace_bytes(&cursors))
+        } else {
+            workspace_bytes
+        };
+        let first_round = plan_first_posting_round(&cursors)?;
+        let workspace_bytes = workspace_bytes.saturating_add(first_round.bytes);
         let _workspace = shared_search_workspace()
             .reserve("text v4 base block-max search", workspace_bytes)
+            .await?;
+        self.read_first_posting_round(&mut cursors, first_round)
             .await?;
         let (allowed, applied_filter_groups, filter_peak_bytes) =
             self.load_filter_mask(groups).await?;
@@ -2085,116 +2129,139 @@ impl TextV4Reader {
         let mut documents_evaluated = 0usize;
         let mut pruning_dirty = true;
 
-        loop {
-            if top_k.len() == retained_k && pruning_dirty {
-                if try_prune_block_window(&mut cursors, &top_k, &mut posting_blocks_skipped)? {
-                    rebuild_cursor_heap(&cursors, &mut merge_heap);
-                    pruning_dirty = true;
-                    continue;
-                }
-                pruning_dirty = false;
-            }
-
-            let (transient, loaded_blocks) = self
-                .load_block_max_heads(
+        if use_maxscore {
+            let maxscore_peak = self
+                .run_maxscore(
                     &mut cursors,
-                    &mut merge_heap,
+                    allowed.as_ref(),
+                    retained_k,
+                    corpus_avg_len,
+                    &mut top_k,
                     &mut postings_decoded,
                     &mut posting_blocks_fetched,
+                    &mut posting_blocks_skipped,
                 )
                 .await?;
-            if loaded_blocks {
-                pruning_dirty = true;
-                peak_live_bytes = peak_live_bytes.max(
-                    exact_query_live_bytes(
-                        &cursors,
-                        allowed.as_ref(),
-                        &merge_heap,
-                        &matched_cursors,
-                        &top_k,
+            peak_live_bytes = peak_live_bytes.max(maxscore_peak.saturating_add(mask_bytes));
+        } else {
+            loop {
+                if top_k.len() == retained_k && pruning_dirty {
+                    if try_prune_block_window(&mut cursors, &top_k, &mut posting_blocks_skipped)? {
+                        rebuild_cursor_heap(&cursors, &mut merge_heap);
+                        pruning_dirty = true;
+                        continue;
+                    }
+                    pruning_dirty = false;
+                }
+
+                let (transient, loaded_blocks) = self
+                    .load_block_max_heads(
+                        &mut cursors,
+                        None,
+                        &mut merge_heap,
+                        &mut postings_decoded,
+                        &mut posting_blocks_fetched,
                     )
-                    .saturating_add(transient),
-                );
-                if top_k.len() == retained_k {
-                    continue;
-                }
-            }
-            let Some(head) = merge_heap.pop() else {
-                break;
-            };
-            documents_evaluated = documents_evaluated.saturating_add(1);
-            if documents_evaluated & (crate::cancel::CHECK_STRIDE - 1) == 0 {
-                crate::cancel::check()?;
-            }
-            let doc = head.doc;
-            matched_cursors.clear();
-            matched_cursors.push(head.cursor);
-            while merge_heap.peek().is_some_and(|head| head.doc == doc) {
-                matched_cursors.push(
-                    merge_heap
-                        .pop()
-                        .expect("peeked block-max text merge head")
-                        .cursor,
-                );
-            }
-            debug_assert!(
-                matched_cursors.windows(2).all(|pair| pair[0] < pair[1]),
-                "equal-doc block-max cursor heads must retain lexical term order"
-            );
-            let previous_threshold = top_k.peek().map(|ranked| ranked.score.to_bits());
-            if allowed.as_ref().is_some_and(|mask| !mask.contains(doc))
-                || !phrases_match_cursors(doc, &query.phrases, &cursors)
-            {
-                // Native filters and phrases can only remove candidates, so
-                // the unfiltered block upper bound remains conservative.
-            } else {
-                let mut score = 0.0f64;
-                for &cursor_index in &matched_cursors {
-                    let cursor = &cursors[cursor_index];
-                    let posting = cursor
-                        .current()
-                        .expect("block-max heap head must name a current posting");
-                    debug_assert_eq!(posting.doc, doc);
-                    score += bm25_term_score(
-                        cursor.idf,
-                        posting.tf,
-                        posting.doc_len as usize,
-                        corpus_avg_len,
+                    .await?;
+                if loaded_blocks {
+                    pruning_dirty = true;
+                    peak_live_bytes = peak_live_bytes.max(
+                        exact_query_live_bytes(
+                            &cursors,
+                            allowed.as_ref(),
+                            &merge_heap,
+                            &matched_cursors,
+                            &top_k,
+                        )
+                        .saturating_add(transient),
                     );
-                }
-                if score > 0.0 && score.is_finite() {
-                    top_k.push(RankedOrdinal { doc, score });
-                    if top_k.len() > retained_k {
-                        top_k.pop();
+                    if top_k.len() == retained_k {
+                        continue;
                     }
                 }
-            }
-
-            let mut crossed_block_boundary = false;
-            for &cursor_index in &matched_cursors {
-                let cursor = &mut cursors[cursor_index];
-                cursor.next_posting += 1;
-                if cursor.next_posting == cursor.postings.len() {
-                    cursor.set_postings(Vec::new());
-                    cursor.next_posting = 0;
-                    crossed_block_boundary = true;
-                } else if let Some(posting) = cursor.current() {
-                    merge_heap.push(CursorHead {
-                        doc: posting.doc,
-                        cursor: cursor_index,
-                    });
+                let Some(head) = merge_heap.pop() else {
+                    break;
+                };
+                documents_evaluated = documents_evaluated.saturating_add(1);
+                if documents_evaluated & (crate::cancel::CHECK_STRIDE - 1) == 0 {
+                    crate::cancel::check()?;
+                    // Hand the thread back now and then: a hybrid search polls its
+                    // other leg in the same task, and its reads would otherwise
+                    // wait out this whole scoring loop.
+                    if documents_evaluated & (SCORING_YIELD_STRIDE - 1) == 0 {
+                        tokio::task::yield_now().await;
+                    }
                 }
+                let doc = head.doc;
+                matched_cursors.clear();
+                matched_cursors.push(head.cursor);
+                while merge_heap.peek().is_some_and(|head| head.doc == doc) {
+                    matched_cursors.push(
+                        merge_heap
+                            .pop()
+                            .expect("peeked block-max text merge head")
+                            .cursor,
+                    );
+                }
+                debug_assert!(
+                    matched_cursors.windows(2).all(|pair| pair[0] < pair[1]),
+                    "equal-doc block-max cursor heads must retain lexical term order"
+                );
+                let previous_threshold = top_k.peek().map(|ranked| ranked.score.to_bits());
+                if allowed.as_ref().is_some_and(|mask| !mask.contains(doc))
+                    || !phrases_match_cursors(doc, &query.phrases, &cursors)
+                {
+                    // Native filters and phrases can only remove candidates, so
+                    // the unfiltered block upper bound remains conservative.
+                } else {
+                    let mut score = 0.0f64;
+                    for &cursor_index in &matched_cursors {
+                        let cursor = &cursors[cursor_index];
+                        let posting = cursor
+                            .current()
+                            .expect("block-max heap head must name a current posting");
+                        debug_assert_eq!(posting.doc, doc);
+                        score += bm25_term_score(
+                            cursor.idf,
+                            posting.tf,
+                            posting.doc_len as usize,
+                            corpus_avg_len,
+                        );
+                    }
+                    if score > 0.0 && score.is_finite() {
+                        top_k.push(RankedOrdinal { doc, score });
+                        if top_k.len() > retained_k {
+                            top_k.pop();
+                        }
+                    }
+                }
+
+                let mut crossed_block_boundary = false;
+                for &cursor_index in &matched_cursors {
+                    let cursor = &mut cursors[cursor_index];
+                    cursor.next_posting += 1;
+                    if cursor.next_posting == cursor.postings.len() {
+                        cursor.set_postings(Vec::new());
+                        cursor.next_posting = 0;
+                        crossed_block_boundary = true;
+                    } else if let Some(posting) = cursor.current() {
+                        merge_heap.push(CursorHead {
+                            doc: posting.doc,
+                            cursor: cursor_index,
+                        });
+                    }
+                }
+                let threshold_changed =
+                    previous_threshold != top_k.peek().map(|ranked| ranked.score.to_bits());
+                pruning_dirty |= crossed_block_boundary || threshold_changed;
+                peak_live_bytes = peak_live_bytes.max(exact_query_live_bytes(
+                    &cursors,
+                    allowed.as_ref(),
+                    &merge_heap,
+                    &matched_cursors,
+                    &top_k,
+                ));
             }
-            let threshold_changed =
-                previous_threshold != top_k.peek().map(|ranked| ranked.score.to_bits());
-            pruning_dirty |= crossed_block_boundary || threshold_changed;
-            peak_live_bytes = peak_live_bytes.max(exact_query_live_bytes(
-                &cursors,
-                allowed.as_ref(),
-                &merge_heap,
-                &matched_cursors,
-                &top_k,
-            ));
         }
         drop(cursors);
         drop(allowed);
@@ -2298,9 +2365,499 @@ impl TextV4Reader {
         Ok(result)
     }
 
+    /// Exact top-k by MaxScore over the block-max metadata.
+    ///
+    /// Terms are ordered by their largest block upper bound. Once the top-k
+    /// threshold exceeds the summed bounds of the lowest-bound terms, those
+    /// terms become non-essential: their posting lists are no longer walked,
+    /// because a document that only they match cannot enter the top k. A
+    /// document an essential term matches is scored from the non-essential
+    /// lists only if its essential score plus the bounds of the non-essential
+    /// blocks covering it can still beat the threshold, and those blocks are
+    /// fetched for a batch of such documents in one store round. On text
+    /// where most query terms are common, the common terms' long posting
+    /// lists are mostly never read.
+    ///
+    /// Scores are summed in lexical term order, exactly like the other
+    /// scorers, so results and scores are identical to theirs.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_maxscore(
+        &self,
+        cursors: &mut [PostingCursor],
+        allowed: Option<&QueryMask>,
+        retained_k: usize,
+        corpus_avg_len: f64,
+        top_k: &mut BinaryHeap<RankedOrdinal>,
+        postings_decoded: &mut usize,
+        posting_blocks_fetched: &mut usize,
+        posting_blocks_skipped: &mut usize,
+    ) -> Result<usize> {
+        let terms = cursors.len();
+        let term_bounds = cursors
+            .iter()
+            .map(|cursor| {
+                cursor
+                    .block_upper_bounds
+                    .iter()
+                    .copied()
+                    .fold(0.0f64, f64::max)
+            })
+            .collect::<Vec<_>>();
+        let mut order = (0..terms).collect::<Vec<_>>();
+        order.sort_by(|left, right| {
+            term_bounds[*left]
+                .total_cmp(&term_bounds[*right])
+                .then_with(|| left.cmp(right))
+        });
+        let mut essential = vec![true; terms];
+        let mut non_essential = 0usize;
+        let mut queue_hints = vec![0usize; terms];
+        let mut state = MaxScoreState {
+            fetch_hints: vec![0usize; terms],
+            cache: BTreeMap::new(),
+            cache_bytes: 0,
+            peak_bytes: 0,
+            blocks_fetched: 0,
+        };
+        let mut merge_heap = BinaryHeap::with_capacity(terms);
+        let mut pending: Vec<MaxScoreCandidate> = Vec::new();
+        let mut fetch_limit = MAXSCORE_FETCH_BLOCKS;
+        let mut matched = Vec::with_capacity(terms);
+        let mut documents_evaluated = 0usize;
+        let mut partition_dirty = true;
+        let mut peak_bytes = 0usize;
+
+        loop {
+            if partition_dirty && top_k.len() == retained_k {
+                partition_dirty = false;
+                let theta = top_k.peek().map(|ranked| ranked.score).unwrap_or(0.0);
+                let mut moved = false;
+                while non_essential < terms {
+                    let bound = conservative_upper_bound_sum(
+                        order[..=non_essential]
+                            .iter()
+                            .map(|term| &term_bounds[*term]),
+                    )
+                    .ok_or_else(|| Error::invariant("text v4 MaxScore bound became non-finite"))?;
+                    if maxscore_margin(bound) >= theta {
+                        break;
+                    }
+                    let term = order[non_essential];
+                    essential[term] = false;
+                    non_essential += 1;
+                    moved = true;
+                    // Lookups read non-essential blocks through the batch
+                    // cache; the walking state is released.
+                    let cursor = &mut cursors[term];
+                    cursor.set_postings(Vec::new());
+                    cursor.next_posting = 0;
+                    cursor.skip_through = None;
+                    cursor.clear_prefetched();
+                }
+                if non_essential == terms {
+                    break;
+                }
+                if moved {
+                    merge_heap.clear();
+                    for (index, cursor) in cursors.iter().enumerate() {
+                        if essential[index] {
+                            if let Some(posting) = cursor.current() {
+                                merge_heap.push(CursorHead {
+                                    doc: posting.doc,
+                                    cursor: index,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            let (transient, _) = self
+                .load_block_max_heads(
+                    cursors,
+                    Some(&essential),
+                    &mut merge_heap,
+                    postings_decoded,
+                    posting_blocks_fetched,
+                )
+                .await?;
+            peak_bytes = peak_bytes.max(
+                cursor_live_bytes(cursors)
+                    .saturating_add(transient)
+                    .saturating_add(state.cache_bytes)
+                    .saturating_add(maxscore_pending_bytes(&pending, terms)),
+            );
+            let Some(head) = merge_heap.pop() else {
+                break;
+            };
+            documents_evaluated = documents_evaluated.saturating_add(1);
+            if documents_evaluated & (crate::cancel::CHECK_STRIDE - 1) == 0 {
+                crate::cancel::check()?;
+                // Hand the thread back now and then: a hybrid search polls its
+                // other leg in the same task, and its reads would otherwise
+                // wait out this whole scoring loop.
+                if documents_evaluated & (SCORING_YIELD_STRIDE - 1) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            let doc = head.doc;
+            matched.clear();
+            matched.push(head.cursor);
+            while merge_heap.peek().is_some_and(|head| head.doc == doc) {
+                matched.push(merge_heap.pop().expect("peeked MaxScore head").cursor);
+            }
+            matched.sort_unstable();
+            let doc_len = cursors[matched[0]]
+                .current()
+                .ok_or_else(|| Error::invariant("text v4 MaxScore head lost its posting"))?
+                .doc_len;
+            let mut tfs = Vec::with_capacity(matched.len());
+            for &index in &matched {
+                let posting = cursors[index]
+                    .current()
+                    .ok_or_else(|| Error::invariant("text v4 MaxScore head lost its posting"))?;
+                if posting.doc_len != doc_len {
+                    return Err(Error::invariant(
+                        "text v4 postings disagree on a document length",
+                    ));
+                }
+                tfs.push((index, posting.tf));
+            }
+            for &index in &matched {
+                let cursor = &mut cursors[index];
+                cursor.next_posting += 1;
+                if cursor.next_posting == cursor.postings.len() {
+                    cursor.set_postings(Vec::new());
+                    cursor.next_posting = 0;
+                } else if let Some(posting) = cursor.current() {
+                    merge_heap.push(CursorHead {
+                        doc: posting.doc,
+                        cursor: index,
+                    });
+                }
+            }
+            if allowed.is_some_and(|mask| !mask.contains(doc)) {
+                continue;
+            }
+            let known = essential
+                .iter()
+                .enumerate()
+                .filter(|(_, essential)| **essential)
+                .fold(0u64, |bits, (term, _)| bits | (1u64 << term));
+            let candidate = MaxScoreCandidate {
+                doc,
+                doc_len,
+                known,
+                tfs,
+            };
+            if non_essential == 0 {
+                let previous = top_k.peek().map(|ranked| ranked.score.to_bits());
+                push_ranked(
+                    top_k,
+                    retained_k,
+                    doc,
+                    candidate.score(cursors, corpus_avg_len),
+                );
+                partition_dirty |= previous != top_k.peek().map(|ranked| ranked.score.to_bits());
+                continue;
+            }
+            let theta = top_k.peek().map(|ranked| ranked.score).unwrap_or(0.0);
+            let bound =
+                candidate.upper_bound(cursors, &essential, &mut queue_hints, corpus_avg_len)?;
+            if top_k.len() == retained_k && maxscore_margin(bound) < theta {
+                continue;
+            }
+            pending.push(candidate);
+            if pending.len() >= fetch_limit * MAXSCORE_PENDING_PER_FETCH_BLOCK {
+                let frontier = essential_frontier(cursors, &essential);
+                let previous = top_k.peek().map(|ranked| ranked.score.to_bits());
+                self.score_maxscore_batch(
+                    cursors,
+                    &essential,
+                    &mut pending,
+                    &mut state,
+                    frontier,
+                    fetch_limit,
+                    retained_k,
+                    corpus_avg_len,
+                    top_k,
+                    postings_decoded,
+                )
+                .await?;
+                fetch_limit = fetch_limit.saturating_mul(2).min(MAXSCORE_FETCH_BLOCKS_MAX);
+                partition_dirty |= previous != top_k.peek().map(|ranked| ranked.score.to_bits());
+            }
+        }
+        self.score_maxscore_batch(
+            cursors,
+            &essential,
+            &mut pending,
+            &mut state,
+            None,
+            fetch_limit,
+            retained_k,
+            corpus_avg_len,
+            top_k,
+            postings_decoded,
+        )
+        .await?;
+        *posting_blocks_fetched = posting_blocks_fetched
+            .checked_add(state.blocks_fetched)
+            .ok_or_else(|| Error::invariant("text v4 fetched block count overflows"))?;
+        let total_blocks = cursors
+            .iter()
+            .map(|cursor| cursor.blocks.len())
+            .sum::<usize>();
+        *posting_blocks_skipped = posting_blocks_skipped
+            .saturating_add(total_blocks.saturating_sub(*posting_blocks_fetched));
+        Ok(peak_bytes.max(state.peak_bytes))
+    }
+
+    /// Complete and rank `pending` (in document order): fetch the
+    /// non-essential blocks the survivors need, at most `fetch_limit` per
+    /// store round, then score each survivor in lexical term order.
+    #[allow(clippy::too_many_arguments)]
+    async fn score_maxscore_batch(
+        &self,
+        cursors: &[PostingCursor],
+        essential: &[bool],
+        pending: &mut Vec<MaxScoreCandidate>,
+        state: &mut MaxScoreState,
+        frontier: Option<u64>,
+        fetch_limit: usize,
+        retained_k: usize,
+        corpus_avg_len: f64,
+        top_k: &mut BinaryHeap<RankedOrdinal>,
+        postings_decoded: &mut usize,
+    ) -> Result<()> {
+        let mut start = 0usize;
+        while start < pending.len() {
+            crate::cancel::check()?;
+            // Survivors of this round and the blocks they need.
+            let theta = top_k.peek().map(|ranked| ranked.score).unwrap_or(0.0);
+            let full = top_k.len() == retained_k;
+            let mut needed: Vec<(usize, usize)> = Vec::new();
+            let mut needed_set: HashSet<(usize, usize)> = HashSet::new();
+            let mut needed_bytes = 0usize;
+            let mut end = start;
+            let mut hints = state.fetch_hints.clone();
+            while end < pending.len() {
+                let candidate = &pending[end];
+                let mut wanted = Vec::new();
+                let mut bound = candidate.partial_bound(cursors, corpus_avg_len)?;
+                for (term, cursor) in cursors.iter().enumerate() {
+                    if essential[term] || candidate.has(term) {
+                        continue;
+                    }
+                    if let Some(block) =
+                        block_covering(&cursor.blocks, &mut hints[term], candidate.doc)
+                    {
+                        bound = next_up_nonnegative(bound + cursor.block_upper_bounds[block])
+                            .ok_or_else(|| {
+                                Error::invariant("text v4 MaxScore bound became non-finite")
+                            })?;
+                        if !state.cache.contains_key(&(term, block)) {
+                            wanted.push((term, block));
+                        }
+                    }
+                }
+                if full && maxscore_margin(bound) < theta {
+                    end += 1;
+                    continue;
+                }
+                let (fresh, fresh_bytes) = wanted
+                    .iter()
+                    .filter(|key| !needed_set.contains(key))
+                    .fold((0usize, 0usize), |(count, bytes), (term, block)| {
+                        (
+                            count + 1,
+                            bytes.saturating_add(maxscore_fetched_bytes(
+                                &cursors[*term].blocks[*block],
+                            )),
+                        )
+                    });
+                if !needed.is_empty()
+                    && (needed.len() + fresh > fetch_limit
+                        || needed_bytes.saturating_add(fresh_bytes) > MAXSCORE_FETCH_ROUND_BYTES)
+                {
+                    break;
+                }
+                needed_bytes = needed_bytes.saturating_add(fresh_bytes);
+                for key in wanted {
+                    if needed_set.insert(key) {
+                        needed.push(key);
+                    }
+                }
+                end += 1;
+            }
+            self.fetch_maxscore_blocks(cursors, &needed, state, postings_decoded)
+                .await?;
+            for candidate in &pending[start..end] {
+                let theta = top_k.peek().map(|ranked| ranked.score).unwrap_or(0.0);
+                let mut bound = candidate.partial_bound(cursors, corpus_avg_len)?;
+                let mut tfs = candidate.tfs.clone();
+                let mut missing = false;
+                for (term, cursor) in cursors.iter().enumerate() {
+                    if essential[term] || candidate.has(term) {
+                        continue;
+                    }
+                    let Some(block) =
+                        block_covering(&cursor.blocks, &mut state.fetch_hints[term], candidate.doc)
+                    else {
+                        continue;
+                    };
+                    bound = next_up_nonnegative(bound + cursor.block_upper_bounds[block])
+                        .ok_or_else(|| {
+                            Error::invariant("text v4 MaxScore bound became non-finite")
+                        })?;
+                    let Some(postings) = state.cache.get(&(term, block)) else {
+                        // Not fetched: this round's threshold already ruled the
+                        // candidate out (checked again below).
+                        missing = true;
+                        continue;
+                    };
+                    if let Ok(position) =
+                        postings.binary_search_by(|posting| posting.doc.cmp(&candidate.doc))
+                    {
+                        if postings[position].doc_len != candidate.doc_len {
+                            return Err(Error::invariant(
+                                "text v4 postings disagree on a document length",
+                            ));
+                        }
+                        tfs.push((term, postings[position].tf));
+                    }
+                }
+                // Blocks are fetched only for candidates that could still
+                // enter when the round was planned; the threshold only rises.
+                if top_k.len() == retained_k && maxscore_margin(bound) < theta {
+                    continue;
+                }
+                if missing {
+                    return Err(Error::invariant(
+                        "text v4 MaxScore candidate lost a non-essential block",
+                    ));
+                }
+                tfs.sort_unstable_by_key(|(term, _)| *term);
+                let scored = MaxScoreCandidate {
+                    doc: candidate.doc,
+                    doc_len: candidate.doc_len,
+                    known: u64::MAX,
+                    tfs,
+                };
+                push_ranked(
+                    top_k,
+                    retained_k,
+                    candidate.doc,
+                    scored.score(cursors, corpus_avg_len),
+                );
+            }
+            // Later candidates have larger ordinals: blocks that end before
+            // the next one are done.
+            let next_doc = pending.get(end).map(|candidate| candidate.doc).or(frontier);
+            state.evict_before(next_doc);
+            start = end;
+        }
+        pending.clear();
+        Ok(())
+    }
+
+    async fn fetch_maxscore_blocks(
+        &self,
+        cursors: &[PostingCursor],
+        needed: &[(usize, usize)],
+        state: &mut MaxScoreState,
+        postings_decoded: &mut usize,
+    ) -> Result<()> {
+        if needed.is_empty() {
+            return Ok(());
+        }
+        let ranges = needed
+            .iter()
+            .map(|(term, block)| cursors[*term].blocks[*block].wire.range())
+            .collect::<Result<Vec<_>>>()?;
+        tracing::debug!(
+            target: "namidb::search_timing",
+            kind = "maxscore_batch",
+            blocks = ranges.len(),
+            "text posting round"
+        );
+        let fetched = self.source.read_blocks_coalesced(&ranges).await?;
+        if fetched.len() != ranges.len() {
+            return Err(Error::invariant(
+                "text v4 source returned wrong posting block count",
+            ));
+        }
+        let compressed_bytes = fetched.iter().map(Bytes::len).sum::<usize>();
+        let mut largest_raw = 0usize;
+        for ((term, block), compressed) in needed.iter().zip(fetched) {
+            let reference = &cursors[*term].blocks[*block];
+            let raw = decode_block(&compressed, &reference.wire, "posting block")?;
+            largest_raw = largest_raw.max(raw.capacity());
+            let decoded = decode_posting_block(&raw, reference, false)?;
+            *postings_decoded = postings_decoded
+                .checked_add(decoded.len())
+                .ok_or_else(|| Error::invariant("text v4 decoded posting count overflows"))?;
+            state.cache_bytes = state.cache_bytes.saturating_add(
+                decoded
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Posting>()),
+            );
+            state.cache.insert((*term, *block), decoded);
+            state.blocks_fetched = state.blocks_fetched.saturating_add(1);
+        }
+        state.peak_bytes = state.peak_bytes.max(
+            state
+                .cache_bytes
+                .saturating_add(compressed_bytes)
+                .saturating_add(largest_raw)
+                .saturating_add(
+                    ranges
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Range<u64>>()),
+                ),
+        );
+        Ok(())
+    }
+
+    /// Read the planned first round (see [`plan_first_posting_round`]) in
+    /// one coalesced call and queue each block on its cursor, where the
+    /// lazy cursor loads find it instead of a round trip each.
+    async fn read_first_posting_round(
+        &self,
+        cursors: &mut [PostingCursor],
+        plan: FirstPostingRound,
+    ) -> Result<()> {
+        if plan.blocks.is_empty() {
+            return Ok(());
+        }
+        let ranges = plan
+            .blocks
+            .iter()
+            .map(|(cursor, block)| cursors[*cursor].blocks[*block].wire.range())
+            .collect::<Result<Vec<_>>>()?;
+        let fetched = self.source.read_blocks_coalesced(&ranges).await?;
+        if fetched.len() != ranges.len() {
+            return Err(Error::invariant(
+                "text v4 source returned wrong first-round block count",
+            ));
+        }
+        tracing::debug!(
+            target: "namidb::search_timing",
+            kind = "first_round",
+            blocks = ranges.len(),
+            bytes = plan.bytes,
+            "text posting round"
+        );
+        for ((cursor, block), bytes) in plan.blocks.into_iter().zip(fetched) {
+            cursors[cursor].push_prefetched(block, bytes);
+        }
+        Ok(())
+    }
+
     async fn load_block_max_heads(
         &self,
         cursors: &mut [PostingCursor],
+        active: Option<&[bool]>,
         merge_heap: &mut BinaryHeap<CursorHead>,
         postings_decoded: &mut usize,
         posting_blocks_fetched: &mut usize,
@@ -2309,10 +2866,12 @@ impl TextV4Reader {
         let mut loaded_any = false;
         loop {
             let loaded_min = merge_heap.peek().map(|head| head.doc);
+            let is_active = |index: usize| active.is_none_or(|active| active[index]);
             let unloaded_min = cursors
                 .iter()
-                .filter(|cursor| cursor.current().is_none())
-                .filter_map(PostingCursor::potential_doc)
+                .enumerate()
+                .filter(|(index, cursor)| is_active(*index) && cursor.current().is_none())
+                .filter_map(|(_, cursor)| cursor.potential_doc())
                 .min();
             let Some(unloaded_min) = unloaded_min else {
                 break;
@@ -2323,7 +2882,7 @@ impl TextV4Reader {
             let due = cursors
                 .iter()
                 .enumerate()
-                .filter(|(_, cursor)| cursor.current().is_none())
+                .filter(|(index, cursor)| is_active(*index) && cursor.current().is_none())
                 .filter(|(_, cursor)| cursor.potential_doc() == Some(unloaded_min))
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
@@ -2559,6 +3118,23 @@ impl TextV4Reader {
         Ok(expanded)
     }
 
+    fn decode_dictionary_block(
+        &self,
+        compressed: &[u8],
+        reference: &DictionaryBlockRef,
+    ) -> Result<Vec<TermEntry>> {
+        let raw = decode_block(compressed, &reference.wire, "dictionary block")?;
+        let entries: Vec<TermEntry> =
+            deserialize_bounded(&raw, MAX_RAW_BLOCK_BYTES, "text v4 dictionary block")?;
+        validate_dictionary_block(
+            &entries,
+            reference,
+            &self.footer.postings_region,
+            self.footer.binding.segment.role,
+        )?;
+        Ok(entries)
+    }
+
     async fn read_dictionary_block(
         &self,
         reference: &DictionaryBlockRef,
@@ -2573,17 +3149,15 @@ impl TextV4Reader {
         {
             return Ok(cached.clone());
         }
-        let compressed = self.source.read_range(reference.wire.range()?).await?;
-        let raw = decode_block(&compressed, &reference.wire, "dictionary block")?;
-        let entries: Vec<TermEntry> =
-            deserialize_bounded(&raw, MAX_RAW_BLOCK_BYTES, "text v4 dictionary block")?;
-        validate_dictionary_block(
-            &entries,
-            reference,
-            &self.footer.postings_region,
-            self.footer.binding.segment.role,
-        )?;
-        let entries = Arc::new(entries);
+        // Read as one exact block: a warmed segment (see
+        // `prefetch_read_metadata`) answers from the range cache.
+        let compressed = self
+            .source
+            .read_blocks_coalesced(&[reference.wire.range()?])
+            .await?
+            .pop()
+            .ok_or_else(|| Error::invariant("text v4 source returned no dictionary block"))?;
+        let entries = Arc::new(self.decode_dictionary_block(&compressed, reference)?);
         let mut cache = self
             .dictionary_blocks
             .lock()
@@ -2633,10 +3207,12 @@ impl TextV4Reader {
 
         let mut jobs = Vec::<(usize, PostingBlockRef)>::with_capacity(cursor_indices.len());
         let mut compressed_blocks = Vec::<Option<Bytes>>::with_capacity(cursor_indices.len());
-        // `(job, first block, last block, byte range)` of every cursor whose
-        // next block was not read ahead: one contiguous read each, all in
-        // one store round.
-        let mut reads = Vec::<(usize, usize, usize, Range<u64>)>::new();
+        // `(job, block, byte range)` of every block in the read-ahead window
+        // of each cursor whose next block was not read ahead. Requested block
+        // by block so blocks already in the range cache are served from it;
+        // the misses are still coalesced into a few large reads, all in one
+        // store round.
+        let mut reads = Vec::<(usize, usize, Range<u64>)>::new();
         let mut previous = None;
         for &cursor_index in cursor_indices {
             if previous.is_some_and(|previous| previous >= cursor_index) {
@@ -2663,20 +3239,21 @@ impl TextV4Reader {
             let prefetched = cursor.take_prefetched(block);
             if prefetched.is_none() {
                 let start = reference.wire.offset;
-                let mut range = reference.wire.range()?;
+                let mut end = reference.wire.range()?.end;
+                reads.push((jobs.len(), block, reference.wire.range()?));
                 let mut last = block;
                 while let Some(next) = cursor.blocks.get(last + 1) {
                     let next_range = next.wire.range()?;
-                    if next_range.start != range.end
+                    if next_range.start != end
                         || next_range.end - start > cursor.readahead_bytes
                         || last - block + 1 >= MAX_READAHEAD_BLOCKS
                     {
                         break;
                     }
-                    range.end = next_range.end;
+                    end = next_range.end;
                     last += 1;
+                    reads.push((jobs.len(), last, next_range));
                 }
-                reads.push((jobs.len(), block, last, range));
             }
             jobs.push((cursor_index, reference));
             compressed_blocks.push(prefetched);
@@ -2690,37 +3267,35 @@ impl TextV4Reader {
 
         let ranges = reads
             .iter()
-            .map(|(_, _, _, range)| range.clone())
+            .map(|(_, _, range)| range.clone())
             .collect::<Vec<_>>();
         let fetched = if ranges.is_empty() {
             Vec::new()
         } else {
-            self.source.read_ranges(&ranges).await?
+            tracing::debug!(
+                target: "namidb::search_timing",
+                kind = "cursor_window",
+                reads = ranges.len(),
+                bytes = ranges.iter().map(|range| range.end - range.start).sum::<u64>(),
+                "text posting round"
+            );
+            self.source.read_blocks_coalesced(&ranges).await?
         };
         if fetched.len() != ranges.len() {
             return Err(Error::invariant(
                 "text v4 source returned wrong posting block count",
             ));
         }
-        for ((job, first, last, range), bytes) in reads.into_iter().zip(fetched) {
+        for ((job, block, range), bytes) in reads.into_iter().zip(fetched) {
             if bytes.len() as u64 != range.end - range.start {
                 return Err(Error::invariant(
-                    "text v4 source returned a short posting read-ahead",
+                    "text v4 source returned a short posting block",
                 ));
             }
-            let cursor_index = jobs[job].0;
-            let cursor = &mut cursors[cursor_index];
-            for block in first..=last {
-                let block_range = cursor.blocks[block].wire.range()?;
-                let slice = bytes.slice(
-                    (block_range.start - range.start) as usize
-                        ..(block_range.end - range.start) as usize,
-                );
-                if block == first {
-                    compressed_blocks[job] = Some(slice);
-                } else {
-                    cursor.push_prefetched(block, slice);
-                }
+            if compressed_blocks[job].is_none() {
+                compressed_blocks[job] = Some(bytes);
+            } else {
+                cursors[jobs[job].0].push_prefetched(block, bytes);
             }
         }
         let compressed_blocks = compressed_blocks
@@ -2873,22 +3448,217 @@ impl TextV4Reader {
     async fn read_doc_records(&self, ordinals: &[u64]) -> Result<Vec<DocRecord>> {
         let mut records = Vec::with_capacity(ordinals.len());
         for chunk in ordinals.chunks(MAX_DOC_BATCH) {
-            let ranges = chunk
+            for ordinal in chunk {
+                // Bounds-checks every ordinal before any read.
+                self.doc_record_range(*ordinal)?;
+            }
+            // The table is read in fixed aligned chunks (cached whole), so
+            // the records of one query share a few reads and a warmed table
+            // answers from the range cache.
+            let mut chunk_ids = chunk
                 .iter()
-                .map(|ordinal| self.doc_record_range(*ordinal))
+                .map(|ordinal| ordinal / DOC_TABLE_CHUNK_RECORDS)
+                .collect::<Vec<_>>();
+            chunk_ids.sort_unstable();
+            chunk_ids.dedup();
+            let ranges = chunk_ids
+                .iter()
+                .map(|chunk_id| self.doc_table_chunk_range(*chunk_id))
                 .collect::<Result<Vec<_>>>()?;
-            let bodies = self.source.read_ranges(&ranges).await?;
-            if bodies.len() != chunk.len() {
+            let bodies = self.source.read_blocks_coalesced(&ranges).await?;
+            if bodies.len() != ranges.len() {
                 return Err(Error::invariant(
-                    "text v4 source returned wrong document record count",
+                    "text v4 source returned wrong document table chunk count",
                 ));
             }
-            for body in bodies {
-                require_len(&body, DOC_RECORD_LEN as usize, "document record")?;
-                records.push(decode_doc_record(&body)?);
+            for ordinal in chunk {
+                let index = chunk_ids
+                    .binary_search(&(ordinal / DOC_TABLE_CHUNK_RECORDS))
+                    .map_err(|_| Error::invariant("text v4 document chunk lost"))?;
+                let body = &bodies[index];
+                let start = usize::try_from(
+                    (ordinal % DOC_TABLE_CHUNK_RECORDS).saturating_mul(DOC_RECORD_LEN),
+                )
+                .map_err(|_| Error::invariant("text v4 document offset overflows"))?;
+                let end = start + DOC_RECORD_LEN as usize;
+                if body.len() < end {
+                    return Err(Error::invariant("text v4 document table chunk is short"));
+                }
+                records.push(decode_doc_record(&body[start..end])?);
             }
         }
         Ok(records)
+    }
+
+    /// Object range of doc-table chunk `chunk_id` (the last one is short).
+    fn doc_table_chunk_range(&self, chunk_id: u64) -> Result<Range<u64>> {
+        let rows = self.footer.doc_table.row_count;
+        let first = chunk_id
+            .checked_mul(DOC_TABLE_CHUNK_RECORDS)
+            .filter(|first| *first < rows)
+            .ok_or_else(|| Error::invariant("text v4 document chunk leaves table"))?;
+        let last = first.saturating_add(DOC_TABLE_CHUNK_RECORDS).min(rows);
+        let start = self
+            .footer
+            .doc_table
+            .offset
+            .checked_add(first * DOC_RECORD_LEN)
+            .ok_or_else(|| Error::invariant("text v4 document offset overflows"))?;
+        Ok(start..start + (last - first) * DOC_RECORD_LEN)
+    }
+
+    /// Read-path metadata of this segment that every query touches: the
+    /// term dictionary (term entries with their posting-block bounds), the
+    /// document table and the version table. Returns the bytes warmed into
+    /// the shared range cache as exact blocks (coalesced into a few large
+    /// reads), or 0 when it would exceed `budget`. Dictionary blocks and
+    /// version pages are checksum-validated before they count.
+    pub async fn prefetch_read_metadata(&self, budget: u64) -> Result<u64> {
+        let dictionary = self
+            .footer
+            .dictionary
+            .iter()
+            .map(|reference| reference.wire.range())
+            .collect::<Result<Vec<_>>>()?;
+        let rows = self.footer.doc_table.row_count;
+        let doc_chunks = (0..rows.div_ceil(DOC_TABLE_CHUNK_RECORDS))
+            .map(|chunk_id| self.doc_table_chunk_range(chunk_id))
+            .collect::<Result<Vec<_>>>()?;
+        let pages = self.version_reader.page_ranges()?;
+        let total = dictionary
+            .iter()
+            .chain(&doc_chunks)
+            .chain(&pages)
+            .map(|range| range.end - range.start)
+            .sum::<u64>();
+        if total == 0 || total > budget {
+            return Ok(0);
+        }
+        let bodies = self.source.read_blocks_warm(&dictionary).await?;
+        for (reference, body) in self.footer.dictionary.iter().zip(&bodies) {
+            decode_block(body, &reference.wire, "dictionary block")?;
+        }
+        drop(bodies);
+        self.source.read_blocks_warm(&doc_chunks).await?;
+        let bodies = self.source.read_blocks_warm(&pages).await?;
+        self.version_reader.validate_pages(&bodies)?;
+        Ok(total)
+    }
+
+    /// Warm the head of each term's posting list into the range cache: its
+    /// first block, and the blocks after it within [`HEAD_WINDOW_BYTES`].
+    /// Terms go in descending document frequency until `budget` is spent:
+    /// long lists are the ones a new query reads in several dependent
+    /// rounds, while a rare term's single block is read in the query's first
+    /// round anyway. Blocks are checksum-validated. Returns the bytes warmed.
+    pub async fn prefetch_posting_heads(&self, budget: u64) -> Result<u64> {
+        if budget == 0 || self.footer.dictionary.is_empty() {
+            return Ok(0);
+        }
+        // `(document frequency, head bytes, dictionary block, entry)`.
+        let mut candidates = Vec::<(u64, u64, u32, u32)>::new();
+        for (dictionary_index, reference) in self.footer.dictionary.iter().enumerate() {
+            crate::cancel::check()?;
+            let entries = self.read_dictionary_entries(reference).await?;
+            for (entry_index, entry) in entries.iter().enumerate() {
+                let bytes = posting_head(&entry.blocks)?
+                    .map(|range| range.end - range.start)
+                    .unwrap_or(0);
+                if bytes == 0 || entry.live_doc_freq == 0 {
+                    continue;
+                }
+                candidates.push((
+                    entry.live_doc_freq,
+                    bytes,
+                    u32::try_from(dictionary_index)
+                        .map_err(|_| Error::invariant("text v4 dictionary index overflows"))?,
+                    u32::try_from(entry_index)
+                        .map_err(|_| Error::invariant("text v4 dictionary entry overflows"))?,
+                ));
+            }
+        }
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then((a.2, a.3).cmp(&(b.2, b.3))));
+        let mut selected = Vec::<(u32, u32)>::new();
+        let mut total = 0u64;
+        for (_, bytes, dictionary_index, entry_index) in candidates {
+            if total + bytes > budget {
+                break;
+            }
+            total += bytes;
+            selected.push((dictionary_index, entry_index));
+        }
+        selected.sort_unstable();
+        let mut warmed = 0u64;
+        let mut batch = Vec::<(Range<u64>, u32)>::new();
+        let mut batch_bytes = 0u64;
+        let mut index = 0;
+        while index < selected.len() {
+            let dictionary_index = selected[index].0;
+            let entries = self
+                .read_dictionary_entries(&self.footer.dictionary[dictionary_index as usize])
+                .await?;
+            while index < selected.len() && selected[index].0 == dictionary_index {
+                let entry = &entries[selected[index].1 as usize];
+                let Some(head) = posting_head(&entry.blocks)? else {
+                    index += 1;
+                    continue;
+                };
+                for block in &entry.blocks {
+                    let range = block.wire.range()?;
+                    if range.start < head.start || range.end > head.end {
+                        break;
+                    }
+                    batch_bytes += range.end - range.start;
+                    batch.push((range, block.wire.compressed_crc32));
+                }
+                index += 1;
+                if batch_bytes >= HEAD_PREFETCH_BATCH_BYTES {
+                    warmed += self.read_posting_head_batch(&mut batch).await?;
+                    batch_bytes = 0;
+                }
+            }
+        }
+        warmed += self.read_posting_head_batch(&mut batch).await?;
+        Ok(warmed)
+    }
+
+    async fn read_dictionary_entries(
+        &self,
+        reference: &DictionaryBlockRef,
+    ) -> Result<Vec<TermEntry>> {
+        let compressed = self
+            .source
+            .read_blocks_coalesced(&[reference.wire.range()?])
+            .await?
+            .pop()
+            .ok_or_else(|| Error::invariant("text v4 source returned no dictionary block"))?;
+        self.decode_dictionary_block(&compressed, reference)
+    }
+
+    async fn read_posting_head_batch(&self, batch: &mut Vec<(Range<u64>, u32)>) -> Result<u64> {
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        crate::cancel::check()?;
+        let ranges = batch
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect::<Vec<_>>();
+        let bodies = self.source.read_blocks_warm(&ranges).await?;
+        if bodies.len() != ranges.len() {
+            return Err(Error::invariant(
+                "text v4 source returned wrong posting head count",
+            ));
+        }
+        let mut bytes = 0u64;
+        for ((range, crc), body) in batch.iter().zip(&bodies) {
+            if body.len() as u64 != range.end - range.start || crc32fast::hash(body) != *crc {
+                return Err(Error::invariant("text v4 posting block checksum mismatch"));
+            }
+            bytes += range.end - range.start;
+        }
+        batch.clear();
+        Ok(bytes)
     }
 
     fn doc_record_range(&self, ordinal: u64) -> Result<Range<u64>> {
@@ -3719,7 +4489,347 @@ const POSTING_READAHEAD_MAX_BYTES: u64 = 1 << 20;
 /// Read-ahead budget shared by all cursors of one query.
 const POSTING_READAHEAD_TOTAL_BYTES: u64 = 8 << 20;
 /// Blocks one read-ahead covers at most (bounds the per-cursor queue).
-const MAX_READAHEAD_BLOCKS: usize = 64;
+const MAX_READAHEAD_BLOCKS: usize = 1024;
+
+/// A term whose whole posting list is at most this many bytes is read in
+/// the first round.
+const FIRST_ROUND_WHOLE_LIST_BYTES: u64 = 1 << 20;
+/// Bytes the planned first round reads at most across all terms.
+const FIRST_ROUND_MAX_BYTES: u64 = 16 << 20;
+
+/// The posting blocks a query reads before scoring: `(cursor, block)` in
+/// cursor-then-block order.
+struct FirstPostingRound {
+    blocks: Vec<(usize, usize)>,
+    bytes: usize,
+}
+
+/// Plan the first posting round: every term's whole list when it is at most
+/// [`FIRST_ROUND_WHOLE_LIST_BYTES`], otherwise its first read-ahead window,
+/// smallest lists first within [`FIRST_ROUND_MAX_BYTES`]. Scoring loads
+/// cursors lazily in document order, one store round trip per cursor
+/// window; reading every term's head up front makes that one round.
+/// `NAMIDB_TEXT_FIRST_ROUND=0` disables it.
+fn plan_first_posting_round(cursors: &[PostingCursor]) -> Result<FirstPostingRound> {
+    let mut plan = FirstPostingRound {
+        blocks: Vec::new(),
+        bytes: 0,
+    };
+    if matches!(
+        std::env::var("NAMIDB_TEXT_FIRST_ROUND")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    ) {
+        return Ok(plan);
+    }
+    let mut order = (0..cursors.len()).collect::<Vec<_>>();
+    let list_bytes = |cursor: &PostingCursor| {
+        cursor
+            .blocks
+            .iter()
+            .map(|block| u64::from(block.wire.len))
+            .sum::<u64>()
+    };
+    order.sort_by_key(|index| list_bytes(&cursors[*index]));
+    let mut total = 0u64;
+    let mut chosen: Vec<(usize, usize)> = Vec::new();
+    for index in order {
+        let cursor = &cursors[index];
+        let whole = list_bytes(cursor);
+        let mut take = 0usize;
+        let mut bytes = 0u64;
+        if whole <= FIRST_ROUND_WHOLE_LIST_BYTES {
+            take = cursor.blocks.len();
+            bytes = whole;
+        } else {
+            for block in &cursor.blocks {
+                let len = u64::from(block.wire.len);
+                if take > 0
+                    && (bytes + len > cursor.readahead_bytes || take >= MAX_READAHEAD_BLOCKS)
+                {
+                    break;
+                }
+                take += 1;
+                bytes += len;
+            }
+        }
+        if take == 0 || total + bytes > FIRST_ROUND_MAX_BYTES {
+            continue;
+        }
+        total += bytes;
+        chosen.extend((0..take).map(|block| (index, block)));
+    }
+    chosen.sort_unstable();
+    plan.blocks = chosen;
+    plan.bytes = usize::try_from(total).unwrap_or(usize::MAX);
+    Ok(plan)
+}
+
+/// Bytes of a posting list's head warmed at open (at least its first block).
+const HEAD_WINDOW_BYTES: u64 = 256 << 10;
+/// Posting-head bytes read per coalesced batch while warming.
+const HEAD_PREFETCH_BATCH_BYTES: u64 = 64 << 20;
+
+/// The contiguous head of a posting list: its first block and the blocks
+/// right after it within [`HEAD_WINDOW_BYTES`].
+fn posting_head(blocks: &[PostingBlockRef]) -> Result<Option<Range<u64>>> {
+    let Some(first) = blocks.first() else {
+        return Ok(None);
+    };
+    let mut head = first.wire.range()?;
+    for block in &blocks[1..] {
+        let range = block.wire.range()?;
+        if range.start != head.end || range.end - head.start > HEAD_WINDOW_BYTES {
+            break;
+        }
+        head.end = range.end;
+    }
+    Ok(Some(head))
+}
+
+/// Documents a scoring loop evaluates between yields to the executor.
+const SCORING_YIELD_STRIDE: usize = 4096;
+
+/// Query terms the MaxScore scorer handles at most (one bit per term).
+const MAXSCORE_MAX_TERMS: usize = 64;
+/// Non-essential posting blocks fetched in the first store round. Later
+/// rounds double it, up to [`MAXSCORE_FETCH_BLOCKS_MAX`]: the first round
+/// sets the threshold, after which fewer, larger rounds cost fewer dependent
+/// round trips for little extra transfer.
+const MAXSCORE_FETCH_BLOCKS: usize = 1024;
+/// Most non-essential blocks fetched per store round.
+const MAXSCORE_FETCH_BLOCKS_MAX: usize = 8192;
+/// Bytes one round's fetched blocks may hold (compressed, then decoded
+/// without positions) at most; a round closes early when it would exceed it.
+const MAXSCORE_FETCH_ROUND_BYTES: usize = 32 << 20;
+/// Candidates waiting for non-essential blocks before a fetch round, per
+/// block of the round's fetch limit.
+const MAXSCORE_PENDING_PER_FETCH_BLOCK: usize = 2;
+/// `NAMIDB_TEXT_MAXSCORE=0` keeps the block-max window scorer instead.
+const MAXSCORE_ENV: &str = "NAMIDB_TEXT_MAXSCORE";
+
+fn maxscore_enabled() -> bool {
+    !matches!(
+        std::env::var(MAXSCORE_ENV)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    )
+}
+
+/// An upper bound widened by a relative margin, so a bound summed in another
+/// order than the exact score can never fall below it through rounding.
+fn maxscore_margin(bound: f64) -> f64 {
+    bound * (1.0 + 1e-9) + f64::MIN_POSITIVE
+}
+
+/// The block of `blocks` whose ordinal range covers `doc`, advancing `hint`
+/// (callers ask in increasing document order). `None` when `doc` falls
+/// between blocks or past the list: the term does not occur in it.
+fn block_covering(blocks: &[PostingBlockRef], hint: &mut usize, doc: u64) -> Option<usize> {
+    while blocks.get(*hint).is_some_and(|block| block.last_doc < doc) {
+        *hint += 1;
+    }
+    blocks
+        .get(*hint)
+        .filter(|block| block.first_doc <= doc)
+        .map(|_| *hint)
+}
+
+/// Smallest document an essential cursor can still produce.
+fn essential_frontier(cursors: &[PostingCursor], essential: &[bool]) -> Option<u64> {
+    cursors
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| essential[*index])
+        .filter_map(|(_, cursor)| cursor.potential_doc())
+        .min()
+}
+
+fn push_ranked(top_k: &mut BinaryHeap<RankedOrdinal>, retained_k: usize, doc: u64, score: f64) {
+    if score > 0.0 && score.is_finite() {
+        top_k.push(RankedOrdinal { doc, score });
+        if top_k.len() > retained_k {
+            top_k.pop();
+        }
+    }
+}
+
+/// A document matched by an essential term, with the term frequencies known
+/// so far (`(term index, tf)` in increasing term order).
+struct MaxScoreCandidate {
+    doc: u64,
+    doc_len: u32,
+    /// Terms whose occurrence in `doc` is known: the essential terms when the
+    /// document was reached (bit `i` is term `i`).
+    known: u64,
+    tfs: Vec<(usize, u32)>,
+}
+
+impl MaxScoreCandidate {
+    fn has(&self, term: usize) -> bool {
+        self.known & (1u64 << term) != 0
+    }
+
+    /// Exact score, summed in term (lexical) order like the other scorers.
+    fn score(&self, cursors: &[PostingCursor], corpus_avg_len: f64) -> f64 {
+        let mut score = 0.0f64;
+        for (term, tf) in &self.tfs {
+            score += bm25_term_score(
+                cursors[*term].idf,
+                *tf,
+                self.doc_len as usize,
+                corpus_avg_len,
+            );
+        }
+        score
+    }
+
+    /// Conservative upper bound of the known terms' contributions.
+    fn partial_bound(&self, cursors: &[PostingCursor], corpus_avg_len: f64) -> Result<f64> {
+        let mut bound = 0.0f64;
+        for (term, tf) in &self.tfs {
+            let value = bm25_term_score(
+                cursors[*term].idf,
+                *tf,
+                self.doc_len as usize,
+                corpus_avg_len,
+            );
+            bound = next_up_nonnegative(bound + value.max(0.0))
+                .ok_or_else(|| Error::invariant("text v4 MaxScore bound became non-finite"))?;
+        }
+        Ok(bound)
+    }
+
+    /// Known contributions plus the block bounds of every non-essential term
+    /// whose block covers this document.
+    fn upper_bound(
+        &self,
+        cursors: &[PostingCursor],
+        essential: &[bool],
+        hints: &mut [usize],
+        corpus_avg_len: f64,
+    ) -> Result<f64> {
+        let mut bound = self.partial_bound(cursors, corpus_avg_len)?;
+        for (term, cursor) in cursors.iter().enumerate() {
+            if essential[term] || self.has(term) {
+                continue;
+            }
+            if let Some(block) = block_covering(&cursor.blocks, &mut hints[term], self.doc) {
+                bound = next_up_nonnegative(bound + cursor.block_upper_bounds[block])
+                    .ok_or_else(|| Error::invariant("text v4 MaxScore bound became non-finite"))?;
+            }
+        }
+        Ok(bound)
+    }
+}
+
+/// Decoded non-essential blocks, keyed by `(term, block)`.
+struct MaxScoreState {
+    fetch_hints: Vec<usize>,
+    cache: BTreeMap<(usize, usize), Vec<Posting>>,
+    cache_bytes: usize,
+    peak_bytes: usize,
+    blocks_fetched: usize,
+}
+
+impl MaxScoreState {
+    /// Drop cached blocks that end before `doc` (all of them for `None`).
+    fn evict_before(&mut self, doc: Option<u64>) {
+        let before = std::mem::take(&mut self.cache);
+        let mut kept = BTreeMap::new();
+        let mut bytes = 0usize;
+        for ((term, block), postings) in before {
+            let keep = match (doc, postings.last()) {
+                (Some(doc), Some(last)) => last.doc >= doc,
+                _ => false,
+            };
+            if keep {
+                bytes = bytes.saturating_add(
+                    postings
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Posting>()),
+                );
+                kept.insert((term, block), postings);
+            }
+        }
+        self.cache = kept;
+        self.cache_bytes = bytes;
+    }
+}
+
+fn maxscore_pending_bytes(pending: &Vec<MaxScoreCandidate>, terms: usize) -> usize {
+    pending.capacity().saturating_mul(
+        std::mem::size_of::<MaxScoreCandidate>()
+            .saturating_add(terms.saturating_mul(std::mem::size_of::<(usize, u32)>())),
+    )
+}
+
+/// Workspace MaxScore adds to the block-max reservation: a fetch round of
+/// the largest blocks (compressed, raw and decoded), one retained block per
+/// term, and the pending candidates.
+/// Bytes one posting block of the query can occupy while it is decoded:
+/// compressed, raw and decoded, for its largest block.
+fn maxscore_block_bytes(cursors: &[PostingCursor]) -> usize {
+    cursors
+        .iter()
+        .flat_map(|cursor| cursor.blocks.iter())
+        .map(|block| {
+            (block.wire.len as usize)
+                .saturating_add(block.wire.raw_len as usize)
+                .saturating_add(
+                    (block.posting_count as usize).saturating_mul(std::mem::size_of::<Posting>()),
+                )
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Bytes a fetched non-essential block holds for the rest of its round:
+/// compressed, then decoded without positions. Its raw form lives only
+/// while it is decoded, one block at a time.
+fn maxscore_fetched_bytes(block: &PostingBlockRef) -> usize {
+    (block.wire.len as usize).saturating_add(
+        (block.posting_count as usize).saturating_mul(std::mem::size_of::<Posting>()),
+    )
+}
+
+fn maxscore_workspace_bytes(cursors: &[PostingCursor]) -> usize {
+    let cap = MAXSCORE_FETCH_BLOCKS_MAX;
+    let largest_fetched = cursors
+        .iter()
+        .flat_map(|cursor| cursor.blocks.iter())
+        .map(maxscore_fetched_bytes)
+        .max()
+        .unwrap_or(0);
+    // The essential cursors' current blocks and the one being decoded, plus
+    // a full round of fetched blocks: at most the round byte bound, which a
+    // round's first candidate may pass.
+    maxscore_block_bytes(cursors)
+        .saturating_mul(cursors.len().saturating_add(1))
+        .saturating_add(
+            largest_fetched.saturating_mul(cap).min(
+                MAXSCORE_FETCH_ROUND_BYTES
+                    .saturating_add(largest_fetched.saturating_mul(MAXSCORE_MAX_TERMS)),
+            ),
+        )
+        .saturating_add(
+            cap.saturating_mul(MAXSCORE_PENDING_PER_FETCH_BLOCK)
+                .next_power_of_two()
+                .saturating_mul(2)
+                .saturating_mul(
+                    std::mem::size_of::<MaxScoreCandidate>().saturating_add(
+                        cursors
+                            .len()
+                            .saturating_mul(std::mem::size_of::<(usize, u32)>()),
+                    ),
+                ),
+        )
+        .saturating_add(
+            cap.saturating_mul(std::mem::size_of::<Range<u64>>() + std::mem::size_of::<Bytes>()),
+        )
+}
 
 fn posting_readahead_bytes(cursors: usize) -> u64 {
     (POSTING_READAHEAD_TOTAL_BYTES / cursors.max(1) as u64).min(POSTING_READAHEAD_MAX_BYTES)
@@ -4724,6 +5834,157 @@ mod tests {
         assert!(
             skipped > 0,
             "the high-score prefix must prune low-score common tail blocks"
+        );
+    }
+
+    /// Zipf-like text: a few words occur in nearly every document, most are
+    /// rare. MaxScore stops walking the common words once the threshold
+    /// passes their bounds, and must still return exactly the exhaustive
+    /// scorer's hits and scores, with or without a filter and at every k.
+    #[tokio::test]
+    async fn maxscore_matches_exhaustive_on_zipf_text_and_skips_common_terms() {
+        fn mix(mut x: u64) -> u64 {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^ (x >> 31)
+        }
+        // Word w_i with probability ~ 1/(i+1) over 400 words.
+        let weights = (0..400).map(|i| 1.0 / (i as f64 + 1.0)).collect::<Vec<_>>();
+        let total = weights.iter().sum::<f64>();
+        let pick = |seed: u64| {
+            let mut target = (mix(seed) % 1_000_000) as f64 / 1_000_000.0 * total;
+            for (index, weight) in weights.iter().enumerate() {
+                if target < *weight {
+                    return index;
+                }
+                target -= weight;
+            }
+            weights.len() - 1
+        };
+        let documents = (1..=2_000u64)
+            .map(|doc| {
+                let len = 20 + mix(doc) % 40;
+                let text = (0..len)
+                    .map(|position| format!("w{}", pick(doc * 1_000 + position)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                TextV4Mutation {
+                    node_id: node(doc),
+                    lsn: doc,
+                    before: None,
+                    after: Some(payload(
+                        &text,
+                        doc % 3 != 0,
+                        if doc % 5 == 0 { "civil" } else { "laboral" },
+                    )),
+                }
+            })
+            .collect::<Vec<_>>();
+        let artifact = build_base_v4(
+            &base_state(),
+            base_context(0x3A5C),
+            documents,
+            TextV4BuildOptions {
+                postings_per_block: 16,
+                terms_per_dictionary_block: 8,
+                compression_level: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let reader = TextV4Reader::open(
+            Arc::new(MemorySource {
+                body: artifact.body.clone(),
+                ranges: Mutex::new(Vec::new()),
+            }),
+            artifact.body.len() as u64,
+            &base_state(),
+            &artifact.output.segment,
+        )
+        .await
+        .unwrap();
+        let mut skipped = 0usize;
+        let mut fetched = (0usize, 0usize);
+        for case in 0..60u64 {
+            let terms = 2 + (mix(case ^ 0xABCD) % 10) as usize;
+            let text = (0..terms)
+                .map(|position| format!("w{}", pick(case * 7_919 + position as u64 + 17)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let query = parse_query(&text);
+            let global = base_global_stats(&reader, &query).await;
+            let groups = if case % 4 == 3 {
+                vec![("vigente".into(), vec![SearchFilterValue::Bool(true)])]
+            } else {
+                Vec::new()
+            };
+            for k in [1usize, 5, 20, 100] {
+                let exhaustive = reader
+                    .search_query_exact(&query, &global, k, &groups)
+                    .await
+                    .unwrap();
+                let maxscore = reader
+                    .search_query_base_block_max_exact(&query, &global, k, &groups)
+                    .await
+                    .unwrap();
+                assert_search_parity(&exhaustive, &maxscore);
+                assert_eq!(maxscore.block_max_fallback, None, "{text} k={k}");
+                skipped = skipped.saturating_add(maxscore.posting_blocks_skipped);
+                fetched.0 = fetched.0.saturating_add(exhaustive.posting_blocks_fetched);
+                fetched.1 = fetched.1.saturating_add(maxscore.posting_blocks_fetched);
+            }
+        }
+        assert!(skipped > 0, "common terms must leave posting blocks unread");
+
+        // The open-time warm-up covers the dictionary, the doc table and the
+        // version table, validates them, and respects its budget.
+        assert_eq!(reader.prefetch_read_metadata(0).await.unwrap(), 0);
+        let warmed = reader.prefetch_read_metadata(u64::MAX).await.unwrap();
+        assert!(warmed >= 2_000 * DOC_RECORD_LEN, "{warmed}");
+        assert_eq!(reader.prefetch_read_metadata(warmed - 1).await.unwrap(), 0);
+        // Posting heads: nothing without a budget, every head with an
+        // unbounded one, and never more than the budget.
+        assert_eq!(reader.prefetch_posting_heads(0).await.unwrap(), 0);
+        let heads = reader.prefetch_posting_heads(u64::MAX).await.unwrap();
+        assert!(heads > 0);
+        let partial = reader.prefetch_posting_heads(heads / 2).await.unwrap();
+        assert!(partial > 0 && partial <= heads / 2, "{partial} of {heads}");
+
+        // The same segment under statistics it is not authoritative for (a
+        // delta of a larger generation): the segment scorer still equals the
+        // exhaustive one.
+        for case in 0..20u64 {
+            let text = (0..4)
+                .map(|position| format!("w{}", pick(case * 104_729 + position + 5)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let query = parse_query(&text);
+            let mut global = base_global_stats(&reader, &query).await;
+            global.document_count += 5_000;
+            global.total_document_len += 5_000 * 40;
+            for df in global.document_frequency.values_mut() {
+                *df += 7;
+            }
+            for k in [1usize, 10, 50] {
+                let exhaustive = reader
+                    .search_query_exact(&query, &global, k, &[])
+                    .await
+                    .unwrap();
+                let segment = reader
+                    .search_query_segment_block_max_exact(&query, &global, k, &[])
+                    .await
+                    .unwrap();
+                assert_search_parity(&exhaustive, &segment);
+                assert_eq!(segment.block_max_fallback, None, "{text} k={k}");
+            }
+        }
+        // A 2k-document corpus with k up to 100 leaves little to prune; the
+        // point here is exactness. Block savings at scale are measured on
+        // the benchmark corpus.
+        assert!(
+            fetched.1 < fetched.0,
+            "MaxScore must read fewer blocks than the exhaustive scorer: {fetched:?}"
         );
     }
 

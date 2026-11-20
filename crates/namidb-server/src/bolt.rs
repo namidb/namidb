@@ -1103,20 +1103,28 @@ impl ServerBackend {
             // cancels `cancellation`, the select below drops `read`, and
             // dropping it cancels the query mid-operator.
             let plan = std::sync::Arc::new(plan);
+            let hints = namidb_query::AutoIndexHints::new();
             let read = crate::isolate::run_read_isolated({
                 let plan = std::sync::Arc::clone(&plan);
                 let budget = budget.clone();
                 let deadline = request.query_deadline(self.state.query_timeout);
                 let row_cap = self.state.query_row_cap();
                 let admission = std::sync::Arc::clone(&admission);
+                let hints = hints.clone();
+                let target = self.state.auto_index_target();
                 async move {
                     let _admission = admission;
                     let snap = owned.borrow();
-                    namidb_query::with_query_memory(
-                        budget,
-                        execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                    let rows = namidb_query::with_auto_index_hints(
+                        hints.clone(),
+                        namidb_query::with_query_memory(
+                            budget,
+                            execute_with_limits(&plan, &snap, &params, deadline, row_cap),
+                        ),
                     )
-                    .await
+                    .await;
+                    crate::auto_index::offer(&target, hints.take());
+                    rows
                 }
             });
             tokio::pin!(read);

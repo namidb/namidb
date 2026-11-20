@@ -28,6 +28,23 @@ use object_store::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Marks one read in flight for [`StoreCounters`]' busy time, released on
+/// drop so a cancelled read does not leave the store "busy".
+struct BusyGuard<'a>(&'a StoreCounters);
+
+impl<'a> BusyGuard<'a> {
+    fn new(counters: &'a StoreCounters) -> Self {
+        counters.read_started();
+        Self(counters)
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.read_finished();
+    }
+}
+
 /// Latency model of the simulated store.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatencyModel {
@@ -57,6 +74,9 @@ pub struct StoreCounters {
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
     requests: AtomicU64,
+    /// `(requests in flight, start of the current busy period, total busy
+    /// nanoseconds)`: wall time with at least one read waiting on the store.
+    busy: Mutex<(u64, Option<Instant>, u64)>,
 }
 
 /// A point-in-time copy of [`StoreCounters`].
@@ -67,6 +87,11 @@ pub struct StoreCountersSnapshot {
     pub requests: u64,
     pub bytes_written: u64,
     pub bytes_read: u64,
+    /// Wall time with at least one read in flight, in nanoseconds. A
+    /// statement's wall time minus this is time spent with no store read
+    /// outstanding (CPU, scheduling, or waiting on something else).
+    #[serde(default)]
+    pub io_busy_ns: u64,
 }
 
 impl StoreCountersSnapshot {
@@ -84,6 +109,7 @@ impl StoreCountersSnapshot {
             requests: self.requests.saturating_sub(earlier.requests),
             bytes_written: self.bytes_written.saturating_sub(earlier.bytes_written),
             bytes_read: self.bytes_read.saturating_sub(earlier.bytes_read),
+            io_busy_ns: self.io_busy_ns.saturating_sub(earlier.io_busy_ns),
         }
     }
 }
@@ -96,8 +122,36 @@ impl StoreCounters {
         *by_op.entry(key).or_insert(0) += 1;
     }
 
+    fn read_started(&self) {
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        if busy.0 == 0 {
+            busy.1 = Some(Instant::now());
+        }
+        busy.0 += 1;
+    }
+
+    fn read_finished(&self) {
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        busy.0 = busy.0.saturating_sub(1);
+        if busy.0 == 0 {
+            if let Some(since) = busy.1.take() {
+                busy.2 = busy.2.saturating_add(since.elapsed().as_nanos() as u64);
+            }
+        }
+    }
+
+    fn io_busy_ns(&self) -> u64 {
+        let busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        busy.2.saturating_add(
+            busy.1
+                .map(|since| since.elapsed().as_nanos() as u64)
+                .unwrap_or(0),
+        )
+    }
+
     pub fn snapshot(&self) -> StoreCountersSnapshot {
         StoreCountersSnapshot {
+            io_busy_ns: self.io_busy_ns(),
             by_op: self.by_op.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             requests: self.requests.load(Ordering::Relaxed),
             bytes_written: self.bytes_in.load(Ordering::Relaxed),
@@ -323,13 +377,17 @@ impl ObjectStore for LatencyStore {
         } else {
             "GET"
         };
-        self.before(op, location, 0).await;
-        let result = self.inner.get_opts(location, options).await?;
-        let bytes = result.range.end.saturating_sub(result.range.start);
-        if op != "HEAD" {
-            self.after_download(bytes).await;
+        let _busy = BusyGuard::new(&self.counters);
+        async {
+            self.before(op, location, 0).await;
+            let result = self.inner.get_opts(location, options).await?;
+            let bytes = result.range.end.saturating_sub(result.range.start);
+            if op != "HEAD" {
+                self.after_download(bytes).await;
+            }
+            Ok(result)
         }
-        Ok(result)
+        .await
     }
 
     async fn get_ranges(
@@ -339,18 +397,22 @@ impl ObjectStore for LatencyStore {
     ) -> object_store::Result<Vec<Bytes>> {
         // The S3 client merges ranges closer than 1 MiB into one request and
         // issues the merged requests 10 at a time: charge exactly that.
-        let requests = coalesced_request_count(ranges);
-        for wave in 0..requests.div_ceil(S3_COALESCE_PARALLEL) {
-            let in_wave = (requests - wave * S3_COALESCE_PARALLEL).min(S3_COALESCE_PARALLEL);
-            for _ in 1..in_wave {
-                self.counters.record("GETR", location);
+        let _busy = BusyGuard::new(&self.counters);
+        async {
+            let requests = coalesced_request_count(ranges);
+            for wave in 0..requests.div_ceil(S3_COALESCE_PARALLEL) {
+                let in_wave = (requests - wave * S3_COALESCE_PARALLEL).min(S3_COALESCE_PARALLEL);
+                for _ in 1..in_wave {
+                    self.counters.record("GETR", location);
+                }
+                self.before("GETR", location, 0).await;
             }
-            self.before("GETR", location, 0).await;
+            let out = self.inner.get_ranges(location, ranges).await?;
+            let bytes: u64 = out.iter().map(|b| b.len() as u64).sum();
+            self.after_download(bytes).await;
+            Ok(out)
         }
-        let out = self.inner.get_ranges(location, ranges).await?;
-        let bytes: u64 = out.iter().map(|b| b.len() as u64).sum();
-        self.after_download(bytes).await;
-        Ok(out)
+        .await
     }
 
     fn delete_stream(

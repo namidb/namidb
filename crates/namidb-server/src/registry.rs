@@ -1221,6 +1221,8 @@ fn spawn_metadata_prefetch(state: &Arc<NamespaceState>) {
                     vector_indexes = summary.vector_indexes,
                     text_indexes = summary.text_indexes,
                     vector_code_bytes = summary.vector_code_bytes,
+                    text_meta_bytes = summary.text_meta_bytes,
+                    text_head_bytes = summary.text_head_bytes,
                     elapsed_ms = summary.elapsed.as_millis() as u64,
                     total_elapsed_ms = summary.total_elapsed.as_millis() as u64,
                     "prefetched namespace read metadata"

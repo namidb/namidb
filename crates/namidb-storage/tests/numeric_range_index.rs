@@ -389,7 +389,7 @@ async fn a_limited_range_scan_confirms_about_limit_candidates() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let paths = NamespacePaths::new("tenants", NamespaceId::new("range-limit").unwrap());
     let mut writer = WriterSession::open(store, paths).await.unwrap();
-    for ordinal in 0..4_000_i64 {
+    for ordinal in 0..48_000_i64 {
         writer
             .upsert_node(
                 "T",
@@ -403,7 +403,8 @@ async fn a_limited_range_scan_confirms_about_limit_candidates() {
     let schema = writer.snapshot().manifest().manifest.schema.clone();
     writer.flush(schema).await.unwrap();
 
-    // 400 matches, inside the route's budget of an eighth of the label.
+    // 400 matches, inside the route's budget of a hundredth of the label
+    // (480 candidates).
     let predicates = [gte(1_000), lt(1_400)];
     let snapshot = writer.snapshot();
     let expected = by_scan(&writer, &predicates).await;

@@ -17,6 +17,64 @@ crates.io release will establish and document that API explicitly.
 
 ### Changed
 
+- **Filtered and new-query search latency.** On a 386k × 1024
+  production-shaped synthetic namespace with 20–40 ms simulated store
+  latency, a never-seen hybrid search with a property filter on a
+  non-indexed boolean went from 17 s to 1.4 s (repeat: 7.2 s to 0.7 s), an
+  unfiltered BM25 k=20 query from 8.9 s to 1.3 s and a hybrid search joined
+  to its parent nodes from 13.9 s to 1.5 s. Results are unchanged.
+  - **MaxScore for BM25.** Query terms are split into essential and
+    non-essential by their per-block score bounds; documents are discovered
+    only from the essential terms, and the non-essential posting blocks a
+    surviving candidate needs are fetched in batches that grow after the
+    first one sets the score threshold. Every FT4 segment uses
+    it, including deltas and multi-segment generations, which previously
+    always took the exhaustive scorer. `NAMIDB_TEXT_MAXSCORE=0` restores
+    the block-max window scorer.
+  - **Coalesced posting reads.** Posting blocks are fetched as a few large
+    reads instead of one request per block, each block served from the range
+    cache when already cached. Before scoring, every query term's whole
+    posting list (when at most 1 MiB) or first read-ahead window is read in
+    one round, so a many-term query no longer pays one round trip per term
+    window (`NAMIDB_TEXT_FIRST_ROUND=0` turns this off).
+  - **Full-text metadata warmed at open.** Opening a namespace now also
+    loads each full-text segment's term dictionary, document table and
+    version table into the range cache, then the head of each posting list
+    in descending document frequency (checksum-validated, together at most a
+    quarter of its memory budget; `NAMIDB_TEXT_METADATA_PREFETCH=0` turns
+    it off), so a new query reads mostly its remaining posting blocks and
+    rows. With the NVMe tier on, the warm-up's coalesced reads (and the
+    vector code tier's) are also kept on the device as whole spans (their
+    small blocks alone stay in memory only), so after a restart they are
+    served locally.
+  - **The BM25 scorer yields.** Its scoring loops hand the worker back
+    every few thousand documents, so a long scoring loop does not hold back
+    the other leg of a hybrid search or other tasks on that worker.
+  - **Filter membership.** A search `filter:` on properties the search index
+    cannot apply natively is resolved once per statement by a column-only
+    scan of the filtered properties and shared by both legs of a hybrid
+    search. It is cached across statements for the same node data, keyed by
+    the resolved filter including bound `$param` values
+    (`NAMIDB_FILTER_CACHE_MAX_BYTES`, default 64 MiB). The BM25 widening loop
+    and the vector rescore drop non-members before reading any record, and
+    the first round of both legs is sized from the filter's selectivity
+    instead of a fixed ×8. Statements with staged writes are not cached.
+  - **Hybrid leg depth.** `search.hybrid` asks each leg for `max(k, 40)`
+    candidates with RRF fusion (measured top-k overlap with the previous
+    `8 × k` default: 1.0 at k=20, 0.9975 at k=40, 0.986 at k=200) and keeps
+    `8 × k` for linear fusion, whose min-max normalisation depends on depth. A new
+    `depth` option sets it explicitly; `k_dense` / `k_sparse` still override
+    each leg.
+- **Index lookups no longer hydrate a wide posting.** An equality or range
+  predicate on an indexed property that matches a large share of its label
+  took the index and resolved every matching node by id — over a 386k-node
+  label, a value matching 38k nodes ran past the 30 s timeout where the
+  column scan takes 2–6 s. The numeric range route now takes the index only
+  for windows up to 1/100 of the label (was 1/8), and the planner keeps the
+  scan instead of a posting lookup when the property's distinct-value
+  estimate predicts more than 1% of the label per value. Selective lookups
+  (`{id: …}` and the like) still seek, and so does a bare `LIMIT` over the
+  predicate, which confirms only the first rows of the posting.
 - **Graph neighbourhood statements answer in about a second.** A statement
   that expands each of many seed nodes in a correlated subquery
   (`UNWIND $ids ... CALL { WITH n OPTIONAL MATCH (n)-[r]->(m) ... LIMIT $per }`,
@@ -135,6 +193,20 @@ crates.io release will establish and document that API explicitly.
   new data; they serve a folded index by exact scan until their next flush
   rebuilds it with their own analyzer (checked by
   `tests/compat/old_binaries_open_new_data.sh`).
+- **Automatic property indexes.** A read whose search filter or `WHERE`
+  equality/range had to scan a label because the property has no index now
+  queues an ordinary property index for it in the background: one build at a
+  time, at most `NAMIDB_AUTO_INDEX_MAX_PER_NAMESPACE` (default 8) per
+  namespace, only for labels with at least `NAMIDB_AUTO_INDEX_MIN_NODES`
+  (default 10000) nodes. They are listed by `SHOW INDEXES` as
+  `auto_index_<label>_<property>`; an explicit `CREATE INDEX` on the same
+  property adopts it. A string or boolean property of a label that carries a
+  vector or full-text index is never indexed automatically, because that
+  would rebuild the search index; those cases are logged and counted
+  (`namidb_auto_index_total{outcome="skipped_search_rebuild"}`).
+  `NAMIDB_AUTO_INDEX=0` turns the feature off. The marker is an optional
+  manifest field: 3.5.1, 3.5.0 and 3.4.3 open such a manifest and see a plain
+  index.
 - **`search.vector` takes an index name**: `{index: 'name', query, k}` in the map
   form, or the positional `search.vector(indexName, k, queryVector [, {ef,
   filter}])` of `db.index.vector.queryNodes`. An unknown option, a missing

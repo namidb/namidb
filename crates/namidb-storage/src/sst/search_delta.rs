@@ -784,6 +784,19 @@ pub trait SearchVersionRangeSource: Send + Sync {
         }
         Ok(values)
     }
+
+    /// Like [`Self::read_ranges`] for many small blocks of one object (in
+    /// any order, possibly repeated): an object-store source groups nearby
+    /// blocks into a few large GETs. Same results, same order.
+    async fn read_blocks_coalesced(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.read_ranges(ranges).await
+    }
+
+    /// [`Self::read_blocks_coalesced`] for an open-time warm-up, whose reads
+    /// a persistent cache keeps across restarts.
+    async fn read_blocks_warm(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.read_blocks_coalesced(ranges).await
+    }
 }
 
 /// Open, sparse-directory-resident version table.
@@ -896,6 +909,28 @@ impl SearchVersionTableReader {
         decode_page(&body, entry)
     }
 
+    /// Object ranges of every record page, in directory (offset) order.
+    pub fn page_ranges(&self) -> Result<Vec<Range<u64>>> {
+        self.directory
+            .iter()
+            .map(|entry| self.page_range(entry))
+            .collect()
+    }
+
+    /// Check pages read ahead of use (see `TextV4Reader::prefetch_read_metadata`)
+    /// against their directory checksums.
+    pub fn validate_pages(&self, bodies: &[Bytes]) -> Result<()> {
+        if bodies.len() != self.directory.len() {
+            return Err(Error::invariant(
+                "search version warm-up returned the wrong page count",
+            ));
+        }
+        for (entry, body) in self.directory.iter().zip(bodies) {
+            decode_page(body, entry)?;
+        }
+        Ok(())
+    }
+
     /// Resident bytes attributable to the sparse directory, excluding the
     /// shared object/range cache.
     pub fn resident_metadata_bytes(&self) -> usize {
@@ -951,7 +986,9 @@ impl SearchVersionTableReader {
             .iter()
             .map(|(page, _)| self.page_range(&self.directory[*page]))
             .collect::<Result<Vec<_>>>()?;
-        let bodies = self.source.read_ranges(&ranges).await?;
+        // Pages are read (and cached) whole: a warmed table answers from
+        // the range cache, a cold one in a few coalesced reads.
+        let bodies = self.source.read_blocks_coalesced(&ranges).await?;
         if bodies.len() != chunk.len() {
             return Err(Error::invariant(
                 "search version range source returned the wrong page count",

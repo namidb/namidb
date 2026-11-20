@@ -88,8 +88,9 @@ pub use format::{
     LEGACY_STORAGE_FORMAT_VERSION, STORAGE_FORMAT_VERSION,
 };
 pub use ingest::{
-    clear_shared_caches, prune_shared_caches, BackgroundFlush, BackgroundFlushInstall,
-    BuiltBackgroundFlush, CommitOutcome, SessionCaches, StageMark, StagedValue, WriterSession,
+    clear_shared_caches, prune_shared_caches, AutoIndexOutcome, BackgroundFlush,
+    BackgroundFlushInstall, BuiltBackgroundFlush, CommitOutcome, SessionCaches, StageMark,
+    StagedValue, WriterSession,
 };
 pub use janitor::{
     descriptor_object_paths, manifest_object_paths, sweep_orphans, sweep_orphans_with,
@@ -120,8 +121,9 @@ pub use range_cache::{
 #[cfg(feature = "vector-index")]
 pub use read::VectorFilterSearch;
 pub use read::{
-    EdgeListView, EdgeScanCursor, EdgeView, NodeScanCursor, NodeView, OwnedSnapshot,
-    PinnedSnapshot, PrefetchSummary, Snapshot, SnapshotCell, VersionPin, PREFETCH_NODE_SST_LIMIT,
+    property_index_population, EdgeListView, EdgeScanCursor, EdgeView, NodeDataIdentity,
+    NodeScanCursor, NodeView, OwnedSnapshot, PinnedSnapshot, PrefetchSummary, Snapshot,
+    SnapshotCell, VersionPin, PREFETCH_NODE_SST_LIMIT,
 };
 pub use reader::ReaderSession;
 pub use recovery::{
