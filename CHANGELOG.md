@@ -68,6 +68,10 @@ crates.io release will establish and document that API explicitly.
   existing memory-gated, one-at-a-time base rebuild, after a query first
   opens them. Until the new base installs, the old one serves through its
   int8 pages.
+- **Procedure options are checked strictly.** `search.bm25` rejects unknown
+  keys with the list of valid ones, like the other `search.*` and `algo.*`
+  procedures; giving both `text_property` and `text_properties`, or a
+  non-string `fusion`, is an error.
 - **Whole-graph grouped counts no longer enumerate paths.** `count(*)` /
   `count(x)` grouped by one node of a linear chain (`MATCH (d:Doc)<-[:R]-(x)
   RETURN d.title, count(x) ORDER BY ... LIMIT 5`, a per-document section
@@ -99,6 +103,38 @@ crates.io release will establish and document that API explicitly.
 
 ### Added
 
+- **Accent-insensitive full-text search.** New full-text indexes, the flat
+  `search.bm25` scan and the `bm25()` scalar fold text and queries the same
+  way (Unicode NFKD, combining marks removed, case folded, plus `ß`, `æ`,
+  `œ`, `ø`, `ł` and similar letters), so `pension` finds `pensión`. CJK,
+  Hangul and kana are unchanged. `CREATE FULLTEXT INDEX ... OPTIONS
+  {analyzer: 'exact'}` (or `indexConfig: {`fulltext.analyzer`: 'exact'}`)
+  keeps the previous lowercase-only matching; unknown options are errors.
+- **Existing full-text indexes are migrated in the background.** An index
+  created by an earlier release keeps its analyzer, and queries against it
+  are analyzed the same way, until a background rebuild swaps in the folded
+  index with one commit:
+  - the rebuild runs in a task of its own beside the compaction worker, one
+    per process at a time: L0 merges, delta consolidations and other base
+    builds keep running during it, and the orphan sweep keeps every object
+    younger than the rebuild;
+  - writes to the index's documents during the rebuild are re-tokenized by a
+    catch-up delta that reads only the documents they touched, and is
+    installed with the new base, so a namespace that keeps writing still
+    migrates (the last, short catch-up runs under the writer lock);
+  - while it runs it and every other base build share the index-build memory
+    budget (half each), and the corpus scan returns the pages it has read to
+    the kernel, so its resident memory stays near the budget instead of
+    growing by the size of the node SSTs;
+  - a pre-folding index waiting for its rebuild gets no base rebuild with
+    the old analyzer (a 3.4.x FT3 base is migrated to FT4 by the same
+    rebuild, not twice);
+  - after five failed attempts the process stops retrying that index until
+    restart and lets routine maintenance rebuild it with its old analyzer.
+  `NAMIDB_TEXT_REANALYSIS=off` disables it. Releases 3.4.3 to 3.5.1 open the
+  new data; they serve a folded index by exact scan until their next flush
+  rebuilds it with their own analyzer (checked by
+  `tests/compat/old_binaries_open_new_data.sh`).
 - **`search.vector` takes an index name**: `{index: 'name', query, k}` in the map
   form, or the positional `search.vector(indexName, k, queryVector [, {ef,
   filter}])` of `db.index.vector.queryNodes`. An unknown option, a missing
@@ -147,6 +183,15 @@ crates.io release will establish and document that API explicitly.
 
 ### Fixed
 
+- **Cold top-k hydration reads only the records it needs.** Hydrating a few
+  hundred search hits rounded each scattered node record up to a 256 KiB
+  cache page, sixteen at a time, and probed each node SST's record index one
+  after the other. Scattered batches now read their exact ranges
+  concurrently, and the SSTs are probed eight at a time.
+- **Reconciling a large full-text top-k takes fewer round trips.** The
+  search version table was probed 64 pages at a time, one batch after
+  another; at k=300 that is hundreds of 24 KiB pages. Four batches now run
+  at once.
 - **A full-text index built by 3.4.x keeps serving after the upgrade and is
   migrated in the background.** Such an index can have a base in the format
   before FT4. The first 3.5 flush that touched its label appended an FT4

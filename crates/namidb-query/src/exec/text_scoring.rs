@@ -27,10 +27,13 @@
 //! more than half the corpus never goes negative). The scalar builtin uses the
 //! same expression with `idf = 1` and a fixed reference `avgdl`.
 //!
-//! Tokenization (re-exported from `namidb_storage::text::tokenize`) is
-//! Unicode case-folding (`char::to_lowercase`, not ASCII), split on
-//! non-alphanumeric runs, with CJK/Hangul runs segmented into overlapping
-//! bigrams; no stemming, no stopwords in v0.
+//! Tokenization (re-exported from `namidb_storage::text`) uses the folded
+//! analyzer by default: Unicode NFKD with the generic diacritics removed and
+//! case folded, so `pensión` and `PENSION` are one term; split on non-word
+//! runs, with CJK/Hangul runs segmented into overlapping bigrams; no stemming,
+//! no stopwords. `search.bm25` uses the analyzer of the full-text index that
+//! covers the request (an index created before 3.5.2 keeps the lowercase-only
+//! analyzer until it is rebuilt).
 //!
 //! The shared, corpus-aware primitives ([`tokenize_counts`], [`bm25_idf`],
 //! [`bm25_term_score`]) live in [`namidb_storage::text`] so the persistent
@@ -38,8 +41,8 @@
 //! re-exported here for the procedure and the scalar below.
 
 pub use namidb_storage::text::{
-    bm25_idf, bm25_term_score, contains_phrase, parse_query, tokenize, tokenize_counts, TextQuery,
-    B, K1, PREFIX_EXPANSION_LIMIT,
+    bm25_idf, bm25_term_score, contains_phrase, parse_query, parse_query_with, tokenize,
+    tokenize_counts, TextAnalyzer, TextQuery, B, K1, PREFIX_EXPANSION_LIMIT,
 };
 
 /// Reference average document length (in tokens) for the corpus-free scalar

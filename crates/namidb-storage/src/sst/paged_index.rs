@@ -1900,13 +1900,87 @@ impl PagedRangeSource for PinnedObjectRangeSource {
     /// lands many pages in each cache page, so it reads whole cache pages
     /// and issues a fraction of the requests.
     async fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        let granularity = if ranges.len() <= NARROW_PROBE_PAGES {
-            crate::range_cache::ReadGranularity::Block
-        } else {
-            crate::range_cache::ReadGranularity::Pages
-        };
-        self.read_ranges_as(ranges, granularity).await
+        if ranges.len() <= NARROW_PROBE_PAGES {
+            return self
+                .read_ranges_as(ranges, crate::range_cache::ReadGranularity::Block)
+                .await;
+        }
+        if !sparse_ranges(ranges) {
+            return self
+                .read_ranges_as(ranges, crate::range_cache::ReadGranularity::Pages)
+                .await;
+        }
+        let (merged, owners) = coalesce_ranges(ranges);
+        let bodies = self
+            .read_ranges_as(&merged, crate::range_cache::ReadGranularity::Block)
+            .await?;
+        Ok(ranges
+            .iter()
+            .zip(owners)
+            .map(|(range, owner)| {
+                let start = (range.start - merged[owner].start) as usize;
+                let end = (range.end - merged[owner].start) as usize;
+                bodies[owner].slice(start..end)
+            })
+            .collect())
     }
+}
+
+/// Ranges of a sparse batch closer than this are read with one request.
+const COALESCE_GAP_BYTES: u64 = 64 * 1024;
+/// Upper bound of one coalesced request.
+const COALESCE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Merge `ranges` whose gaps are at most [`COALESCE_GAP_BYTES`] into requests
+/// of at most [`COALESCE_MAX_BYTES`] (a single larger range stays whole).
+/// Returns the merged ranges and, per input range, the merged range holding
+/// it.
+fn coalesce_ranges(ranges: &[Range<u64>]) -> (Vec<Range<u64>>, Vec<usize>) {
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|&index| (ranges[index].start, ranges[index].end));
+    let mut merged: Vec<Range<u64>> = Vec::new();
+    let mut owners = vec![0usize; ranges.len()];
+    for index in order {
+        let range = &ranges[index];
+        match merged.last_mut() {
+            Some(last)
+                if range.start <= last.end.saturating_add(COALESCE_GAP_BYTES)
+                    && range.end.max(last.end) - last.start <= COALESCE_MAX_BYTES =>
+            {
+                last.end = last.end.max(range.end);
+            }
+            _ => merged.push(range.clone()),
+        }
+        owners[index] = merged.len() - 1;
+    }
+    (merged, owners)
+}
+
+/// Whole cache pages would move this many times the requested bytes or more
+/// before a batch counts as sparse.
+const SPARSE_PAGE_AMPLIFICATION: u64 = 8;
+
+/// `true` when rounding `ranges` up to whole cache pages would read far more
+/// than they ask for: a few hundred records scattered over a large object (a
+/// top-k hydration's node records) share almost no page, so page reads move
+/// one 256 KiB page per record, sixteen at a time. Such a batch reads its
+/// ranges, with near neighbours coalesced, all at once instead.
+fn sparse_ranges(ranges: &[Range<u64>]) -> bool {
+    let page = crate::range_cache::DEFAULT_RANGE_CACHE_PAGE_BYTES as u64;
+    let mut pages = std::collections::BTreeSet::new();
+    let mut wanted = 0u64;
+    for range in ranges {
+        if range.end <= range.start {
+            continue;
+        }
+        wanted = wanted.saturating_add(range.end - range.start);
+        for index in range.start / page..=(range.end - 1) / page {
+            pages.insert(index);
+        }
+    }
+    wanted > 0
+        && (pages.len() as u64).saturating_mul(page)
+            >= wanted.saturating_mul(SPARSE_PAGE_AMPLIFICATION)
 }
 
 /// Internal pages a node-record prefetch warms at most (1 MiB).
@@ -3451,6 +3525,46 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scattered_record_reads_are_sparse_and_dense_scans_are_not() {
+        // 300 records of ~12 KiB spread over a 1 GiB object.
+        let scattered: Vec<std::ops::Range<u64>> = (0..300u64)
+            .map(|i| {
+                let start = i * 3_500_000;
+                start..start + 12_000
+            })
+            .collect();
+        assert!(super::sparse_ranges(&scattered));
+        // Adjacent pages of a bulk probe share cache pages.
+        let dense: Vec<std::ops::Range<u64>> =
+            (0..300u64).map(|i| i * 4096..(i + 1) * 4096).collect();
+        assert!(!super::sparse_ranges(&dense));
+        assert!(!super::sparse_ranges(&[]));
+    }
+
+    #[test]
+    fn coalescing_merges_near_ranges_and_maps_every_input() {
+        let ranges = vec![
+            90_000..90_100,
+            0..10,
+            50..60,
+            10_000_000..10_000_500,
+            40_000..40_010,
+        ];
+        let (merged, owners) = super::coalesce_ranges(&ranges);
+        assert_eq!(merged, vec![0..90_100, 10_000_000..10_000_500]);
+        assert_eq!(owners, vec![0, 0, 0, 1, 0]);
+        // A run never grows past the request cap.
+        let chain: Vec<std::ops::Range<u64>> =
+            (0..40u64).map(|i| i * 60_000..i * 60_000 + 1_000).collect();
+        let (merged, owners) = super::coalesce_ranges(&chain);
+        assert!(merged.len() > 1);
+        for (range, owner) in chain.iter().zip(owners) {
+            assert!(merged[owner].start <= range.start && range.end <= merged[owner].end);
+            assert!(merged[owner].end - merged[owner].start <= super::COALESCE_MAX_BYTES);
+        }
+    }
+
     use std::fmt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;

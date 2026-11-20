@@ -179,7 +179,11 @@ impl fmt::Display for CreateFulltextIndexClause {
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ")?;
         }
-        write!(f, "ON :{}({})", self.label, props)
+        write!(f, "ON :{}({})", self.label, props)?;
+        if let Some(analyzer) = self.analyzer {
+            write!(f, " OPTIONS {{analyzer: '{analyzer}'}}")?;
+        }
+        Ok(())
     }
 }
 

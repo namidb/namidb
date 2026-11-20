@@ -2136,10 +2136,11 @@ async fn run_write(
     }
     #[cfg(feature = "text-index")]
     if let Some(cfi) = parsed.as_create_fulltext_index() {
-        let desc = namidb_storage::manifest::TextIndexDescriptor::new(
+        let desc = namidb_storage::manifest::TextIndexDescriptor::with_analyzer(
             cfi.name.name.clone(),
             cfi.label.name.clone(),
             cfi.properties.iter().map(|p| p.name.clone()).collect(),
+            cfi.analyzer.unwrap_or_default(),
         );
         guard
             .register_text_index(desc, cfi.if_not_exists)

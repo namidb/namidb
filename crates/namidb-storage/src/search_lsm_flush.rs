@@ -592,6 +592,7 @@ pub(crate) async fn prepare_search_flush(
         let builder = TextV4ExternalBuilder::with_config(
             &state,
             TextV4BuildContext {
+                analyzer: descriptor.effective_analyzer(),
                 sst_id: Uuid::now_v7(),
                 event_ranges: vec![event],
                 complete_filter_properties: filters.clone(),
@@ -1142,13 +1143,14 @@ impl TextWork {
         }
         // Tokenize each side exactly once: the fingerprint, the BM25 length
         // and the builder's postings all come from the same token list.
+        let analyzer = self.descriptor.effective_analyzer();
         let before_prepared = before_payload
             .as_ref()
-            .map(crate::sst::text::v4::TextV4PreparedPayload::new)
+            .map(|payload| crate::sst::text::v4::TextV4PreparedPayload::new(payload, analyzer))
             .transpose()?;
         let after_prepared = after_payload
             .as_ref()
-            .map(crate::sst::text::v4::TextV4PreparedPayload::new)
+            .map(|payload| crate::sst::text::v4::TextV4PreparedPayload::new(payload, analyzer))
             .transpose()?;
         let before_fingerprint = before_prepared.as_ref().map(|payload| payload.fingerprint);
         let after_fingerprint = after_prepared.as_ref().map(|payload| payload.fingerprint);

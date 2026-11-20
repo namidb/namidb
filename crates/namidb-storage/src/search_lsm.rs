@@ -29,7 +29,16 @@ use crate::manifest::{
 };
 
 const CATALOG_SIGNATURE_VERSION: u16 = 1;
-const TEXT_ANALYZER_VERSION: u16 = 1;
+/// Analyzer version of the catalog signature: [`TextAnalyzer::version`] of
+/// the descriptor's effective analyzer. The lowercase-only analyzer keeps
+/// version 1, so every generation built before analyzers were selectable keeps
+/// its signature and stays valid; a folded generation has a different
+/// signature and can never be read (or appended to) with the other analyzer.
+///
+/// [`TextAnalyzer::version`]: crate::text::TextAnalyzer::version
+fn text_analyzer_version(descriptor: &TextIndexDescriptor) -> u16 {
+    descriptor.effective_analyzer().version()
+}
 const VECTOR_FILTER_ENCODING_VERSION: u16 = 1;
 const BARRIER_FORMAT_VERSION: u16 = 2;
 const LEGACY_BARRIER_FORMAT_VERSION: u16 = 1;
@@ -769,7 +778,7 @@ pub fn text_catalog_signature(descriptor: &TextIndexDescriptor) -> String {
     let mut hasher = signature_hasher(SearchLsmKind::Text);
     hash_str(&mut hasher, &descriptor.name);
     hash_str(&mut hasher, &descriptor.label);
-    hasher.update(&TEXT_ANALYZER_VERSION.to_le_bytes());
+    hasher.update(&text_analyzer_version(descriptor).to_le_bytes());
     let mut properties = descriptor.properties.clone();
     properties.sort();
     properties.dedup();
@@ -819,7 +828,7 @@ pub fn text_lsm_catalog_signature(manifest: &Manifest, descriptor: &TextIndexDes
     let mut hasher = signature_hasher(SearchLsmKind::Text);
     hash_str(&mut hasher, &descriptor.name);
     hash_str(&mut hasher, &descriptor.label);
-    hasher.update(&TEXT_ANALYZER_VERSION.to_le_bytes());
+    hasher.update(&text_analyzer_version(descriptor).to_le_bytes());
     let mut properties = descriptor.properties.clone();
     properties.sort();
     properties.dedup();
@@ -2950,6 +2959,7 @@ mod tests {
             name: "ft".into(),
             label: "Doc".into(),
             properties: vec!["b".into(), "a".into(), "a".into()],
+            analyzer: ordered.analyzer,
         };
         assert_eq!(
             text_catalog_signature(&ordered),

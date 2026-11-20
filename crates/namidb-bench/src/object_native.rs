@@ -944,6 +944,7 @@ async fn run_text(config: &ObjectNativeConfig) -> Result<TextReport> {
     let mut builder = TextIndexExternalBuilder::with_options(ExternalTextIndexBuildOptions {
         memory_budget_bytes: config.build_memory_bytes,
         spool_directory: Some(scratch.path().to_path_buf()),
+        analyzer: namidb_storage::text::TextAnalyzer::Exact,
     })
     .map_err(|error| anyhow!("create NAMIFT03 builder: {error}"))?;
     let build_start = Instant::now();

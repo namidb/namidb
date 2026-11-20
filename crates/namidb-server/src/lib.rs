@@ -1902,6 +1902,17 @@ pub async fn run_with_memory_limits(
                     &state_for_maint.metrics,
                     None,
                 );
+                // A pre-folding full-text index is rebuilt in a task of its
+                // own, beside the compaction worker.
+                #[cfg(feature = "text-index")]
+                let _ = maintenance::maybe_start_text_reanalysis(
+                    &state_for_maint.compaction_scheduler,
+                    &state_for_maint.writer,
+                    &state_for_maint.snapshot,
+                    &state_for_maint.writer_health,
+                    &state_for_maint.namespace,
+                    None,
+                );
                 // Sweep only after the entire active+pending burst is idle;
                 // otherwise it can race immutable outputs uploaded by the
                 // off-lock prepare before their manifest install.
@@ -1942,7 +1953,9 @@ pub async fn run_with_memory_limits(
                 let horizon = state_for_maint.snapshot.retention_horizon();
                 if let Err(e) = maintenance::run_sweep(
                     &maint_manifest_store,
-                    sweep.options(horizon),
+                    state_for_maint
+                        .compaction_scheduler
+                        .sweep_options(sweep.options(horizon)),
                     &state_for_maint.namespace,
                     &state_for_maint.metrics,
                 )
@@ -3840,10 +3853,11 @@ async fn run_create_vector_index(
 fn text_index_descriptor_from(
     cfi: &namidb_query::parser::ast::CreateFulltextIndexClause,
 ) -> namidb_storage::manifest::TextIndexDescriptor {
-    namidb_storage::manifest::TextIndexDescriptor::new(
+    namidb_storage::manifest::TextIndexDescriptor::with_analyzer(
         cfi.name.name.clone(),
         cfi.label.name.clone(),
         cfi.properties.iter().map(|p| p.name.clone()).collect(),
+        cfi.analyzer.unwrap_or_default(),
     )
 }
 
@@ -5335,7 +5349,7 @@ async fn admin_sweep_run(
     metrics: &Metrics,
 ) -> Response {
     let _sweep_guard = scheduler.sweep_guard().await;
-    let options = request.options(settings, snapshot.retention_horizon());
+    let options = scheduler.sweep_options(request.options(settings, snapshot.retention_horizon()));
     match maintenance::run_sweep(history, options, namespace, metrics).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => (

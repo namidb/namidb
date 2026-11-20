@@ -26,9 +26,21 @@
 //! with `k1 = 1.5`, `b = 0.75`, `N` the document count, `df(t)` the number of
 //! documents containing `t`, and `avgdl` the average document length. The `+1`
 //! inside the IDF log is the Lucene form that keeps IDF non-negative.
+//!
+//! **Analyzers.** Every index and query names a [`TextAnalyzer`]. The default,
+//! [`TextAnalyzer::Folded`], applies Unicode compatibility decomposition
+//! (NFKD), drops the generic combining diacritics it exposes and lowercases,
+//! so `jubilación`, `jubilacion` and `JUBILACIÓN` are one term.
+//! [`TextAnalyzer::Exact`] is the lowercase-only analyzer every index created
+//! before 3.5.2 was built with; such an index keeps answering with it until it
+//! is rebuilt, and an index can opt into it explicitly. Index and query must
+//! use the same analyzer: the catalog signature of a search generation covers
+//! the analyzer version, so a generation can never be read with another one.
 
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
+
+use serde::{Deserialize, Serialize};
 
 /// BM25 `k1` — term-frequency saturation point.
 pub const K1: f64 = 1.5;
@@ -43,12 +55,160 @@ pub const B: f64 = 0.75;
 /// scored terms.
 pub const PREFIX_EXPANSION_LIMIT: usize = 64;
 
+/// How text is turned into terms, identically at index and at query time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAnalyzer {
+    /// Unicode lowercasing only: `jubilación` and `jubilacion` are distinct
+    /// terms. The analyzer of every full-text index created before 3.5.2.
+    Exact,
+    /// Unicode NFKD, generic combining diacritics removed, lowercased, plus a
+    /// few Latin letters that have no decomposition (`ß`→`ss`, `œ`→`oe`,
+    /// `ø`→`o`, …): accent- and case-insensitive matching.
+    #[default]
+    Folded,
+}
+
+impl TextAnalyzer {
+    /// Every analyzer a user may name, for diagnostics.
+    pub const NAMES: [&'static str; 2] = ["folded", "exact"];
+
+    /// Stable analyzer version mixed into search catalog signatures.
+    /// `Exact` keeps the historical version 1 so that generations built
+    /// before analyzers were selectable stay valid.
+    pub const fn version(self) -> u16 {
+        match self {
+            TextAnalyzer::Exact => 1,
+            TextAnalyzer::Folded => 2,
+        }
+    }
+
+    /// The user-facing name (`OPTIONS {analyzer: '…'}`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TextAnalyzer::Exact => "exact",
+            TextAnalyzer::Folded => "folded",
+        }
+    }
+
+    /// Parse a user-facing analyzer name, case-insensitively.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "folded" => Some(TextAnalyzer::Folded),
+            "exact" => Some(TextAnalyzer::Exact),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TextAnalyzer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Generic combining diacritics: the marks NFKD splits off Latin, Greek and
+/// Cyrillic letters. Script-specific marks (Devanagari vowel signs, Hebrew
+/// points, Thai tone marks, …) are deliberately kept: they are part of the
+/// word, not an accent on it.
+fn is_generic_diacritic(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F     // Combining Diacritical Marks
+        | 0x1AB0..=0x1AFF   // Combining Diacritical Marks Extended
+        | 0x1DC0..=0x1DFF   // Combining Diacritical Marks Supplement
+        | 0x20D0..=0x20FF   // Combining Diacritical Marks for Symbols
+        | 0xFE20..=0xFE2F   // Combining Half Marks
+    )
+}
+
+/// Characters NFKD must not touch: decomposing Hangul syllables into jamo or
+/// kana into base + voicing mark would change the CJK bigram segmentation.
+fn keep_undecomposed(c: char) -> bool {
+    is_cjk(c) || matches!(c as u32, 0x1100..=0x11FF | 0x3130..=0x318F | 0xFF61..=0xFFDC)
+}
+
+/// A word character for the folded analyzer: alphanumeric, or a combining
+/// mark that survived folding (it belongs to its base letter, so it must not
+/// split the word the way it did under the exact analyzer).
+fn is_folded_word_char(c: char) -> bool {
+    c.is_alphanumeric() || unicode_normalization::char::is_combining_mark(c)
+}
+
+/// Push the folded form of one already-lowercased, non-diacritic character.
+fn push_folded_letter(c: char, push: &mut impl FnMut(char)) {
+    match c {
+        'ß' => {
+            push('s');
+            push('s');
+        }
+        'æ' => {
+            push('a');
+            push('e');
+        }
+        'œ' => {
+            push('o');
+            push('e');
+        }
+        'þ' => {
+            push('t');
+            push('h');
+        }
+        'ø' => push('o'),
+        'ł' => push('l'),
+        'ŀ' => push('l'),
+        'đ' | 'ð' => push('d'),
+        'ħ' => push('h'),
+        'ı' => push('i'),
+        'ς' => push('σ'),
+        other => push(other),
+    }
+}
+
+/// Fold one input character into zero or more output characters
+/// (NFKD → drop generic diacritics → lowercase → letter table).
+fn fold_char(c: char, push: &mut impl FnMut(char)) {
+    if c.is_ascii() {
+        push(c.to_ascii_lowercase());
+        return;
+    }
+    if keep_undecomposed(c) {
+        for lower in c.to_lowercase() {
+            push(lower);
+        }
+        return;
+    }
+    unicode_normalization::char::decompose_compatible(c, |decomposed| {
+        if is_generic_diacritic(decomposed) {
+            return;
+        }
+        for lower in decomposed.to_lowercase() {
+            if !is_generic_diacritic(lower) {
+                push_folded_letter(lower, push);
+            }
+        }
+    });
+}
+
+/// The folded form of `text` (no segmentation): what the folded analyzer
+/// compares. Exposed for callers that fold a single value outside the
+/// tokenizer, e.g. a test or a diagnostic.
+pub fn fold_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        fold_char(c, &mut |folded| out.push(folded));
+    }
+    out
+}
+
 /// A parsed full-text query: quoted phrases (position-adjacency required),
 /// trailing-`*` prefixes (expanded over the corpus vocabulary), and plain
 /// bag-of-words terms. Produced by [`parse_query`], consumed by both the
 /// persistent index and the flat-scan fallback so their semantics agree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextQuery {
+    /// The analyzer the terms below were produced with. An index answers a
+    /// query only when it was built with the same analyzer.
+    pub analyzer: TextAnalyzer,
     /// Distinct plain terms, sorted — ordinary bag-of-words BM25.
     pub terms: Vec<String>,
     /// Quoted phrases as token sequences. A document must contain every
@@ -109,6 +269,12 @@ impl TextQuery {
 /// A query with no `"` and no `*` parses to plain terms only, keeping the
 /// historical bag-of-words behaviour untouched.
 pub fn parse_query(query: &str) -> TextQuery {
+    parse_query_with(TextAnalyzer::default(), query)
+}
+
+/// [`parse_query`] with an explicit analyzer: the one the index that will
+/// answer the query was built with.
+pub fn parse_query_with(analyzer: TextAnalyzer, query: &str) -> TextQuery {
     let mut terms: BTreeSet<String> = BTreeSet::new();
     let mut phrases: Vec<Vec<String>> = Vec::new();
     let mut prefixes: BTreeSet<String> = BTreeSet::new();
@@ -116,25 +282,43 @@ pub fn parse_query(query: &str) -> TextQuery {
     let mut in_quotes = false;
     for span in query.split('"') {
         if in_quotes {
-            let tokens = tokenize(span);
+            let tokens = tokenize_with(analyzer, span);
             if !tokens.is_empty() {
                 phrases.push(tokens);
             }
         } else {
-            parse_unquoted_span(span, &mut terms, &mut prefixes);
+            match analyzer {
+                TextAnalyzer::Exact => {
+                    parse_unquoted_span(span, char::is_alphanumeric, &mut terms, &mut prefixes)
+                }
+                TextAnalyzer::Folded => parse_unquoted_span(
+                    &fold_text(span),
+                    is_folded_word_char,
+                    &mut terms,
+                    &mut prefixes,
+                ),
+            }
         }
         in_quotes = !in_quotes;
     }
 
     TextQuery {
+        analyzer,
         terms: terms.into_iter().collect(),
         phrases,
         prefixes: prefixes.into_iter().collect(),
     }
 }
 
-/// Split one unquoted span into plain terms and trailing-`*` prefixes.
-fn parse_unquoted_span(span: &str, terms: &mut BTreeSet<String>, prefixes: &mut BTreeSet<String>) {
+/// Split one unquoted span into plain terms and trailing-`*` prefixes. A
+/// folded span arrives already folded; combining marks that survive folding
+/// stay inside their word, exactly as [`tokenize_with`] keeps them.
+fn parse_unquoted_span(
+    span: &str,
+    is_word: fn(char) -> bool,
+    terms: &mut BTreeSet<String>,
+    prefixes: &mut BTreeSet<String>,
+) {
     let mut flush = |run: &mut String, starred: bool| {
         if run.is_empty() {
             return;
@@ -151,7 +335,7 @@ fn parse_unquoted_span(span: &str, terms: &mut BTreeSet<String>, prefixes: &mut 
     };
     let mut run = String::new();
     for c in span.chars() {
-        if c.is_alphanumeric() {
+        if is_word(c) {
             run.push(c);
         } else {
             flush(&mut run, c == '*');
@@ -199,6 +383,74 @@ fn is_cjk(c: char) -> bool {
 /// only for the duration of that callback.
 pub fn try_visit_tokens<E>(
     text: &str,
+    visitor: impl FnMut(&str) -> Result<(), E>,
+) -> Result<usize, E> {
+    try_visit_tokens_with(TextAnalyzer::default(), text, visitor)
+}
+
+/// [`try_visit_tokens`] with an explicit analyzer.
+pub fn try_visit_tokens_with<E>(
+    analyzer: TextAnalyzer,
+    text: &str,
+    visitor: impl FnMut(&str) -> Result<(), E>,
+) -> Result<usize, E> {
+    // ASCII text folds to its ASCII lowercase and has no combining marks, so
+    // both analyzers produce exactly the lowercase-only tokens.
+    match analyzer {
+        TextAnalyzer::Folded if !text.is_ascii() => try_visit_folded_tokens(text, visitor),
+        _ => try_visit_exact_tokens(text, visitor),
+    }
+}
+
+/// The folded analyzer: fold character by character into a segment buffer,
+/// cutting segments on folded non-word characters, so a decomposed
+/// (NFD) accent never splits its word and nothing document-sized is kept.
+fn try_visit_folded_tokens<E>(
+    text: &str,
+    mut visitor: impl FnMut(&str) -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut scratch = String::new();
+    let mut segment = String::new();
+    let mut emitted = 0usize;
+    let mut failure: Option<E> = None;
+    for c in text.chars() {
+        {
+            let mut push = |folded: char| {
+                if failure.is_some() {
+                    return;
+                }
+                if is_folded_word_char(folded) {
+                    segment.push(folded);
+                    return;
+                }
+                if segment.is_empty() {
+                    return;
+                }
+                match try_visit_segment_tokens(&segment, &mut scratch, &mut visitor) {
+                    Ok(count) => emitted = emitted.saturating_add(count),
+                    Err(error) => failure = Some(error),
+                }
+                segment.clear();
+            };
+            fold_char(c, &mut push);
+        }
+        if let Some(error) = failure.take() {
+            return Err(error);
+        }
+    }
+    if !segment.is_empty() {
+        emitted = emitted.saturating_add(try_visit_segment_tokens(
+            &segment,
+            &mut scratch,
+            &mut visitor,
+        )?);
+    }
+    Ok(emitted)
+}
+
+/// The exact (lowercase-only) analyzer.
+fn try_visit_exact_tokens<E>(
+    text: &str,
     mut visitor: impl FnMut(&str) -> Result<(), E>,
 ) -> Result<usize, E> {
     let mut scratch = String::new();
@@ -217,8 +469,17 @@ pub fn try_visit_tokens<E>(
 }
 
 /// Infallible streaming token visitor. Returns the emitted document length.
-pub fn visit_tokens(text: &str, mut visitor: impl FnMut(&str)) -> usize {
-    match try_visit_tokens(text, |token| {
+pub fn visit_tokens(text: &str, visitor: impl FnMut(&str)) -> usize {
+    visit_tokens_with(TextAnalyzer::default(), text, visitor)
+}
+
+/// [`visit_tokens`] with an explicit analyzer.
+pub fn visit_tokens_with(
+    analyzer: TextAnalyzer,
+    text: &str,
+    mut visitor: impl FnMut(&str),
+) -> usize {
+    match try_visit_tokens_with(analyzer, text, |token| {
         visitor(token);
         Ok::<(), Infallible>(())
     }) {
@@ -227,11 +488,13 @@ pub fn visit_tokens(text: &str, mut visitor: impl FnMut(&str)) -> usize {
     }
 }
 
-/// Tokenize text into lowercased terms (split on non-alphanumeric runs; no
-/// stemming, no stopwords).
+/// Tokenize text with the default ([`TextAnalyzer::Folded`]) analyzer: split
+/// on non-word runs, fold accents and case; no stemming, no stopwords. See
+/// [`tokenize_with`] for the lowercase-only analyzer older indexes use.
 ///
 /// Case folding is Unicode-aware (`to_lowercase`), so `CAFÉ`, `ÜBER`, `ПРИВЕТ`
-/// fold to `café`, `über`, `привет` and match their lowercase forms. Using
+/// fold to `cafe`, `uber`, `привет` (and, with the exact analyzer, to `café`,
+/// `über`, `привет`) and match their lowercase forms. Using
 /// `to_ascii_lowercase` left every non-ASCII capital un-folded, so
 /// case-insensitive full-text search silently failed for all non-English text.
 ///
@@ -240,12 +503,17 @@ pub fn visit_tokens(text: &str, mut visitor: impl FnMut(&str)) -> usize {
 /// otherwise the whole run became one token that no realistic query ever typed.
 /// A length-1 CJK run is emitted as a unigram.
 ///
-/// The index and the flat `bm25` scalar both call this, so they stay in exact
-/// agreement (an index built by an older binary reindexes on the next
-/// authoritative compaction).
+/// The index and the flat scan call the same analyzer, so they stay in exact
+/// agreement; an index built with another analyzer is never read with this
+/// one (its catalog signature differs).
 pub fn tokenize(text: &str) -> Vec<String> {
+    tokenize_with(TextAnalyzer::default(), text)
+}
+
+/// [`tokenize`] with an explicit analyzer.
+pub fn tokenize_with(analyzer: TextAnalyzer, text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    visit_tokens(text, |token| out.push(token.to_owned()));
+    visit_tokens_with(analyzer, text, |token| out.push(token.to_owned()));
     out
 }
 
@@ -344,8 +612,13 @@ fn try_visit_subrun_tokens<E>(
 /// Tokenize `text` into a term→count map plus the total token count (document
 /// length). The basis for corpus-aware BM25 over a document.
 pub fn tokenize_counts(text: &str) -> (HashMap<String, u32>, usize) {
+    tokenize_counts_with(TextAnalyzer::default(), text)
+}
+
+/// [`tokenize_counts`] with an explicit analyzer.
+pub fn tokenize_counts_with(analyzer: TextAnalyzer, text: &str) -> (HashMap<String, u32>, usize) {
     let mut counts: HashMap<String, u32> = HashMap::new();
-    let len = visit_tokens(text, |term| {
+    let len = visit_tokens_with(analyzer, text, |term| {
         if let Some(count) = counts.get_mut(term) {
             *count = count.saturating_add(1);
         } else {
@@ -437,9 +710,159 @@ mod tests {
     fn tokenize_case_folds_non_ascii_letters() {
         // Non-ASCII capitals must fold so case-insensitive search works for
         // non-English text (the ASCII-only fold left É/Ü/П un-folded).
-        assert_eq!(tokenize("CAFÉ"), vec!["café"]);
-        assert_eq!(tokenize("ÜBER Über über"), vec!["über", "über", "über"]);
+        let exact = |text| tokenize_with(TextAnalyzer::Exact, text);
+        assert_eq!(exact("CAFÉ"), vec!["café"]);
+        assert_eq!(exact("ÜBER Über über"), vec!["über", "über", "über"]);
+        assert_eq!(exact("ПРИВЕТ Привет"), vec!["привет", "привет"]);
+        // The folded default also drops the accents.
+        assert_eq!(tokenize("CAFÉ"), vec!["cafe"]);
+        assert_eq!(tokenize("ÜBER Über über"), vec!["uber", "uber", "uber"]);
         assert_eq!(tokenize("ПРИВЕТ Привет"), vec!["привет", "привет"]);
+    }
+
+    fn folded(text: &str) -> Vec<String> {
+        tokenize_with(TextAnalyzer::Folded, text)
+    }
+
+    #[test]
+    fn folded_analyzer_matches_spanish_accent_and_case_variants() {
+        for variant in [
+            "jubilación",
+            "jubilacion",
+            "JUBILACIÓN",
+            "Jubilación",
+            "JUBILACION",
+        ] {
+            assert_eq!(folded(variant), vec!["jubilacion"], "{variant}");
+        }
+        // Decomposed (NFD) input: the combining accent must neither survive
+        // nor split the word, unlike the exact analyzer.
+        assert_eq!(folded("jubilacio\u{301}n"), vec!["jubilacion"]);
+        assert_eq!(
+            tokenize_with(TextAnalyzer::Exact, "jubilacio\u{301}n"),
+            vec!["jubilacio", "n"]
+        );
+        assert_eq!(
+            folded("Derecho a la PENSIÓN de vejez, año 2024; niñez y pingüino"),
+            vec![
+                "derecho", "a", "la", "pension", "de", "vejez", "ano", "2024", "ninez", "y",
+                "pinguino"
+            ]
+        );
+    }
+
+    #[test]
+    fn folded_analyzer_matches_portuguese_and_french_variants() {
+        // Portuguese: tilde, cedilla, circumflex.
+        assert_eq!(
+            folded("Ação São Paulo PROTEÇÃO você"),
+            vec!["acao", "sao", "paulo", "protecao", "voce"]
+        );
+        assert_eq!(
+            folded("acao sao paulo protecao voce"),
+            folded("Ação São Paulo PROTEÇÃO você")
+        );
+        // French: grave/acute/circumflex/diaeresis and the œ/æ ligatures.
+        assert_eq!(
+            folded("Élève à l'hôpital, Noël, cœur, Lætitia, ÉTÉ"),
+            vec!["eleve", "a", "l", "hopital", "noel", "coeur", "laetitia", "ete"]
+        );
+        // German/Nordic letters with no decomposition, compatibility forms.
+        assert_eq!(
+            folded("Straße Øresund Łódź ﬁnal ＡＢＣ"),
+            vec!["strasse", "oresund", "lodz", "final", "abc"]
+        );
+        // Greek accents and final sigma.
+        assert_eq!(folded("Άλφα ΛΌΓΟΣ λόγος"), vec!["αλφα", "λογοσ", "λογοσ"]);
+    }
+
+    #[test]
+    fn folded_analyzer_keeps_cjk_and_script_marks() {
+        // CJK bigrams, Hangul syllables and kana are left as the exact
+        // analyzer emits them (no jamo / voicing-mark decomposition).
+        assert_eq!(folded("東京大学"), vec!["東京", "京大", "大学"]);
+        assert_eq!(
+            folded("한국어"),
+            tokenize_with(TextAnalyzer::Exact, "한국어")
+        );
+        assert_eq!(
+            folded("がっこう"),
+            tokenize_with(TextAnalyzer::Exact, "がっこう")
+        );
+        // Devanagari vowel signs and the nukta are part of their word.
+        let tokens = folded("किताब पढ़ो");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[1], fold_text("पढ़ो"));
+        assert!(tokens[1].contains('\u{93c}'), "{:?}", tokens[1]);
+        assert_eq!(folded("किताब").len(), 1);
+    }
+
+    #[test]
+    fn folded_query_parsing_agrees_with_document_tokens() {
+        let q = parse_query_with(
+            TextAnalyzer::Folded,
+            "\"Jubilación ANTICIPADA\" pensión* Niño",
+        );
+        assert_eq!(q.analyzer, TextAnalyzer::Folded);
+        assert_eq!(q.phrases, vec![strs(&["jubilacion", "anticipada"])]);
+        assert_eq!(q.prefixes, strs(&["pension"]));
+        assert_eq!(q.terms, strs(&["nino"]));
+        let doc = folded("La jubilacion anticipada del nino");
+        assert!(contains_phrase(&doc, &q.phrases[0]));
+        // Exact parsing keeps the accents.
+        let exact = parse_query_with(TextAnalyzer::Exact, "pensión*");
+        assert_eq!(exact.prefixes, strs(&["pensión"]));
+        assert_eq!(exact.analyzer, TextAnalyzer::Exact);
+    }
+
+    #[test]
+    fn folded_and_exact_agree_on_ascii_and_streaming_matches_tokenize() {
+        let ascii = "The QUICK brown-fox, 42 times! e-mail";
+        assert_eq!(folded(ascii), tokenize_with(TextAnalyzer::Exact, ascii));
+        let text = "Crème BRÛLÉE — jubilación,東京大学 Ærø";
+        let mut streamed = Vec::new();
+        let len = visit_tokens_with(TextAnalyzer::Folded, text, |t| streamed.push(t.to_owned()));
+        assert_eq!(streamed, folded(text));
+        assert_eq!(len, streamed.len());
+        let (counts, len) = tokenize_counts_with(TextAnalyzer::Folded, "Pensión pension PENSIÓN");
+        assert_eq!(len, 3);
+        assert_eq!(counts.get("pension").copied(), Some(3));
+    }
+
+    #[test]
+    fn folded_fallible_visitor_stops_early() {
+        let mut seen = Vec::new();
+        let error = try_visit_tokens_with(TextAnalyzer::Folded, "uno dós trés cuatro", |t| {
+            seen.push(t.to_owned());
+            if t == "dos" {
+                Err("stop")
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, "stop");
+        assert_eq!(seen, vec!["uno", "dos"]);
+    }
+
+    #[test]
+    fn analyzer_names_and_versions_are_stable() {
+        assert_eq!(TextAnalyzer::Exact.version(), 1);
+        assert_eq!(TextAnalyzer::Folded.version(), 2);
+        assert_eq!(TextAnalyzer::default(), TextAnalyzer::Folded);
+        assert_eq!(
+            TextAnalyzer::from_name(" EXACT "),
+            Some(TextAnalyzer::Exact)
+        );
+        assert_eq!(
+            TextAnalyzer::from_name("folded"),
+            Some(TextAnalyzer::Folded)
+        );
+        assert_eq!(TextAnalyzer::from_name("english"), None);
+        assert_eq!(
+            serde_json::to_string(&TextAnalyzer::Folded).unwrap(),
+            "\"folded\""
+        );
     }
 
     #[test]
@@ -510,10 +933,12 @@ mod tests {
         }
 
         let expected = reference_tokenize(&text);
-        assert_eq!(tokenize(&text), expected);
+        assert_eq!(tokenize_with(TextAnalyzer::Exact, &text), expected);
 
         let mut streamed = Vec::new();
-        let emitted = visit_tokens(&text, |token| streamed.push(token.to_owned()));
+        let emitted = visit_tokens_with(TextAnalyzer::Exact, &text, |token| {
+            streamed.push(token.to_owned())
+        });
         assert_eq!(emitted, expected.len());
         assert_eq!(streamed, expected);
     }

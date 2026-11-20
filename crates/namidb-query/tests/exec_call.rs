@@ -1881,6 +1881,12 @@ async fn unknown_procedure_map_keys_error_instead_of_running_unfiltered() {
         "CALL search.hybrid({ label: 'Doc', query_text: 'alpha', \
           text_property: 'body', Filter: { tenant: 'acme' } }) \
           YIELD node RETURN node",
+        "CALL search.bm25({ label: 'Doc', text_property: 'body', \
+          qurey: 'alpha' }) YIELD node RETURN node",
+        "CALL search.bm25({ label: 'Doc', text_property: 'body', \
+          query: 'alpha', filtre: { tenant: 'acme' } }) YIELD node RETURN node",
+        "CALL db.index.vector.queryNodes('doc_emb', 3, [0.1, 0.2], \
+          { ef: 10, filtre: { tenant: 'acme' } }) YIELD node RETURN node",
     ] {
         let parsed = parse(query).unwrap();
         let plan = lower(&parsed).unwrap();
@@ -1892,6 +1898,52 @@ async fn unknown_procedure_map_keys_error_instead_of_running_unfiltered() {
             message.contains("does not recognise the option"),
             "error must name the rejected key, got: {message}"
         );
+    }
+}
+
+/// A present option of the wrong type, or two spellings of the same option,
+/// is an error naming the option, never a silent default.
+#[cfg(all(feature = "vector-index", feature = "text-index"))]
+#[tokio::test]
+async fn mistyped_procedure_options_error_with_the_option_name() {
+    let writer = WriterSession::open(store(), paths("exec-mistyped-proc-keys"))
+        .await
+        .unwrap();
+    let snapshot = writer.snapshot();
+    for (query, needle) in [
+        (
+            "CALL search.bm25({ label: 'Doc', text_property: 'body', query: 'a', k: 'ten' }) \
+             YIELD node RETURN node",
+            "`k`",
+        ),
+        (
+            "CALL search.bm25({ label: 'Doc', text_property: 'body', \
+             text_properties: ['body'], query: 'a' }) YIELD node RETURN node",
+            "not both",
+        ),
+        (
+            "CALL search.hybrid({ label: 'Doc', query_text: 'a', text_property: 'body', \
+             fusion: 1 }) YIELD node RETURN node",
+            "`fusion` must be the string",
+        ),
+        (
+            "CALL search.hybrid({ label: 'Doc', query_text: 'a', text_property: 'body', \
+             text_properties: ['body'] }) YIELD node RETURN node",
+            "not both",
+        ),
+        (
+            "CALL search.vector({ label: 'Doc', property: 'embedding', query: [0.1, 0.2], \
+             k: -1 }) YIELD node RETURN node",
+            "`k`",
+        ),
+    ] {
+        let parsed = parse(query).unwrap();
+        let plan = lower(&parsed).unwrap();
+        let error = execute(&plan, &snapshot, &Params::new())
+            .await
+            .expect_err(query);
+        let message = format!("{error:?}");
+        assert!(message.contains(needle), "{query}: {message}");
     }
 }
 

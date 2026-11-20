@@ -49,6 +49,11 @@ const RECORDS_PER_PAGE: usize = 512;
 const MAX_DIRECTORY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PAGE_COUNT: usize = MAX_DIRECTORY_BYTES / DIRECTORY_ENTRY_LEN;
 const MAX_POINT_PROBE_PAGES_PER_BATCH: usize = 64;
+/// Point-probe page batches read at once (each at most 64 pages of 24 KiB).
+const POINT_PROBE_BATCH_CONCURRENCY: usize = 4;
+
+/// A version page and the `(output position, NodeId)` probes that fall in it.
+type PageProbes = (usize, Vec<(usize, [u8; 16])>);
 const MAX_VERIFY_PAGES_PER_BATCH: usize = 32;
 const SUPPRESS_ORDINAL: u64 = u64::MAX;
 const LIVE_TAG: u8 = 1;
@@ -916,36 +921,58 @@ impl SearchVersionTableReader {
                 by_page.entry(page).or_default().push((position, node_id));
             }
         }
+        use futures::StreamExt;
+
         let groups = by_page.into_iter().collect::<Vec<_>>();
-        for chunk in groups.chunks(MAX_POINT_PROBE_PAGES_PER_BATCH) {
-            let ranges = chunk
-                .iter()
-                .map(|(page, _)| self.page_range(&self.directory[*page]))
-                .collect::<Result<Vec<_>>>()?;
-            let bodies = self.source.read_ranges(&ranges).await?;
-            if bodies.len() != chunk.len() {
-                return Err(Error::invariant(
-                    "search version range source returned the wrong page count",
-                ));
-            }
-            for (((page, probes), body), range) in chunk.iter().zip(bodies).zip(ranges.iter()) {
-                require_exact_len(
-                    &body,
-                    usize::try_from(range.end - range.start)
-                        .map_err(|_| Error::invariant("search version page length overflows"))?,
-                    "page",
-                )?;
-                let records = decode_page(&body, &self.directory[*page])?;
-                for (position, node_id) in probes {
-                    if let Ok(found) =
-                        records.binary_search_by_key(node_id, |record| record.node_id)
-                    {
-                        output[*position] = Some(records[found]);
-                    }
-                }
+        // Batches are independent reads; a few run at once so a probe that
+        // touches hundreds of pages (reconciling a large top-k) costs a few
+        // round trips, not one per batch.
+        let batches = futures::stream::iter(
+            groups
+                .chunks(MAX_POINT_PROBE_PAGES_PER_BATCH)
+                .map(|chunk| self.probe_page_batch(chunk))
+                .collect::<Vec<_>>(),
+        )
+        .buffer_unordered(POINT_PROBE_BATCH_CONCURRENCY);
+        futures::pin_mut!(batches);
+        while let Some(found) = batches.next().await {
+            for (position, record) in found? {
+                output[position] = Some(record);
             }
         }
         Ok(output)
+    }
+
+    async fn probe_page_batch(
+        &self,
+        chunk: &[PageProbes],
+    ) -> Result<Vec<(usize, SearchVersionRecord)>> {
+        let ranges = chunk
+            .iter()
+            .map(|(page, _)| self.page_range(&self.directory[*page]))
+            .collect::<Result<Vec<_>>>()?;
+        let bodies = self.source.read_ranges(&ranges).await?;
+        if bodies.len() != chunk.len() {
+            return Err(Error::invariant(
+                "search version range source returned the wrong page count",
+            ));
+        }
+        let mut found = Vec::new();
+        for (((page, probes), body), range) in chunk.iter().zip(bodies).zip(ranges.iter()) {
+            require_exact_len(
+                &body,
+                usize::try_from(range.end - range.start)
+                    .map_err(|_| Error::invariant("search version page length overflows"))?,
+                "page",
+            )?;
+            let records = decode_page(&body, &self.directory[*page])?;
+            for (position, node_id) in probes {
+                if let Ok(index) = records.binary_search_by_key(node_id, |record| record.node_id) {
+                    found.push((*position, records[index]));
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Scrub every page and verify the footer-facing semantic content hash

@@ -211,6 +211,11 @@ pub struct PreparedCompaction {
     unadoptable_search_markers: Vec<(SstKind, String)>,
     search_lsm_activations: Vec<PreparedSearchLsmActivation>,
     replaced_search_lsm: Vec<(crate::search_lsm::SearchLsmKind, String)>,
+    /// The plan is an analyzer migration: a text base followed by the delta
+    /// that re-tokenizes what flushes appended after the base's basis (see
+    /// [`PreparedTextReanalysis`]). Install applies the two in order to the
+    /// same generation; every other plan names each generation once.
+    text_catch_up: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -488,6 +493,413 @@ impl CompactionBasis {
     }
 }
 
+/// Re-tokenizing a full-text index built by an older analyzer.
+///
+/// Indexes created before accent folding keep the lowercase-only analyzer
+/// (their descriptor has no `analyzer` field) and stay fully usable: queries
+/// against them are parsed with that analyzer. The migration rebuilds such an
+/// index off-manifest and swaps it in with one manifest commit:
+///
+/// 1. [`CompactionBasis::prepare_text_reanalysis`] takes a basis manifest,
+///    derives a copy in which the descriptor names the folding analyzer and
+///    the generation carries the matching catalog signature, and builds a
+///    complete base from the node corpus against that copy (bounded by the
+///    index-build memory budget, one re-analysis per process at a time). The
+///    live index keeps serving meanwhile; nothing is published.
+/// 2. Flushes keep appending deltas of the old analyzer to the index while
+///    the base builds. [`CompactionBasis::catch_up_text_reanalysis`] replaces
+///    all of them with one delta of the new analyzer, reading only the
+///    documents they touch (in the basis and in the current manifest). It can
+///    run as often as needed; each run covers what landed since the basis.
+/// 3. [`WriterSession::install_text_reanalysis`](crate::WriterSession::install_text_reanalysis)
+///    commits the base and the catch-up delta together, provided the
+///    descriptor is unchanged, the basis segments are still the generation's
+///    prefix and the catch-up covers exactly the segments after them.
+///    Coverage-only flushes and Nodes merges are rebased exactly as for any
+///    base rebuild. Otherwise the install is refused with
+///    [`Error::Precondition`] and the caller catches up again.
+///
+/// The caller must keep the basis manifest's objects alive until the install
+/// (a retention pin at or below its version): the catch-up reads the basis
+/// documents.
+///
+/// Rollback: a binary that predates the field drops it on its next manifest
+/// rewrite, finds the generation's signature foreign, serves the index by
+/// exact scan until its next flush retires it, and rebuilds it with its own
+/// analyzer. Results stay correct throughout.
+#[cfg(feature = "text-index")]
+#[derive(Debug)]
+pub struct PreparedTextReanalysis {
+    index_name: String,
+    target: crate::text::TextAnalyzer,
+    /// Analyzer the basis generation (and every delta flushed until the
+    /// install) was written with.
+    source: crate::text::TextAnalyzer,
+    basis_descriptor: crate::manifest::TextIndexDescriptor,
+    basis_segments: Vec<crate::search_lsm::SearchSegmentRef>,
+    basis_generation: crate::search_lsm::SearchLsmState,
+    /// The re-signed basis manifest the base was built from.
+    basis: LoadedManifest,
+    inner: PreparedCompaction,
+    /// The current catch-up delta, with the segments after the basis it
+    /// replaces.
+    catch_up: Option<(
+        search_lsm_compact::PreparedSearchCompaction,
+        Vec<crate::search_lsm::SearchSegmentRef>,
+    )>,
+    /// Every object a catch-up uploaded, including superseded attempts.
+    catch_up_uploads: Vec<String>,
+}
+
+#[cfg(feature = "text-index")]
+impl PreparedTextReanalysis {
+    /// The index this rebuild replaces.
+    pub fn index_name(&self) -> &str {
+        &self.index_name
+    }
+
+    /// Manifest version the rebuild was planned against.
+    pub fn base_version(&self) -> u64 {
+        self.inner.base_version
+    }
+
+    /// Object paths the prepare and every catch-up uploaded (see
+    /// [`PreparedCompaction::uploaded_object_paths`]).
+    pub fn uploaded_object_paths(&self) -> Vec<String> {
+        let mut paths = self.inner.uploaded_object_paths();
+        paths.extend(self.catch_up_uploads.iter().cloned());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// The segments `manifest` holds after this rebuild's basis prefix, or
+    /// [`Error::Precondition`] when the index changed in a way no catch-up can
+    /// follow (definition, generation, or the basis prefix itself).
+    fn segments_after_basis<'m>(
+        &self,
+        manifest: &'m crate::manifest::Manifest,
+    ) -> Result<&'m [crate::search_lsm::SearchSegmentRef]> {
+        let name = self.index_name.as_str();
+        let outrun = |what: &str| {
+            Error::precondition(format!(
+                "abandoning text index `{name}` re-analysis (basis v{}): {what} changed in \
+                 manifest v{}; the prepared base is left for the orphan sweep",
+                self.inner.base_version, manifest.version
+            ))
+        };
+        let descriptor = manifest
+            .text_indexes
+            .iter()
+            .find(|descriptor| descriptor.name == name);
+        if descriptor != Some(&self.basis_descriptor) {
+            return Err(outrun("the index definition"));
+        }
+        let generation = manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text && state.index_name == name
+            })
+            .ok_or_else(|| outrun("the index generation"))?;
+        if generation.generation_id != self.basis_generation.generation_id
+            || generation.catalog_signature != self.basis_generation.catalog_signature
+            || generation.status != self.basis_generation.status
+            || !generation.segments.starts_with(&self.basis_segments)
+        {
+            return Err(outrun("the index segments"));
+        }
+        Ok(&generation.segments[self.basis_segments.len()..])
+    }
+
+    /// Whether the catch-up covers exactly what `manifest` appended after the
+    /// basis, so an install against it needs no further catch-up.
+    pub fn caught_up_with(&self, manifest: &crate::manifest::Manifest) -> Result<bool> {
+        let after = self.segments_after_basis(manifest)?;
+        Ok(match &self.catch_up {
+            Some((_, covered)) => covered.as_slice() == after,
+            None => after.is_empty(),
+        })
+    }
+}
+
+/// `manifest` with text index `index_name` switched to `target` and its
+/// Search-LSM generation re-signed for it; `None` when the index or its
+/// generation is missing.
+#[cfg(feature = "text-index")]
+fn reanalyzed_manifest(
+    manifest: &crate::manifest::Manifest,
+    index_name: &str,
+    target: crate::text::TextAnalyzer,
+) -> Option<crate::manifest::Manifest> {
+    let mut next = manifest.clone();
+    let descriptor = next
+        .text_indexes
+        .iter_mut()
+        .find(|descriptor| descriptor.name == index_name)?;
+    descriptor.analyzer = Some(target);
+    let signature = crate::search_lsm::catalog_signature(
+        &next,
+        crate::search_lsm::SearchLsmKind::Text,
+        index_name,
+    )?;
+    let state = next.search_lsm.iter_mut().find(|state| {
+        state.kind == crate::search_lsm::SearchLsmKind::Text && state.index_name == index_name
+    })?;
+    state.catalog_signature = signature;
+    Some(next)
+}
+
+#[cfg(feature = "text-index")]
+impl CompactionBasis {
+    /// Full-text indexes still on the pre-folding analyzer that
+    /// [`Self::prepare_text_reanalysis`] can rebuild from this basis: legacy
+    /// descriptor, valid Active generation with segments. Metadata only.
+    pub fn legacy_text_indexes(&self) -> Vec<String> {
+        let manifest = &self.base.manifest;
+        if crate::search_lsm::validate_search_lsm(manifest).is_err() {
+            return Vec::new();
+        }
+        manifest
+            .text_indexes
+            .iter()
+            .filter(|descriptor| descriptor.is_legacy_analyzer())
+            .filter(|descriptor| {
+                matches!(
+                    search_lsm_compact::select_text_reanalysis(manifest, &descriptor.name),
+                    Ok(Some(_))
+                )
+            })
+            .map(|descriptor| descriptor.name.clone())
+            .collect()
+    }
+
+    /// Build a folded base for the legacy text index `index_name` off-lock.
+    /// `Ok(None)` when the index is no longer a candidate.
+    pub async fn prepare_text_reanalysis(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<PreparedTextReanalysis>> {
+        let target = crate::text::TextAnalyzer::Folded;
+        let manifest = &self.base.manifest;
+        let Some(basis_descriptor) = manifest
+            .text_indexes
+            .iter()
+            .find(|descriptor| descriptor.name == index_name && descriptor.is_legacy_analyzer())
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(basis_generation) = manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == index_name
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let Some(derived) = reanalyzed_manifest(manifest, index_name, target) else {
+            return Ok(None);
+        };
+        validate_search_lsm(&derived).map_err(|error| {
+            Error::invariant(format!("re-signed text generation is invalid: {error}"))
+        })?;
+        let Some(selection) = search_lsm_compact::select_text_reanalysis(&derived, index_name)?
+        else {
+            return Ok(None);
+        };
+        let derived = LoadedManifest::new(
+            self.base.pointer.clone(),
+            self.base.pointer_etag.clone(),
+            self.base.pointer_version.clone(),
+            derived,
+        );
+        let search_compactions = search_lsm_compact::prepare_text_reanalysis(
+            self.manifest_store.store().clone(),
+            self.manifest_store.paths(),
+            &derived,
+            selection,
+        )
+        .await?;
+        if search_compactions.is_empty() {
+            return Ok(None);
+        }
+        let mut new_descs = Vec::new();
+        let mut removed_ids = Vec::new();
+        for search in &search_compactions {
+            removed_ids.extend(search.selection.selected_ids());
+            if let Some(output) = search.output_descriptor() {
+                new_descs.push(output.clone());
+            }
+        }
+        let max_node_lsn = derived
+            .manifest
+            .ssts
+            .iter()
+            .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+            .map(|descriptor| descriptor.max_lsn)
+            .max()
+            .unwrap_or(0);
+        let consolidated_base_markers = derived
+            .manifest
+            .text_indexes
+            .iter()
+            .find(|descriptor| descriptor.name == index_name)
+            .map(|descriptor| crate::manifest::SearchIndexBuildState {
+                kind: SstKind::TextIndex,
+                name: index_name.to_owned(),
+                catalog_signature: text_catalog_signature(descriptor),
+                max_node_lsn,
+            })
+            .into_iter()
+            .collect();
+        let inner = PreparedCompaction {
+            new_descs,
+            removed_ids,
+            bloom_count: 0,
+            base_version: derived.manifest.version,
+            base_schema: derived.manifest.schema.clone(),
+            base_vector_indexes: derived.manifest.vector_indexes.clone(),
+            base_text_indexes: derived.manifest.text_indexes.clone(),
+            base_search_lsm: derived.manifest.search_lsm.clone(),
+            node_rewrites: Vec::new(),
+            search_compactions,
+            search_build_states: Vec::new(),
+            consolidated_base_markers,
+            unadoptable_search_markers: Vec::new(),
+            search_lsm_activations: Vec::new(),
+            replaced_search_lsm: Vec::new(),
+            text_catch_up: false,
+        };
+        Ok(Some(PreparedTextReanalysis {
+            index_name: index_name.to_owned(),
+            target,
+            source: basis_descriptor.effective_analyzer(),
+            basis_segments: basis_generation.segments.clone(),
+            basis_descriptor,
+            basis_generation,
+            basis: derived,
+            inner,
+            catch_up: None,
+            catch_up_uploads: Vec::new(),
+        }))
+    }
+
+    /// Bring `prepared` up to this basis (the current manifest): re-tokenize,
+    /// with the new analyzer, every delta flushed after the rebuild's own
+    /// basis (see [`PreparedTextReanalysis`]). A no-op when the catch-up
+    /// already covers them. Reads only the documents those deltas touch.
+    /// [`Error::Precondition`] when the index changed in a way no catch-up
+    /// can follow; the rebuild is then abandoned.
+    pub async fn catch_up_text_reanalysis(
+        &self,
+        prepared: &mut PreparedTextReanalysis,
+    ) -> Result<()> {
+        if prepared.caught_up_with(&self.base.manifest)? {
+            return Ok(());
+        }
+        let after = prepared.segments_after_basis(&self.base.manifest)?.to_vec();
+        if after.is_empty() {
+            prepared.catch_up = None;
+            return Ok(());
+        }
+        let Some(current) =
+            reanalyzed_manifest(&self.base.manifest, &prepared.index_name, prepared.target)
+        else {
+            return Err(Error::precondition(format!(
+                "abandoning text index `{}` re-analysis: the index disappeared",
+                prepared.index_name
+            )));
+        };
+        let current = LoadedManifest::new(
+            self.base.pointer.clone(),
+            self.base.pointer_etag.clone(),
+            self.base.pointer_version.clone(),
+            current,
+        );
+        let source_state = self
+            .base
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == prepared.index_name
+            })
+            .cloned()
+            .ok_or_else(|| Error::precondition("re-analysis catch-up: generation disappeared"))?;
+        let catch_up = search_lsm_compact::prepare_text_catch_up(
+            self.manifest_store.store().clone(),
+            self.manifest_store.paths(),
+            &prepared.basis,
+            &current,
+            &source_state,
+            &prepared.index_name,
+            prepared.basis_segments.len(),
+            prepared.source,
+        )
+        .await?;
+        if let Some(output) = catch_up.output_descriptor() {
+            prepared
+                .catch_up_uploads
+                .extend(crate::janitor::descriptor_object_paths(output));
+        }
+        tracing::info!(
+            index = %prepared.index_name,
+            deltas = after.len(),
+            touched_rows = catch_up.metrics.touched_rows,
+            prepare_millis = catch_up.metrics.prepare_millis,
+            "re-tokenized the deltas flushed during a full-text re-analysis"
+        );
+        prepared.catch_up = Some((catch_up, after));
+        Ok(())
+    }
+}
+
+/// Install half of the analyzer migration (see [`PreparedTextReanalysis`]).
+#[cfg(feature = "text-index")]
+pub(crate) async fn install_text_reanalysis(
+    manifest_store: &ManifestStore,
+    fence: &WriterFence,
+    current: &LoadedManifest,
+    prepared: PreparedTextReanalysis,
+) -> Result<CompactionOutcome> {
+    let name = prepared.index_name.as_str();
+    // Segments written since the basis hold postings of the old analyzer;
+    // only the catch-up delta built for exactly those may follow the base.
+    if !prepared.caught_up_with(&current.manifest)? {
+        return Err(Error::precondition(format!(
+            "abandoning text index `{name}` re-analysis install (basis v{}): deltas flushed \
+             in manifest v{} are not caught up yet",
+            prepared.inner.base_version, current.manifest.version
+        )));
+    }
+    let Some(derived) = reanalyzed_manifest(&current.manifest, name, prepared.target) else {
+        return Err(Error::precondition(format!(
+            "abandoning text index `{name}` re-analysis: the index generation disappeared"
+        )));
+    };
+    let derived = LoadedManifest::new(
+        current.pointer.clone(),
+        current.pointer_etag.clone(),
+        current.pointer_version.clone(),
+        derived,
+    );
+    let mut inner = prepared.inner;
+    if let Some((catch_up, _)) = prepared.catch_up {
+        inner.removed_ids.extend(catch_up.selection.selected_ids());
+        if let Some(output) = catch_up.output_descriptor() {
+            inner.new_descs.push(output.clone());
+        }
+        inner.search_compactions.push(catch_up);
+        inner.text_catch_up = true;
+    }
+    install_prepared(manifest_store, fence, &derived, inner).await
+}
+
 /// The physical Search-LSM consolidations one pass of `scope` plans.
 fn scoped_search_selections(
     manifest: &crate::manifest::Manifest,
@@ -706,6 +1118,7 @@ async fn prepare_node_layout_rewrite(
         unadoptable_search_markers: Vec::new(),
         search_lsm_activations: Vec::new(),
         replaced_search_lsm: Vec::new(),
+        text_catch_up: false,
     };
     Ok((prepared, migration))
 }
@@ -2371,6 +2784,7 @@ async fn prepare_leveled_scoped(
         unadoptable_search_markers,
         search_lsm_activations,
         replaced_search_lsm,
+        text_catch_up: false,
     })
 }
 
@@ -3211,7 +3625,13 @@ pub async fn install_prepared(
                 search.selection.captured_state.kind,
                 search.selection.captured_state.index_name.clone(),
             );
-            if !physical_keys.insert(key.clone()) {
+            // An analyzer migration's catch-up delta follows its base on the
+            // same generation and rebases onto the state the base produced.
+            let follows_base = !physical_keys.insert(key.clone());
+            if follows_base
+                && !(prepared.text_catch_up
+                    && search.selection.mode == search_lsm_compact::SearchCompactionMode::DeltaRun)
+            {
                 return Err(Error::invariant(
                     "prepared compaction contains duplicate physical Search-LSM plans",
                 ));
@@ -3251,11 +3671,24 @@ pub async fn install_prepared(
                         ))
                     })?,
             };
-            rebased_search_states.push(search_lsm_compact::rebase_prepared_search_compaction(
-                &current.manifest,
-                search,
-                &working,
-            )?);
+            let rebased = if follows_base {
+                let mut staged = current.manifest.clone();
+                for state in &mut staged.search_lsm {
+                    if state.kind == key.0 && state.index_name == key.1 {
+                        *state = working.clone();
+                    }
+                }
+                search_lsm_compact::rebase_prepared_search_compaction_with(
+                    &staged, search, &working, true,
+                )?
+            } else {
+                search_lsm_compact::rebase_prepared_search_compaction(
+                    &current.manifest,
+                    search,
+                    &working,
+                )?
+            };
+            rebased_search_states.push(rebased);
         }
     }
     if rebased_search_states.iter().any(|state| {
@@ -3667,6 +4100,97 @@ struct NodeSourceCursor {
     batches_decoded: usize,
     /// Total row count per the Parquet footer (bloom sizing upper bound).
     total_rows: u64,
+    /// Hands the pages of fully consumed row groups back to the kernel.
+    release: ConsumedPages,
+}
+
+/// Returns the pages of a sequentially scanned body to the kernel once the
+/// cursor has consumed them.
+///
+/// Compaction and base-build inputs are file-backed maps of whole SST bodies
+/// (see [`get_sst_body`]). Every page the scan touches stays resident until
+/// the body is dropped, so a corpus scan over a multi-GiB Nodes SST grew the
+/// process RSS by the SST size, and with it the container's memory charge,
+/// for the whole build. Each row group whose rows have all been consumed is
+/// advised out with `MADV_PAGEOUT`, which never changes the contents (a later
+/// touch faults the page in again) and is a no-op where unsupported.
+struct ConsumedPages {
+    body: Bytes,
+    /// `(rows up to and including the row group, byte end of the row group)`.
+    row_groups: Vec<(u64, usize)>,
+    next_group: usize,
+    rows_consumed: u64,
+    released_to: usize,
+}
+
+impl ConsumedPages {
+    fn new(body: Bytes, metadata: &parquet::file::metadata::ParquetMetaData) -> Self {
+        let mut rows = 0u64;
+        let mut row_groups = Vec::with_capacity(metadata.num_row_groups());
+        for group in metadata.row_groups() {
+            rows = rows.saturating_add(group.num_rows().max(0) as u64);
+            let end = group
+                .columns()
+                .iter()
+                .map(|column| {
+                    let (start, len) = column.byte_range();
+                    start.saturating_add(len)
+                })
+                .max()
+                .unwrap_or(0);
+            row_groups.push((rows, usize::try_from(end).unwrap_or(usize::MAX)));
+        }
+        Self {
+            body,
+            row_groups,
+            next_group: 0,
+            rows_consumed: 0,
+            released_to: 0,
+        }
+    }
+
+    /// Record `rows` more consumed rows and release the row groups they
+    /// complete.
+    fn consumed(&mut self, rows: usize) {
+        self.rows_consumed = self.rows_consumed.saturating_add(rows as u64);
+        let mut end = None;
+        while let Some(&(group_rows, group_end)) = self.row_groups.get(self.next_group) {
+            if group_rows > self.rows_consumed {
+                break;
+            }
+            end = Some(group_end.min(self.body.len()));
+            self.next_group += 1;
+        }
+        if let Some(end) = end {
+            self.release_to(end);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn release_to(&mut self, end: usize) {
+        // SAFETY: sysconf has no preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|page| page.is_power_of_two())
+            .unwrap_or(4096);
+        let base = self.body.as_ptr() as usize;
+        let start = (base + self.released_to).next_multiple_of(page);
+        let stop = (base + end) & !(page - 1);
+        if stop > start {
+            // SAFETY: [start, stop) lies inside the live mapping or
+            // allocation `self.body` keeps alive, and MADV_PAGEOUT only
+            // reclaims pages; their contents are unchanged on the next touch.
+            unsafe {
+                libc::madvise(start as *mut libc::c_void, stop - start, libc::MADV_PAGEOUT);
+            }
+            self.released_to = stop - base;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn release_to(&mut self, end: usize) {
+        self.released_to = end;
+    }
 }
 
 impl NodeSourceCursor {
@@ -3676,12 +4200,13 @@ impl NodeSourceCursor {
 
     fn open_with_batch_rows(label_def: &LabelDef, body: Bytes, batch_rows: usize) -> Result<Self> {
         let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
-            body,
+            body.clone(),
             ArrowReaderOptions::new().with_page_index(true),
         )
         .map_err(|e| Error::invariant(format!("parquet open: {e}")))?;
         crate::sst::nodes::check_node_schema(builder.schema(), label_def)?;
         let total_rows = builder.metadata().file_metadata().num_rows().max(0) as u64;
+        let release = ConsumedPages::new(body, builder.metadata());
         let batches = builder
             .with_batch_size(batch_rows.max(1))
             .build()
@@ -3694,6 +4219,7 @@ impl NodeSourceCursor {
             started: false,
             batches_decoded: 0,
             total_rows,
+            release,
         })
     }
 
@@ -3715,6 +4241,7 @@ impl NodeSourceCursor {
                     self.current = Some(view.key(self.row)?);
                     return Ok(());
                 }
+                self.release.consumed(view.len());
                 self.view = None;
                 self.row = 0;
             }
@@ -5007,6 +5534,7 @@ impl TextMemberCollector {
     ) -> Result<Self> {
         let mut options = crate::sst::text::ExternalTextIndexBuildOptions::from_env()?;
         options.memory_budget_bytes = memory_budget_bytes;
+        options.analyzer = desc.effective_analyzer();
         Ok(Self {
             label_id: label_dict.id(&desc.label).map(|lid| lid.0),
             desc,
@@ -6157,6 +6685,7 @@ mod tests {
             unadoptable_search_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
+            text_catch_up: false,
         };
         let installed = install_prepared(&ms, &fence, &current, prepared)
             .await
@@ -6231,6 +6760,7 @@ mod tests {
             unadoptable_search_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
+            text_catch_up: false,
         };
 
         let mut concurrent_manifest = basis.manifest.next_version(fence.writer_id);
@@ -6302,6 +6832,7 @@ mod tests {
             unadoptable_search_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
+            text_catch_up: false,
         };
 
         let mut ddl_manifest = basis.manifest.next_version(fence.writer_id);
@@ -6362,6 +6893,7 @@ mod tests {
             unadoptable_search_markers: Vec::new(),
             search_lsm_activations: Vec::new(),
             replaced_search_lsm: Vec::new(),
+            text_catch_up: false,
         };
 
         let mut ddl_manifest = basis.manifest.next_version(fence.writer_id);
@@ -6921,7 +7453,11 @@ mod tests {
         };
         assert_eq!(
             winner.payload_fingerprint,
-            crate::sst::text::v4::text_v4_payload_fingerprint(&expected_payload).unwrap()
+            crate::sst::text::v4::text_v4_payload_fingerprint(
+                &expected_payload,
+                crate::text::TextAnalyzer::default()
+            )
+            .unwrap()
         );
 
         let empty_memtable = crate::memtable::MemtableSnapshot::empty();

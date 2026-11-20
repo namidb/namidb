@@ -5055,6 +5055,64 @@ impl<'mt> Snapshot<'mt> {
         let mut sorted_pending: Vec<[u8; 16]> = pending.iter().copied().collect();
         sorted_pending.sort_unstable();
         let sst_idxs: Vec<usize> = self.manifest.index.node_descriptors();
+        // Probe the SSTs' exact-record indexes concurrently: each probe walks
+        // its B+tree one level per round trip, so probing the SSTs one after
+        // the other multiplied a cold hydration's latency by the SST count.
+        // At most `EXACT_PROBE_FAN_OUT` run at once, so a deep L0 backlog does
+        // not turn one hydration into a burst of requests. Every overlapping
+        // SST is probed either way (the newest LSN wins across all of them);
+        // the results are consumed below in the original SST order.
+        const EXACT_PROBE_FAN_OUT: usize = 8;
+        let mut exact_probes: HashMap<usize, Result<_>> = {
+            let probes = sst_idxs.iter().filter_map(|&idx| {
+                let desc = &self.manifest.manifest.ssts[idx];
+                if !pending
+                    .iter()
+                    .any(|id| id >= &desc.min_key && id <= &desc.max_key)
+                    || !crate::manifest::node_locator_has_exact_records(desc)
+                {
+                    return None;
+                }
+                let locator = desc
+                    .node_locator
+                    .as_ref()
+                    .filter(|locator| locator.entry_count == desc.row_count)?;
+                let locator_absolute = format!(
+                    "{}/{}",
+                    self.paths.namespace_prefix().as_ref(),
+                    locator.path
+                );
+                let sorted_pending = &sorted_pending;
+                Some(async move {
+                    let probed = match self
+                        .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
+                        .await
+                    {
+                        Ok(source) => {
+                            crate::sst::paged_index::probe_node_records_from_source(
+                                &source,
+                                sorted_pending,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    (idx, probed)
+                })
+            });
+            let mut probes = probes.collect::<Vec<_>>().into_iter();
+            let mut probed = HashMap::new();
+            loop {
+                let wave = probes
+                    .by_ref()
+                    .take(EXACT_PROBE_FAN_OUT)
+                    .collect::<Vec<_>>();
+                if wave.is_empty() {
+                    break probed;
+                }
+                probed.extend(futures::future::join_all(wave).await);
+            }
+        };
         for idx in sst_idxs {
             let desc = &self.manifest.manifest.ssts[idx];
             // Cheap pre-filter: skip the SST if its [min_key, max_key]
@@ -5082,24 +5140,9 @@ impl<'mt> Snapshot<'mt> {
                     .as_ref()
                     .filter(|locator| locator.entry_count == desc.row_count)
                 {
-                    let locator_absolute = format!(
-                        "{}/{}",
-                        self.paths.namespace_prefix().as_ref(),
-                        locator.path
-                    );
-                    let probed = match self
-                        .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
-                        .await
-                    {
-                        Ok(source) => {
-                            crate::sst::paged_index::probe_node_records_from_source(
-                                &source,
-                                &sorted_pending,
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error),
-                    };
+                    let probed = exact_probes.remove(&idx).ok_or_else(|| {
+                        Error::invariant("exact node-record probe was not scheduled")
+                    })?;
                     match probed {
                         Ok((records, stats)) if stats.index_entries == locator.entry_count => {
                             let decoded = records
@@ -10691,13 +10734,20 @@ impl<'mt> Snapshot<'mt> {
         &self,
         index_name: &str,
         label: &str,
+        analyzer: crate::text::TextAnalyzer,
     ) -> Result<Option<Vec<[u8; 16]>>> {
+        // The index answers only queries analyzed the way it was built: a
+        // query parsed with another analyzer takes the exact flat scan.
         if !self
             .manifest
             .manifest
             .text_indexes
             .iter()
-            .any(|descriptor| descriptor.name == index_name && descriptor.label == label)
+            .any(|descriptor| {
+                descriptor.name == index_name
+                    && descriptor.label == label
+                    && descriptor.effective_analyzer() == analyzer
+            })
         {
             return Ok(None);
         }
@@ -10764,7 +10814,10 @@ impl<'mt> Snapshot<'mt> {
             crate::sst::text::v4::TextV4GlobalStats,
         )>,
     > {
-        let Some(dirty) = self.text_index_dirty_ids(index_name, label).await? else {
+        let Some(dirty) = self
+            .text_index_dirty_ids(index_name, label, query.analyzer)
+            .await?
+        else {
             return Ok(None);
         };
         match search_lsm_read::text_query_stats(self, index_name, query, &dirty).await {
@@ -10783,7 +10836,10 @@ impl<'mt> Snapshot<'mt> {
         query: &crate::text::TextQuery,
         k: Option<usize>,
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
-        let Some(dirty) = self.text_index_dirty_ids(index_name, label).await? else {
+        let Some(dirty) = self
+            .text_index_dirty_ids(index_name, label, query.analyzer)
+            .await?
+        else {
             return Ok(None);
         };
         match search_lsm_read::text_search(self, index_name, query, k, &[], &dirty).await? {
@@ -10965,12 +11021,18 @@ impl<'mt> Snapshot<'mt> {
         k: Option<usize>,
         groups: &[(String, Vec<Value>)],
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
+        // The index answers only queries analyzed the way it was built: a
+        // query parsed with another analyzer takes the exact flat scan.
         if !self
             .manifest
             .manifest
             .text_indexes
             .iter()
-            .any(|descriptor| descriptor.name == index_name && descriptor.label == label)
+            .any(|descriptor| {
+                descriptor.name == index_name
+                    && descriptor.label == label
+                    && descriptor.effective_analyzer() == query.analyzer
+            })
         {
             return Ok(None);
         }
@@ -13619,6 +13681,26 @@ impl Drop for PinnedSnapshot {
     }
 }
 
+/// A retention hold on one manifest version (see [`SnapshotCell::pin_version`]).
+#[derive(Debug)]
+pub struct VersionPin {
+    registry: Arc<SnapshotRegistry>,
+    version: u64,
+}
+
+impl VersionPin {
+    /// The manifest version held.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl Drop for VersionPin {
+    fn drop(&mut self) {
+        self.registry.release(self.version);
+    }
+}
+
 impl PinnedSnapshot {
     /// Clone the shared `Arc` for callers that need to store or republish
     /// it. The clone is NOT separately registered; the horizon hold lives
@@ -13745,6 +13827,19 @@ impl SnapshotCell {
             .min_live()
             .map(|m| m.min(current))
             .unwrap_or(current)
+    }
+
+    /// Hold the retention horizon at or below `version` until the returned
+    /// pin drops, without retaining a snapshot (its memtable and caches).
+    /// For long background work that reads the objects of an older manifest,
+    /// such as a full-text re-analysis reading its basis documents.
+    pub fn pin_version(&self, version: u64) -> VersionPin {
+        let version = version.min(self.manifest_version());
+        self.registry.acquire(version);
+        VersionPin {
+            registry: Arc::clone(&self.registry),
+            version,
+        }
     }
 
     /// Whether any [`PinnedSnapshot`] from this cell is still alive.

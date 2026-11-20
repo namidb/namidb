@@ -56,6 +56,9 @@ pub struct ExternalTextIndexBuildOptions {
     /// Directory for anonymous temporary files. `None` prefers `/var/tmp` on
     /// Unix and otherwise uses the platform's secure tempfile directory.
     pub spool_directory: Option<PathBuf>,
+    /// Analyzer of the index this body is built for. V3 bodies predate
+    /// selectable analyzers, so the default is the lowercase-only one.
+    pub analyzer: crate::text::TextAnalyzer,
 }
 
 impl ExternalTextIndexBuildOptions {
@@ -91,6 +94,8 @@ impl ExternalTextIndexBuildOptions {
         Ok(Self {
             memory_budget_bytes,
             spool_directory,
+            // Callers building for a descriptor set its analyzer.
+            analyzer: crate::text::TextAnalyzer::Exact,
         })
     }
 
@@ -99,6 +104,7 @@ impl ExternalTextIndexBuildOptions {
         Self {
             memory_budget_bytes,
             spool_directory: Some(spool_directory.to_path_buf()),
+            analyzer: crate::text::TextAnalyzer::Exact,
         }
     }
 }
@@ -108,6 +114,7 @@ impl Default for ExternalTextIndexBuildOptions {
         Self {
             memory_budget_bytes: DEFAULT_INDEX_BUILD_MEMORY_BYTES,
             spool_directory: None,
+            analyzer: crate::text::TextAnalyzer::Exact,
         }
     }
 }
@@ -381,7 +388,8 @@ impl TextIndexExternalBuilder {
             return Err(Error::invariant("text v3 document count exceeds u32"));
         }
 
-        let token_count = count_tokens(&text)?;
+        let analyzer = self.options.analyzer;
+        let token_count = count_tokens(analyzer, &text)?;
         let doc_len = u32::try_from(token_count)
             .map_err(|_| Error::invariant("text v3 document token count exceeds u32"))?;
         let new_total_len = self
@@ -394,7 +402,7 @@ impl TextIndexExternalBuilder {
         self.output.write_all(&doc_len.to_le_bytes())?;
 
         let mut emitted = 0u64;
-        for_each_token(&text, |term| {
+        for_each_token(analyzer, &text, |term| {
             let position = u32::try_from(emitted)
                 .map_err(|_| Error::invariant("text v3 token position exceeds u32"))?;
             self.push_occurrence(Occurrence {
@@ -1646,9 +1654,9 @@ fn read_u32_io(reader: &mut impl Read) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn count_tokens(text: &str) -> Result<u64> {
+fn count_tokens(analyzer: crate::text::TextAnalyzer, text: &str) -> Result<u64> {
     let mut count = 0u64;
-    for_each_token(text, |_| {
+    for_each_token(analyzer, text, |_| {
         count = count
             .checked_add(1)
             .ok_or_else(|| Error::invariant("text token count overflows u64"))?;
@@ -1657,8 +1665,23 @@ fn count_tokens(text: &str) -> Result<u64> {
     Ok(count)
 }
 
-/// Streaming equivalent of `crate::text::tokenize`.
-fn for_each_token(mut text: &str, mut emit: impl FnMut(String) -> Result<()>) -> Result<()> {
+/// Streaming equivalent of `crate::text::tokenize_with(analyzer, …)`.
+fn for_each_token(
+    analyzer: crate::text::TextAnalyzer,
+    text: &str,
+    mut emit: impl FnMut(String) -> Result<()>,
+) -> Result<()> {
+    match analyzer {
+        crate::text::TextAnalyzer::Exact => for_each_exact_token(text, emit),
+        crate::text::TextAnalyzer::Folded => {
+            crate::text::try_visit_tokens_with(analyzer, text, |token| emit(token.to_owned()))
+                .map(|_| ())
+        }
+    }
+}
+
+/// Streaming equivalent of `crate::text::tokenize_with(TextAnalyzer::Exact, …)`.
+fn for_each_exact_token(mut text: &str, mut emit: impl FnMut(String) -> Result<()>) -> Result<()> {
     while !text.is_empty() {
         let Some((start, first)) = text.char_indices().find(|(_, ch)| ch.is_alphanumeric()) else {
             break;
@@ -1719,7 +1742,7 @@ mod tests {
     use super::*;
     use crate::sst::text::run_merge::MERGE_FAN_IN;
     use crate::sst::text::{build_body, TextIndex};
-    use crate::text::{parse_query, tokenize};
+    use crate::text::parse_query;
 
     fn id(value: u16) -> [u8; 16] {
         let mut id = [0u8; 16];
@@ -1768,13 +1791,22 @@ mod tests {
             "한글테스트 mixed_42",
             "a 中 b",
         ] {
-            let mut actual = Vec::new();
-            for_each_token(text, |token| {
-                actual.push(token);
-                Ok(())
-            })
-            .unwrap();
-            assert_eq!(actual, tokenize(text), "{text:?}");
+            for analyzer in [
+                crate::text::TextAnalyzer::Exact,
+                crate::text::TextAnalyzer::Folded,
+            ] {
+                let mut actual = Vec::new();
+                for_each_token(analyzer, text, |token| {
+                    actual.push(token);
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(
+                    actual,
+                    crate::text::tokenize_with(analyzer, text),
+                    "{text:?} {analyzer}"
+                );
+            }
         }
     }
 

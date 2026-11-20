@@ -2528,6 +2528,28 @@ impl WriterSession {
         Ok(outcome)
     }
 
+    /// Install a full-text index rebuilt with the folding analyzer (see
+    /// [`crate::PreparedTextReanalysis`]). Refused with
+    /// [`Error::Precondition`], leaving `self` untouched, when the index's
+    /// definition or segments moved since the prepare; the caller retries.
+    #[cfg(feature = "text-index")]
+    pub async fn install_text_reanalysis(
+        &mut self,
+        prepared: crate::PreparedTextReanalysis,
+    ) -> Result<CompactionOutcome> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        let outcome = crate::compact::install_text_reanalysis(
+            &self.manifest_store,
+            &self.fence,
+            &self.current,
+            prepared,
+        )
+        .await?;
+        self.current = outcome.committed.clone();
+        self.prune_sst_cache();
+        Ok(outcome)
+    }
+
     /// Drop every `SstCache` tier (raw bodies, row groups, metadata, decoded
     /// streams/readers, property indexes, blooms, vector and text indexes) for
     /// immutable objects the current manifest no longer references.
