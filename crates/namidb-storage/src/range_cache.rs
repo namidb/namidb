@@ -38,7 +38,7 @@ use foyer::{
     HybridCacheBuilder, HybridCachePolicy, RecoverMode, Source,
 };
 use fs2::FileExt as _;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt};
 use thiserror::Error;
@@ -2050,6 +2050,13 @@ impl PinnedObjectRangeSource {
                             .filter(|bytes| bytes.len() as u64 == span.end - span.start),
                         _ => None,
                     };
+                    if cached_span.is_none() {
+                        if let (Some(cache), Some(token)) = (&self.range_cache, &token) {
+                            return self
+                                .prime_span_cached(cache, path, token, members, span, persist_spans)
+                                .await;
+                        }
+                    }
                     let wire = match cached_span {
                         Some(bytes) => bytes,
                         None => {
@@ -2087,6 +2094,93 @@ impl PinnedObjectRangeSource {
             .try_collect()
             .await?;
         Ok(spans.into_iter().flatten().collect())
+    }
+
+    /// One span of [`Self::prime_blocks`] through the range cache. Every
+    /// block goes through the cache's single-flight read, and the fetch
+    /// behind each miss is one shared GET of the whole span, issued at most
+    /// once and only if some block actually misses. A block the cache
+    /// already holds (in RAM or on disk) costs nothing, and a block another
+    /// caller is fetching (a query, or a concurrent warm-up of the same
+    /// base) is awaited instead of read a second time. With `persist_span`
+    /// the span is also kept as one entry of its own once it is read (see
+    /// [`Self::prime_blocks_persistent`]).
+    async fn prime_span_cached(
+        &self,
+        cache: &ImmutableRangeCache,
+        path: &str,
+        token: &str,
+        members: &[Range<u64>],
+        span: Range<u64>,
+        persist_span: bool,
+    ) -> crate::error::Result<Vec<Bytes>> {
+        let wire = {
+            let source = self.clone();
+            let span = span.clone();
+            let persist = persist_span.then(|| (cache.clone(), path.to_owned(), token.to_owned()));
+            async move {
+                let wire = source.direct_read(span.clone()).await.map_err(Arc::new)?;
+                if let Some((cache, path, token)) = persist {
+                    // Refused by admission: only a later miss.
+                    let _ = cache.insert(&path, &token, span, wire.clone());
+                }
+                Ok::<_, Arc<crate::error::Error>>(wire)
+            }
+            .boxed()
+            .shared()
+        };
+        let slice = |wire: &Bytes, block: &Range<u64>| {
+            let start =
+                usize::try_from(block.start - span.start).expect("validated range fits usize");
+            let end = usize::try_from(block.end - span.start).expect("validated range fits usize");
+            Bytes::copy_from_slice(&wire[start..end])
+        };
+        let span = &span;
+        let slice = &slice;
+        let reads = members.iter().map(|block| {
+            let wire = wire.clone();
+            let span_start = span.start;
+            async move {
+                if block.is_empty() || block.end - block.start > MAX_BLOCK_READ_BYTES {
+                    let bytes = wire.await.map_err(|error| {
+                        crate::error::Error::ObjectStore(object_store::Error::Generic {
+                            store: "pinned-object-range",
+                            source: Box::new(error),
+                        })
+                    })?;
+                    return Ok(slice(&bytes, block));
+                }
+                let fetch_block = block.clone();
+                let fetched = cache
+                    .get_or_fetch(path, token, block.clone(), move || async move {
+                        let bytes = wire.await?;
+                        let start = usize::try_from(fetch_block.start - span_start)
+                            .expect("validated range fits usize");
+                        let end = usize::try_from(fetch_block.end - span_start)
+                            .expect("validated range fits usize");
+                        Ok::<_, Arc<crate::error::Error>>(Bytes::copy_from_slice(
+                            &bytes[start..end],
+                        ))
+                    })
+                    .await;
+                match fetched {
+                    Ok(bytes) => Ok(bytes),
+                    Err(error) if error.is_local_failure() => {
+                        tracing::warn!(
+                            path = %self.meta.location,
+                            start = block.start,
+                            end = block.end,
+                            error = %error,
+                            "local range-cache failure while priming; reading the span"
+                        );
+                        let bytes = self.direct_read(span.clone()).await?;
+                        Ok(slice(&bytes, block))
+                    }
+                    Err(error) => Err(pinned_range_cache_error(&self.meta.location, error)),
+                }
+            }
+        });
+        futures::future::try_join_all(reads).await
     }
 
     /// Many small blocks of this object, in any order and possibly repeated:
@@ -3049,6 +3143,248 @@ mod tests {
         assert!(after <= 3, "misses go out as spans: {after}");
         source.read_blocks_coalesced(&blocks).await.unwrap();
         assert_eq!(source.stats().remote_requests, after, "all blocks now hit");
+    }
+
+    /// A store that counts data GETs and holds each one for `delay`, so
+    /// concurrent readers of the same cold range overlap in flight.
+    #[derive(Debug)]
+    struct SlowCountingStore {
+        inner: Arc<dyn ObjectStore>,
+        delay: Duration,
+        gets: AtomicUsize,
+    }
+
+    impl fmt::Display for SlowCountingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "SlowCountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for SlowCountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if !options.head {
+                self.gets.fetch_add(1, AtomicOrdering::Relaxed);
+                tokio::time::sleep(self.delay).await;
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+    }
+
+    /// One object, a shared cache, and a slow counting store in front.
+    async fn slow_source_fixture(
+        delay: Duration,
+    ) -> (
+        Arc<SlowCountingStore>,
+        ImmutableRangeCache,
+        ObjectMeta,
+        Bytes,
+    ) {
+        let mut config = memory_config(32 * 1024 * 1024);
+        config.page_size_bytes = 64 * 1024;
+        let cache = ImmutableRangeCache::open(config).await.unwrap();
+        let store = Arc::new(SlowCountingStore {
+            inner: Arc::new(InMemory::new()),
+            delay,
+            gets: AtomicUsize::new(0),
+        });
+        let location = ObjectPath::from("objects/shared-cold");
+        let body = Bytes::from(
+            (0..4 * 1024 * 1024u32)
+                .map(|value| (value % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        store
+            .put(&location, PutPayload::from(body.clone()))
+            .await
+            .unwrap();
+        let meta = store.head(&location).await.unwrap();
+        (store, cache, meta, body)
+    }
+
+    /// Concurrent queries that miss the same cold blocks, pages or fine rows
+    /// (each through its own pinned source, as separate statements do) pay
+    /// one GET per distinct cache entry, not one per caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_reads_pay_one_get_per_entry() {
+        const CALLERS: usize = 16;
+        let blocks: Vec<Range<u64>> = (0..32u64)
+            .map(|i| 100_000 + i * 20_000..100_000 + i * 20_000 + 12_345)
+            .collect();
+        for (granularity, expected) in [
+            (ReadGranularity::Block, blocks.len()),
+            // 100_000..732_345 spans 64 KiB pages 1..=11.
+            (ReadGranularity::Pages, 11),
+            // Each 12 KiB block touches one or two 16 KiB fine pages.
+            (ReadGranularity::Fine, {
+                let mut pages: Vec<u64> = blocks
+                    .iter()
+                    .flat_map(|b| {
+                        (b.start / FINE_RANGE_PAGE_BYTES)..=((b.end - 1) / FINE_RANGE_PAGE_BYTES)
+                    })
+                    .collect();
+                pages.dedup();
+                pages.len()
+            }),
+        ] {
+            let (store, cache, meta, body) = slow_source_fixture(Duration::from_millis(30)).await;
+            let readers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    let source = PinnedObjectRangeSource::from_meta_with_cache(
+                        store.clone() as Arc<dyn ObjectStore>,
+                        meta.clone(),
+                        Some(cache.clone()),
+                    )
+                    .unwrap();
+                    let blocks = blocks.clone();
+                    tokio::spawn(async move {
+                        source.read_ranges_as(&blocks, granularity).await.unwrap()
+                    })
+                })
+                .collect();
+            for reader in readers {
+                let read = reader.await.unwrap();
+                for (range, bytes) in blocks.iter().zip(&read) {
+                    assert_eq!(bytes, &body.slice(range.start as usize..range.end as usize));
+                }
+            }
+            assert_eq!(
+                store.gets.load(AtomicOrdering::Relaxed),
+                expected,
+                "{granularity:?}: {CALLERS} concurrent callers"
+            );
+        }
+    }
+
+    /// The warm-up's span reads skip blocks the cache already holds, and
+    /// concurrent warm-ups (or a warm-up racing a query) share the fetch of
+    /// each block instead of each issuing its own span GET.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn primed_blocks_share_in_flight_fetches_and_skip_cached_blocks() {
+        const CALLERS: usize = 8;
+        let blocks: Vec<Range<u64>> = (0..64u64)
+            .map(|i| 200_000 + i * 3_072..200_000 + (i + 1) * 3_072)
+            .collect();
+        let source_of =
+            |store: &Arc<SlowCountingStore>, cache: &ImmutableRangeCache, meta: &ObjectMeta| {
+                PinnedObjectRangeSource::from_meta_with_cache(
+                    store.clone() as Arc<dyn ObjectStore>,
+                    meta.clone(),
+                    Some(cache.clone()),
+                )
+                .unwrap()
+            };
+
+        // Overlapping primes of the same cold blocks: the others start once
+        // the first one's span GET is in flight. One span GET in all.
+        let (store, cache, meta, body) = slow_source_fixture(Duration::from_millis(200)).await;
+        let spawn_prime = || {
+            let source = source_of(&store, &cache, &meta);
+            let blocks = blocks.clone();
+            tokio::spawn(async move { source.prime_blocks(&blocks, 1024 * 1024, 4).await })
+        };
+        let mut primes = vec![spawn_prime()];
+        while store.gets.load(AtomicOrdering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The GET can start (on another worker) before the first prime has
+        // registered its last blocks; give it time to, well inside the GET.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        primes.extend((1..CALLERS).map(|_| spawn_prime()));
+        for prime in primes {
+            let primed = prime.await.unwrap().unwrap();
+            for (range, bytes) in blocks.iter().zip(&primed) {
+                assert_eq!(bytes, &body.slice(range.start as usize..range.end as usize));
+            }
+        }
+        let concurrent_primes = store.gets.load(AtomicOrdering::Relaxed);
+
+        // Priming blocks that are already cached reads nothing.
+        source_of(&store, &cache, &meta)
+            .prime_blocks(&blocks, 1024 * 1024, 4)
+            .await
+            .unwrap();
+        let warm_prime = store.gets.load(AtomicOrdering::Relaxed) - concurrent_primes;
+
+        // A query over the same cold blocks while the warm-up's GET is in
+        // flight.
+        let (store2, cache2, meta2, _) = slow_source_fixture(Duration::from_millis(200)).await;
+        let prime = {
+            let source = source_of(&store2, &cache2, &meta2);
+            let blocks = blocks.clone();
+            tokio::spawn(async move { source.prime_blocks(&blocks, 1024 * 1024, 4).await })
+        };
+        while store2.gets.load(AtomicOrdering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let query = {
+            let source = source_of(&store2, &cache2, &meta2);
+            let blocks = blocks.clone();
+            tokio::spawn(
+                async move { source.read_ranges_as(&blocks, ReadGranularity::Block).await },
+            )
+        };
+        prime.await.unwrap().unwrap();
+        query.await.unwrap().unwrap();
+        let racing = store2.gets.load(AtomicOrdering::Relaxed);
+
+        assert_eq!(
+            (concurrent_primes, warm_prime, racing),
+            (1, 0, 1),
+            "(concurrent primes, prime of cached blocks, prime racing a query)"
+        );
     }
 
     #[tokio::test]

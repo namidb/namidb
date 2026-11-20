@@ -255,6 +255,41 @@ crates.io release will establish and document that API explicitly.
 
 ### Fixed
 
+- **Concurrent vector searches no longer run one at a time.** A vector
+  search sizes how many pages it fetches per round trip (navigation batches
+  and rerank waves, up to 64 pages) from the shared search workspace, and
+  reserves that much for its whole run. It sized them against the entire
+  pool, so one search reserved nearly all of the default 256 MiB pool of a
+  2-CPU server, and 258 MiB (a quarter, once the 64-page cap applied) of the
+  1 GiB pool on 8 CPUs. Every other vector or hybrid search queued behind
+  it while the CPUs were idle. Most reservations waited (78-81% on 2
+  CPUs, 43% on 8), and an 8-CPU server used under two of its cores.
+  Batches beyond one page are now sized against one search's share of the
+  pool: the capacity divided by the default read concurrency (two per CPU,
+  at least four), so every admitted read can hold its share at once. A
+  search whose single-page plan is larger than its share still runs with
+  that plan, within the whole pool, as before. Only the number of round
+  trips changes; hits, order and scores are identical. With
+  `bench/mixed_concurrency.py` on a busy machine (so the numbers are
+  noisy): on 2 CPUs the mixed workload went from 12.7 to 17.0 q/s at C=4
+  and from 11.3 to 19.7 q/s at C=16, and vector-only from 4.4 to 6.9 q/s
+  at C=4 and from 4.4 to 7.0 q/s at C=16 (medians of three alternating
+  runs), with no reservation waiting (78% before). On 8 CPUs the mixed
+  workload went from 21.6 to 30-44 q/s at C=16, from 24.4 to 38-43 q/s at
+  C=32 and from 18.5 to 41-44 q/s at C=64. Single-stream throughput and
+  per-shape latency are unchanged within the noise.
+- **Warm-up span reads share in-flight fetches and skip cached blocks.**
+  The open-time warm-ups (the vector code tier, and the coalesced reads of
+  the full-text metadata) read their blocks in large spans, and a cold span
+  bypassed the range cache's single-flight: overlapping warm-ups of one
+  segment each issued their own span GET, a query missing the same blocks
+  meanwhile fetched each one separately, and the vector code tier
+  downloaded blocks already cached as blocks again. Each block now goes
+  through the cache's single-flight read, and its fetch is one shared GET
+  of the span (kept as a span entry on the NVMe tier as before), issued
+  only if a block actually misses. In the tests: overlapping warm-ups of
+  one segment went from 8 span GETs to 1, a warm-up of cached blocks from 1
+  to 0, and a warm-up racing a query over 64 blocks from 65 GETs to 1.
 - **`CREATE INDEX` and uniqueness constraints no longer stop search on the
   label.** An equality index or constraint on a Bool/String property of a
   label with a vector or full-text index changes the indexes' native-filter
