@@ -8,10 +8,12 @@
 //!
 //! This replays the sequence that left an index stuck — a V3 base, an FT4
 //! delta, a bulk `SET` of non-indexed scalars, a `CREATE INDEX` on a string
-//! property of the same label (which retires the text generation), and a
-//! restart — and checks at every step that searches are served natively
-//! unless the generation is really gone (then they fail fast, naming the
-//! index), that `SHOW INDEXES` says so truthfully, and that after the
+//! property of the same label (which changes the text index's native-filter
+//! set; since 3.5.2 it re-signs the generation in place, which keeps
+//! serving), and a restart — and checks at every step that searches are
+//! served natively unless the generation is really gone (then they fail
+//! fast, naming the index), that `SHOW INDEXES` says so truthfully, and that
+//! after the
 //! restart every index is ONLINE on an FT4 base within bounded time, with
 //! the same answers as before.
 #![cfg(feature = "text-index")]
@@ -530,9 +532,10 @@ async fn a_legacy_full_text_base_keeps_serving_through_the_incident_sequence() {
     );
 
     // Step 3: an equality index on a string property of the label changes the
-    // text index's native-filter catalog and retires its generation. While
-    // it is gone the searches on it must fail fast (or answer within the
-    // budget), never wait for the query timeout; the other index is unaffected.
+    // text index's native-filter catalog. The generation is re-signed in
+    // place and keeps serving every search with the same answers (a filter
+    // on the new property is applied as a residual until the background
+    // rebuild adds it); SHOW INDEXES keeps it ONLINE.
     let (status, body) = cypher(
         &base,
         "CREATE INDEX art_cat FOR (a:Article) ON (a.cat)",
@@ -542,7 +545,7 @@ async fn a_legacy_full_text_base_keeps_serving_through_the_incident_sequence() {
     assert_eq!(status, 200, "{body}");
     for round in 0..8 {
         let answers = searches_match_show(&base, &format!("after CREATE INDEX #{round}")).await;
-        assert_eq!(answers[6..], before[6..], "note_ft is untouched");
+        assert_eq!(answers, before, "every index keeps serving");
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
@@ -557,12 +560,11 @@ async fn a_legacy_full_text_base_keeps_serving_through_the_incident_sequence() {
         before
     );
 
-    // Step 5: the same sequence, restarted while the retired generation has
-    // not been rebuilt yet (the schema change committed, no compaction ran
-    // since). The restarted server must rebuild it on its own, failing
-    // searches on it fast meanwhile, and end ONLINE on FT4 bases with the
-    // same answers (up to the order of equal scores: node ids differ in this
-    // second store).
+    // Step 5: the same sequence, restarted while the filter rebuild has not
+    // run yet (the schema change committed, no compaction ran since). The
+    // restarted server must rebuild it on its own, serving meanwhile, and end
+    // ONLINE on FT4 bases with the same answers (up to the order of equal
+    // scores: node ids differ in this second store).
     let dir = tempfile::tempdir().unwrap();
     let store_uri = format!("file://{}?ns={NS}", dir.path().display());
     seed_legacy_store(&store_uri).await;
@@ -581,13 +583,17 @@ async fn a_legacy_full_text_base_keeps_serving_through_the_incident_sequence() {
     );
     assert_eq!(
         shown.state,
-        namidb_storage::search_progress::IndexState::Building,
-        "the schema change retires the full-text generation"
+        namidb_storage::search_progress::IndexState::Online,
+        "the schema change keeps the full-text generation serving"
+    );
+    assert!(
+        shown.migration_percent.is_some(),
+        "and schedules its rebuild"
     );
     drop(writer);
     let manifests = ManifestStore::new(store, paths);
     let base = boot(store_uri, Some(Duration::from_secs(1))).await;
-    let after = until_online_on_ft4(&base, &manifests, "restart while retired").await;
+    let after = until_online_on_ft4(&base, &manifests, "restart before the rebuild").await;
     assert_eq!(after.len(), before.len());
     for (search, (left, right)) in searches().iter().zip(before.iter().zip(&after)) {
         let scores = |answer: &Answer| {

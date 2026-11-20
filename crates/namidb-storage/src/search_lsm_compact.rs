@@ -572,6 +572,7 @@ fn current_live_count(state: &SearchLsmState) -> Result<u64> {
 }
 
 fn base_rebuild_needed(
+    manifest: &Manifest,
     state: &SearchLsmState,
     descriptors: &[SstDescriptor],
     policy: SearchCompactionPolicy,
@@ -596,6 +597,14 @@ fn base_rebuild_needed(
     if crate::search_lsm::legacy_base_migration_due(state)
         || crate::search_lsm::segment_set_fallback(state).is_some()
     {
+        return Ok(true);
+    }
+    // A schema DDL changed the label's native-filter set and re-signed the
+    // generation in place: it serves meanwhile, without a native filter on
+    // what some segment lacks. The rebuilt base carries every catalog
+    // filter (built from the node corpus, never folded from segments that
+    // lack one), so this fires once per change.
+    if crate::search_lsm::filter_rebuild_due(manifest, state) {
         return Ok(true);
     }
     let has_delta = state
@@ -772,7 +781,7 @@ pub(super) fn select_search_compactions(
         } else {
             nodes_bytes
         };
-        let rebuild_base = base_rebuild_needed(state, &descriptors, policy)?
+        let rebuild_base = base_rebuild_needed(manifest, state, &descriptors, policy)?
             || vector_base_rebuild_due(
                 state,
                 &descriptors,
@@ -1429,6 +1438,28 @@ pub(super) fn rebase_prepared_search_compaction_with(
             segments.extend_from_slice(&current.segments[selected_len..]);
             rebased.segments = segments;
             rebased.base_frontier = prepared.output.as_ref().map(|_| captured.next_event_seq);
+            // A base is built with every catalog filter (a fold only from
+            // segments that carry them all), so a catalog filter missing
+            // from it was omitted over the distinct cap: remember it, or
+            // `filter_rebuild_due` would ask for this rebuild again.
+            rebased.filters_omitted_over_cap = match &prepared.output {
+                Some(output) => crate::search_lsm::catalog_native_filter_properties(
+                    manifest,
+                    rebased.kind,
+                    &rebased.index_name,
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|property| {
+                    output
+                        .segment
+                        .complete_filter_properties
+                        .binary_search(property)
+                        .is_err()
+                })
+                .collect(),
+                None => Vec::new(),
+            };
             let mut proven_empty = Vec::new();
             if prepared.output.is_none() {
                 proven_empty.extend(selection.selected_event_ranges.iter().copied());
@@ -1747,8 +1778,27 @@ fn vector_segment_merge_supported(
 }
 
 #[cfg(feature = "text-index")]
-fn segment_merge_supported(selection: &SearchCompactionSelection) -> bool {
+fn segment_merge_supported(manifest: &Manifest, selection: &SearchCompactionSelection) -> bool {
     let selected = &selection.captured_state.segments[selection.selected_segment_start..];
+    // A base folded from segments keeps only the filters they all carry; a
+    // base owed a filter some segment lacks is rebuilt from the nodes.
+    let filters_complete = || {
+        crate::search_lsm::catalog_native_filter_properties(
+            manifest,
+            SearchLsmKind::Text,
+            &selection.captured_state.index_name,
+        )
+        .is_some_and(|filters| {
+            selected.iter().all(|segment| {
+                filters.iter().all(|property| {
+                    segment
+                        .complete_filter_properties
+                        .binary_search(property)
+                        .is_ok()
+                })
+            })
+        })
+    };
     selection.captured_state.kind == SearchLsmKind::Text
         && (selection.captured_state.status == SearchLsmStatus::Active
             || selection.mode == SearchCompactionMode::DeltaRun)
@@ -1763,7 +1813,9 @@ fn segment_merge_supported(selection: &SearchCompactionSelection) -> bool {
             // generation whose events do not yet account for every Nodes SST
             // (no base) needs the corpus scan.
             SearchCompactionMode::BasePrefix => {
-                selection.selected_segment_start == 0 && selected[0].role == SearchSegmentRole::Base
+                selection.selected_segment_start == 0
+                    && selected[0].role == SearchSegmentRole::Base
+                    && filters_complete()
             }
         }
 }
@@ -2977,9 +3029,10 @@ async fn prepare_search_compactions_with(
     let _ = text_segment_merge;
     #[cfg(feature = "text-index")]
     let base_selections = {
-        let (merged, mut scanned): (Vec<_>, Vec<_>) = base_selections
-            .into_iter()
-            .partition(|selection| text_segment_merge && segment_merge_supported(selection));
+        let (merged, mut scanned): (Vec<_>, Vec<_>) =
+            base_selections.into_iter().partition(|selection| {
+                text_segment_merge && segment_merge_supported(manifest, selection)
+            });
         for selection in merged {
             match build_text_segment_merge(store.clone(), paths, base, selection.clone()).await {
                 Ok(merged) => built.push(merged),
@@ -3180,7 +3233,7 @@ async fn build_delta_run_compaction(
         SearchLsmKind::Text => {
             #[cfg(feature = "text-index")]
             {
-                if segment_merge_supported(&selection) {
+                if segment_merge_supported(&base.manifest, &selection) {
                     match build_text_segment_merge(store.clone(), paths, base, selection.clone())
                         .await
                     {
@@ -4993,6 +5046,7 @@ mod tests {
             coverage,
             compat_barrier_sst_id: Some(barrier),
             equal_lsn_conflict_count: 0,
+            filters_omitted_over_cap: Vec::new(),
         };
         let barrier_body = crate::search_lsm::encode_search_barrier(&state).unwrap();
         manifest.ssts.push(search_barrier_descriptor(
@@ -5170,6 +5224,7 @@ mod tests {
             coverage,
             compat_barrier_sst_id: Some(barrier),
             equal_lsn_conflict_count: 0,
+            filters_omitted_over_cap: Vec::new(),
         };
         let barrier_body = crate::search_lsm::encode_search_barrier(&state).unwrap();
         manifest.ssts.push(search_barrier_descriptor(

@@ -1127,7 +1127,14 @@ async fn run_text_reanalysis(
                 "full-text index now uses the accent-folding analyzer"
             );
         }
-        Err(error) => record_failure(error),
+        Err(TextReanalysisEnd::Restart(error)) => info!(
+            namespace,
+            index = %index,
+            %error,
+            "full-text re-analysis restarts: a property index or constraint changed the \
+             index's native filters while it was being rebuilt"
+        ),
+        Err(TextReanalysisEnd::Failed(error)) => record_failure(error),
     }
     // Uploads the manifest does not reference now (a refused install, or
     // superseded catch-up attempts) are this task's alone: delete them.
@@ -1171,24 +1178,38 @@ async fn catch_up_and_install(
     snapshot: &SnapshotCell,
     writer_health: &WriterHealth,
     namespace: &str,
-) -> (namidb_storage::Result<()>, Vec<String>) {
+) -> (Result<(), TextReanalysisEnd>, Vec<String>) {
+    // An abandoned rebuild, and whether it was abandoned only because a
+    // filter DDL re-signed the generation (see `TextReanalysisEnd`).
+    let abandon = |error: namidb_storage::Error,
+                   prepared: &namidb_storage::PreparedTextReanalysis,
+                   manifest: &namidb_storage::manifest::Manifest| {
+        let end = if matches!(error, namidb_storage::Error::Precondition(_))
+            && prepared.outrun_by_filter_resign(manifest)
+        {
+            TextReanalysisEnd::Restart(error)
+        } else {
+            TextReanalysisEnd::Failed(error)
+        };
+        (Err(end), prepared.uploaded_object_paths())
+    };
     for round in 0..=TEXT_REANALYSIS_UNLOCKED_CATCH_UPS {
         let mut guard = writer.lock().await;
         let caught_up = match prepared.caught_up_with(guard.current_manifest()) {
             Ok(caught_up) => caught_up,
-            Err(error) => return (Err(error), prepared.uploaded_object_paths()),
+            Err(error) => return abandon(error, &prepared, guard.current_manifest()),
         };
         if !caught_up {
             let current = guard.compaction_basis();
             if round < TEXT_REANALYSIS_UNLOCKED_CATCH_UPS {
                 drop(guard);
                 if let Err(error) = current.catch_up_text_reanalysis(&mut prepared).await {
-                    return (Err(error), prepared.uploaded_object_paths());
+                    return abandon(error, &prepared, current.base_manifest());
                 }
                 continue;
             }
             if let Err(error) = current.catch_up_text_reanalysis(&mut prepared).await {
-                return (Err(error), prepared.uploaded_object_paths());
+                return abandon(error, &prepared, current.base_manifest());
             }
         }
         let uploaded = prepared.uploaded_object_paths();
@@ -1207,9 +1228,23 @@ async fn catch_up_and_install(
                 .await;
             }
         }
-        return (result.map(|_| ()), uploaded);
+        return (
+            result.map(|_| ()).map_err(TextReanalysisEnd::Failed),
+            uploaded,
+        );
     }
     unreachable!("the last catch-up round always installs or fails")
+}
+
+/// How a re-analysis that did not install ended.
+#[cfg(feature = "text-index")]
+enum TextReanalysisEnd {
+    /// A property-index or constraint DDL re-signed the generation for a
+    /// new native-filter set while the base was being built. Not a failure:
+    /// the next attempt starts from the re-signed generation and its base
+    /// carries the new filter, which also settles the filter rebuild.
+    Restart(namidb_storage::Error),
+    Failed(namidb_storage::Error),
 }
 
 /// Search indexes a long pass is building a base for, with the segment prefix

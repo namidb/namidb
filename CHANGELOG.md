@@ -255,6 +255,29 @@ crates.io release will establish and document that API explicitly.
 
 ### Fixed
 
+- **`CREATE INDEX` and uniqueness constraints no longer stop search on the
+  label.** An equality index or constraint on a Bool/String property of a
+  label with a vector or full-text index changes the indexes' native-filter
+  set. That retired their generations outright: every `search.vector`,
+  `search.bm25` and `search.hybrid` on the label then scanned it (or failed
+  with `index_building` past the scan budget) until both indexes were rebuilt
+  from scratch, minutes on a large label. Now the serving generations stay:
+  - the DDL re-signs them in place (no second generation is started),
+    so they keep answering every query, and writes keep reaching them; a
+    filter on the new property is applied as a residual until the rebuild;
+  - one background base rebuild, through the usual memory-gated path with
+    progress logs and `/v0/health`, adds the new filter and swaps in
+    atomically; a restart resumes it, and the old segments go to the orphan
+    sweep;
+  - `SHOW INDEXES` keeps the index `ONLINE` at 100% and shows the rebuild in
+    `migrationPercent`;
+  - a constraint that removes a property from the filter set needs no
+    rebuild, and a filter whose values exceed the per-segment distinct cap
+    is recorded as omitted instead of requesting rebuilds forever.
+
+  If you roll back below 3.5.2 while a filter rebuild is in flight, search on
+  that index falls back to a scan until the rebuild finishes on 3.5.2. Wait
+  for `SHOW INDEXES` to show `migrationPercent` null before downgrading.
 - **Cold top-k hydration reads only the records it needs.** Hydrating a few
   hundred search hits rounded each scattered node record up to a 256 KiB
   cache page, sixteen at a time, and probed each node SST's record index one

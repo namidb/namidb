@@ -252,16 +252,18 @@ pub struct IndexStatus {
     /// `populationPercent`: 100 when online, otherwise the in-flight
     /// activation's progress (0 until it starts).
     pub percent: f64,
-    /// `migrationPercent`: `Some` while an online index still has a base in
-    /// a legacy format that a background rebuild replaces (a full-text base
-    /// built before FT4): the rebuild's progress, 0 until it starts. The
-    /// index serves natively meanwhile. `None` when no migration is due.
+    /// `migrationPercent`: `Some` while an online index has a background base
+    /// rebuild pending — a base in a legacy format to replace (a full-text
+    /// base built before FT4), or a native filter to add after a property
+    /// index or constraint DDL on its label: the rebuild's progress, 0 until
+    /// it starts. The index serves natively meanwhile. `None` when no
+    /// rebuild is due.
     pub migration_percent: Option<f64>,
 }
 
-/// [`index_state`] plus the legacy base migration indicator.
+/// [`index_state`] plus the pending base rebuild indicator.
 pub fn index_status(manifest: &Manifest, kind: SearchLsmKind, name: &str) -> IndexStatus {
-    use crate::search_lsm::{legacy_base_migration_due, select_search_read_plan, SearchReadPlan};
+    use crate::search_lsm::{base_rebuild_pending, select_search_read_plan, SearchReadPlan};
     let state = manifest
         .search_lsm
         .iter()
@@ -277,7 +279,7 @@ pub fn index_status(manifest: &Manifest, kind: SearchLsmKind, name: &str) -> Ind
             state: IndexState::Online,
             percent: 100.0,
             migration_percent: state
-                .filter(|state| legacy_base_migration_due(state))
+                .filter(|state| base_rebuild_pending(manifest, state))
                 .map(|_| progress.unwrap_or(0.0)),
         },
     }
