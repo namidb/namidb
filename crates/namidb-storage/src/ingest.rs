@@ -3715,8 +3715,9 @@ impl WriterSession {
         self.commit_schema_ddl(schema).await
     }
 
-    /// Commit an updated schema (metadata-only manifest bump), retiring
-    /// signature-stale search generations and resetting the caches whose
+    /// Commit an updated schema (metadata-only manifest bump), reconciling
+    /// signature-stale search generations (re-signed in place when only their
+    /// native-filter set changed, retired otherwise) and resetting the caches whose
     /// contents key off the schema. Shared tail of every property/index DDL.
     /// Commit the first value types durable writes recorded for DDL
     /// placeholders ([`PropertyDef::type_pending`]), so the flush that
@@ -3724,9 +3725,9 @@ impl WriterSession {
     /// `schema` (the caller's flush schema) with the same resolutions.
     ///
     /// Committed as a schema version of its own rather than inside the flush
-    /// manifest so that Search-LSM retires only the generations whose own
-    /// catalog signature changed (`retire_signature_stale_generations`),
-    /// exactly as for a user-issued DDL. The logical property caches stay
+    /// manifest so that Search-LSM reconciles only the generations whose own
+    /// catalog signature changed (`reconcile_search_catalog`), exactly as for
+    /// a user-issued DDL. The logical property caches stay
     /// warm: a resolved type changes no value, flag or constraint they
     /// describe. No-op unless a placeholder saw a value.
     async fn resolve_pending_types(&mut self, mut schema: Schema) -> Result<Schema> {
