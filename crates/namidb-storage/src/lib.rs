@@ -77,8 +77,8 @@ pub use cache_budget::{
 #[cfg(feature = "text-index")]
 pub use compact::PreparedTextReanalysis;
 pub use compact::{
-    compact_l0_to_l1, install_prepared, prepare_compaction, CompactionBasis, CompactionOutcome,
-    NodeLayoutMigration, PreparedCompaction,
+    compact_l0_to_l1, compaction_due, install_prepared, prepare_compaction, CompactionBasis,
+    CompactionOutcome, NodeLayoutMigration, PreparedCompaction,
 };
 pub use error::{Error, Result};
 pub use fence::{Epoch, WriterFence};
@@ -89,8 +89,8 @@ pub use format::{
 };
 pub use ingest::{
     clear_shared_caches, prune_shared_caches, AutoIndexOutcome, BackgroundFlush,
-    BackgroundFlushInstall, BuiltBackgroundFlush, CommitOutcome, SessionCaches, StageMark,
-    StagedValue, WriterSession,
+    BackgroundFlushInstall, BuiltBackgroundFlush, CommitOutcome, HintedDdlOutcome,
+    PropertyTypeHint, SessionCaches, StageMark, StagedValue, WriterSession,
 };
 pub use janitor::{
     descriptor_object_paths, manifest_object_paths, sweep_orphans, sweep_orphans_with,

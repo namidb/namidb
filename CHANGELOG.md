@@ -17,6 +17,40 @@ crates.io release will establish and document that API explicitly.
 
 ### Changed
 
+- **Background builds yield to queries.** Every background build (the
+  Search-LSM base builds behind a vector or full-text index — new
+  indexes, native-filter rebuilds after a property index or constraint
+  DDL, RaBitQ backfills, the full-text re-analysis —, segment merges and
+  node compactions, including the automatic property-index sidecars) now
+  runs on build slots and yields while a statement runs. The lower thread
+  priority alone (nice +10) only orders threads that compete for the same
+  core: under a container CPU quota a build kept running on the other core
+  beside the query. At most `NAMIDB_INDEX_BUILD_THREADS` build threads run
+  at once (default half the CPUs, at least one), and while a statement runs
+  a build works in 4 ms slices at `NAMIDB_INDEX_BUILD_DUTY_PERCENT` of the
+  time (default 20; 100 turns yielding off); with nothing running it uses
+  the whole CPU. Builds take longer while the engine is busy.
+- **`CREATE INDEX` no longer stops writes.** For a property the schema does
+  not type yet, the type was inferred by decoding the whole label under the
+  writer lock (a minute on 386k rows of 1024-dimension embeddings, every
+  write answered `writer is busy` meanwhile). It is now read from one row,
+  projected to that property, on the published snapshot before the writer
+  lock is taken; the commit re-validates it against the manifest it builds
+  on and looks it up again when the property's definition changed in
+  between. `CREATE CONSTRAINT … IS UNIQUE` validates existing rows decoding
+  only the constrained properties.
+- **A schema DDL is never lost to the HTTP request ceiling.** `CREATE INDEX`,
+  `CREATE CONSTRAINT` and composite indexes run on a task of their own: when
+  the request is cut (408 at the request ceiling, a client that
+  disconnects), the statement still reaches its outcome, `SHOW INDEXES` /
+  `SHOW CONSTRAINTS` show a committed one, and the server logs it. Before,
+  the cut request dropped the statement with nothing committed.
+- **Interrupted rebuilds resume soon after a restart.** When a namespace
+  opens with maintenance work already due (a base rebuild a restart
+  interrupted, a RaBitQ backfill, a `BUILDING` index, a full-text
+  re-analysis), the first maintenance pass runs 20 s after the open instead
+  of one maintenance interval (300 s by default) later; with no writes,
+  nothing else triggered it.
 - **Filtered and new-query search latency.** On a 386k × 1024
   production-shaped synthetic namespace with 20–40 ms simulated store
   latency, a never-seen hybrid search with a property filter on a

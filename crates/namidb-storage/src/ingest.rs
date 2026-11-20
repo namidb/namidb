@@ -3458,7 +3458,13 @@ impl WriterSession {
         {
             let snap = self.snapshot();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for node in snap.scan_label(label).await? {
+            // Only the constrained properties are decoded: a label of large
+            // rows (embeddings, long text) validates at the cost of its key
+            // columns.
+            for node in snap
+                .scan_label_with_predicates_and_projection(label, &[], Some(properties))
+                .await?
+            {
                 // A row is exempt unless every property is present and non-null.
                 let mut key_parts: Vec<String> = Vec::with_capacity(properties.len());
                 let mut complete = true;
@@ -3583,7 +3589,50 @@ impl WriterSession {
                 "an index on {label}({property}) already exists"
             )));
         }
-        self.alter_property_for_ddl(label, property, false, true)
+        match self
+            .alter_property_for_ddl(label, property, false, true, None)
+            .await?
+        {
+            HintedDdlOutcome::Committed(version) => Ok(version),
+            HintedDdlOutcome::BasisChanged => Err(Error::invariant(
+                "an index DDL without a type hint reported a changed hint basis",
+            )),
+        }
+    }
+
+    /// [`Self::create_property_index_named`] with the property's type
+    /// inferred beforehand, off the writer lock, on a published snapshot
+    /// ([`PropertyTypeHint::infer`]). The hint is used when the property's
+    /// definition is the same in the manifest this commit builds on as in
+    /// the snapshot it was inferred from; otherwise nothing is committed and
+    /// [`HintedDdlOutcome::BasisChanged`] asks the caller to infer again.
+    /// A hint that saw no live value is ignored: the type is then looked up
+    /// here, as without a hint, so writes since the snapshot are seen.
+    pub async fn create_property_index_hinted(
+        &mut self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        if_not_exists: bool,
+        hint: &PropertyTypeHint,
+    ) -> Result<HintedDdlOutcome> {
+        self.fence.assert_alive(self.current.manifest.epoch)?;
+        if hint.label != label || hint.property != property {
+            return Err(Error::invariant(
+                "a property type hint was inferred for another property",
+            ));
+        }
+        let indexed =
+            property_def(&self.current.manifest.schema, label, property).is_some_and(|p| p.indexed);
+        if indexed {
+            // Adoption of an automatic index, IF NOT EXISTS or the
+            // duplicate error: no type to infer.
+            return self
+                .create_property_index_named(name, label, property, if_not_exists)
+                .await
+                .map(HintedDdlOutcome::Committed);
+        }
+        self.alter_property_for_ddl(label, property, false, true, Some(hint))
             .await
     }
 
@@ -3617,30 +3666,10 @@ impl WriterSession {
             .map(|p| p.data_type.clone());
         let dtype = match declared {
             Some(dtype) => dtype,
-            None => {
-                // One projected row is enough to type the property; this
-                // never decodes whole nodes.
-                let projection = [property.to_string()];
-                let rows = self
-                    .snapshot()
-                    .scan_label_with_predicates_and_projection_limited(
-                        label,
-                        &[crate::sst::predicates::ScanPredicate::IsNotNull {
-                            column: property.to_string(),
-                        }],
-                        Some(&projection),
-                        1,
-                    )
-                    .await?;
-                match rows
-                    .iter()
-                    .find_map(|row| row.properties.get(property))
-                    .and_then(value_datatype)
-                {
-                    Some(dtype) => dtype,
-                    None => return Ok(AutoIndexOutcome::NoValues),
-                }
-            }
+            None => match first_live_value_type(&self.snapshot(), label, property).await? {
+                Some(dtype) => dtype,
+                None => return Ok(AutoIndexOutcome::NoValues),
+            },
         };
         if !crate::flush::equality_indexable(&dtype) {
             return Ok(AutoIndexOutcome::UnsupportedType);
@@ -3673,33 +3702,28 @@ impl WriterSession {
         property: &str,
         unique: bool,
         indexed: bool,
-    ) -> Result<u64> {
+        hint: Option<&PropertyTypeHint>,
+    ) -> Result<HintedDdlOutcome> {
         self.fence.assert_alive(self.current.manifest.epoch)?;
 
-        // The declared type wins; otherwise infer it from the first live value.
-        let declared_type = self
-            .current
-            .manifest
-            .schema
-            .label(label)
-            .and_then(|l| l.properties.iter().find(|p| p.name == property))
+        // The declared type wins; otherwise infer it from a live value.
+        let current_def = property_def(&self.current.manifest.schema, label, property);
+        let declared_type = current_def
             .filter(|p| !p.type_pending)
             .map(|p| p.data_type.clone());
 
-        let mut inferred: Option<DataType> = None;
-        if declared_type.is_none() {
-            let snap = self.snapshot();
-            for node in snap.scan_label(label).await? {
-                let Some(v) = node.properties.get(property) else {
-                    continue;
-                };
-                if matches!(v, Value::Null) {
-                    continue;
+        let inferred = match (declared_type.is_some(), hint) {
+            (true, _) => None,
+            (false, Some(hint)) if hint.inferred.is_some() => {
+                if hint.basis_version != self.current.manifest.version
+                    && hint.basis_def.as_ref() != current_def
+                {
+                    return Ok(HintedDdlOutcome::BasisChanged);
                 }
-                inferred = value_datatype(v);
-                break;
+                hint.inferred.clone()
             }
-        }
+            (false, _) => first_live_value_type(&self.snapshot(), label, property).await?,
+        };
 
         let (dtype, type_pending) = ddl_property_type(declared_type, inferred);
         let mut schema = self.current.manifest.schema.clone();
@@ -3712,7 +3736,9 @@ impl WriterSession {
             unique,
             indexed,
         )?;
-        self.commit_schema_ddl(schema).await
+        self.commit_schema_ddl(schema)
+            .await
+            .map(HintedDdlOutcome::Committed)
     }
 
     /// Commit an updated schema (metadata-only manifest bump), reconciling
@@ -3952,19 +3978,10 @@ impl WriterSession {
                     .and_then(|l| l.properties.iter().find(|p| p.name == *property))
                     .filter(|p| !p.type_pending)
                     .map(|p| p.data_type.clone());
-                let mut inferred: Option<DataType> = None;
-                if declared.is_none() {
-                    for node in snap.scan_label(label).await? {
-                        let Some(v) = node.properties.get(property) else {
-                            continue;
-                        };
-                        if matches!(v, Value::Null) {
-                            continue;
-                        }
-                        inferred = value_datatype(v);
-                        break;
-                    }
-                }
+                let inferred = match declared {
+                    Some(_) => None,
+                    None => first_live_value_type(&snap, label, property).await?,
+                };
                 let (dtype, type_pending) = ddl_property_type(declared, inferred);
                 member_types.push((property.clone(), dtype, type_pending));
             }
@@ -4411,6 +4428,97 @@ pub enum AutoIndexOutcome {
     WouldRebuildSearch(Vec<String>),
 }
 
+/// The type `CREATE INDEX` declares for a property the schema does not type
+/// yet, inferred from one live value of a published snapshot while the
+/// writer lock is free, so writes keep flowing during the lookup
+/// ([`WriterSession::create_property_index_hinted`]).
+#[derive(Debug, Clone)]
+pub struct PropertyTypeHint {
+    label: String,
+    property: String,
+    /// Manifest version of the snapshot the hint was inferred on.
+    basis_version: u64,
+    /// The property's definition in that manifest.
+    basis_def: Option<PropertyDef>,
+    /// The type of a live value; `None` when the property is declared or
+    /// the snapshot held no value.
+    inferred: Option<DataType>,
+}
+
+impl PropertyTypeHint {
+    /// Infer on `snapshot`: a one-row projected scan, nothing when the
+    /// property is already typed.
+    pub async fn infer(
+        snapshot: &crate::read::OwnedSnapshot,
+        label: &str,
+        property: &str,
+    ) -> Result<Self> {
+        let manifest = &snapshot.manifest().manifest;
+        let basis_def = property_def(&manifest.schema, label, property).cloned();
+        let declared = basis_def.as_ref().is_some_and(|p| !p.type_pending);
+        let inferred = if declared {
+            None
+        } else {
+            first_live_value_type(&snapshot.borrow(), label, property).await?
+        };
+        Ok(Self {
+            label: label.to_string(),
+            property: property.to_string(),
+            basis_version: manifest.version,
+            basis_def,
+            inferred,
+        })
+    }
+
+    /// The inferred type, if any (tests and logs).
+    pub fn inferred(&self) -> Option<&DataType> {
+        self.inferred.as_ref()
+    }
+}
+
+/// Outcome of [`WriterSession::create_property_index_hinted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HintedDdlOutcome {
+    /// Committed (or an `IF NOT EXISTS` no-op) at this manifest version.
+    Committed(u64),
+    /// The property's definition changed after the hint's snapshot; nothing
+    /// was committed.
+    BasisChanged,
+}
+
+fn property_def<'a>(schema: &'a Schema, label: &str, property: &str) -> Option<&'a PropertyDef> {
+    schema
+        .label(label)
+        .and_then(|l| l.properties.iter().find(|p| p.name == property))
+}
+
+/// The type of one live, non-null value of `label.property` in `snap`: a
+/// projected scan that stops at the first row carrying the property, so it
+/// never decodes whole nodes (a label of embeddings used to be read in full,
+/// under the writer lock, to type one string column).
+async fn first_live_value_type(
+    snap: &Snapshot<'_>,
+    label: &str,
+    property: &str,
+) -> Result<Option<DataType>> {
+    let projection = [property.to_string()];
+    let rows = snap
+        .scan_label_with_predicates_and_projection_limited(
+            label,
+            &[crate::sst::predicates::ScanPredicate::IsNotNull {
+                column: property.to_string(),
+            }],
+            Some(&projection),
+            1,
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .find_map(|row| row.properties.get(property))
+        .filter(|value| !matches!(value, Value::Null))
+        .and_then(value_datatype))
+}
+
 /// Names of the vector/full-text indexes whose catalog signature `schema`
 /// would change relative to `manifest` (a change retires and rebuilds the
 /// search generation).
@@ -4502,6 +4610,51 @@ mod tests {
     use object_store::ObjectStoreExt;
 
     use super::*;
+
+    /// A type hint whose property definition changed after its snapshot is
+    /// refused without committing; the caller infers again.
+    #[tokio::test]
+    async fn a_stale_type_hint_commits_nothing() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let paths = crate::paths::NamespacePaths::new(
+            "tenants",
+            namidb_core::NamespaceId::new("stale-hint").unwrap(),
+        );
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+        let mut props = BTreeMap::new();
+        props.insert("city".to_string(), Value::Str("quito".into()));
+        let record = NodeWriteRecord {
+            properties: props,
+            schema_version: 1,
+            ..Default::default()
+        };
+        writer.upsert_node("Doc", NodeId::new(), &record).unwrap();
+        writer.commit_batch().await.unwrap();
+        let mut hint = PropertyTypeHint::infer(&writer.owned_snapshot(), "Doc", "city")
+            .await
+            .unwrap();
+        assert_eq!(hint.inferred, Some(DataType::Utf8));
+        // As if the snapshot had seen another definition of the property at
+        // an older version (a placeholder another DDL since replaced).
+        hint.basis_version = 0;
+        hint.basis_def = Some(PropertyDef::new("city", DataType::Int64, true).unwrap());
+        let before = writer.snapshot().manifest().manifest.version;
+        let outcome = writer
+            .create_property_index_hinted(None, "Doc", "city", false, &hint)
+            .await
+            .unwrap();
+        assert_eq!(outcome, HintedDdlOutcome::BasisChanged);
+        assert_eq!(writer.snapshot().manifest().manifest.version, before);
+        // A fresh lookup commits.
+        let hint = PropertyTypeHint::infer(&writer.owned_snapshot(), "Doc", "city")
+            .await
+            .unwrap();
+        let outcome = writer
+            .create_property_index_hinted(None, "Doc", "city", false, &hint)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, HintedDdlOutcome::Committed(_)));
+    }
 
     #[tokio::test]
     async fn scan_all_node_ids_single_pass_matches_per_label_union() {

@@ -1086,6 +1086,7 @@ impl TextV4ExternalBuilder {
     }
 
     fn push_record(&mut self, record: TermRecord) -> Result<()> {
+        crate::background::pace();
         let record_bytes = size_of::<TermRecord>()
             .checked_add(record.term.capacity())
             .ok_or_else(|| Error::invariant("text v4 record accounting overflows"))?;
@@ -1827,6 +1828,7 @@ impl RunWriter {
     }
 
     fn push(&mut self, record: &TermRecord) -> Result<()> {
+        crate::background::pace();
         let term_len = u32::try_from(record.term.len())
             .map_err(|_| Error::precondition("text v4 run term exceeds u32"))?;
         self.write_payload(&term_len.to_le_bytes())?;
@@ -1948,6 +1950,7 @@ impl RunReader {
     }
 
     fn next(&mut self) -> Result<Option<TermRecord>> {
+        crate::background::pace();
         if self.read_count == self.expected_count {
             self.verify_end()?;
             return Ok(None);

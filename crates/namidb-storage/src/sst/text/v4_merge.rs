@@ -169,6 +169,7 @@ fn merge_winners(
     let mut live_total_len = 0u64;
     let mut batch: Vec<(usize, SearchVersionRecord)> = Vec::with_capacity(WINNER_BATCH);
     while let Some(Reverse((node_id, _))) = heap.peek().copied() {
+        crate::background::pace();
         let mut group: Vec<(usize, SearchVersionRecord)> = Vec::new();
         while let Some(Reverse((candidate, index))) = heap.peek().copied() {
             if candidate != node_id {
@@ -480,6 +481,7 @@ fn merge_terms(
                 break;
             }
             heap.pop();
+            crate::background::pace();
             let cursor = &mut cursors[index];
             let entry = cursor.entries[cursor.offset].clone();
             delta_df = delta_df.checked_add(entry.delta_df).ok_or_else(|| {

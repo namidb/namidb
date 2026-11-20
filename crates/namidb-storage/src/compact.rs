@@ -1210,6 +1210,16 @@ pub(crate) fn search_compaction_due(manifest: &crate::manifest::Manifest) -> boo
     )
 }
 
+/// `true` when a compaction pass over `manifest` would do work: a node or
+/// edge merge, a missing sidecar, or Search-LSM work (delta consolidation,
+/// a base rebuild such as a native-filter rebuild, a RaBitQ backfill or the
+/// activation of a `BUILDING` index). Metadata only; the server uses it to
+/// resume such work soon after an open instead of a maintenance interval
+/// later.
+pub fn compaction_due(manifest: &crate::manifest::Manifest) -> bool {
+    any_bucket_plans(manifest, compaction_base_bytes(), compaction_level_ratio())
+}
+
 /// `true` when any `(kind, scope)` bucket of `ssts` would plan a merge under
 /// the given budgets — a metadata-only mirror of the per-bucket
 /// [`plan_bucket_merge`] calls the prepare phase makes, with no object-store
@@ -4615,6 +4625,7 @@ fn merge_node_sources(
         let Some(Reverse(entry)) = heap.pop() else {
             break;
         };
+        crate::background::pace();
         let cursor = &mut cursors[entry.src];
         if last_id != Some(entry.id) {
             // First (highest-LSN) observation of this id: the winner.
@@ -5262,6 +5273,7 @@ fn merge_edge_sources(
 
     let mut last: Option<([u8; 16], [u8; 16])> = None;
     while let Some(Reverse(entry)) = heap.pop() {
+        crate::background::pace();
         let cursor = &mut cursors[entry.src];
         let pair = (entry.key_id, entry.partner_id);
         if last != Some(pair) {

@@ -159,6 +159,7 @@ impl<S: SortedRunSource> KWayMerge<S> {
 
     /// The next record in merged order, borrowed until the following call.
     pub(super) fn next(&mut self) -> Result<Option<&S::Record>> {
+        crate::background::pace();
         let Some(HeapEntry { record, source }) = self.heap.pop() else {
             if !self.sources.iter().all(SortedRunSource::verified) {
                 return Err(Error::invariant(self.messages.unverified));
