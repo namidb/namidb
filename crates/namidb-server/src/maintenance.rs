@@ -1830,6 +1830,135 @@ mod tests {
         );
     }
 
+    /// Closing the namespace stops an in-flight re-analysis: the task ends
+    /// without installing anything, the slot (and with it the sweep floor) is
+    /// released, and the cancellation is not counted as a failure, so the
+    /// next start runs it to completion.
+    #[cfg(feature = "text-index")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn text_reanalysis_stops_when_the_namespace_closes() {
+        use namidb_storage::manifest::TextIndexDescriptor;
+        use namidb_storage::text::TextAnalyzer;
+
+        let (_unused, paths) =
+            namidb_storage::parse_uri("memory://text-reanalysis-cancel").unwrap();
+        let blocking_store = Arc::new(BlockFirstSstGet {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            should_block: AtomicBool::new(false),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let store: Arc<dyn ObjectStore> = blocking_store.clone();
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+        writer
+            .register_text_index(
+                TextIndexDescriptor {
+                    analyzer: None,
+                    ..TextIndexDescriptor::new("doc_ft".into(), "Doc".into(), vec!["body".into()])
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        for n in 0..10 {
+            writer
+                .upsert_node(
+                    "Doc",
+                    NodeId::new(),
+                    &NodeWriteRecord {
+                        properties: BTreeMap::from([(
+                            "body".into(),
+                            Value::Str(format!("pensión {n}")),
+                        )]),
+                        schema_version: 0,
+                        labels: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+        writer.flush(Schema::empty()).await.unwrap();
+        writer.compact_l0(&Schema::empty()).await.unwrap();
+        let state = AppState::new(writer, None, "text-reanalysis-cancel".into());
+        {
+            let writer = state.writer.lock().await;
+            state.snapshot.store(writer.owned_snapshot());
+        }
+        let analyzer = || async {
+            state
+                .writer
+                .lock()
+                .await
+                .current_manifest()
+                .text_indexes
+                .iter()
+                .find(|descriptor| descriptor.name == "doc_ft")
+                .and_then(|descriptor| descriptor.analyzer)
+        };
+        let scheduler = Arc::clone(&state.compaction_scheduler);
+        let floor = |scheduler: &CompactionScheduler| {
+            scheduler
+                .sweep_options(SweepOptions {
+                    min_age: Duration::ZERO,
+                    ..SweepSettings::default().options(0)
+                })
+                .min_age
+        };
+
+        blocking_store.should_block.store(true, Ordering::SeqCst);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let task = maybe_start_text_reanalysis(
+            &scheduler,
+            &state.writer,
+            &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
+            Some(cancel_rx),
+        )
+        .expect("a legacy index starts a re-analysis");
+        tokio::time::timeout(Duration::from_secs(10), blocking_store.started.notified())
+            .await
+            .expect("the re-analysis reaches its corpus read");
+        assert!(floor(&scheduler) >= TEXT_REANALYSIS_SWEEP_MARGIN);
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("cancellation stops the task while its read is still held")
+            .unwrap();
+        assert_eq!(floor(&scheduler), Duration::ZERO, "the slot is released");
+        assert_eq!(analyzer().await, None, "nothing was installed");
+        blocking_store.release.notify_one();
+
+        // Not a failure: the next start (no backoff) completes it.
+        let (_open_tx, open_rx) = watch::channel(false);
+        let task = maybe_start_text_reanalysis(
+            &scheduler,
+            &state.writer,
+            &state.snapshot,
+            &state.writer_health,
+            &state.namespace,
+            Some(open_rx),
+        )
+        .expect("restarts right away");
+        tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("the re-analysis finishes")
+            .unwrap();
+        assert_eq!(analyzer().await, Some(TextAnalyzer::Folded));
+        assert!(
+            maybe_start_text_reanalysis(
+                &scheduler,
+                &state.writer,
+                &state.snapshot,
+                &state.writer_health,
+                &state.namespace,
+                None,
+            )
+            .is_none(),
+            "no legacy index is left"
+        );
+    }
+
     /// Barrier-based fairness and burst-coalescing regression:
     ///
     /// * the sole worker blocks inside the first pass's SST GET;
