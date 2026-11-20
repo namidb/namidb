@@ -1,0 +1,50 @@
+name: rollback-compat
+
+# Data written by this tree must open, serve correct results, take writes,
+# flush and compact under the previous releases, and roll forward again.
+# The old servers are built from their release tags and cached by tag.
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tests/compat/**"
+      - ".github/workflows/compat.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  NAMIDB_COMPAT_TAGS: "v3.4.3 v3.5.0 v3.5.1"
+
+permissions:
+  contents: read
+
+jobs:
+  old-binaries-open-new-data:
+    name: old releases open data written by this tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Restore the old release binaries
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            target/compat/v*/namidb-server
+          key: compat-bins-${{ runner.os }}-${{ env.NAMIDB_COMPAT_TAGS }}
+      - name: Build the old releases (if not cached) and run the rollback check
+        run: bash tests/compat/old_binaries_open_new_data.sh
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: compat-logs
+          path: /tmp/**/*.log
+          if-no-files-found: ignore
