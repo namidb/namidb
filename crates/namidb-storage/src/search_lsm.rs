@@ -2882,6 +2882,82 @@ mod tests {
             .contains("state JSON"));
     }
 
+    /// `SearchLsmState` exactly as 3.4.3, 3.5.0 and 3.5.1 define it: what
+    /// their V2 barrier decoder parses the state JSON into.
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+    #[serde(default)]
+    struct ReleasedSearchLsmState {
+        index_name: String,
+        kind: SearchLsmKind,
+        catalog_signature: String,
+        generation_id: Uuid,
+        status: SearchLsmStatus,
+        next_event_seq: u64,
+        base_frontier: Option<u64>,
+        segments: Vec<SearchSegmentRef>,
+        proven_empty_event_ranges: Vec<SearchEventRange>,
+        coverage: Vec<SearchCoverage>,
+        compat_barrier_sst_id: Option<Uuid>,
+        equal_lsn_conflict_count: u64,
+    }
+
+    /// Barriers are written in the V2 envelope (bincode `{u16, bytes}`
+    /// around the state as JSON), the format the released engines read, so
+    /// the new optional state field is a JSON key, not a positional bincode
+    /// field. Absent, the state JSON is byte-identical to the released
+    /// shape's; present, the released decoder ignores it.
+    #[test]
+    fn barriers_written_now_decode_with_the_released_decoder() {
+        for omitted in [Vec::new(), vec!["code".to_string()]] {
+            let state = SearchLsmState {
+                index_name: "doc_ft".into(),
+                kind: SearchLsmKind::Text,
+                catalog_signature: "catalog-v2".into(),
+                generation_id: Uuid::now_v7(),
+                status: SearchLsmStatus::Active,
+                next_event_seq: 3,
+                base_frontier: Some(2),
+                compat_barrier_sst_id: Some(Uuid::now_v7()),
+                filters_omitted_over_cap: omitted.clone(),
+                ..SearchLsmState::default()
+            };
+            let body = encode_search_barrier(&state).unwrap();
+            let footer = &body[SEARCH_LSM_BARRIER_MAGIC.len()..body.len() - BARRIER_TRAILER_LEN];
+            let envelope: SearchBarrierFooterV2 = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .with_limit(footer.len() as u64)
+                .reject_trailing_bytes()
+                .deserialize(footer)
+                .unwrap();
+            assert_eq!(envelope.format_version, BARRIER_FORMAT_VERSION);
+            let released: ReleasedSearchLsmState =
+                serde_json::from_slice(&envelope.state_json).unwrap();
+            let expected = ReleasedSearchLsmState {
+                index_name: state.index_name.clone(),
+                kind: state.kind,
+                catalog_signature: state.catalog_signature.clone(),
+                generation_id: state.generation_id,
+                status: state.status,
+                next_event_seq: state.next_event_seq,
+                base_frontier: state.base_frontier,
+                segments: state.segments.clone(),
+                proven_empty_event_ranges: state.proven_empty_event_ranges.clone(),
+                coverage: state.coverage.clone(),
+                compat_barrier_sst_id: state.compat_barrier_sst_id,
+                equal_lsn_conflict_count: state.equal_lsn_conflict_count,
+            };
+            assert_eq!(released, expected);
+            if omitted.is_empty() {
+                assert_eq!(
+                    envelope.state_json,
+                    serde_json::to_vec(&expected).unwrap(),
+                    "byte-identical to the released shape"
+                );
+            }
+            assert_eq!(decode_search_barrier(&body).unwrap(), state);
+        }
+    }
+
     #[test]
     fn legacy_v1_barrier_with_decodable_state_remains_compatible() {
         // V1 embedded the manifest-shaped state directly in bincode. Tagged
