@@ -97,11 +97,28 @@ async fn active_writer(name: &str) -> WriterSession {
     writer
 }
 
-/// The prevention half: the DDL commit itself retires stale generations,
-/// keeps the manifest valid, and the next maintenance cycle rebuilds.
+/// The prevention half, as it stands since 3.5.2: the DDL commit keeps the
+/// manifest valid by re-signing the generations whose native-filter set it
+/// changed. They keep their segments and keep serving natively (a filter on
+/// the new property is applied as a residual until the rebuild), and the
+/// next maintenance cycle rebuilds their bases with the new filter, once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn property_index_ddl_retires_stale_generations_and_rebuilds() {
+async fn property_index_ddl_keeps_serving_and_rebuilds_the_filter_in_the_background() {
+    use namidb_storage::search_lsm::{filter_rebuild_due, SearchLsmStatus};
+    use namidb_storage::search_progress::{index_status, IndexState};
+
     let mut writer = active_writer("ddl-signature-index").await;
+    let generations = |writer: &WriterSession| {
+        writer
+            .snapshot()
+            .manifest()
+            .manifest
+            .search_lsm
+            .iter()
+            .map(|state| (state.index_name.clone(), state.generation_id, state.status))
+            .collect::<Vec<_>>()
+    };
+    let before = generations(&writer);
 
     writer
         .create_property_index_named(None, "Doc", "city", false)
@@ -110,39 +127,88 @@ async fn property_index_ddl_retires_stale_generations_and_rebuilds() {
     let manifest = writer.snapshot().manifest().manifest.clone();
     namidb_storage::search_lsm::validate_search_lsm(&manifest)
         .expect("the DDL commit must leave a VALID manifest");
+    assert_eq!(
+        generations(&writer),
+        before,
+        "the DDL keeps the serving generations instead of retiring them"
+    );
+    for state in &manifest.search_lsm {
+        assert_eq!(state.status, SearchLsmStatus::Active);
+        assert!(filter_rebuild_due(&manifest, state), "{}", state.index_name);
+        let status = index_status(&manifest, state.kind, &state.index_name);
+        assert_eq!(status.state, IndexState::Online, "{}", state.index_name);
+        assert_eq!(status.migration_percent, Some(0.0), "{}", state.index_name);
+    }
+    let alpha = namidb_storage::text::parse_query("alpha");
+    let hits = writer
+        .snapshot()
+        .text_search("doc_ft", "Doc", &alpha, None)
+        .await
+        .unwrap()
+        .expect("the re-signed text generation serves natively");
+    assert_eq!(hits.len(), 8);
+    let groups = vec![("city".to_string(), vec![CoreValue::Str("madrid".into())])];
     assert!(
-        manifest.search_lsm.is_empty(),
-        "signature-stale generations must be retired in the DDL commit"
+        writer
+            .snapshot()
+            .text_search_filter_groups("doc_ft", "Doc", &alpha, None, &groups)
+            .await
+            .unwrap()
+            .is_none(),
+        "no native filter on the new property before the rebuild"
     );
 
-    // The next maintenance cycle rebuilds under the new signature and serves.
+    // Writes keep reaching the serving generation.
     writer.upsert_node("Doc", NodeId::new(), &doc(99)).unwrap();
     writer
         .flush(schema(true))
         .await
         .expect("flush after the DDL must not wedge");
+    assert_eq!(generations(&writer), before, "the flush appends to it");
+    let hits = writer
+        .snapshot()
+        .text_search("doc_ft", "Doc", &alpha, None)
+        .await
+        .unwrap()
+        .expect("still native");
+    assert_eq!(hits.len(), 9);
+
     writer
         .compact_l0(&schema(true))
         .await
         .expect("compaction after the DDL must not wedge");
     let manifest = writer.snapshot().manifest().manifest.clone();
-    assert_eq!(
-        manifest.search_lsm.len(),
-        2,
-        "fresh generations must exist under the new signature"
-    );
+    namidb_storage::search_lsm::validate_search_lsm(&manifest).unwrap();
+    assert_eq!(manifest.search_lsm.len(), 2);
+    for state in &manifest.search_lsm {
+        assert!(
+            !filter_rebuild_due(&manifest, state),
+            "{}",
+            state.index_name
+        );
+        assert!(state
+            .segments
+            .iter()
+            .all(|segment| segment.complete_filter_properties == ["city"]));
+        assert_eq!(
+            index_status(&manifest, state.kind, &state.index_name).migration_percent,
+            None
+        );
+    }
+    assert!(!writer.search_compaction_due(), "the rebuild runs once");
     let snapshot = writer.snapshot();
     let hits = snapshot
-        .text_search(
-            "doc_ft",
-            "Doc",
-            &namidb_storage::text::parse_query("alpha"),
-            None,
-        )
+        .text_search("doc_ft", "Doc", &alpha, None)
         .await
         .unwrap()
         .expect("the rebuilt text generation must serve natively");
     assert_eq!(hits.len(), 9);
+    let filtered = snapshot
+        .text_search_filter_groups("doc_ft", "Doc", &alpha, None, &groups)
+        .await
+        .unwrap()
+        .expect("the rebuilt base carries the new native filter");
+    assert_eq!(filtered.len(), 9);
 }
 
 /// The self-heal half: a manifest already poisoned by an older writer (schema

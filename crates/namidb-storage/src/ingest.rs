@@ -3521,17 +3521,7 @@ impl WriterSession {
 
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.schema = schema;
-        #[cfg(any(feature = "vector-index", feature = "text-index"))]
-        {
-            let stale = crate::search_lsm::retire_signature_stale_generations(&mut next);
-            if !stale.is_empty() {
-                tracing::warn!(
-                    indexes = ?stale,
-                    "property DDL changed the native-filter catalog; retiring the \
-                     affected search generations for rebuild"
-                );
-            }
-        }
+        self.reconcile_search_catalog(&mut next).await?;
         let committed = self
             .manifest_store
             .commit(&self.fence, &self.current, next)
@@ -3782,6 +3772,50 @@ impl WriterSession {
         Ok(())
     }
 
+    /// Bring the Search-LSM generations of `next` (a schema change of the
+    /// current manifest) in line with its catalog. A change of a label's
+    /// native-filter set re-signs the generations on it in place, so they
+    /// keep serving and receiving writes while a background base rebuild
+    /// adds the new filters (see
+    /// [`crate::search_lsm::resign_filter_catalog_generations`]); a
+    /// generation stale for any other reason is retired.
+    async fn reconcile_search_catalog(&self, next: &mut crate::manifest::Manifest) -> Result<()> {
+        #[cfg(any(feature = "vector-index", feature = "text-index"))]
+        {
+            let resigned =
+                crate::search_lsm::resign_filter_catalog_generations(&self.current.manifest, next);
+            if !resigned.is_empty() {
+                let names = resigned
+                    .iter()
+                    .map(|&position| next.search_lsm[position].index_name.clone())
+                    .collect::<Vec<_>>();
+                crate::search_lsm_flush::rewrite_search_barriers(
+                    self.manifest_store.store(),
+                    self.manifest_store.paths(),
+                    next,
+                    &resigned,
+                )
+                .await?;
+                tracing::info!(
+                    indexes = ?names,
+                    "property DDL changed the native-filter catalog; the affected search \
+                     indexes keep serving and rebuild their bases in the background"
+                );
+            }
+            let stale = crate::search_lsm::retire_signature_stale_generations(next);
+            if !stale.is_empty() {
+                tracing::warn!(
+                    indexes = ?stale,
+                    "property DDL changed the search catalog; retiring the affected search \
+                     generations for rebuild"
+                );
+            }
+        }
+        #[cfg(not(any(feature = "vector-index", feature = "text-index")))]
+        let _ = next;
+        Ok(())
+    }
+
     async fn commit_schema_ddl(&mut self, schema: Schema) -> Result<u64> {
         let version = self.commit_schema(schema).await?;
         self.property_index_cache.reset_preserving_node_counts();
@@ -3797,17 +3831,7 @@ impl WriterSession {
     async fn commit_schema(&mut self, schema: Schema) -> Result<u64> {
         let mut next = self.current.manifest.next_version(self.fence.writer_id);
         next.schema = schema;
-        #[cfg(any(feature = "vector-index", feature = "text-index"))]
-        {
-            let stale = crate::search_lsm::retire_signature_stale_generations(&mut next);
-            if !stale.is_empty() {
-                tracing::warn!(
-                    indexes = ?stale,
-                    "property DDL changed the native-filter catalog; retiring the \
-                     affected search generations for rebuild"
-                );
-            }
-        }
+        self.reconcile_search_catalog(&mut next).await?;
         let committed = self
             .manifest_store
             .commit(&self.fence, &self.current, next)

@@ -612,6 +612,30 @@ impl PreparedTextReanalysis {
         Ok(&generation.segments[self.basis_segments.len()..])
     }
 
+    /// Whether `manifest` abandons this rebuild only because a property-index
+    /// or constraint DDL re-signed the generation in place for a new
+    /// native-filter set (same definition, generation, status and basis
+    /// prefix; see `search_lsm::resign_filter_catalog_generations`). Such a
+    /// rebuild is restarted from the re-signed generation, whose base then
+    /// carries the new filter, rather than counted as a failure.
+    pub fn outrun_by_filter_resign(&self, manifest: &crate::manifest::Manifest) -> bool {
+        let name = self.index_name.as_str();
+        let same_definition = manifest
+            .text_indexes
+            .iter()
+            .find(|descriptor| descriptor.name == name)
+            == Some(&self.basis_descriptor);
+        same_definition
+            && manifest.search_lsm.iter().any(|state| {
+                state.kind == crate::search_lsm::SearchLsmKind::Text
+                    && state.index_name == name
+                    && state.generation_id == self.basis_generation.generation_id
+                    && state.status == self.basis_generation.status
+                    && state.catalog_signature != self.basis_generation.catalog_signature
+                    && state.segments.starts_with(&self.basis_segments)
+            })
+    }
+
     /// Whether the catch-up covers exactly what `manifest` appended after the
     /// basis, so an install against it needs no further catch-up.
     pub fn caught_up_with(&self, manifest: &crate::manifest::Manifest) -> Result<bool> {
@@ -6461,6 +6485,7 @@ mod tests {
             ],
             compat_barrier_sst_id: Some(barrier),
             equal_lsn_conflict_count: 0,
+            filters_omitted_over_cap: Vec::new(),
         };
         let barrier_body = encode_search_barrier(&state).unwrap();
         manifest.ssts.push(search_barrier_descriptor(

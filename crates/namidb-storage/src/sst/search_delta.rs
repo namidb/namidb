@@ -1332,11 +1332,19 @@ impl SearchSegmentWireBinding {
                 ));
             }
         };
+        // The catalog signature the segment was built under is not compared
+        // with the state's: a property-index or constraint DDL re-signs a
+        // generation in place when only its native-filter set changed
+        // (`search_lsm::resign_filter_catalog_generations`), so segments
+        // built before it carry the previous signature. The generation id
+        // binds the segment to its generation, whose descriptor never
+        // changes (any other catalog change retires it and starts a new
+        // one), and the segment reference — compared whole, with its
+        // complete filter list — says which filters it carries.
         if self.format_version != SEARCH_SEGMENT_BINDING_VERSION
             || state.kind != expected_kind
             || self.generation_id != state.generation_id
             || self.index_name != state.index_name
-            || self.catalog_signature != state.catalog_signature
             || &self.segment != segment
         {
             return Err(Error::invariant(
@@ -1797,6 +1805,14 @@ mod tests {
         let mut drift = segment.clone();
         drift.max_lsn += 1;
         assert!(binding.validate(&state, &drift).is_err());
+        // A filter DDL re-signs the generation in place: its segments stay
+        // bound to it. Another generation never accepts them.
+        let mut resigned = state.clone();
+        resigned.catalog_signature = "catalog-v2".into();
+        binding.validate(&resigned, &segment).unwrap();
+        let mut other = state.clone();
+        other.generation_id = Uuid::now_v7();
+        assert!(binding.validate(&other, &segment).is_err());
     }
 
     #[test]

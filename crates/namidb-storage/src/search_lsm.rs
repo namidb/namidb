@@ -252,6 +252,15 @@ pub struct SearchLsmState {
     pub compat_barrier_sst_id: Option<Uuid>,
     /// Cross-segment equal-LSN conflicts observed by the builder/compactor.
     pub equal_lsn_conflict_count: u64,
+    /// Catalog native filters the generation's latest base build left out
+    /// because their values exceeded the per-segment distinct cap (filtered
+    /// searches on them take the exact fallback). [`filter_rebuild_due`]
+    /// counts them as satisfied, so such a property does not request base
+    /// rebuilds forever. Omitted from the encoding when empty, so manifests
+    /// and barriers without one are byte-identical to before; an engine that
+    /// predates it ignores it, and losing it costs at most one more rebuild.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filters_omitted_over_cap: Vec<String>,
 }
 
 /// Checksummed payload of the downgrade barrier.
@@ -265,7 +274,47 @@ pub struct SearchLsmState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LegacySearchBarrierFooter {
     format_version: u16,
-    state: SearchLsmState,
+    state: LegacySearchLsmStateV1,
+}
+
+/// The state exactly as the V1 footer laid it out. Bincode is positional, so
+/// the footer decodes into this frozen shape rather than into
+/// [`SearchLsmState`], whose later fields would read past the end of a V1
+/// payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LegacySearchLsmStateV1 {
+    index_name: String,
+    kind: SearchLsmKind,
+    catalog_signature: String,
+    generation_id: Uuid,
+    status: SearchLsmStatus,
+    next_event_seq: u64,
+    base_frontier: Option<u64>,
+    segments: Vec<SearchSegmentRef>,
+    proven_empty_event_ranges: Vec<SearchEventRange>,
+    coverage: Vec<SearchCoverage>,
+    compat_barrier_sst_id: Option<Uuid>,
+    equal_lsn_conflict_count: u64,
+}
+
+impl From<LegacySearchLsmStateV1> for SearchLsmState {
+    fn from(legacy: LegacySearchLsmStateV1) -> Self {
+        Self {
+            index_name: legacy.index_name,
+            kind: legacy.kind,
+            catalog_signature: legacy.catalog_signature,
+            generation_id: legacy.generation_id,
+            status: legacy.status,
+            next_event_seq: legacy.next_event_seq,
+            base_frontier: legacy.base_frontier,
+            segments: legacy.segments,
+            proven_empty_event_ranges: legacy.proven_empty_event_ranges,
+            coverage: legacy.coverage,
+            compat_barrier_sst_id: legacy.compat_barrier_sst_id,
+            equal_lsn_conflict_count: legacy.equal_lsn_conflict_count,
+            filters_omitted_over_cap: Vec::new(),
+        }
+    }
 }
 
 /// V2 keeps the manifest model behind its JSON evolution boundary. Bincode is
@@ -511,7 +560,7 @@ pub fn decode_search_barrier(body: &[u8]) -> Result<SearchLsmState, SearchBarrie
                 .map_err(|error| {
                     SearchBarrierError::new(format!("legacy footer decode failed: {error}"))
                 })?;
-            Ok(footer.state)
+            Ok(footer.state.into())
         }
         other => Err(SearchBarrierError::new(format!(
             "footer version {other} is unsupported"
@@ -1145,6 +1194,7 @@ pub fn wrap_legacy_search_base(
         coverage,
         compat_barrier_sst_id: Some(barrier_sst_id),
         equal_lsn_conflict_count: 0,
+        filters_omitted_over_cap: Vec::new(),
     })
 }
 
@@ -1277,13 +1327,160 @@ pub fn legacy_base_migration_due(state: &SearchLsmState) -> bool {
             .any(|segment| segment.format == SearchSegmentFormat::TextV3Base)
 }
 
-/// Validate every Search-LSM state using manifest metadata only.
+/// The complete native-filter properties the catalog asks of `state`'s
+/// index, or `None` when its descriptor is missing or ambiguous.
+pub fn catalog_native_filter_properties(
+    manifest: &Manifest,
+    kind: SearchLsmKind,
+    index_name: &str,
+) -> Option<Vec<String>> {
+    match kind {
+        SearchLsmKind::Vector => {
+            let mut matches = manifest
+                .vector_indexes
+                .iter()
+                .filter(|descriptor| descriptor.name == index_name);
+            let descriptor = matches.next()?;
+            matches
+                .next()
+                .is_none()
+                .then(|| vector_native_filter_properties(manifest, descriptor))
+        }
+        SearchLsmKind::Text => {
+            let mut matches = manifest
+                .text_indexes
+                .iter()
+                .filter(|descriptor| descriptor.name == index_name);
+            let descriptor = matches.next()?;
+            matches
+                .next()
+                .is_none()
+                .then(|| text_native_filter_properties(manifest, descriptor))
+        }
+    }
+}
+
+/// Whether an Active generation has a segment that does not carry every
+/// native filter its catalog now asks for: the state a property-index or
+/// uniqueness DDL leaves behind (see [`resign_filter_catalog_generations`]).
+/// The generation keeps serving meanwhile — a query filtering on a property
+/// some segment lacks takes the unfiltered route plus a residual filter —
+/// and one background base rebuild, which writes every catalog filter,
+/// restores the native filter.
+pub fn filter_rebuild_due(manifest: &Manifest, state: &SearchLsmState) -> bool {
+    if state.status != SearchLsmStatus::Active || state.segments.is_empty() {
+        return false;
+    }
+    let Some(filters) = catalog_native_filter_properties(manifest, state.kind, &state.index_name)
+    else {
+        return false;
+    };
+    state.segments.iter().any(|segment| {
+        filters.iter().any(|property| {
+            segment
+                .complete_filter_properties
+                .binary_search(property)
+                .is_err()
+                && !state.filters_omitted_over_cap.contains(property)
+        })
+    })
+}
+
+/// Whether an Active generation is serving while a background base rebuild
+/// is pending for it: a legacy base to migrate
+/// ([`legacy_base_migration_due`]) or a native filter to add
+/// ([`filter_rebuild_due`]).
+pub fn base_rebuild_pending(manifest: &Manifest, state: &SearchLsmState) -> bool {
+    legacy_base_migration_due(state) || filter_rebuild_due(manifest, state)
+}
+
+/// Keep serving the generations a schema DDL only changed the native-filter
+/// set of, instead of retiring them.
 ///
-/// `Building` states validate catalog identity and any references they already
-/// publish, but may be incomplete. `Active` states enforce invariants 1-8 and
-/// 10. Invariant 9 (footer/object binding) belongs to object readers: the
-/// migration read path enforces it for barrier + V5/V3, and VG6/FT4 will bind
-/// it directly in each segment footer.
+/// The catalog signature covers the index descriptor and the label's
+/// native-filter schema (indexed, non-unique Bool/String properties), so a
+/// `CREATE INDEX`, a uniqueness constraint or a resolved placeholder type on
+/// the label changes it. Every segment records the filters it physically
+/// carries (`complete_filter_properties`) and readers use a native filter
+/// only when every segment carries it, so a generation built for the
+/// previous filter set still answers every query correctly. This re-signs
+/// such a generation in place: same segments, the new signature, so it
+/// keeps serving and keeps receiving flushes (new deltas carry the new
+/// filters), and [`filter_rebuild_due`] schedules the base rebuild that
+/// writes the new filters into every segment and swaps in with an ordinary
+/// compaction install.
+///
+/// A generation is re-signed only when it was valid against `previous` and
+/// its descriptor is unchanged, so nothing but the filter schema moved; any
+/// other mismatch is left for [`retire_signature_stale_generations`]. The
+/// state's compatibility barrier repeats the state, so the caller must write
+/// a fresh one for every returned position before committing. Interop build
+/// markers of a re-signed index are dropped, as a retirement would.
+///
+/// The result is an ordinary manifest: one state per index, matching its
+/// catalog signature, so engines that predate this function open and serve
+/// it as they would any generation (without the new native filter).
+pub fn resign_filter_catalog_generations(previous: &Manifest, next: &mut Manifest) -> Vec<usize> {
+    let mut resigned = Vec::new();
+    for position in 0..next.search_lsm.len() {
+        let state = &next.search_lsm[position];
+        let Some(expected) = catalog_signature(next, state.kind, &state.index_name) else {
+            continue;
+        };
+        if expected == state.catalog_signature
+            || catalog_signature(previous, state.kind, &state.index_name).as_deref()
+                != Some(state.catalog_signature.as_str())
+            || !same_search_descriptor(previous, next, state.kind, &state.index_name)
+        {
+            continue;
+        }
+        let sst_kind = state.kind.sst_kind();
+        let name = state.index_name.clone();
+        next.search_index_builds
+            .retain(|marker| !(marker.kind == sst_kind && marker.name == name));
+        let filters = catalog_native_filter_properties(next, state.kind, &name).unwrap_or_default();
+        let state = &mut next.search_lsm[position];
+        state.catalog_signature = expected;
+        state
+            .filters_omitted_over_cap
+            .retain(|property| filters.contains(property));
+        resigned.push(position);
+    }
+    resigned
+}
+
+fn same_search_descriptor(
+    previous: &Manifest,
+    next: &Manifest,
+    kind: SearchLsmKind,
+    index_name: &str,
+) -> bool {
+    match kind {
+        SearchLsmKind::Vector => {
+            let find = |manifest: &Manifest| {
+                manifest
+                    .vector_indexes
+                    .iter()
+                    .filter(|descriptor| descriptor.name == index_name)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            find(previous) == find(next)
+        }
+        SearchLsmKind::Text => {
+            let find = |manifest: &Manifest| {
+                manifest
+                    .text_indexes
+                    .iter()
+                    .filter(|descriptor| descriptor.name == index_name)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            find(previous) == find(next)
+        }
+    }
+}
+
 /// Retire every Search-LSM generation whose catalog signature no longer
 /// matches `manifest`'s current catalog/schema — the aftermath of a property
 /// index / uniqueness DDL that changed the native-filter set. Removes the
@@ -1322,6 +1519,13 @@ pub fn retire_signature_stale_generations(manifest: &mut Manifest) -> Vec<String
     retired_names
 }
 
+/// Validate every Search-LSM state using manifest metadata only.
+///
+/// `Building` states validate catalog identity and any references they already
+/// publish, but may be incomplete. `Active` states enforce invariants 1-8 and
+/// 10. Invariant 9 (footer/object binding) belongs to object readers: the
+/// migration read path enforces it for barrier + V5/V3, and VG6/FT4 will bind
+/// it directly in each segment footer.
 pub fn validate_search_lsm(manifest: &Manifest) -> Result<(), SearchLsmValidationError> {
     let mut keys = HashSet::new();
     let mut claimed_descriptors: HashMap<Uuid, String> = HashMap::new();
@@ -2472,6 +2676,7 @@ mod tests {
             ],
             compat_barrier_sst_id: Some(barrier),
             equal_lsn_conflict_count: 0,
+            filters_omitted_over_cap: Vec::new(),
         };
         let base_descriptor = manifest
             .ssts
@@ -2685,7 +2890,20 @@ mod tests {
         let state = SearchLsmState::default();
         let footer = LegacySearchBarrierFooter {
             format_version: LEGACY_BARRIER_FORMAT_VERSION,
-            state: state.clone(),
+            state: LegacySearchLsmStateV1 {
+                index_name: state.index_name.clone(),
+                kind: state.kind,
+                catalog_signature: state.catalog_signature.clone(),
+                generation_id: state.generation_id,
+                status: state.status,
+                next_event_seq: state.next_event_seq,
+                base_frontier: state.base_frontier,
+                segments: state.segments.clone(),
+                proven_empty_event_ranges: state.proven_empty_event_ranges.clone(),
+                coverage: state.coverage.clone(),
+                compat_barrier_sst_id: state.compat_barrier_sst_id,
+                equal_lsn_conflict_count: state.equal_lsn_conflict_count,
+            },
         };
         let encoded = bincode::DefaultOptions::new()
             .with_fixint_encoding()

@@ -1454,6 +1454,59 @@ fn relative_sst_path(level: u32, file_name: &str) -> String {
     format!("sst/level{level}/{file_name}")
 }
 
+/// Write a fresh compatibility barrier for each listed Search-LSM state of
+/// `manifest` (positions into `manifest.search_lsm`), after a metadata-only
+/// change to the state such as a re-signed catalog: the barrier repeats the
+/// state byte for byte, and readers refuse a generation whose barrier
+/// disagrees. Uploads the new barriers and swaps their descriptors in; the
+/// previous barrier objects become unreferenced for the orphan sweep once
+/// `manifest` commits (and stay referenced if it does not).
+pub(crate) async fn rewrite_search_barriers(
+    store: &Arc<dyn ObjectStore>,
+    paths: &crate::paths::NamespacePaths,
+    manifest: &mut Manifest,
+    positions: &[usize],
+) -> Result<()> {
+    for &position in positions {
+        let state = manifest
+            .search_lsm
+            .get_mut(position)
+            .ok_or_else(|| Error::invariant("search barrier rewrite position out of range"))?;
+        let Some(old_barrier) = state.compat_barrier_sst_id else {
+            continue;
+        };
+        let barrier_id = Uuid::now_v7();
+        state.compat_barrier_sst_id = Some(barrier_id);
+        let state = state.clone();
+        let body = encode_search_barrier(&state)
+            .map_err(|error| Error::invariant(format!("search barrier encode failed: {error}")))?;
+        let file_name = format!(
+            "{}-{}-{}.slb",
+            barrier_id.simple(),
+            state.kind.sst_kind().path_tag(),
+            state.index_name
+        );
+        let size_bytes = body.len() as u64;
+        store
+            .put(
+                &paths.sst_object(SstLevel::L0.as_u32(), &file_name),
+                body.into(),
+            )
+            .await?;
+        manifest
+            .ssts
+            .retain(|descriptor| descriptor.id != old_barrier);
+        manifest.ssts.push(search_barrier_descriptor(
+            &state,
+            barrier_id,
+            SstLevel::L0,
+            relative_sst_path(SstLevel::L0.as_u32(), &file_name),
+            size_bytes,
+        ));
+    }
+    Ok(())
+}
+
 async fn select_or_initialize_state(
     store: Arc<dyn ObjectStore>,
     paths: &crate::paths::NamespacePaths,
