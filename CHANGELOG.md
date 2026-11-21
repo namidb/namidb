@@ -15,6 +15,8 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.5.2] - 2026-11-21
+
 ### Changed
 
 - **Background builds yield to queries.** Every background build (the
@@ -5808,7 +5810,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.1...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.2...HEAD
+[3.5.2]: https://github.com/namidb/namidb/compare/v3.5.1...v3.5.2
 [3.5.1]: https://github.com/namidb/namidb/compare/v3.5.0...v3.5.1
 [3.5.0]: https://github.com/namidb/namidb/compare/v3.4.3...v3.5.0
 [3.4.3]: https://github.com/namidb/namidb/compare/v3.4.2...v3.4.3
