@@ -1079,6 +1079,51 @@ impl<'mt> Snapshot<'mt> {
         ))
     }
 
+    /// [`Self::node_data_identity`] of the flushed node data alone: equal
+    /// for every snapshot over the same manifest, whatever its memtable or
+    /// overlay holds. Pairs with [`Self::persisted_only`].
+    pub fn persisted_node_data_identity(&self) -> Option<NodeDataIdentity> {
+        Some((
+            self.cache_namespace.clone(),
+            self.property_index_cache.as_ref()?.instance(),
+            self.manifest.manifest.version,
+            // No memtable generation reaches u64::MAX: never equal to a
+            // snapshot identity that includes memtable rows.
+            u64::MAX,
+        ))
+    }
+
+    /// This snapshot's flushed corpus: the same manifest without the
+    /// memtable or a transaction overlay.
+    pub fn persisted_only(&self) -> Snapshot<'static> {
+        static EMPTY: std::sync::OnceLock<MemtableSnapshot> = std::sync::OnceLock::new();
+        let mut persisted = Snapshot::new(
+            self.manifest.clone(),
+            EMPTY.get_or_init(MemtableSnapshot::default),
+            self.store.clone(),
+            self.paths.clone(),
+        );
+        if let Some(cache) = &self.cache {
+            persisted = persisted.with_cache(cache.clone());
+        }
+        persisted
+    }
+
+    /// Ids of every unflushed node row (committed memtable and overlay),
+    /// sorted and deduplicated.
+    pub fn unflushed_node_ids(&self) -> Vec<NodeId> {
+        let mut ids = self
+            .node_entries()
+            .filter_map(|(key, _)| match key {
+                MemKey::Node { id } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     pub fn with_overlay(mut self, overlay: MemtableSnapshot) -> Self {
         self.overlay = Some(overlay);
         self
@@ -10813,24 +10858,25 @@ impl<'mt> Snapshot<'mt> {
         Ok(Some(FreshVectorDelta { tail, candidates }))
     }
 
-    /// (`text-index`): full BM25 top-k over the `TextIndex` SST(s) registered for
-    /// `index_name`, **only when the index is authoritative for `label`**.
+    /// (`text-index`): full BM25 top-k over the full-text index registered as
+    /// `index_name`, exact against the flat scan of the corpus this snapshot
+    /// sees.
     ///
-    /// Returns `Ok(None)` — meaning "fall back to the flat scan" — when the index
-    /// would not see the full corpus: no built `TextIndex` SST yet, or there is
-    /// un-compacted node data for `label` (committed/staged memtable entries, or
-    /// an L0 `Nodes` SST not yet folded into the index by compaction). This keeps
-    /// the index path freshness-equivalent to the flat scan: a write is visible
-    /// to `search.bm25` immediately, regardless of whether an index exists. The
-    /// index only serves once compaction has caught the corpus up.
+    /// Unflushed rows of `label` (committed memtable, or a transaction's
+    /// staged overlay) are merged in: the index's versions of the documents
+    /// they rewrite, delete or relabel are dropped, the corpus statistics
+    /// (N, average length, df) are corrected for both sides, and each
+    /// unflushed document is scored from its own values. `Ok(None)` —
+    /// meaning "take the flat scan" — when that cannot be exact or cheap: no
+    /// active index generation (or an undecodable one), a query analyzed
+    /// differently from the index, more unflushed documents than
+    /// [`crate::search_freshness::fresh_text_max_docs`], or an unflushed
+    /// document that changes a `prefix*` expansion.
     ///
-    /// `Ok(Some(hits))` is the BM25 result from the single authoritative index:
-    /// `(NodeId, score)` best-first with a node-id tie-break. Multiple bodies
-    /// indicate stale/anomalous generations and force the exact fallback
-    /// because their per-corpus BM25 statistics are not comparable. `k = None`
-    /// returns every match. `query` is the parsed query — phrases, prefixes and
-    /// plain terms — whose semantics `TextIndex::search_query` shares verbatim
-    /// with the executor's flat scan.
+    /// `Ok(Some(hits))` is `(NodeId, score)` best-first with a node-id
+    /// tie-break. `k = None` returns every match. `query` is the parsed
+    /// query — phrases, prefixes and plain terms — whose semantics the index
+    /// shares verbatim with the executor's flat scan.
     #[cfg(feature = "text-index")]
     pub async fn text_search(
         &self,
@@ -10846,75 +10892,161 @@ impl<'mt> Snapshot<'mt> {
         result
     }
 
-    /// Freshness gate shared by every read served from full-text index
-    /// `index_name`: `None` when the memtable/overlay holds a live document
-    /// delta for the indexed corpus (only the exact scan is correct then),
-    /// otherwise the ids of fresh rows that may shadow an indexed document
-    /// (tombstones and possible relabels), which the index must prove absent.
+    /// The unflushed rows (committed memtable plus a transaction's staged
+    /// overlay) a read served from full-text index `index_name` must
+    /// reconcile with it. `None` when the index cannot answer the query at
+    /// all (another analyzer) or when more unflushed documents touch the
+    /// label than a read merges (then only the exact scan is cheap enough).
+    ///
+    /// Deletes and rows that no longer carry `label` (possible relabels) are
+    /// shadowed: the index must not serve its version of them. A row that
+    /// carries `label` is shadowed and scored from its own values, except
+    /// when its label membership and indexed text equal its persisted
+    /// version (an embedding-only `SET`, say; see `text_changed_rows`): the
+    /// index already holds exactly that document. `filter_properties`
+    /// (native filter groups) disable that exception, since the index's
+    /// filter values of such a row may be stale.
     #[cfg(feature = "text-index")]
-    async fn text_index_dirty_ids(
+    async fn text_freshness(
         &self,
         index_name: &str,
         label: &str,
         analyzer: crate::text::TextAnalyzer,
-    ) -> Result<Option<Vec<[u8; 16]>>> {
+        filter_properties: &[String],
+    ) -> Result<Option<search_lsm_read::TextFreshness>> {
         // The index answers only queries analyzed the way it was built: a
         // query parsed with another analyzer takes the exact flat scan.
-        if !self
+        let Some(descriptor) = self
             .manifest
             .manifest
             .text_indexes
             .iter()
-            .any(|descriptor| {
+            .find(|descriptor| {
                 descriptor.name == index_name
                     && descriptor.label == label
                     && descriptor.effective_analyzer() == analyzer
             })
-        {
+        else {
             return Ok(None);
-        }
-        // ...and no memtable/overlay entry that touches the indexed corpus. The
-        // check is label-scoped: an unflushed write to an UNRELATED label must
-        // not disable the index (it used to — under live mixed traffic every
-        // `search.bm25` became an `O(corpus)` flat scan). BM25 scores depend on
-        // corpus-wide stats (N, avgdl, df), so exact flat-scan parity allows
-        // serving only when the delta provably does not touch the corpus:
-        //   - an upsert CARRYING `label` is a live document delta → flat scan;
-        //   - a tombstone, or an upsert NOT carrying `label` (a possible
-        //     relabel), affects the corpus only if its id is an indexed
-        //     document — probed against the decoded index below.
-        //   - except an upsert whose label membership and indexed text equal
-        //     its persisted version (an embedding-only `SET`, say): the index
-        //     already holds exactly that document (see `text_changed_rows`).
+        };
+        let mut properties = descriptor.properties.clone();
+        properties.sort();
+        properties.dedup();
         let dict = &self.manifest.manifest.label_dict;
-        let mut dirty: Vec<[u8; 16]> = Vec::new();
-        let mut carrying: Vec<NodeId> = Vec::new();
-        for (mk, entry) in self.node_entries() {
-            let MemKey::Node { id } = mk else {
+        // Highest LSN per id: a transaction's staged row outranks the
+        // committed one it rewrites.
+        let mut latest: BTreeMap<NodeId, &MemEntry> = BTreeMap::new();
+        for (key, entry) in self.node_entries() {
+            let MemKey::Node { id } = key else {
                 continue;
             };
-            match &entry.op {
-                MemOp::Tombstone => dirty.push(*id.0.as_bytes()),
-                MemOp::Upsert(payload) => {
-                    let rec = NodeWriteRecord::decode(payload)?;
-                    if record_carries_label(&rec, label, dict) {
-                        carrying.push(*id);
-                        continue;
-                    }
-                    dirty.push(*id.0.as_bytes());
+            match latest.get(id) {
+                Some(current) if current.lsn >= entry.lsn => {}
+                _ => {
+                    latest.insert(*id, entry);
                 }
             }
         }
-        if !carrying.is_empty() {
-            let Some(changed) = self.text_changed_rows(index_name, label).await? else {
-                return Ok(None);
-            };
-            if carrying.iter().any(|id| changed.changed.contains(id)) {
-                return Ok(None);
+        let mut fresh = search_lsm_read::TextFreshness {
+            label: label.to_string(),
+            properties,
+            ..Default::default()
+        };
+        let mut carrying: Vec<(NodeId, NodeWriteRecord)> = Vec::new();
+        for (id, entry) in latest {
+            match &entry.op {
+                MemOp::Tombstone => fresh.shadowed.push(*id.0.as_bytes()),
+                MemOp::Upsert(payload) => {
+                    let record = NodeWriteRecord::decode(payload)?;
+                    if record_carries_label(&record, label, dict) {
+                        carrying.push((id, record));
+                    } else {
+                        fresh.shadowed.push(*id.0.as_bytes());
+                    }
+                }
             }
         }
+        if !carrying.is_empty() && filter_properties.is_empty() {
+            if let Some(changed) = self.text_changed_rows(index_name, label).await? {
+                carrying.retain(|(id, _)| changed.changed.contains(id));
+            }
+        }
+        let limit = crate::search_freshness::fresh_text_max_docs();
+        if carrying.len() > limit {
+            self.note_fresh_text_overflow(index_name, carrying.len());
+            return Ok(None);
+        }
+        fresh.rewritten = carrying.len();
+        for (id, mut record) in carrying {
+            fresh.shadowed.push(*id.0.as_bytes());
+            let fields = fresh
+                .properties
+                .iter()
+                .filter_map(|property| match record.properties.get(property) {
+                    Some(Value::Str(text)) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if fields.is_empty() {
+                continue;
+            }
+            let filters = filter_properties
+                .iter()
+                .filter_map(|property| {
+                    record
+                        .properties
+                        .remove(property)
+                        .map(|value| (property.clone(), value))
+                })
+                .collect();
+            fresh.current.push(search_lsm_read::FreshTextDoc {
+                id,
+                fields,
+                filters,
+            });
+        }
+        Ok(Some(fresh))
+    }
 
-        Ok(Some(dirty))
+    /// The indexed text of the persisted (flushed) version of each id, the
+    /// version a full-text index covers: `None` for an id that has none, or
+    /// does not carry `label`, or holds no string value of `properties`.
+    #[cfg(feature = "text-index")]
+    pub(crate) async fn persisted_text_fields(
+        &self,
+        label: &str,
+        properties: &[String],
+        ids: &[NodeId],
+    ) -> Result<Vec<Option<Vec<String>>>> {
+        let views = self.persisted_only().batch_lookup_nodes("", ids).await?;
+        Ok(views
+            .into_iter()
+            .map(|view| {
+                let view = view.filter(|view| view.labels.contains(label))?;
+                let fields = properties
+                    .iter()
+                    .filter_map(|property| match view.properties.get(property) {
+                        Some(Value::Str(text)) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                (!fields.is_empty()).then_some(fields)
+            })
+            .collect())
+    }
+
+    /// A full-text read found more unflushed documents than it merges.
+    #[cfg(feature = "text-index")]
+    pub(crate) fn note_fresh_text_overflow(&self, index_name: &str, fresh: usize) {
+        crate::search_freshness::note_overflow(
+            self.paths.namespace().as_str(),
+            index_name,
+            (
+                self.manifest.manifest.version,
+                self.memtable.len() + self.overlay.as_ref().map_or(0, |overlay| overlay.len()),
+            ),
+            fresh,
+        );
     }
 
     /// Corpus-wide BM25 statistics of `query` from full-text index
@@ -10936,13 +11068,13 @@ impl<'mt> Snapshot<'mt> {
             crate::sst::text::v4::TextV4GlobalStats,
         )>,
     > {
-        let Some(dirty) = self
-            .text_index_dirty_ids(index_name, label, query.analyzer)
+        let Some(fresh) = self
+            .text_freshness(index_name, label, query.analyzer, &[])
             .await?
         else {
             return Ok(None);
         };
-        match search_lsm_read::text_query_stats(self, index_name, query, &dirty).await {
+        match search_lsm_read::text_query_stats(self, index_name, query, &fresh).await {
             Ok(search_lsm_read::ActiveSearch::Ready(stats)) => Ok(Some(stats)),
             Ok(_) => Ok(None),
             Err(error) if optional_accelerator_fallback(&error) => Ok(None),
@@ -10958,17 +11090,23 @@ impl<'mt> Snapshot<'mt> {
         query: &crate::text::TextQuery,
         k: Option<usize>,
     ) -> Result<Option<Vec<(NodeId, f64)>>> {
-        let Some(dirty) = self
-            .text_index_dirty_ids(index_name, label, query.analyzer)
+        let Some(fresh) = self
+            .text_freshness(index_name, label, query.analyzer, &[])
             .await?
         else {
             return Ok(None);
         };
-        match search_lsm_read::text_search(self, index_name, query, k, &[], &dirty).await? {
+        match search_lsm_read::text_search(self, index_name, query, k, &[], &fresh).await? {
             search_lsm_read::ActiveSearch::Ready(hits) => return Ok(Some(hits)),
             search_lsm_read::ActiveSearch::Unavailable => return Ok(None),
             search_lsm_read::ActiveSearch::NotActive => {}
         }
+        // A legacy (pre-Search-LSM) index merges nothing: a rewritten
+        // document of the label leaves only the exact scan.
+        if fresh.rewritten > 0 {
+            return Ok(None);
+        }
+        let dirty = fresh.shadowed;
         let Some(selected) = self
             .select_search_base(SearchLsmKind::Text, index_name)
             .await?
@@ -11158,24 +11296,17 @@ impl<'mt> Snapshot<'mt> {
         {
             return Ok(None);
         }
-        let dict = &self.manifest.manifest.label_dict;
-        let mut dirty = Vec::new();
-        for (key, entry) in self.node_entries() {
-            let MemKey::Node { id } = key else {
-                continue;
-            };
-            match &entry.op {
-                MemOp::Tombstone => dirty.push(*id.0.as_bytes()),
-                MemOp::Upsert(payload) => {
-                    let record = NodeWriteRecord::decode(payload)?;
-                    if record_carries_label(&record, label, dict) {
-                        return Ok(None);
-                    }
-                    dirty.push(*id.0.as_bytes());
-                }
-            }
-        }
-        match search_lsm_read::text_search(self, index_name, query, k, groups, &dirty).await? {
+        let filter_properties = groups
+            .iter()
+            .map(|(property, _)| property.clone())
+            .collect::<Vec<_>>();
+        let Some(fresh) = self
+            .text_freshness(index_name, label, query.analyzer, &filter_properties)
+            .await?
+        else {
+            return Ok(None);
+        };
+        match search_lsm_read::text_search(self, index_name, query, k, groups, &fresh).await? {
             search_lsm_read::ActiveSearch::Ready(hits) => Ok(Some(hits)),
             search_lsm_read::ActiveSearch::Unavailable
             | search_lsm_read::ActiveSearch::NotActive => Ok(None),

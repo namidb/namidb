@@ -1145,6 +1145,24 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
+            "# HELP namidb_search_text_fresh_total Full-text reads with unflushed documents \
+             of the indexed label: merged into the index answer, or past \
+             NAMIDB_SEARCH_FRESH_TEXT_MAX_DOCS and served by the exact scan (each overflow \
+             also requests an early flush)."
+        );
+        let _ = writeln!(out, "# TYPE namidb_search_text_fresh_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_search_text_fresh_total{{outcome=\"merged\"}} {}",
+            routes.text_fresh_merged
+        );
+        let _ = writeln!(
+            out,
+            "namidb_search_text_fresh_total{{outcome=\"overflow\"}} {}",
+            routes.text_fresh_overflow
+        );
+        let _ = writeln!(
+            out,
             "# HELP namidb_property_lookup_route_total Graph property lookups by physical route. \
              A climbing fallback counter beside a flat native one means an indexed property is \
              silently paying O(label) scan prices (pre-sidecar SSTs in scope, unreadable sidecar, \

@@ -22,6 +22,8 @@ static PROPERTY_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static TUPLE_NATIVE: AtomicU64 = AtomicU64::new(0);
 static TUPLE_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static SHORTEST_BIDIRECTIONAL: AtomicU64 = AtomicU64::new(0);
+static TEXT_FRESH_MERGED: AtomicU64 = AtomicU64::new(0);
+static TEXT_FRESH_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
 /// Record one text index search outcome: `native = true` when the index
 /// served the answer, `false` when it declined (freshness gate, missing or
@@ -32,6 +34,19 @@ pub fn record_text(native: bool) {
     } else {
         TEXT_FALLBACK.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Record one full-text read the index served with unflushed documents of
+/// its label merged in (scored from their memtable values).
+pub fn record_text_fresh_merged() {
+    TEXT_FRESH_MERGED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one full-text read that found more unflushed documents than it
+/// merges ([`crate::search_freshness::fresh_text_max_docs`]) and took the
+/// exact flat scan.
+pub fn record_text_fresh_overflow() {
+    TEXT_FRESH_OVERFLOW.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record one vector index search outcome; same contract as [`record_text`].
@@ -89,6 +104,8 @@ pub struct RouteTelemetrySnapshot {
     pub tuple_native: u64,
     pub tuple_fallback: u64,
     pub shortest_bidirectional: u64,
+    pub text_fresh_merged: u64,
+    pub text_fresh_overflow: u64,
 }
 
 pub fn snapshot() -> RouteTelemetrySnapshot {
@@ -102,6 +119,8 @@ pub fn snapshot() -> RouteTelemetrySnapshot {
         tuple_native: TUPLE_NATIVE.load(Ordering::Relaxed),
         tuple_fallback: TUPLE_FALLBACK.load(Ordering::Relaxed),
         shortest_bidirectional: SHORTEST_BIDIRECTIONAL.load(Ordering::Relaxed),
+        text_fresh_merged: TEXT_FRESH_MERGED.load(Ordering::Relaxed),
+        text_fresh_overflow: TEXT_FRESH_OVERFLOW.load(Ordering::Relaxed),
     }
 }
 

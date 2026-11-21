@@ -1662,7 +1662,18 @@ pub async fn run_with_memory_limits(
                     // Over the memory ceiling after reclaim: the memtable is
                     // the reconstructible memory left to give back.
                     _ = memory::pressure_flush_requested() => {}
+                    // A full-text read found more unflushed documents than
+                    // it merges (`namidb_storage::search_freshness`).
+                    _ = namidb_storage::search_freshness::flush_requested() => {
+                        if !namidb_storage::search_freshness::take_flush_request(
+                            &state_for_flush.namespace,
+                        ) {
+                            continue;
+                        }
+                    }
                 }
+                // Any flush satisfies a pending early-flush request.
+                namidb_storage::search_freshness::take_flush_request(&state_for_flush.namespace);
                 if retry_after.is_some_and(|at| std::time::Instant::now() < at) {
                     continue;
                 }
