@@ -8292,7 +8292,7 @@ fn filter_seek_plan(filter: &Expression, alias: &str, params: &Params) -> Option
         };
         groups.extend(group);
     }
-    (!groups.is_empty()).then(|| FilterSeekPlan {
+    (!groups.is_empty()).then_some(FilterSeekPlan {
         single_group: terms.len() == 1 && groups.len() == 1,
         groups,
     })
