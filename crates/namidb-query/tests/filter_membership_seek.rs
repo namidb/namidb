@@ -553,7 +553,6 @@ mod search_legs {
     };
     use namidb_storage::{NamespacePaths, NodeWriteRecord, Snapshot, WriterSession};
     use object_store::memory::InMemory;
-    use object_store::ObjectStore;
 
     const LABEL: &str = "Section";
     const DIM: usize = 4;
