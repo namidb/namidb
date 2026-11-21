@@ -117,6 +117,19 @@ fn epsilon() -> f32 {
 /// fewer on every dataset measured; the cap only bounds a pathological query.
 const CANDIDATE_CAP_FACTOR: usize = 8;
 
+/// Re-rank candidates of a member search ([`VectorV5Reader::search_members`]).
+/// The bound alone selects them; this only bounds the exact reads of a
+/// pathological query (64 MiB of f32 rows at 1024 dimensions, read in waves).
+const MEMBER_CANDIDATE_CAP: usize = 16_384;
+
+/// A member search widens every row's error bound by this factor before
+/// selecting re-rank candidates. Its members are typically one tight cluster
+/// with score gaps far below the bound, so the plain bound's small failure
+/// rate shows up as swapped near-ties; doubled, a neighbour is lost only on
+/// an estimate error about four times the stated bound. The extra candidates
+/// are re-ranked exactly and stay under [`MEMBER_CANDIDATE_CAP`].
+const MEMBER_BOUND_WIDENING: f32 = 2.0;
+
 #[cfg(test)]
 thread_local! {
     /// Test-only: build bases as releases before the section did.
@@ -1259,6 +1272,7 @@ fn rabitq_plan(
     cap: usize,
     groups: &[(String, Vec<Value>)],
     filtered: bool,
+    with_ids: bool,
     budget: usize,
 ) -> RabitqPlan {
     let dim = footer.dim as usize;
@@ -1276,6 +1290,9 @@ fn rabitq_plan(
         let mut bytes = page.codes.len as usize;
         if filtered {
             bytes += page.filters.len as usize * (1 + NAV_DECODE_WORKSPACE_FACTOR);
+        }
+        if with_ids {
+            bytes += page.ids.len as usize;
         }
         bytes
     };
@@ -1396,9 +1413,30 @@ impl VectorV5Reader {
         options: VectorV5SearchOptions,
         groups: &[(String, Vec<Value>)],
     ) -> Result<VectorV5SearchResult, Error> {
+        self.search_rabitq_where(index, query, k, options, groups, None)
+            .await
+    }
+
+    /// [`Self::search_rabitq`], optionally restricted to the rows whose
+    /// NodeId `members` admits. A restricted search reads every page (its
+    /// codes and id block) and offers only admitted rows, so its result is
+    /// the exact top-`k` of the admitted rows, re-ranked like any other.
+    pub(super) async fn search_rabitq_where(
+        &self,
+        index: &RabitqIndex,
+        query: &[f32],
+        k: usize,
+        options: VectorV5SearchOptions,
+        groups: &[(String, Vec<Value>)],
+        members: Option<&super::VectorMemberFilter<'_>>,
+    ) -> Result<VectorV5SearchResult, Error> {
         let pages = self.footer.pages.len();
-        let initial_nprobe = options.nprobe.max(1).min(pages);
-        let max_nprobe = options.max_nprobe.max(initial_nprobe).min(pages);
+        let (initial_nprobe, max_nprobe) = if members.is_some() {
+            (pages, pages)
+        } else {
+            let initial = options.nprobe.max(1).min(pages);
+            (initial, options.max_nprobe.max(initial).min(pages))
+        };
         let point_count = usize::try_from(self.footer.point_count)
             .map_err(|_| Error::invariant("vector v5 point count does not fit usize"))?;
         let final_k = k.min(point_count);
@@ -1406,10 +1444,17 @@ impl VectorV5Reader {
             .saturating_mul(options.rerank_factor.max(1))
             .max(k)
             .min(point_count);
-        let cap = rerank_k
-            .saturating_mul(CANDIDATE_CAP_FACTOR)
-            .max(final_k)
-            .min(point_count);
+        // A member search answers for a filter that ANN probing could not:
+        // members are often one tight cluster, where estimate errors exceed
+        // the score gaps, so it re-ranks every candidate whose bound still
+        // reaches the k-th best rather than a multiple of `k` of them.
+        let cap = if members.is_some() {
+            MEMBER_CANDIDATE_CAP
+        } else {
+            rerank_k.saturating_mul(CANDIDATE_CAP_FACTOR)
+        }
+        .max(final_k)
+        .min(point_count);
         let supported_groups = prepare_groups(&self.footer.filter_properties, groups);
         let applied_filter_groups = supported_groups.len();
         let filtered = applied_filter_groups > 0;
@@ -1420,6 +1465,7 @@ impl VectorV5Reader {
             cap,
             groups,
             filtered,
+            members.is_some(),
             search_planning_budget(),
         );
         let _workspace = shared_search_workspace()
@@ -1446,6 +1492,9 @@ impl VectorV5Reader {
                     if filtered {
                         ranges.push(entry.filters.range());
                     }
+                    if members.is_some() {
+                        ranges.push(entry.ids.range());
+                    }
                 }
                 let blocks = {
                     namidb_core::profile_scope!("v5.rabitq.read");
@@ -1456,7 +1505,7 @@ impl VectorV5Reader {
                         "vector v5 range source returned wrong rabitq block count",
                     ));
                 }
-                let per_page = if filtered { 2 } else { 1 };
+                let per_page = 1 + usize::from(filtered) + usize::from(members.is_some());
                 namidb_core::profile_scope!("v5.rabitq.score");
                 for (&page, wires) in batch.iter().zip(blocks.chunks_exact(per_page)) {
                     let entry = &index.directory.pages[page as usize];
@@ -1467,6 +1516,12 @@ impl VectorV5Reader {
                     } else {
                         None
                     };
+                    let ids = match members {
+                        Some(_) => {
+                            Some(verify_block(&wires[per_page - 1], &entry.ids, "id block")?)
+                        }
+                        None => None,
+                    };
                     index.center(&self.footer, page as usize, &mut center);
                     scorer.prepare_page(&index.rotation, &center);
                     let factor_base = rows * code_bytes;
@@ -1476,10 +1531,26 @@ impl VectorV5Reader {
                                 continue;
                             }
                         }
+                        if let (Some(members), Some(ids)) = (members, ids.as_ref()) {
+                            let id: &[u8; ID_BYTES] = ids
+                                .get(row * ID_BYTES..(row + 1) * ID_BYTES)
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .ok_or_else(|| {
+                                    Error::invariant("vector v5 rabitq id out of range")
+                                })?;
+                            if !members(id) {
+                                continue;
+                            }
+                        }
                         eligible_rows_seen += 1;
                         let code = &block[row * code_bytes..(row + 1) * code_bytes];
                         let factors = read_factors(block, factor_base + row * FACTOR_BYTES);
                         let (estimate, bound) = scorer.estimate(code, factors);
+                        let bound = if members.is_some() {
+                            bound * MEMBER_BOUND_WIDENING
+                        } else {
+                            bound
+                        };
                         if !estimate.is_finite() || !bound.is_finite() {
                             return Err(Error::invariant(
                                 "vector v5 rabitq estimate is not finite",
@@ -1490,7 +1561,10 @@ impl VectorV5Reader {
                 }
             }
             fetched = target;
-            if applied_filter_groups == 0 || eligible_rows_seen >= k || fetched >= max_nprobe {
+            if (applied_filter_groups == 0 && members.is_none())
+                || eligible_rows_seen >= k
+                || fetched >= max_nprobe
+            {
                 break;
             }
             target = fetched.saturating_mul(2).max(fetched + 1).min(max_nprobe);
@@ -2418,6 +2492,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_member_search_is_the_exact_top_k_of_its_members() {
+        let rows = clustered(3_000, 96, 12, 29);
+        let member = |id: &[u8; 16]| u32::from_be_bytes(id[12..].try_into().unwrap()) % 13 == 0;
+        let member_count = rows.iter().filter(|(id, _)| member(id)).count();
+        for metric in [
+            VectorMetric::Dot,
+            VectorMetric::Cosine,
+            VectorMetric::Euclidean,
+        ] {
+            let body = build(metric, &rows, true, VectorFilterPostings::new());
+            let reader = open(&body).await;
+            assert!(reader.has_rabitq());
+            let (mut found, mut wanted) = (0usize, 0usize);
+            // Queries from rows outside the member set: the members are
+            // rarely among the query's own neighbours.
+            for (_, query) in rows.iter().filter(|(id, _)| !member(id)).step_by(53) {
+                let all = reader
+                    .search_exact_filter_groups(query, rows.len(), &[])
+                    .await
+                    .unwrap();
+                let truth: Vec<([u8; 16], f32)> = all
+                    .hits
+                    .iter()
+                    .filter(|(id, _)| member(id))
+                    .take(10)
+                    .copied()
+                    .collect();
+                let result = reader
+                    .search_members(query, 10, 8, &member)
+                    .await
+                    .unwrap()
+                    .expect("a base with codes answers");
+                assert_eq!(result.probed_pages, reader.page_count());
+                assert_eq!(result.eligible_rows_seen, member_count);
+                assert_eq!(result.hits.len(), 10);
+                for (id, score) in &result.hits {
+                    assert!(member(id), "{metric:?}: a non-member was returned");
+                    let (_, expected) = all.hits.iter().find(|(other, _)| other == id).unwrap();
+                    assert!((score - expected).abs() < 1e-5, "{metric:?}: exact score");
+                }
+                let truth_ids: HashSet<[u8; 16]> = truth.iter().map(|(id, _)| *id).collect();
+                found += result
+                    .hits
+                    .iter()
+                    .filter(|(id, _)| truth_ids.contains(id))
+                    .count();
+                wanted += truth.len();
+            }
+            let recall = found as f64 / wanted as f64;
+            assert!(recall >= 0.99, "{metric:?}: member recall {recall}");
+        }
+
+        // No members: an empty page. More wanted than there are: all of them.
+        let body = build(
+            VectorMetric::Cosine,
+            &rows,
+            true,
+            VectorFilterPostings::new(),
+        );
+        let reader = open(&body).await;
+        let none = reader
+            .search_members(&rows[1].1, 10, 8, &|_: &[u8; 16]| false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(none.hits.is_empty() && none.eligible_rows_seen == 0);
+        let few = |id: &[u8; 16]| u32::from_be_bytes(id[12..].try_into().unwrap()) < 7;
+        let all_few = reader
+            .search_members(&rows[1].1, 10, 8, &few)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(all_few.hits.len(), 7);
+        // A zero cosine query, and a base without codes, decline.
+        assert!(reader
+            .search_members(&vec![0.0; 96], 10, 8, &member)
+            .await
+            .unwrap()
+            .is_none());
+        let old = build(
+            VectorMetric::Cosine,
+            &rows,
+            false,
+            VectorFilterPostings::new(),
+        );
+        assert!(open(&old)
+            .await
+            .search_members(&rows[1].1, 10, 8, &member)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn filters_apply_before_k_on_the_rabitq_path() {
         let members = clustered(1_200, 32, 4, 3);
         let (rare, common): (Vec<u32>, Vec<u32>) =
@@ -2655,7 +2823,8 @@ mod tests {
         let RabitqState::Present(index) = &reader.rabitq else {
             panic!("the base carries a RaBitQ section");
         };
-        let plan = |budget: usize| rabitq_plan(&reader.footer, index, 10, 400, &[], false, budget);
+        let plan =
+            |budget: usize| rabitq_plan(&reader.footer, index, 10, 400, &[], false, false, budget);
 
         let minimal = plan(0);
         assert_eq!(
@@ -2692,13 +2861,15 @@ mod tests {
         let RabitqState::Present(index) = &reader.rabitq else {
             panic!("the base carries a RaBitQ section");
         };
-        let one_page = rabitq_plan(&reader.footer, index, 10, 400, &[], false, 0).required_bytes;
+        let one_page =
+            rabitq_plan(&reader.footer, index, 10, 400, &[], false, false, 0).required_bytes;
         let budgets = [usize::MAX, 3 * one_page, 0];
         // The fixture is large enough for the budgets to split the waves.
         let waves: Vec<usize> = budgets
             .iter()
             .map(|budget| {
-                rabitq_plan(&reader.footer, index, 10, 400, &[], false, *budget).exact_batch_pages
+                rabitq_plan(&reader.footer, index, 10, 400, &[], false, false, *budget)
+                    .exact_batch_pages
             })
             .collect();
         assert!(waves[0] > waves[1] && waves[1] > waves[2], "{waves:?}");

@@ -927,3 +927,278 @@ mod search_legs {
         );
     }
 }
+
+/// A filtered vector search whose filter has no index and whose members sit
+/// far from the query (see the module comment).
+#[cfg(feature = "vector-index")]
+mod member_scan {
+    // `search.vector` with an unindexed range filter admitting ~8% of the
+    // label, all of it in a cluster far from the queries: the ANN probe the
+    // first round sizes from the filter's selectivity finds none of them, and
+    // widening used to run until the exact scan of every node. After one
+    // under-filled round the search now ranks exactly the members from the
+    // index's codes. Its answers must equal the widening route's (ids, scores
+    // to f32 precision), flushed and with unflushed moves into and out of the
+    // member set, re-embeddings and deletes; filters the first round fills
+    // never take it.
+
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use namidb_core::id::{NamespaceId, NodeId};
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
+    use namidb_core::value::Value as CoreValue;
+    use namidb_query::{
+        execute, lower, optimize, parse, set_vector_member_scan_enabled, vector_member_scans,
+        Params, RuntimeValue, StatsCatalog,
+    };
+    use namidb_storage::manifest::{VectorIndexDescriptor, VectorMetric, VectorQuantization};
+    use namidb_storage::{NamespacePaths, NodeWriteRecord, Snapshot, WriterSession};
+    use object_store::memory::InMemory;
+
+    use super::SERIAL;
+
+    const LABEL: &str = "Doc";
+    const DIM: usize = 16;
+    const DOCS: usize = 54_000;
+
+    fn schema() -> Schema {
+        SchemaBuilder::new()
+            .label(LabelDef {
+                name: LABEL.into(),
+                properties: vec![
+                    PropertyDef::new("level", DataType::Int64, true).unwrap(),
+                    PropertyDef::new("parentId", DataType::Utf8, true)
+                        .unwrap()
+                        .with_indexed(true),
+                ],
+            })
+            .unwrap()
+            .build()
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn unit(&mut self) -> f32 {
+            (self.next() % 10_000) as f32 / 10_000.0 - 0.5
+        }
+
+        /// Around `+center` on the first axis (near) or `-center` (far).
+        fn embedding(&mut self, far: bool) -> Vec<f32> {
+            (0..DIM)
+                .map(|axis| {
+                    let center = if axis == 0 {
+                        if far {
+                            -3.0
+                        } else {
+                            3.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    center + self.unit()
+                })
+                .collect()
+        }
+    }
+
+    fn record(level: i64, parent: usize, embedding: &[f32]) -> NodeWriteRecord {
+        let mut properties = BTreeMap::new();
+        properties.insert("level".into(), CoreValue::I64(level));
+        properties.insert("parentId".into(), CoreValue::Str(format!("p{parent}")));
+        properties.insert("embedding".into(), CoreValue::Vec(embedding.to_vec()));
+        NodeWriteRecord {
+            properties,
+            schema_version: 1,
+            ..Default::default()
+        }
+    }
+
+    async fn run(snapshot: &Snapshot<'_>, cypher: &str, params: &Params) -> Vec<(NodeId, f64)> {
+        let query = parse(cypher).unwrap();
+        let plan = optimize(lower(&query).unwrap(), &StatsCatalog::empty());
+        execute(&plan, snapshot, params)
+            .await
+            .unwrap_or_else(|error| panic!("execute {cypher}: {error}"))
+            .iter()
+            .map(|row| {
+                let id = match row.get("node") {
+                    Some(RuntimeValue::Node(node)) => node.id,
+                    other => panic!("node: {other:?}"),
+                };
+                let score = match row.get("score") {
+                    Some(RuntimeValue::Float(score)) => *score,
+                    other => panic!("score: {other:?}"),
+                };
+                (id, score)
+            })
+            .collect()
+    }
+
+    fn search(filter: &str, k: usize) -> String {
+        format!(
+            "CALL search.vector({{label: '{LABEL}', property: 'embedding', query: $v, k: {k}, \
+             filter: {filter}}}) YIELD node, score RETURN node, score"
+        )
+    }
+
+    /// `(filter, the member scan answers it)`.
+    /// More members than the exact flat route takes (4096), fewer than the
+    /// first round's over-fetch reaches; a selective one and a broad one.
+    const FILTERS: [(&str, bool); 4] = [
+        ("{level: {lte: 4}}", true),
+        ("{level: {lt: 5}}", true),
+        ("{level: {lte: 4}, parentId: 'p3'}", false),
+        ("{level: {gte: 5}}", false),
+    ];
+
+    async fn assert_parity(snapshot: &Snapshot<'_>, rng: &mut Rng, context: &str) {
+        let mut cases = Vec::new();
+        for (filter, scanned) in FILTERS {
+            for k in [10, 50] {
+                for _ in 0..2 {
+                    let mut params = Params::new();
+                    params.insert("v".into(), RuntimeValue::Vector(rng.embedding(false)));
+                    cases.push((search(filter, k), params, scanned, k));
+                }
+            }
+        }
+        set_vector_member_scan_enabled(true);
+        let mut scanned_results = Vec::new();
+        for (cypher, params, scanned, _) in &cases {
+            let before = vector_member_scans();
+            scanned_results.push(run(snapshot, cypher, params).await);
+            let took = vector_member_scans() > before;
+            if *scanned {
+                assert!(took, "{context}: {cypher} did not take the member scan");
+            } else {
+                assert!(!took, "{context}: {cypher} took the member scan");
+            }
+        }
+        set_vector_member_scan_enabled(false);
+        for ((cypher, params, _, k), scanned) in cases.iter().zip(scanned_results) {
+            let widened = run(snapshot, cypher, params).await;
+            assert_eq!(scanned.len(), widened.len(), "{context}: {cypher} k={k}");
+            assert!(scanned.len() == *k || scanned.len() < *k, "{context}");
+            for (position, ((left_id, left), (right_id, right))) in
+                scanned.iter().zip(&widened).enumerate()
+            {
+                assert!(
+                    (left - right).abs() <= 1e-5 * right.abs().max(1.0),
+                    "{context}: {cypher} k={k} rank {position}: score {left} vs {right}"
+                );
+                // Ids agree except between scores tied to f32 precision.
+                if left_id != right_id {
+                    let tied = widened
+                        .iter()
+                        .chain(&scanned)
+                        .filter(|(_, score)| (score - left).abs() <= 1e-5 * left.abs().max(1.0))
+                        .count();
+                    assert!(
+                        tied > 2,
+                        "{context}: {cypher} k={k} rank {position}: ids differ"
+                    );
+                }
+            }
+        }
+        set_vector_member_scan_enabled(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn far_members_are_ranked_from_the_codes_like_the_widening_route() {
+        let _serial = SERIAL.lock().await;
+        let paths = NamespacePaths::new("tenants", NamespaceId::new("member-scan").unwrap());
+        let mut writer = WriterSession::open(Arc::new(InMemory::new()), paths)
+            .await
+            .unwrap();
+        writer
+            .register_vector_index(
+                VectorIndexDescriptor {
+                    name: "doc_emb".into(),
+                    label: LABEL.into(),
+                    property: "embedding".into(),
+                    dim: DIM as u32,
+                    metric: VectorMetric::Cosine,
+                    r: 32,
+                    l_build: 64,
+                    alpha: 1.2,
+                    quantization: VectorQuantization::None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let mut rng = Rng(353);
+        let mut ids = Vec::with_capacity(DOCS);
+        for index in 0..DOCS {
+            // One in twelve is a member (level <= 4, 4500 of them), far from
+            // the queries.
+            let member = index % 12 == 0;
+            let level = if member {
+                (index % 5) as i64
+            } else {
+                5 + (index % 7) as i64
+            };
+            let id = NodeId::new();
+            writer
+                .upsert_node(
+                    LABEL,
+                    id,
+                    &record(level, index % 40, &rng.embedding(member)),
+                )
+                .unwrap();
+            ids.push((id, member));
+        }
+        writer.commit_batch().await.unwrap();
+        writer.flush(schema()).await.unwrap();
+        writer.compact_l0(&schema()).await.unwrap();
+        assert_parity(&writer.snapshot(), &mut rng, "flushed").await;
+
+        // Unflushed: near nodes moved into the member set (and re-embedded far),
+        // members moved out, members re-embedded, members deleted.
+        // Fewer fresh members than `k`: a delta that fills a round on its own
+        // ends the search on the first round, member scan or not.
+        let mut moved_in = 0;
+        for (position, (id, member)) in ids.iter().enumerate().take(2_400) {
+            match (member, position % 4) {
+                (false, 1) if moved_in < 8 => {
+                    moved_in += 1;
+                    writer
+                        .upsert_node(LABEL, *id, &record(3, 3, &rng.embedding(true)))
+                        .unwrap();
+                }
+                (true, 0) => {
+                    writer
+                        .upsert_node(LABEL, *id, &record(9, 3, &rng.embedding(false)))
+                        .unwrap();
+                }
+                (true, _) if position % 5 == 0 => {
+                    writer.tombstone_node(LABEL, *id).unwrap();
+                }
+                (true, _) if moved_in < 8 => {
+                    moved_in += 1;
+                    writer
+                        .upsert_node(LABEL, *id, &record(1, 3, &rng.embedding(true)))
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+        writer.commit_batch().await.unwrap();
+        assert_parity(&writer.snapshot(), &mut rng, "unflushed").await;
+
+        writer.flush(schema()).await.unwrap();
+        assert_parity(&writer.snapshot(), &mut rng, "flushed again").await;
+        writer.compact_l0(&schema()).await.unwrap();
+        assert_parity(&writer.snapshot(), &mut rng, "merged").await;
+    }
+}

@@ -8172,6 +8172,45 @@ fn filter_membership_seek_cap() -> usize {
     }
 }
 
+/// Under-filled widening rounds after which a filtered vector search with a
+/// known membership scores the members exactly from the index's codes
+/// (`Snapshot::try_vector_search_members`) instead of widening further.
+/// `NAMIDB_VECTOR_MEMBER_SCAN_AFTER_ROUNDS`, default 1; `0` disables it.
+///
+/// One code pass costs about what probing every leaf costs, whatever the
+/// members' distance to the query; each further widening round costs a wider
+/// probe and, past the last round, an exact scan of every node. A member set
+/// that the first, selectivity-sized round under-fills is small or far from
+/// the query, and further rounds rarely fill it.
+#[cfg(feature = "vector-index")]
+fn vector_member_scan_after_rounds() -> usize {
+    if VECTOR_MEMBER_SCAN_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROUNDS.get_or_init(|| {
+        std::env::var("NAMIDB_VECTOR_MEMBER_SCAN_AFTER_ROUNDS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(1)
+    })
+}
+
+static VECTOR_MEMBER_SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VECTOR_MEMBER_SCAN_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the member scan off or back on process-wide (the widening route then
+/// answers alone; for differential tests and benchmarks).
+pub fn set_vector_member_scan_enabled(enabled: bool) {
+    VECTOR_MEMBER_SCAN_DISABLED.store(!enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Filtered vector searches answered by a member scan since process start.
+pub fn vector_member_scans() -> u64 {
+    VECTOR_MEMBER_SCANS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static MEMBERSHIP_SEEK_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static MEMBERSHIP_SEEK_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -9532,6 +9571,11 @@ async fn try_index_search(
     // guarantee the full over-fetch gave.
     let mut delta_overfetch = 0_usize;
     let mut rounds_left = max_rounds;
+    // Under-filled rounds so far, and the persisted hits of a member scan
+    // ([`vector_member_scan_after_rounds`]) for the next round to use.
+    let mut underfilled_rounds = 0_usize;
+    let mut member_scanned = false;
+    let mut member_round: Option<(Vec<(NodeId, f32)>, bool)> = None;
     while rounds_left > 0 {
         let round_started = std::time::Instant::now();
         let kprime = k
@@ -9552,7 +9596,7 @@ async fn try_index_search(
         // residual expression. It grows with the widening round so a second,
         // unsupported conjunct does not force an immediate flat scan.
         let search_k = kprime;
-        let native = if native_groups_supported == Some(false) {
+        let native = if member_round.is_some() || native_groups_supported == Some(false) {
             None
         } else {
             match snapshot
@@ -9584,6 +9628,7 @@ async fn try_index_search(
             }
         };
         if native.is_none()
+            && member_round.is_none()
             && native_groups_supported == Some(false)
             && !filter_groups.is_empty()
             && !capped_eligibility_resolved
@@ -9610,7 +9655,10 @@ async fn try_index_search(
             }
         }
         let (raw_hits, index_exhausted, persisted_candidates_complete) =
-            if let Some(applied) = native {
+            if let Some((hits, complete)) = member_round.take() {
+                // Every persisted member was ranked: nothing wider exists.
+                (hits, true, complete)
+            } else if let Some(applied) = native {
                 applied
             } else if let Some(eligible) = capped_eligibility.as_ref() {
                 let Some((hits, point_count)) = snapshot
@@ -9839,6 +9887,28 @@ async fn try_index_search(
                 *flat_eligible = Some(eligible);
                 if selective {
                     return Ok(None);
+                }
+            }
+        }
+        // A known membership the ANN probe keeps missing (its members sit far
+        // from the query, or the filter admits too few for an over-fetch to
+        // reach): score exactly the members, from the index's codes, instead
+        // of widening towards the exact scan of every node.
+        underfilled_rounds += 1;
+        let scan_after = vector_member_scan_after_rounds();
+        if !member_scanned && scan_after > 0 && underfilled_rounds >= scan_after {
+            if let Some(membership) = membership.as_ref() {
+                member_scanned = true;
+                // Fresh writes are scored from the delta; their persisted
+                // versions are superseded, so they never take a slot here.
+                let admit = |id: &NodeId| membership.contains(id) && !delta_contains(id);
+                if let Some((hits, _point_count, complete)) = snapshot
+                    .try_vector_search_members(&index_name, &qv, k, &admit)
+                    .await?
+                {
+                    VECTOR_MEMBER_SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    member_round = Some((hits, complete));
+                    continue;
                 }
             }
         }

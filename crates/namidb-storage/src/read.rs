@@ -10321,6 +10321,103 @@ impl<'mt> Snapshot<'mt> {
         Ok(Some((all, point_count)))
     }
 
+    /// The exact top-`k` persisted vectors among the nodes `members` admits.
+    ///
+    /// Every row of the active generation is considered: a V5 base ranks its
+    /// admitted rows from the RaBitQ codes of every page and re-ranks the
+    /// best of them with the stored vectors; a VG6 delta scores its admitted
+    /// rows exactly; versions reconcile as on every other route. The cost is
+    /// one pass over the codes, independent of how far the admitted rows sit
+    /// from the query, which is what an ANN probe restricted by a filter it
+    /// cannot read pays for: it keeps widening until it reaches them.
+    ///
+    /// Returns the hits, the persisted point count, and whether the hits are
+    /// provably every admitted persisted vector when fewer than `k`. `Ok(None)`
+    /// when the index cannot answer this way (a base without RaBitQ codes, a
+    /// legacy graph body, a zero cosine query, an unavailable generation); the
+    /// caller keeps its other routes.
+    #[cfg(feature = "vector-index")]
+    pub async fn try_vector_search_members(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        members: &(dyn Fn(&NodeId) -> bool + Send + Sync),
+    ) -> Result<Option<(Vec<(NodeId, f32)>, u64, bool)>> {
+        let by_bytes = |id: &[u8; 16]| members(&NodeId(Uuid::from_bytes(*id)));
+        match search_lsm_read::vector_search_where(
+            self,
+            index_name,
+            query,
+            k,
+            k,
+            &[],
+            Some(&by_bytes),
+        )
+        .await?
+        {
+            search_lsm_read::ActiveSearch::Ready(
+                search_lsm_read::CoordinatedVectorFilterResult::Applied(result),
+            ) => {
+                let complete = result.eligible_count != usize::MAX;
+                return Ok(Some((result.hits, result.point_count, complete)));
+            }
+            search_lsm_read::ActiveSearch::Ready(
+                search_lsm_read::CoordinatedVectorFilterResult::Unsupported,
+            )
+            | search_lsm_read::ActiveSearch::Unavailable => return Ok(None),
+            search_lsm_read::ActiveSearch::NotActive => {}
+        }
+        let Some(selected) = self
+            .select_search_base(SearchLsmKind::Vector, index_name)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let desc = &self.manifest.manifest.ssts[selected.descriptor_index];
+        let Some(idx) = self.fetch_vector_search_index(desc).await? else {
+            return Ok(None);
+        };
+        if selected
+            .active_segment
+            .as_ref()
+            .is_some_and(|segment| !active_vector_base_matches(&idx, desc, segment))
+        {
+            return Ok(None);
+        }
+        let point_count = idx.point_count();
+        let VectorSearchIndex::Ranged(reader) = idx else {
+            return Ok(None);
+        };
+        let rerank_factor = vector_v5_search_options(&reader, k).rerank_factor;
+        let result = match reader
+            .search_members(query, k, rerank_factor, &by_bytes)
+            .await
+        {
+            Ok(Some(result)) => result,
+            Ok(None) => return Ok(None),
+            Err(error) if optional_accelerator_fallback(&error) => {
+                tracing::warn!(
+                    path = %desc.path,
+                    error = %error,
+                    "vector member search page is corrupt; falling back"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        // Every admitted row was ranked; at most `k` of them, all returned,
+        // proves there are no more.
+        let complete =
+            result.eligible_rows_seen <= k && result.hits.len() == result.eligible_rows_seen;
+        let hits = result
+            .hits
+            .into_iter()
+            .map(|(id, score)| (NodeId(Uuid::from_bytes(id)), score))
+            .collect();
+        Ok(Some((hits, point_count, complete)))
+    }
+
     /// Filter-aware vector-index probe.
     ///
     /// Unlike fetching an unfiltered top-k and discarding rows afterwards,

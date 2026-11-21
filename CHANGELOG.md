@@ -35,6 +35,22 @@ crates.io release will establish and document that API explicitly.
   disables it); a larger posting, or a filter without an indexed equality
   conjunct, keeps the column read and its cross-statement cache. Counted
   by `namidb_filter_membership_seek_total{outcome="served"|"declined"}`.
+- **A filtered vector search that its first round under-fills ranks the
+  filter's members from the index's codes.** `search.vector` (and the
+  dense leg of `search.hybrid`) with a filter the vector index cannot apply
+  itself, for example a range on an unindexed property, over-fetches from
+  the index and widens up to four rounds before an exact scan of every
+  node. When the filter admits more nodes than the exact flat route takes
+  but sits far from the query, those rounds found few or none of them and
+  the scan of every node ran into the query timeout. After one under-filled
+  round, the search now ranks exactly the filter's members from every
+  page's RaBitQ codes, re-ranks the best of them with the stored vectors,
+  and merges unflushed writes as before: one pass over the codes, whatever
+  the members' distance to the query. Scores are exact; a member is missed
+  only on an estimate error about four times the codes' stated bound.
+  Bases without RaBitQ codes keep widening. `NAMIDB_VECTOR_MEMBER_SCAN_AFTER_ROUNDS`
+  (default 1, `0` disables it) sets the round; counted by
+  `namidb_vector_member_scan_total`.
 
 ### Fixed
 

@@ -1197,6 +1197,18 @@ impl Metrics {
         }
         let _ = writeln!(
             out,
+            "# HELP namidb_vector_member_scan_total Filtered vector searches whose first \
+             widening round under-filled and that then ranked exactly the filter's members \
+             from the index's codes."
+        );
+        let _ = writeln!(out, "# TYPE namidb_vector_member_scan_total counter");
+        let _ = writeln!(
+            out,
+            "namidb_vector_member_scan_total {}",
+            namidb_query::vector_member_scans()
+        );
+        let _ = writeln!(
+            out,
             "# HELP namidb_property_lookup_route_total Graph property lookups by physical route. \
              A climbing fallback counter beside a flat native one means an indexed property is \
              silently paying O(label) scan prices (pre-sidecar SSTs in scope, unreadable sidecar, \

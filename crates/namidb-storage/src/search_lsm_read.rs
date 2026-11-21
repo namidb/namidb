@@ -26,6 +26,8 @@ use crate::sst::search_delta::{
     SearchFilterValue, SearchVersionOperation, SearchVersionRangeSource, SearchVersionRecord,
     SearchVersionTableReader,
 };
+#[cfg(feature = "vector-index")]
+use crate::sst::vector::v5::VectorMemberFilter;
 
 const WINNER_PROBE_BATCH: usize = 512;
 /// Segment lookups inside one query are independent object-store reads. Issuing
@@ -1165,8 +1167,64 @@ async fn search_vector_segment(
     ef: usize,
     value_groups: &[(String, Vec<Value>)],
     canonical_groups: &[(String, Vec<SearchFilterValue>)],
+    members: Option<&VectorMemberFilter<'_>>,
 ) -> Result<SegmentVectorCandidates> {
     match segment {
+        OpenedVectorSegment::V5Base { reader, .. } if members.is_some() => {
+            let members = members.expect("guarded above");
+            // Every page is scored, so the probe is exhaustive by
+            // construction. The caller checked every base has RaBitQ codes.
+            let result = reader
+                .search_members(
+                    query,
+                    limit,
+                    super::vector_v5_search_options(reader, ef).rerank_factor,
+                    members,
+                )
+                .await?
+                .ok_or_else(|| {
+                    Error::invariant("Search-LSM V5 base cannot restrict a search to members")
+                })?;
+            Ok(SegmentVectorCandidates {
+                hits: result
+                    .hits
+                    .into_iter()
+                    .map(|(node_id, score)| VectorCandidate {
+                        node_id,
+                        score,
+                        version: VectorCandidateVersion::V5Base,
+                    })
+                    .collect(),
+                eligible_rows_seen: result.eligible_rows_seen,
+                probed_all_pages: true,
+            })
+        }
+        OpenedVectorSegment::V6 { reader, .. } if members.is_some() => {
+            let result = reader
+                .search_exact_where(query, limit, canonical_groups, members)
+                .await?;
+            if result.scanned_pages != reader.page_count() {
+                return Err(Error::invariant(
+                    "Search-LSM VG6 member search did not exhaust its pages",
+                ));
+            }
+            Ok(SegmentVectorCandidates {
+                hits: result
+                    .hits
+                    .into_iter()
+                    .map(|hit| VectorCandidate {
+                        node_id: hit.node_id,
+                        score: hit.score,
+                        version: VectorCandidateVersion::Versioned {
+                            lsn: hit.lsn,
+                            fingerprint: hit.payload_fingerprint,
+                        },
+                    })
+                    .collect(),
+                eligible_rows_seen: result.eligible_rows_seen,
+                probed_all_pages: true,
+            })
+        }
         OpenedVectorSegment::V5Base { reader, .. } => {
             // A clustered V5 base is an IVF index: probing every page turns it
             // back into a full scan of the corpus it exists to avoid. `ef` is
@@ -1291,11 +1349,38 @@ pub(super) async fn vector_search(
     ef: usize,
     groups: &[(String, Vec<Value>)],
 ) -> Result<ActiveSearch<CoordinatedVectorFilterResult>> {
+    vector_search_where(snapshot, index_name, query, k, ef, groups, None).await
+}
+
+/// [`vector_search`], optionally restricted to the rows whose NodeId
+/// `members` admits. A restricted search scores every row of every segment
+/// (a V5 base from its RaBitQ codes, re-ranked exactly; a VG6 delta exactly)
+/// and reconciles versions like any other, so an `Applied` result with an
+/// exact eligible count is the exact top-`k` of the admitted rows. A
+/// generation with a base that has no RaBitQ codes is `Unavailable`.
+#[cfg(feature = "vector-index")]
+pub(super) async fn vector_search_where(
+    snapshot: &Snapshot<'_>,
+    index_name: &str,
+    query: &[f32],
+    k: usize,
+    ef: usize,
+    groups: &[(String, Vec<Value>)],
+    members: Option<&VectorMemberFilter<'_>>,
+) -> Result<ActiveSearch<CoordinatedVectorFilterResult>> {
     let generation = match open_vector_generation(snapshot, index_name).await? {
         ActiveSearch::NotActive => return Ok(ActiveSearch::NotActive),
         ActiveSearch::Unavailable => return Ok(ActiveSearch::Unavailable),
         ActiveSearch::Ready(generation) => generation,
     };
+    if members.is_some()
+        && (generation.segments.iter().any(|segment| {
+            matches!(segment, OpenedVectorSegment::V5Base { reader, .. } if !reader.has_rabitq())
+        }) || (generation.metric == VectorMetric::Cosine
+            && query.iter().all(|value| *value == 0.0)))
+    {
+        return Ok(ActiveSearch::Unavailable);
+    }
     let Some(canonical_groups) = canonical_search_filter_groups(groups) else {
         return Ok(ActiveSearch::Ready(
             CoordinatedVectorFilterResult::Unsupported,
@@ -1373,6 +1458,7 @@ pub(super) async fn vector_search(
                         segment_ef,
                         groups,
                         canonical_groups,
+                        members,
                     )
                     .await,
                 )

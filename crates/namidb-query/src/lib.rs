@@ -41,10 +41,11 @@ pub use exec::{
     execute_write_with_deadline, factorize_enabled, filter_membership_ids_for_tests,
     filter_membership_paths, filter_membership_seek_ids_for_tests, filter_membership_seeks,
     process_resident_bytes, resident_memory_probe, set_filter_membership_seek_enabled,
-    show_constraints_rows, show_indexes_columns, show_indexes_rows, show_schema_columns,
-    system_memory_bytes, with_auto_index_hints, with_query_memory, AutoIndexHints, EvalError,
-    ExecError, MemoryProbe, Params, QueryMemoryBudget, QueryMemoryExceeded, QueryMemoryPool,
-    QueryMemoryScope, Row, RuntimeValue, WriteOutcome,
+    set_vector_member_scan_enabled, show_constraints_rows, show_indexes_columns, show_indexes_rows,
+    show_schema_columns, system_memory_bytes, vector_member_scans, with_auto_index_hints,
+    with_query_memory, AutoIndexHints, EvalError, ExecError, MemoryProbe, Params,
+    QueryMemoryBudget, QueryMemoryExceeded, QueryMemoryPool, QueryMemoryScope, Row, RuntimeValue,
+    WriteOutcome,
 };
 pub use optimize::{convert_cross_to_hash, normalize_filters, optimize, predicate_pushdown};
 pub use parser::{parse, ParseError, ParseResult, Query};
