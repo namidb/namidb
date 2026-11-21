@@ -76,6 +76,18 @@ crates.io release will establish and document that API explicitly.
   label. The set is now cached per flushed corpus and patched with the
   unflushed rows, evaluated on their memtable values
   (`NAMIDB_FILTER_MEMBERSHIP_FRESH_MAX_ROWS`, default 50 000).
+- **A filtered vector or hybrid search takes one index round.** A filter
+  whose selectivity is known (its membership set) sized the first index
+  round from it, but no wider than the blind ×8 over-fetch, so a filter
+  admitting fewer than about 1 in 5 nodes always came back short and took a
+  second, ×4 wider round: on a 386k-node label a 1-in-12 filter cost the
+  dense leg of `search.hybrid` a 320- and then a 1280-candidate round on
+  every query. The first round is now sized up to the widest round (×512),
+  so such a filter takes one round of about k × 18. A selective filter that
+  admits at most 4 096 nodes is scored exactly over them directly, the path
+  its short first round led to anyway. An unknown selectivity, a filter the
+  index applies natively, and a short sized round keep the ×8 start and the
+  ×4 widening.
 - **A flush or a compaction no longer makes the next filtered search
   re-read the label.** The flushed corpus's filter set was recomputed from
   the filter's columns of the whole label whenever a flush or a compaction
