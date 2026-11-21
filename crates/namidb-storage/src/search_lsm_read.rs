@@ -2286,6 +2286,11 @@ pub(super) async fn text_search(
         Err(error) => return Err(error),
     };
     if expanded.is_empty() {
+        // Only prefixes the index does not expand: no indexed document
+        // matches, but an unflushed one may.
+        if merging {
+            return Ok(ActiveSearch::Unavailable);
+        }
         return Ok(ActiveSearch::Ready(Vec::new()));
     }
     let global = match global_text_stats(&generation, &expanded).await {

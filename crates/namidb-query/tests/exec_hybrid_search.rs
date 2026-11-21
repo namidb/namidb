@@ -1057,23 +1057,24 @@ mod indexed_sparse_filter {
     }
 
     #[tokio::test]
-    async fn hybrid_filtered_bm25_stale_ft_falls_back_to_fresh_corpus() {
+    async fn hybrid_filtered_bm25_merges_unflushed_documents_into_the_ft() {
         let _cap = CapEnvGuard::set(64);
         let docs = vec![
             ("old-a", "other", "alpha alpha"),
             ("old-b", "other", "alpha beta"),
         ];
-        let (mut writer, _, probe) = indexed_corpus("hybrid-ft-stale", &docs).await;
+        let (mut writer, _, _) = indexed_corpus("hybrid-ft-stale", &docs).await;
         assert_eq!(authoritative_hits(&writer, "alpha", 8).await.len(), 2);
 
         let mut properties = BTreeMap::new();
         properties.insert("title".into(), CoreValue::Str("fresh".into()));
         properties.insert("tenant".into(), CoreValue::Str("acme".into()));
         properties.insert("body".into(), CoreValue::Str("zebra".into()));
+        let fresh = NodeId::new();
         writer
             .upsert_node(
                 "Doc",
-                NodeId::new(),
+                fresh,
                 &NodeWriteRecord {
                     properties,
                     schema_version: 1,
@@ -1082,17 +1083,19 @@ mod indexed_sparse_filter {
             )
             .unwrap();
         writer.commit_batch().await.unwrap();
-        assert!(
-            writer
-                .snapshot()
-                .text_search(INDEX_NAME, "Doc", &parse_query("zebra"), Some(8))
-                .await
-                .unwrap()
-                .is_none(),
-            "a same-label delta must make the persisted .ft non-authoritative"
+        // The persisted .ft does not hold the unflushed document; the read
+        // merges it instead of serving the index alone.
+        let hits = writer
+            .snapshot()
+            .text_search(INDEX_NAME, "Doc", &parse_query("zebra"), Some(8))
+            .await
+            .unwrap()
+            .expect("the unflushed document is merged into the .ft read");
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![fresh]
         );
 
-        let before = probe.text_gets();
         let rows = run(
             &writer,
             "CALL search.hybrid({ label: 'Doc', query_text: 'zebra', \
@@ -1103,11 +1106,6 @@ mod indexed_sparse_filter {
         )
         .await;
         assert_eq!(titles(&rows), vec!["fresh".to_string()]);
-        assert_eq!(
-            probe.text_gets() - before,
-            0,
-            "the freshness gate must reject stale .ft before fetching its body"
-        );
     }
 
     #[tokio::test]

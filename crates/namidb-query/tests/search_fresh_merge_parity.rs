@@ -341,15 +341,20 @@ async fn mutate(writer: &mut WriterSession, model: &mut Model) {
     writer.commit_batch().await.unwrap();
 }
 
-const QUERIES: [&str; 8] = [
+const QUERIES: [&str; 10] = [
     "graph",
     "graph storage engine",
     "search index",
     "w1 w2 w3",
     "\"graph engine\"",
     "vector search",
+    // Terms only unflushed documents carry.
     "fresh",
+    "joins corpus",
     "w4*",
+    // A prefix the index does not expand at all, matched by unflushed
+    // documents only.
+    "fre*",
 ];
 
 async fn run(snapshot: &Snapshot<'_>, cypher: &str, params: &Params) -> Vec<namidb_query::Row> {
