@@ -1536,10 +1536,13 @@ mod indexed {
             .collect();
         assert_eq!(got, exact_topk(&eligible, &q, 3));
         assert_eq!(got.len(), 3, "selective metadata filter must still fill k");
+        // The filter's membership set (which sizes the first round and
+        // filters the fresh delta) resolves through the equality index: one
+        // posting lookup. Native `.vg` filtering itself adds none.
         assert_eq!(
             w.property_index_cache().equality_lookup_calls(),
-            equality_lookups,
-            "v4 native filtering must not eagerly open/hydrate equality sidecars"
+            equality_lookups + 1,
+            "v4 native filtering must not open equality sidecars beyond the membership's one lookup"
         );
     }
 
