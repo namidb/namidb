@@ -88,6 +88,80 @@ pub fn norm_i8(codes: &[i8], scale: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// Lengths of the kernel tests: edge classes, then pseudo-random ones.
+    fn kernel_lengths(state: &mut u64) -> Vec<usize> {
+        let mut lengths = vec![
+            0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 127, 1023, 1024, 1025, 1536, 2100,
+        ];
+        lengths.extend((0..24).map(|_| (next(state) % 2101) as usize));
+        lengths
+    }
+
+    fn next(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn random_unit(state: &mut u64) -> f32 {
+        (next(state) >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+    }
+
+    /// The asymmetric dot and the code norm against f64 references on every
+    /// length class, including codes at -128 (decoded data, not quantizer
+    /// output) and buffers of different lengths.
+    #[test]
+    fn dot_and_norm_kernels_match_f64_references_on_every_length() {
+        let mut state = 0x4b45_524e_454c_5332u64;
+        for len in kernel_lengths(&mut state) {
+            let other = if next(&mut state) % 4 == 0 {
+                (next(&mut state) % 2101) as usize
+            } else {
+                len
+            };
+            let query: Vec<f32> = (0..len).map(|_| random_unit(&mut state) * 3.0).collect();
+            let codes: Vec<i8> = (0..other).map(|_| next(&mut state) as i8).collect();
+            let scale = random_unit(&mut state).abs() * 0.01;
+            let exact: f64 = query
+                .iter()
+                .zip(&codes)
+                .map(|(q, c)| *q as f64 * *c as f64)
+                .sum::<f64>()
+                * scale as f64;
+            let magnitude: f64 = query
+                .iter()
+                .zip(&codes)
+                .map(|(q, c)| (*q as f64 * *c as f64).abs())
+                .sum::<f64>()
+                * scale as f64;
+            let got = dot_i8_asymmetric(&query, &codes, scale);
+            assert!(
+                (got as f64 - exact).abs() <= 1e-4 * magnitude + 1e-6,
+                "{len}/{other}: {got} vs {exact}"
+            );
+            let norm = codes
+                .iter()
+                .map(|c| *c as f64 * *c as f64)
+                .sum::<f64>()
+                .sqrt()
+                * scale as f64;
+            let got = norm_i8(&codes, scale);
+            assert!(
+                (got as f64 - norm).abs() <= 1e-5 * norm + 1e-9,
+                "{other}: {got} vs {norm}"
+            );
+            let (quantized, q_scale) = quantize_i8(&query);
+            assert_eq!(quantized.len(), len);
+            assert!(
+                quantized.iter().all(|c| *c != i8::MIN),
+                "quantizer stays in ±127"
+            );
+            assert!(q_scale.is_finite() && q_scale >= 0.0);
+        }
+    }
+
     #[test]
     fn round_trip_bounds_the_error_per_vector() {
         // Per-vector error is at most half a step = 0.5 * scale, where

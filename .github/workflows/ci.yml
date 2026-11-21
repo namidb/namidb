@@ -106,6 +106,29 @@ jobs:
           cargo test --locked -p namidb-storage -p namidb-query -p namidb-server \
             --features vector-index,text-index --no-fail-fast
 
+  # The vector kernels are portable Rust, and the `test` and `test-features`
+  # jobs above already run their checks on amd64. Those checks use the test profile's opt-level 1,
+  # where LLVM's loop vectoriser does not run. This job runs them at
+  # opt-level 3 with debug assertions and overflow checks still on, so the
+  # x86 vector code the release build ships is held bit-exact to the scalar
+  # references. It also logs which x86 features the runner has.
+  kernels-amd64:
+    name: kernels (amd64, opt-level 3)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_TEST_OPT_LEVEL: "3"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: storage kernels
+        run: cargo test --locked -p namidb-storage --lib --features vector-index kernel -- --nocapture
+      - name: core kernels
+        run: cargo test --locked -p namidb-core --lib kernels -- --nocapture
+
   object-native:
     name: object-native acceptance
     runs-on: ubuntu-latest

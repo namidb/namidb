@@ -2552,14 +2552,18 @@ fn approximate_score(
         }
         VectorMetric::Cosine => {
             let mut dot = [0.0f32; LANES];
-            let mut code_norm = [0i32; LANES];
+            // Unsigned: a lane sums up to `MAX_DIM / LANES` squares of at
+            // most 128² (a decoded page may hold -128), exactly 2^31 at
+            // `MAX_DIM`, one past `i32::MAX`.
+            let mut code_norm = [0u32; LANES];
             for (q, c) in query[..split]
                 .chunks_exact(LANES)
                 .zip(codes[..split].chunks_exact(LANES))
             {
                 for lane in 0..LANES {
                     dot[lane] += q[lane] * c[lane] as f32;
-                    code_norm[lane] += c[lane] as i32 * c[lane] as i32;
+                    let magnitude = u32::from(c[lane].unsigned_abs());
+                    code_norm[lane] += magnitude * magnitude;
                 }
             }
             let mut dot_sum = dot.iter().sum::<f32>();
@@ -3350,6 +3354,9 @@ fn validate_tree_reachability(footer: &Footer) -> Result<(), Error> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod kernel_tests;
 
 #[cfg(test)]
 mod tests {

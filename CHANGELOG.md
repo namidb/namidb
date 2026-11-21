@@ -15,6 +15,20 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **Panic records survive the process.** The server installs a panic hook at
+  startup. Release builds abort on panic, and an abort under concurrent search
+  load left no message once the container was gone. Every panic now logs
+  `panic: <message>` at ERROR with the thread, `file:line:col` and a forced
+  backtrace. With `NAMIDB_PANIC_LOG=<path>` set, the hook also appends the
+  same record, with a UTC timestamp and the pid, to that file in one
+  `O_APPEND` write. Past 16 MiB the file rotates once to `<path>.1`. The
+  default hook still prints to stderr. Point the variable at a persistent
+  volume that is not emptied at start: a spool directory is not one. A stack
+  overflow or an allocation failure aborts without a panic, so it still
+  reaches only stderr.
+
 ### Changed
 
 - **Selective equality filters resolve through the property index.** A
@@ -61,6 +75,23 @@ crates.io release will establish and document that API explicitly.
   for the seconds its output was still uploading and installing, and an
   idle stop in that window threw the upload away. The registration now
   lasts until the output is installed (or discarded).
+- **The int8 cosine scorer's code norm could overflow.** A lane summed
+  `i32` squares of the codes, and with every code at -128 (possible in a
+  decoded page, never written by the quantizer) it reached exactly 2^31 at the
+  largest accepted dimension (1,048,576). Debug builds panicked there and
+  release builds scored NaN. The lanes are unsigned now, and results do not
+  change for any other input.
+
+### Tests
+
+- The vector kernels (int8 navigation scores and norm, RaBitQ rotation, sign
+  coding and lookup-table code dot, the tail scorer's int8 dot, the core
+  asymmetric dot) are checked against scalar references. The checks cover
+  lengths 0 to 2100, every lane-tail class, unaligned slices and mismatched
+  buffer lengths. They are bit-exact where the summation order is fixed.
+  These kernels are portable Rust with no architecture-specific code.
+  CI also runs them on amd64 at `opt-level = 3`, where the compiler
+  vectorises them, and logs the x86 features the runner reports.
 
 ## [3.5.2] - 2026-11-21
 
