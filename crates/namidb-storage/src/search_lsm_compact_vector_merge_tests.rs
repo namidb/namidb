@@ -547,7 +547,8 @@ async fn segment_merged_base_equals_the_node_scan_base() {
             false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         let merge_elapsed = started.elapsed();
         let started = Instant::now();
         let scanned = prepare_search_compactions_with(
@@ -560,7 +561,8 @@ async fn segment_merged_base_equals_the_node_scan_base() {
             false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         let scan_elapsed = started.elapsed();
         let [merged] = merged.as_slice() else {
             panic!("one merged base")
@@ -724,10 +726,17 @@ async fn vector_base_is_rebuilt_from_segments_past_the_nodes_input_cap() {
         "the vector base rebuild must be scheduled although the node tables exceed the cap"
     );
     assert!(vector_segment_merge_supported(manifest, &selections[0]));
-    let prepared =
-        prepare_search_compactions(corpus.store.clone(), &corpus.paths, &loaded, selections)
+    let generation = selections[0].captured_state.generation_id;
+    let (prepared, hold) =
+        prepare_search_compactions_held(corpus.store.clone(), &corpus.paths, &loaded, selections)
             .await
             .unwrap();
+    // A base folded from segments (no node scan) is registered too, and stays
+    // in flight while the caller holds it for the install.
+    assert!(hold.is_some());
+    assert!(crate::search_progress::build_percent(generation).is_some());
+    drop(hold);
+    assert_eq!(crate::search_progress::build_percent(generation), None);
     let [prepared] = prepared.as_slice() else {
         panic!("one prepared base")
     };

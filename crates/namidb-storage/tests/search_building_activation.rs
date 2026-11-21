@@ -790,3 +790,206 @@ async fn a_generation_retired_during_prepare_drops_only_its_own_compaction() {
         drop((store, paths));
     }
 }
+
+/// Build registration through upload and install (see the module comment).
+mod in_flight {
+    // A search index base build stays counted in
+    // `search_progress::builds_in_flight` until its output is installed, not only
+    // while it scans: uploading and installing a large base takes seconds after
+    // the build itself is done, and a host that idles the engine once the gauge
+    // reads zero would otherwise discard the upload. Dropping the prepared
+    // result (an install refused or never attempted) ends the registration too.
+
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use namidb_core::id::{NamespaceId, NodeId};
+    use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
+    use namidb_core::value::Value as CoreValue;
+    use namidb_storage::manifest::TextIndexDescriptor;
+    use namidb_storage::search_lsm::{SearchLsmKind, SearchLsmStatus};
+    use namidb_storage::search_progress::{builds_in_flight, builds_in_flight_detail};
+    use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+
+    fn schema() -> Schema {
+        SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![
+                    PropertyDef::new("body", DataType::Utf8, true).unwrap(),
+                    PropertyDef::new("title", DataType::Utf8, true).unwrap(),
+                ],
+            })
+            .unwrap()
+            .build()
+    }
+
+    fn doc(ordinal: u64) -> NodeWriteRecord {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "body".into(),
+            CoreValue::Str(format!("body común text{ordinal}")),
+        );
+        properties.insert(
+            "title".into(),
+            CoreValue::Str(format!("title common t{ordinal}")),
+        );
+        NodeWriteRecord {
+            properties,
+            schema_version: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The registry is process-wide and tests run in parallel: each test looks
+    /// for its own, uniquely named index.
+    fn in_flight(index: &str) -> bool {
+        builds_in_flight_detail()
+            .iter()
+            .any(|build| build.indexes.iter().any(|name| name == index))
+    }
+
+    fn status(writer: &WriterSession, name: &str) -> Option<SearchLsmStatus> {
+        writer
+            .snapshot()
+            .manifest()
+            .manifest
+            .search_lsm
+            .iter()
+            .find(|state| state.kind == SearchLsmKind::Text && state.index_name == name)
+            .map(|state| state.status)
+    }
+
+    async fn corpus(name: &str, index: TextIndexDescriptor) -> WriterSession {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let paths = NamespacePaths::new("tenants", NamespaceId::new(name).unwrap());
+        let mut writer = WriterSession::open(store, paths).await.unwrap();
+        writer.register_text_index(index, false).await.unwrap();
+        for ordinal in 0..40 {
+            writer
+                .upsert_node("Doc", NodeId::new(), &doc(ordinal))
+                .unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+        writer.flush(schema()).await.unwrap();
+        writer.compact_l0(&schema()).await.unwrap();
+        writer
+    }
+
+    /// A Building generation's activation: scanned, uploaded, then installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_activation_stays_in_flight_until_it_installs() {
+        const INDEX: &str = "inflight_activation_ft";
+        let mut writer = corpus(
+            "inflight-activation",
+            TextIndexDescriptor::new("inflight_body_ft".into(), "Doc".into(), vec!["body".into()]),
+        )
+        .await;
+        writer
+            .register_text_index(
+                TextIndexDescriptor::new(INDEX.into(), "Doc".into(), vec!["title".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+        writer
+            .upsert_node("Doc", NodeId::new(), &doc(1000))
+            .unwrap();
+        writer.flush(schema()).await.unwrap();
+        assert_eq!(status(&writer, INDEX), Some(SearchLsmStatus::Building));
+        assert!(!in_flight(INDEX));
+
+        let prepared = writer
+            .compaction_basis()
+            .prepare_search_only(&schema())
+            .await
+            .unwrap();
+        // The base is built and uploaded; the manifest does not reference it yet.
+        assert_eq!(status(&writer, INDEX), Some(SearchLsmStatus::Building));
+        assert!(
+            in_flight(INDEX),
+            "a built but uninstalled base is still in flight: {:?}",
+            builds_in_flight_detail()
+        );
+        assert!(builds_in_flight() >= 1);
+
+        writer.install_prepared_compaction(prepared).await.unwrap();
+        assert_eq!(status(&writer, INDEX), Some(SearchLsmStatus::Active));
+        assert!(
+            !in_flight(INDEX),
+            "an installed base is no longer in flight"
+        );
+    }
+
+    /// A prepared base nobody installs (an install refused, a pass abandoned)
+    /// leaves the gauge when it drops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_discarded_base_leaves_the_gauge() {
+        const INDEX: &str = "inflight_discarded_ft";
+        let mut writer = corpus(
+            "inflight-discarded",
+            TextIndexDescriptor::new(
+                "inflight_other_ft".into(),
+                "Doc".into(),
+                vec!["body".into()],
+            ),
+        )
+        .await;
+        writer
+            .register_text_index(
+                TextIndexDescriptor::new(INDEX.into(), "Doc".into(), vec!["title".into()]),
+                false,
+            )
+            .await
+            .unwrap();
+        writer
+            .upsert_node("Doc", NodeId::new(), &doc(1000))
+            .unwrap();
+        writer.flush(schema()).await.unwrap();
+
+        let prepared = writer
+            .compaction_basis()
+            .prepare_search_only(&schema())
+            .await
+            .unwrap();
+        assert!(in_flight(INDEX));
+        // A clone (a retried install keeps one) holds it as long as it lives.
+        let retry = prepared.clone();
+        drop(prepared);
+        assert!(in_flight(INDEX));
+        drop(retry);
+        assert!(!in_flight(INDEX));
+        assert_eq!(status(&writer, INDEX), Some(SearchLsmStatus::Building));
+    }
+
+    /// The analyzer re-analysis rebuild: built off-manifest, then installed
+    /// after a catch-up. It stays in flight until that install.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reanalysis_stays_in_flight_until_it_installs() {
+        const INDEX: &str = "inflight_reanalysis_ft";
+        let legacy = TextIndexDescriptor {
+            analyzer: None,
+            ..TextIndexDescriptor::new(INDEX.into(), "Doc".into(), vec!["body".into()])
+        };
+        let mut writer = corpus("inflight-reanalysis", legacy).await;
+        assert!(!in_flight(INDEX));
+        let prepared = writer
+            .compaction_basis()
+            .prepare_text_reanalysis(INDEX)
+            .await
+            .unwrap()
+            .expect("a legacy index is a re-analysis candidate");
+        assert!(
+            in_flight(INDEX),
+            "a re-analysed base waiting for its install is still in flight"
+        );
+        writer.install_text_reanalysis(prepared).await.unwrap();
+        assert!(
+            !in_flight(INDEX),
+            "an installed re-analysis is no longer in flight"
+        );
+        assert!(writer.compaction_basis().legacy_text_indexes().is_empty());
+    }
+}
