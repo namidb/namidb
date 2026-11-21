@@ -17,6 +17,7 @@ pub use isolate::running_isolated_reads;
 mod maintenance;
 pub mod memory;
 pub mod metrics;
+pub mod panic_log;
 pub mod recovery;
 pub mod registry;
 pub mod shared;
