@@ -2506,19 +2506,6 @@ impl<'a> TermDeltaRunMerge<'a> {
     }
 }
 
-/// [`prepare_search_compactions_held`] without the build registration.
-#[cfg(test)]
-pub(super) async fn prepare_search_compactions(
-    store: Arc<dyn ObjectStore>,
-    paths: &NamespacePaths,
-    base: &LoadedManifest,
-    selections: Vec<SearchCompactionSelection>,
-) -> Result<Vec<PreparedSearchCompaction>> {
-    prepare_search_compactions_held(store, paths, base, selections)
-        .await
-        .map(|(prepared, _build)| prepared)
-}
-
 /// The registration of a base build that has produced and uploaded its
 /// output but not installed it yet: the build stays counted in
 /// [`crate::search_progress::builds_in_flight`] until this drops, so an idle
@@ -2972,7 +2959,7 @@ fn shared_build_memory(per_collector: usize) -> usize {
     }
 }
 
-/// [`prepare_search_compactions`]; `vector_segment_merge: false` forces every
+/// [`prepare_search_compactions_held`]; `vector_segment_merge: false` forces every
 /// vector base through the node scan (tests compare the two builds).
 async fn prepare_search_compactions_with(
     store: Arc<dyn ObjectStore>,

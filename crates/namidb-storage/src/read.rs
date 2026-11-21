@@ -2150,6 +2150,7 @@ impl<'mt> Snapshot<'mt> {
             .unwrap_or_default())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn indexed_node_ids_by_property_value_inner(
         &self,
         label: &str,
