@@ -8146,11 +8146,10 @@ fn filter_membership_fresh_max_rows() -> usize {
 
 /// The membership of the snapshot's corpus, unflushed rows included.
 ///
-/// The set over the flushed corpus is cached per manifest; each snapshot
-/// then re-evaluates only its unflushed rows (from their memtable or
-/// transaction-overlay values) on top of it. Keyed by the full snapshot
-/// identity, every write invalidated the set and the next filtered search
-/// re-read the filter's columns of the whole label.
+/// The set over the flushed corpus comes from [`persisted_filter_membership`]
+/// (kept across flushes and compactions); each snapshot then re-evaluates only
+/// its unflushed rows (from their memtable or transaction-overlay values) on
+/// top of it.
 async fn compute_fresh_filter_membership(
     snapshot: &Snapshot<'_>,
     label: &str,
@@ -8161,37 +8160,59 @@ async fn compute_fresh_filter_membership(
     key: &str,
 ) -> Result<Option<Arc<FilterMembership>>, ExecError> {
     let unflushed = snapshot.unflushed_node_ids();
-    let persisted_identity = snapshot.persisted_node_data_identity();
-    let Some(persisted_identity) = persisted_identity
-        .filter(|_| !unflushed.is_empty() && unflushed.len() <= filter_membership_fresh_max_rows())
+    let Some(lineage) = snapshot
+        .node_data_lineage()
+        .filter(|_| unflushed.len() <= filter_membership_fresh_max_rows())
     else {
         return compute_filter_membership(snapshot, label, alias, properties, filter, params).await;
     };
-    let persisted_key = (persisted_identity, key.to_string());
-    let base = match membership_cache_get(&persisted_key) {
-        Some(base) => base,
-        None => {
-            let persisted = snapshot.persisted_only();
-            let base =
-                compute_filter_membership(&persisted, label, alias, properties, filter, params)
-                    .await?;
-            membership_cache_put(persisted_key, base.clone());
-            base
-        }
-    };
+    let base = persisted_filter_membership(
+        snapshot, lineage, key, label, alias, properties, filter, params,
+    )
+    .await?;
     let Some(base) = base else {
         return Ok(None);
     };
+    if unflushed.is_empty() {
+        return Ok(Some(base));
+    }
+    let (ids, visited_fresh) = patch_membership_ids(
+        snapshot, &base.ids, &unflushed, label, alias, filter, params,
+    )
+    .await?;
+    if ids.len() > filter_membership_max_ids() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(FilterMembership {
+        ids: Arc::new(ids),
+        // Selectivity only sizes search rounds: the flushed count plus the
+        // unflushed label rows bounds the live label from above.
+        visited: base.visited.saturating_add(visited_fresh),
+    })))
+}
+
+/// `base` with every id of `changed` (sorted) re-evaluated on its version
+/// in `snapshot`: removed, then re-admitted when that version carries
+/// `label` and passes `filter`. Also returns how many of them carry `label`.
+async fn patch_membership_ids(
+    snapshot: &Snapshot<'_>,
+    base: &[NodeId],
+    changed: &[NodeId],
+    label: &str,
+    alias: &str,
+    filter: &Expression,
+    params: &Params,
+) -> Result<(Vec<NodeId>, usize), ExecError> {
     let mut admitted = Vec::new();
-    let mut visited_fresh = 0usize;
-    for chunk in unflushed.chunks(256) {
+    let mut visited = 0usize;
+    for chunk in changed.chunks(256) {
         crate::exec::limits::check_deadline()?;
         let views = snapshot.batch_lookup_nodes(label, chunk).await?;
         for view in views.into_iter().flatten() {
             if !view.labels.contains(label) {
                 continue;
             }
-            visited_fresh += 1;
+            visited += 1;
             let id = view.id;
             let mut row = Row::new();
             row.set(
@@ -8204,23 +8225,406 @@ async fn compute_fresh_filter_membership(
         }
     }
     let mut ids = base
-        .ids
         .iter()
         .copied()
-        .filter(|id| unflushed.binary_search(id).is_err())
+        .filter(|id| changed.binary_search(id).is_err())
         .collect::<Vec<_>>();
     ids.extend(admitted);
     ids.sort_unstable();
     ids.dedup();
-    if ids.len() > filter_membership_max_ids() {
-        return Ok(None);
+    Ok((ids, visited))
+}
+
+/// A membership set over one flushed corpus, and what it was computed over:
+/// the highest row LSN of its node SSTs (the watermark) and those SSTs.
+struct PersistedMembership {
+    membership: Option<Arc<FilterMembership>>,
+    watermark: u64,
+    /// Every node SST, sorted by id.
+    ssts: Vec<namidb_storage::NodeSstSpan>,
+}
+
+impl PersistedMembership {
+    fn bytes(&self) -> usize {
+        self.membership.as_ref().map_or(0, |m| m.bytes())
+            + self.ssts.len() * std::mem::size_of::<namidb_storage::NodeSstSpan>()
+            + 64
     }
-    Ok(Some(Arc::new(FilterMembership {
-        ids: Arc::new(ids),
-        // Selectivity only sizes search rounds: the flushed count plus the
-        // unflushed label rows bounds the live label from above.
-        visited: base.visited.saturating_add(visited_fresh),
-    })))
+}
+
+type PersistedMembershipKey = (namidb_storage::NodeDataLineage, String);
+
+/// How [`persisted_filter_membership`] answered: the cached set as is, carried
+/// across a compaction, patched with newer rows, or recomputed.
+static MEMBERSHIP_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEMBERSHIP_CARRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEMBERSHIP_PATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEMBERSHIP_RECOMPUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Flushed-corpus filter membership sets served `(reused, carried across a
+/// compaction, patched with newer rows, recomputed)` (process totals).
+#[doc(hidden)]
+pub fn filter_membership_paths() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        MEMBERSHIP_REUSED.load(Relaxed),
+        MEMBERSHIP_CARRIED.load(Relaxed),
+        MEMBERSHIP_PATCHED.load(Relaxed),
+        MEMBERSHIP_RECOMPUTED.load(Relaxed),
+    )
+}
+
+/// Sets kept per filter: the newest and the one before, so a read pinned on
+/// the previous flushed corpus while a newer one is patched still finds its
+/// own.
+const PERSISTED_MEMBERSHIP_VERSIONS: usize = 2;
+
+#[allow(clippy::type_complexity)]
+fn persisted_membership_cache() -> &'static std::sync::Mutex<(
+    std::collections::VecDeque<(PersistedMembershipKey, Arc<PersistedMembership>)>,
+    usize,
+)> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<(
+            std::collections::VecDeque<(PersistedMembershipKey, Arc<PersistedMembership>)>,
+            usize,
+        )>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The cached set of `key` with the highest watermark at or below
+/// `watermark`: never one computed over rows newer than the reader's corpus.
+fn persisted_membership_get(
+    key: &PersistedMembershipKey,
+    watermark: u64,
+) -> Option<Arc<PersistedMembership>> {
+    let mut guard = persisted_membership_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (entries, _) = &mut *guard;
+    let position = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (cached, entry))| cached == key && entry.watermark <= watermark)
+        .max_by_key(|(_, (_, entry))| entry.watermark)
+        .map(|(position, _)| position)?;
+    let entry = entries.remove(position)?;
+    let value = entry.1.clone();
+    entries.push_back(entry);
+    Some(value)
+}
+
+/// Insert a new set (never mutating one a reader may hold), keeping the
+/// [`PERSISTED_MEMBERSHIP_VERSIONS`] highest watermarks of `key`, within
+/// the `NAMIDB_FILTER_CACHE_MAX_BYTES` budget (least recently used first).
+fn persisted_membership_put(key: PersistedMembershipKey, value: Arc<PersistedMembership>) {
+    let budget = filter_cache_max_bytes();
+    let bytes = value.bytes() + key.1.len() + 64;
+    if bytes > budget {
+        return;
+    }
+    let entry_bytes = |key: &PersistedMembershipKey, value: &PersistedMembership| {
+        value.bytes() + key.1.len() + 64
+    };
+    let mut guard = persisted_membership_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (entries, used) = &mut *guard;
+    // Same watermark: the newer SST list replaces the older one.
+    if let Some(position) = entries
+        .iter()
+        .position(|(cached, entry)| *cached == key && entry.watermark == value.watermark)
+    {
+        if let Some((old_key, old)) = entries.remove(position) {
+            *used = used.saturating_sub(entry_bytes(&old_key, &old));
+        }
+    }
+    *used += bytes;
+    entries.push_back((key.clone(), value));
+    let mut watermarks = entries
+        .iter()
+        .filter(|(cached, _)| *cached == key)
+        .map(|(_, entry)| entry.watermark)
+        .collect::<Vec<_>>();
+    if watermarks.len() > PERSISTED_MEMBERSHIP_VERSIONS {
+        watermarks.sort_unstable_by(|a, b| b.cmp(a));
+        let floor = watermarks[PERSISTED_MEMBERSHIP_VERSIONS - 1];
+        let mut kept = std::collections::VecDeque::with_capacity(entries.len());
+        for (cached, entry) in entries.drain(..) {
+            if cached == key && entry.watermark < floor {
+                *used = used.saturating_sub(entry_bytes(&cached, &entry));
+            } else {
+                kept.push_back((cached, entry));
+            }
+        }
+        *entries = kept;
+    }
+    while *used > budget {
+        let Some((old_key, old)) = entries.pop_front() else {
+            break;
+        };
+        *used = used.saturating_sub(entry_bytes(&old_key, &old));
+    }
+}
+
+/// `(node id, lsn)` of every row of a node SST, by SST id: shared by every
+/// filter whose set a new SST patches, within the filter cache budget.
+#[allow(clippy::type_complexity)]
+fn sst_keys_cache() -> &'static std::sync::Mutex<(
+    std::collections::VecDeque<(uuid::Uuid, Arc<Vec<(NodeId, u64)>>)>,
+    usize,
+)> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<(
+            std::collections::VecDeque<(uuid::Uuid, Arc<Vec<(NodeId, u64)>>)>,
+            usize,
+        )>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+async fn sst_row_keys(
+    snapshot: &Snapshot<'_>,
+    sst: uuid::Uuid,
+) -> Result<Arc<Vec<(NodeId, u64)>>, ExecError> {
+    let entry_bytes =
+        |keys: &Vec<(NodeId, u64)>| keys.len() * std::mem::size_of::<(NodeId, u64)>() + 64;
+    {
+        let mut guard = sst_keys_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (entries, _) = &mut *guard;
+        if let Some(position) = entries.iter().position(|(id, _)| *id == sst) {
+            if let Some(entry) = entries.remove(position) {
+                let keys = entry.1.clone();
+                entries.push_back(entry);
+                return Ok(keys);
+            }
+        }
+    }
+    let keys = Arc::new(snapshot.node_sst_row_keys(sst).await?);
+    let budget = filter_cache_max_bytes();
+    let bytes = entry_bytes(&keys);
+    if bytes <= budget {
+        let mut guard = sst_keys_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (entries, used) = &mut *guard;
+        if !entries.iter().any(|(id, _)| *id == sst) {
+            *used += bytes;
+            entries.push_back((sst, keys.clone()));
+            while *used > budget {
+                let Some((_, old)) = entries.pop_front() else {
+                    break;
+                };
+                *used = used.saturating_sub(entry_bytes(&old));
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// The membership of the snapshot's flushed corpus, kept across flushes and
+/// compactions instead of re-read per manifest.
+///
+/// A cached set records `W`, the highest row LSN of the node SSTs it was
+/// computed over, and those SSTs. Every row keeps the LSN of its write
+/// (compaction copies the winner's), so against a newer corpus:
+///
+/// - every row written after `W` is in an SST the set has not seen (all of
+///   its SSTs end at or below `W`), with an LSN above `W`: its id is
+///   re-evaluated on its newest version, which flips a changed value and
+///   drops a deleted or relabeled node;
+/// - a member can otherwise leave only when the SST holding its row is
+///   merged away and a newer tombstone dropped with it: every member inside
+///   a removed SST's key range that no new SST holds is re-evaluated too.
+///
+/// With nothing to re-evaluate the set carries as is (a compaction of rows it
+/// reflects). It is recomputed when no set is cached for the lineage
+/// (writer session, epoch, schema and index definitions) at or below the
+/// reader's watermark, or when SSTs of older rows appear without any SST
+/// leaving (an attach).
+#[allow(clippy::too_many_arguments)]
+async fn persisted_filter_membership(
+    snapshot: &Snapshot<'_>,
+    lineage: namidb_storage::NodeDataLineage,
+    key: &str,
+    label: &str,
+    alias: &str,
+    properties: &BTreeSet<String>,
+    filter: &Expression,
+    params: &Params,
+) -> Result<Option<Arc<FilterMembership>>, ExecError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut ssts = snapshot.persisted_node_ssts();
+    ssts.sort_unstable_by_key(|span| span.id);
+    let watermark = ssts.iter().map(|span| span.max_lsn).max().unwrap_or(0);
+    let cache_key = (lineage, key.to_string());
+    let persisted = snapshot.persisted_only();
+    if let Some(cached) = persisted_membership_get(&cache_key, watermark) {
+        let in_list = |list: &[namidb_storage::NodeSstSpan], id: uuid::Uuid| {
+            list.binary_search_by_key(&id, |span| span.id).is_ok()
+        };
+        let removed = cached
+            .ssts
+            .iter()
+            .filter(|span| !in_list(&ssts, span.id))
+            .collect::<Vec<_>>();
+        let added = ssts
+            .iter()
+            .filter(|span| !in_list(&cached.ssts, span.id))
+            .collect::<Vec<_>>();
+        // Every row at or below `W` was in the set's SSTs, so a new SST of
+        // such rows is a rewrite of removed ones; with nothing removed it is
+        // an attach of rows the set never saw.
+        let attach =
+            removed.is_empty() && added.iter().any(|span| span.max_lsn <= cached.watermark);
+        if !attach {
+            if removed.is_empty() && added.is_empty() {
+                MEMBERSHIP_REUSED.fetch_add(1, Relaxed);
+                return Ok(cached.membership.clone());
+            }
+            if cached.membership.is_none() {
+                // Too large to keep: it stays declined until a recompute.
+                MEMBERSHIP_CARRIED.fetch_add(1, Relaxed);
+                persisted_membership_put(
+                    cache_key,
+                    Arc::new(PersistedMembership {
+                        membership: None,
+                        watermark,
+                        ssts,
+                    }),
+                );
+                return Ok(None);
+            }
+            let mut changed = Vec::new();
+            let mut present = Vec::new();
+            for span in &added {
+                let keys = sst_row_keys(&persisted, span.id).await?;
+                debug_assert!(
+                    span.min_lsn <= cached.watermark
+                        || keys.iter().all(|(_, lsn)| *lsn > cached.watermark),
+                    "an SST whose min_lsn is above the watermark holds an older row"
+                );
+                changed.extend(
+                    keys.iter()
+                        .filter(|(_, lsn)| *lsn > cached.watermark)
+                        .map(|(id, _)| *id),
+                );
+                if !removed.is_empty() {
+                    present.extend(keys.iter().map(|(id, _)| *id));
+                }
+            }
+            if let (Some(base), false) = (&cached.membership, removed.is_empty()) {
+                present.sort_unstable();
+                present.dedup();
+                let in_removed_range = |id: &NodeId| {
+                    let bytes = *id.as_bytes();
+                    removed
+                        .iter()
+                        .any(|span| span.min_key <= bytes && bytes <= span.max_key)
+                };
+                changed.extend(
+                    base.ids
+                        .iter()
+                        .copied()
+                        .filter(|id| in_removed_range(id) && present.binary_search(id).is_err()),
+                );
+            }
+            changed.sort_unstable();
+            changed.dedup();
+            let membership = match &cached.membership {
+                Some(base) if !changed.is_empty() => {
+                    // Newest version of each id: the flushed corpus merges
+                    // every SST, so a newer row always wins.
+                    let (ids, visited) = patch_membership_ids(
+                        &persisted, &base.ids, &changed, label, alias, filter, params,
+                    )
+                    .await?;
+                    (ids.len() <= filter_membership_max_ids()).then(|| {
+                        Arc::new(FilterMembership {
+                            visited: base.visited.max(ids.len()).max(visited),
+                            ids: Arc::new(ids),
+                        })
+                    })
+                }
+                other => other.clone(),
+            };
+            let counter = if changed.is_empty() {
+                &MEMBERSHIP_CARRIED
+            } else {
+                &MEMBERSHIP_PATCHED
+            };
+            counter.fetch_add(1, Relaxed);
+            tracing::debug!(
+                target: "namidb::search_timing",
+                label,
+                changed = changed.len(),
+                added = added.len(),
+                removed = removed.len(),
+                from = cached.watermark,
+                to = watermark,
+                "filter membership carried forward"
+            );
+            persisted_membership_put(
+                cache_key,
+                Arc::new(PersistedMembership {
+                    membership: membership.clone(),
+                    watermark,
+                    ssts,
+                }),
+            );
+            return Ok(membership);
+        }
+    }
+    let membership =
+        compute_filter_membership(&persisted, label, alias, properties, filter, params).await?;
+    MEMBERSHIP_RECOMPUTED.fetch_add(1, Relaxed);
+    persisted_membership_put(
+        cache_key,
+        Arc::new(PersistedMembership {
+            membership: membership.clone(),
+            watermark,
+            ssts,
+        }),
+    );
+    Ok(membership)
+}
+
+/// Test hook: the `label` nodes a procedure-style `filter` map admits on
+/// `snapshot`, from the cross-flush membership path (`exact == false`) or
+/// from a full read of the filter's columns (`exact == true`). `None` when
+/// the filter is not a property-only filter or admits too many nodes.
+#[doc(hidden)]
+pub async fn filter_membership_ids_for_tests(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    filter: &RuntimeValue,
+    exact: bool,
+) -> Result<Option<Vec<NodeId>>, ExecError> {
+    let alias = "node";
+    let expression = proc_filter_expr(filter, alias)?;
+    let params = Params::new();
+    let Some(properties) = filter_property_projection(&expression, alias) else {
+        return Ok(None);
+    };
+    let membership = if exact {
+        compute_filter_membership(snapshot, label, alias, &properties, &expression, &params).await?
+    } else {
+        let key = resolved_filter_key(label, alias, &expression, &params);
+        compute_fresh_filter_membership(
+            snapshot,
+            label,
+            alias,
+            &properties,
+            &expression,
+            &params,
+            &key,
+        )
+        .await?
+    };
+    Ok(membership.map(|membership| membership.ids.as_ref().clone()))
 }
 
 async fn compute_filter_membership(

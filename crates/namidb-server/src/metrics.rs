@@ -1161,6 +1161,26 @@ impl Metrics {
             "namidb_search_text_fresh_total{{outcome=\"overflow\"}} {}",
             routes.text_fresh_overflow
         );
+        let (reused, carried, patched, recomputed) = namidb_query::filter_membership_paths();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_filter_membership_total Flushed-corpus membership sets of a \
+             search filter, by how they were served: reused as cached, carried across a \
+             compaction, patched with the rows of newer flushes, or recomputed from the \
+             filter's columns."
+        );
+        let _ = writeln!(out, "# TYPE namidb_filter_membership_total counter");
+        for (path, value) in [
+            ("reused", reused),
+            ("carried", carried),
+            ("patched", patched),
+            ("recomputed", recomputed),
+        ] {
+            let _ = writeln!(
+                out,
+                "namidb_filter_membership_total{{path=\"{path}\"}} {value}"
+            );
+        }
         let _ = writeln!(
             out,
             "# HELP namidb_property_lookup_route_total Graph property lookups by physical route. \

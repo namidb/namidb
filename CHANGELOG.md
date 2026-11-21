@@ -74,6 +74,18 @@ crates.io release will establish and document that API explicitly.
   label. The set is now cached per flushed corpus and patched with the
   unflushed rows, evaluated on their memtable values
   (`NAMIDB_FILTER_MEMBERSHIP_FRESH_MAX_ROWS`, default 50 000).
+- **A flush or a compaction no longer makes the next filtered search
+  re-read the label.** The flushed corpus's filter set was recomputed from
+  the filter's columns of the whole label whenever a flush or a compaction
+  published a new manifest (seconds on a large label, every 30 s under a
+  steady write load). The set now carries across manifests: a flush
+  re-evaluates the ids of the new SSTs' rows on their newest version, a
+  compaction of rows the set reflects keeps it, and a compaction that also
+  merged unseen rows re-evaluates those plus any member it may have
+  dropped with a tombstone. It is recomputed after a restart, a fencing or
+  a schema, label or index change, and for a snapshot older than every
+  kept set. Counted by `namidb_filter_membership_total{path}` (`reused`,
+  `carried`, `patched`, `recomputed`).
 - **Filtered and new-query search latency.** On a 386k × 1024
   production-shaped synthetic namespace with 20–40 ms simulated store
   latency, a never-seen hybrid search with a property filter on a

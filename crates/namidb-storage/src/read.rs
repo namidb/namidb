@@ -1093,6 +1093,31 @@ impl<'mt> Snapshot<'mt> {
         ))
     }
 
+    /// Identity of what a value derived from the flushed node data stays
+    /// valid within across manifest versions: the namespace, the writer
+    /// session, the manifest epoch and writer, and a fingerprint of the
+    /// schema (types decide how values compare), the label dictionary and
+    /// the search index definitions. Any restore, re-open, fencing, DDL or
+    /// index drop/recreate changes it. `None` for a standalone snapshot.
+    pub fn node_data_lineage(&self) -> Option<NodeDataLineage> {
+        use std::hash::Hasher;
+        let manifest = &self.manifest.manifest;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        manifest.schema.version.hash(&mut hasher);
+        format!(
+            "{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
+            manifest.schema, manifest.label_dict, manifest.vector_indexes, manifest.text_indexes
+        )
+        .hash(&mut hasher);
+        Some((
+            self.cache_namespace.clone(),
+            self.property_index_cache.as_ref()?.instance(),
+            manifest.epoch.0,
+            manifest.writer_id,
+            hasher.finish(),
+        ))
+    }
+
     /// This snapshot's flushed corpus: the same manifest without the
     /// memtable or a transaction overlay.
     pub fn persisted_only(&self) -> Snapshot<'static> {
@@ -1122,6 +1147,95 @@ impl<'mt> Snapshot<'mt> {
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+
+    /// Every non-empty node SST of the flushed corpus, any label scope, in
+    /// manifest order. Every row of a node SST keeps the LSN of the write
+    /// that produced it (compaction copies the winner's), so the LSN ranges
+    /// bound which SSTs hold rows written after a given LSN.
+    pub fn persisted_node_ssts(&self) -> Vec<NodeSstSpan> {
+        self.manifest
+            .manifest
+            .ssts
+            .iter()
+            // An empty SST (its LSN range coerced to 0) holds no row.
+            .filter(|descriptor| descriptor.kind == SstKind::Nodes && descriptor.row_count > 0)
+            .map(|descriptor| NodeSstSpan {
+                id: descriptor.id,
+                min_lsn: descriptor.min_lsn,
+                max_lsn: descriptor.max_lsn,
+                min_key: descriptor.min_key,
+                max_key: descriptor.max_key,
+                row_count: descriptor.row_count,
+            })
+            .collect()
+    }
+
+    /// `(node id, lsn)` of every row (tombstones included) of node SST `sst`
+    /// of this snapshot's manifest, in key order, read from the key columns
+    /// alone. An SST not in the manifest is an invariant error: the caller
+    /// lists it from the same snapshot.
+    pub async fn node_sst_row_keys(&self, sst: Uuid) -> Result<Vec<(NodeId, u64)>> {
+        let mut keys = Vec::new();
+        {
+            let sst = &sst;
+            let desc = self
+                .manifest
+                .manifest
+                .ssts
+                .iter()
+                .find(|descriptor| descriptor.id == *sst && descriptor.kind == SstKind::Nodes)
+                .ok_or_else(|| Error::invariant("node SST is not in the snapshot's manifest"))?;
+            if desc.row_count == 0 {
+                return Ok(keys);
+            }
+            let sst_label_def = self.label_def_for_node_sst(desc);
+            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+            let cached_metadata = self
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.get_metadata(&absolute));
+            let metadata_was_cached = cached_metadata.is_some();
+            let (mut stream, metadata) = node_scan_limited_async(
+                self.store.clone(),
+                Path::from(absolute.clone()),
+                desc.size_bytes,
+                &sst_label_def,
+                &[],
+                Some(&[]),
+                cached_metadata,
+            )
+            .await?;
+            if !metadata_was_cached {
+                if let Some(cache) = &self.cache {
+                    cache.insert_metadata(absolute, metadata);
+                }
+            }
+            while let Some(batches) = stream.next_row_group().await? {
+                for batch in batches {
+                    let batch = batch.map_err(|error| {
+                        Error::invariant(format!("node SST key scan read: {error}"))
+                    })?;
+                    crate::cancel::check()?;
+                    let id_col = batch
+                        .column_by_name(COL_NODE_ID)
+                        .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
+                        .ok_or_else(|| Error::invariant("node_id column missing"))?;
+                    let lsn_col = batch
+                        .column_by_name(COL_LSN)
+                        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                        .ok_or_else(|| Error::invariant("lsn column missing"))?;
+                    for row in 0..batch.num_rows() {
+                        let id: [u8; 16] = id_col
+                            .value(row)
+                            .try_into()
+                            .map_err(|_| Error::invariant("node_id row length != 16"))?;
+                        keys.push((NodeId::from_uuid(Uuid::from_bytes(id)), lsn_col.value(row)));
+                    }
+                }
+            }
+        }
+        Ok(keys)
     }
 
     pub fn with_overlay(mut self, overlay: MemtableSnapshot) -> Self {
@@ -13981,6 +14095,21 @@ impl Drop for PinnedSnapshot {
 /// See [`Snapshot::node_data_identity`]: namespace, writer session, manifest
 /// version, node generation.
 pub type NodeDataIdentity = (Arc<str>, u64, u64, u64);
+
+/// See [`Snapshot::node_data_lineage`]: namespace, writer session, manifest
+/// epoch, writer id and a schema/index fingerprint.
+pub type NodeDataLineage = (Arc<str>, u64, u64, Uuid, u64);
+
+/// One node SST of a flushed corpus (see [`Snapshot::persisted_node_ssts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeSstSpan {
+    pub id: Uuid,
+    pub min_lsn: u64,
+    pub max_lsn: u64,
+    pub min_key: [u8; 16],
+    pub max_key: [u8; 16],
+    pub row_count: u64,
+}
 
 /// A retention hold on one manifest version (see [`SnapshotCell::pin_version`]).
 #[derive(Debug)]
