@@ -550,13 +550,12 @@ mod indexed_sparse_filter {
         }
     }
 
-    /// Cache-free probes must GET the immutable `.ft` once per widening round.
-    /// Counting those GETs makes the indexed route observable without relying on
-    /// execution time or on a corpus scan returning a different logical answer.
+    /// Counts generation-barrier pins, which make the indexed route
+    /// observable without relying on execution time or on a corpus scan
+    /// returning a different logical answer.
     #[derive(Debug)]
     struct TextGetProbe {
         inner: Arc<dyn ObjectStore>,
-        text_gets: AtomicUsize,
         /// Generation-barrier pins. Every `search_lsm_read` coordinator
         /// invocation pins its `.slb` barrier exactly once via `store.head()`,
         /// so this counts query-side probes on the NATIVE route only — a flat
@@ -572,13 +571,8 @@ mod indexed_sparse_filter {
             namidb_storage::range_cache::disable_create_only_head_cache_for_tests();
             Self {
                 inner: Arc::new(InMemory::new()),
-                text_gets: AtomicUsize::new(0),
                 barrier_pins: AtomicUsize::new(0),
             }
-        }
-
-        fn text_gets(&self) -> usize {
-            self.text_gets.load(Ordering::SeqCst)
         }
 
         fn barrier_pins(&self) -> usize {
@@ -618,12 +612,6 @@ mod indexed_sparse_filter {
         ) -> object_store::Result<object_store::GetResult> {
             if options.head && location.as_ref().ends_with(".slb") {
                 self.barrier_pins.fetch_add(1, Ordering::SeqCst);
-            }
-            // Legacy monolithic bodies and native FT4 segments are both text
-            // index traffic; kept for the stale/corrupt tests, whose gates
-            // fire before any index fetch on either route.
-            if location.as_ref().ends_with(".ft") || location.as_ref().ends_with(".ft4") {
-                self.text_gets.fetch_add(1, Ordering::SeqCst);
             }
             self.inner.get_opts(location, options).await
         }
@@ -1063,7 +1051,7 @@ mod indexed_sparse_filter {
             ("old-a", "other", "alpha alpha"),
             ("old-b", "other", "alpha beta"),
         ];
-        let (mut writer, _, _) = indexed_corpus("hybrid-ft-stale", &docs).await;
+        let (mut writer, _, probe) = indexed_corpus("hybrid-ft-stale", &docs).await;
         assert_eq!(authoritative_hits(&writer, "alpha", 8).await.len(), 2);
 
         let mut properties = BTreeMap::new();
@@ -1096,6 +1084,7 @@ mod indexed_sparse_filter {
             vec![fresh]
         );
 
+        let before = probe.barrier_pins();
         let rows = run(
             &writer,
             "CALL search.hybrid({ label: 'Doc', query_text: 'zebra', \
@@ -1106,6 +1095,10 @@ mod indexed_sparse_filter {
         )
         .await;
         assert_eq!(titles(&rows), vec!["fresh".to_string()]);
+        assert!(
+            probe.barrier_pins() > before,
+            "the filtered text leg is served by the index, not the flat scan"
+        );
     }
 
     #[tokio::test]
