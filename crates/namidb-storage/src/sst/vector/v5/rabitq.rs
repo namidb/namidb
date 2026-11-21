@@ -1265,6 +1265,7 @@ struct RabitqPlan {
     required_bytes: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rabitq_plan(
     footer: &Footer,
     index: &RabitqIndex,
