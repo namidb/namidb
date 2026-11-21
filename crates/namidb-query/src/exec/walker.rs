@@ -9180,19 +9180,45 @@ async fn try_index_search(
     const OVERFETCH_BASE: usize = 8;
     const WIDEN_GROWTH: usize = 4;
     const MAX_WIDEN_ROUNDS: usize = 4; // mult = 8, 32, 128, 512
-                                       // int8 hits are rescored with the exact f32 metric before truncation, so
-                                       // fetch a wider pool than k even without a filter: membership then depends
-                                       // on true scores, confining the quantization error to beam recall.
+    /// The widest over-fetch any round asks for (the last blind round's).
+    const MAX_OVERFETCH: usize = OVERFETCH_BASE * WIDEN_GROWTH * WIDEN_GROWTH * WIDEN_GROWTH;
+    // int8 hits are rescored with the exact f32 metric before truncation, so
+    // fetch a wider pool than k even without a filter: membership then depends
+    // on true scores, confining the quantization error to beam recall.
     const INT8_RESCORE_POOL: usize = 4;
     let widen = source_filter.is_some();
     let max_rounds = if widen { MAX_WIDEN_ROUNDS } else { 1 };
     let mut mult = if let Some(membership) = membership.as_ref().filter(|_| widen) {
-        // A known selectivity sizes the first round (`k / selectivity`, half
-        // again as margin) instead of the blind ×8; an under-filled round
-        // still widens below.
         let sized = (1.5 / membership.selectivity().max(f64::MIN_POSITIVE)).ceil();
         let floor = if index_int8 { INT8_RESCORE_POOL } else { 1 };
-        (sized.min(OVERFETCH_BASE as f64) as usize).max(floor)
+        if !filter_groups.is_empty() {
+            // Equality groups the index may apply natively count `search_k`
+            // among their eligible members, so the round is not diluted by
+            // the selectivity: keep the blind-round bound.
+            (sized.min(OVERFETCH_BASE as f64) as usize).max(floor)
+        } else if sized > OVERFETCH_BASE as f64
+            && membership.ids.len() <= FILTERED_FLAT_ELIGIBLE_CAP
+            && flat_eligible.is_none()
+        {
+            // A selective filter (the blind ×8 round would under-fill)
+            // admitting few nodes: score exactly those, the flat path over the
+            // membership ids, which is where the under-filled round led
+            // anyway. A sized round would probe a beam far wider than the set.
+            tracing::debug!(
+                target: "namidb::search_timing",
+                k,
+                admitted = membership.ids.len(),
+                "vector filter scored exactly over its membership set"
+            );
+            *flat_eligible = Some(Some(membership.ids.as_ref().clone()));
+            return Ok(None);
+        } else {
+            // A known selectivity sizes the first round (`k / selectivity`,
+            // half again as margin) instead of the blind ×8, up to the widest
+            // blind round: a 1-in-12 filter takes one round of ×18 rather than
+            // ×8 (short) then ×32. An under-filled round still widens below.
+            (sized.min(MAX_OVERFETCH as f64) as usize).max(floor)
+        }
     } else if widen {
         OVERFETCH_BASE
     } else if index_int8 {
@@ -9529,7 +9555,11 @@ async fn try_index_search(
                 }
             }
         }
-        mult = mult.saturating_mul(WIDEN_GROWTH);
+        // The widest round came back short: the flat scan is the ground truth.
+        if mult >= MAX_OVERFETCH {
+            break;
+        }
+        mult = mult.saturating_mul(WIDEN_GROWTH).min(MAX_OVERFETCH);
         rounds_left -= 1;
     }
 
