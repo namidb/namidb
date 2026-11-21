@@ -6472,6 +6472,10 @@ impl<'mt> Snapshot<'mt> {
         }))
         .buffered(projection_scan_fanout());
         while let Some((idx, views)) = projected.next().await {
+            // The visitor probes the deadline per row, but a row group's
+            // decode happens before it sees any: probe between SSTs and row
+            // groups too, or a scan overshoots by whole decodes.
+            crate::cancel::check().map_err(E::from)?;
             if let Some(views) = views.map_err(E::from)? {
                 for view in views {
                     visitor(view)?;
@@ -6504,6 +6508,7 @@ impl<'mt> Snapshot<'mt> {
                     .scan_iter_with_predicates_and_projection(&[], Some(projection))
                     .map_err(E::from)?;
                 for batch in batches {
+                    crate::cancel::check().map_err(E::from)?;
                     let mut rows = Vec::new();
                     consume_limited_node_batches(
                         std::iter::once(batch),
@@ -6539,6 +6544,7 @@ impl<'mt> Snapshot<'mt> {
                     }
                 }
                 while let Some(batches) = stream.next_row_group().await.map_err(E::from)? {
+                    crate::cancel::check().map_err(E::from)?;
                     for batch in batches {
                         let mut rows = Vec::new();
                         consume_limited_node_batches(
@@ -6596,7 +6602,11 @@ impl<'mt> Snapshot<'mt> {
                     let mut views = Vec::new();
                     let mut next_ordinal = 0_u64;
                     while let Some(batches) = stream.next_row_group().await? {
+                        // A whole SST decodes here before the visitor sees
+                        // a row: probe per row group.
+                        crate::cancel::check()?;
                         for batch in batches {
+                            crate::cancel::check()?;
                             let batch = batch.map_err(|error| {
                                 Error::invariant(format!("projected Parquet visitor read: {error}"))
                             })?;
@@ -18359,6 +18369,32 @@ mod tests {
                     SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_BYTES_ENV,
                 )
         );
+    }
+
+    /// The projected visit probes the query's guards between row groups
+    /// itself. A visitor that never probes (or a decode that takes longer
+    /// than the visitor's rows) used to let a scan run whole SST decodes past
+    /// its deadline.
+    #[tokio::test]
+    async fn projected_visit_stops_at_the_deadline_without_the_visitors_help() {
+        let store = make_store();
+        let paths = make_paths("node-property-visit-deadline");
+        let committed = object_native_doc_fixture(&store, &paths, 64, 2048).await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snapshot = Snapshot::new(committed, &empty_view, store, paths);
+        let mut visited = 0usize;
+        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let result = crate::cancel::with_deadline(
+            Some(expired),
+            snapshot.visit_label_with_projection::<_, Error>("Doc", &["title".into()], |_| {
+                visited += 1;
+                Ok(())
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+        assert_eq!(visited, 0);
     }
 
     #[tokio::test]

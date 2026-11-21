@@ -113,6 +113,15 @@ crates.io release will establish and document that API explicitly.
   row. A list that is still read stays bound on every row as before, and its
   copies are now charged to the memory budget often enough to stop a large
   one within a few rows.
+- **A flat vector scan stops near its deadline, and a zero cosine query
+  answers at once.** The scan of a label's embeddings decodes a whole SST, row
+  group by row group, before its visitor sees the first row, and only the
+  visitor probed the deadline, so a flat cosine `ORDER BY ... LIMIT` with a
+  3 s timeout got its 504 after about 26 s. The label visit now probes before
+  each SST and each row group. A cosine search with an all-zero query vector
+  has no answer (cosine is undefined for it, and every candidate was already
+  dropped), but it still scanned the whole label to return nothing. It now
+  returns no rows without reading anything.
 
 ### Tests
 

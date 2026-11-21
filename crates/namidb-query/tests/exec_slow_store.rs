@@ -1,11 +1,16 @@
-//! A variable-length pattern into a bound endpoint that binds its path, and
-//! an `allShortestPaths` that binds its path, read the node reached at every
-//! hop with one point lookup. The walk only probed the query's guards every
-//! few thousand edges, so on a store where each lookup costs milliseconds it
-//! ran minutes past its deadline, and kept running after the client had gone.
-//! The point lookup now probes the guards itself: the walk stops within one
-//! lookup of the deadline or of a cancel. A deadline that fires inside a
-//! storage read is the query timeout, like one an executor probe sees.
+//! Deadlines and cancels on a store whose reads are slow, as a cold remote
+//! one is.
+//!
+//! - A variable-length pattern into a bound endpoint that binds its path,
+//!   and an `allShortestPaths` that binds its path, read the node reached at
+//!   every hop with one point lookup. The walk only probed the query's guards
+//!   every few thousand edges, so when each lookup cost milliseconds it ran
+//!   minutes past its deadline, and kept running after the client had gone.
+//!   The point lookup now probes the guards itself.
+//! - A deadline that fires inside a storage read is the query timeout, like
+//!   one an executor probe sees.
+//! - A flat vector scan times out on time (its row-group probe is unit
+//!   tested in storage), and a zero cosine query does not read the store.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -360,4 +365,116 @@ async fn a_deadline_inside_a_storage_read_is_a_timeout() {
     .await
     .expect_err("the lookup cannot finish in 100 ms");
     assert!(matches!(err, ExecError::Timeout), "{err:?}");
+}
+
+/// Embedding width for the vector tests.
+const DIM: usize = 64;
+
+/// `ssts` flushes of 40 `:Doc` nodes with an embedding each, uncached, so
+/// a flat scan reads every SST from the store.
+async fn embedded_docs(name: &str, ssts: usize) -> Graph {
+    let latency_us = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let store: Arc<dyn ObjectStore> = Arc::new(SlowReads {
+        inner: Arc::new(InMemory::new()),
+        latency_us: Arc::clone(&latency_us),
+        reads: Arc::clone(&reads),
+    });
+    let paths = NamespacePaths::new("tenants", NamespaceId::new(name).unwrap());
+    let mut writer = WriterSession::open_with_caches(store, paths, SessionCaches::none())
+        .await
+        .unwrap();
+    let schema = || {
+        SchemaBuilder::new()
+            .label(LabelDef {
+                name: "Doc".into(),
+                properties: vec![PropertyDef::new("k", DataType::Int64, true).unwrap()],
+            })
+            .unwrap()
+            .build()
+    };
+    for sst in 0..ssts {
+        for i in 0..40 {
+            let k = sst * 40 + i;
+            let mut properties = BTreeMap::new();
+            properties.insert("k".to_string(), CoreValue::I64(k as i64));
+            let embedding: Vec<f32> = (0..DIM)
+                .map(|d| ((k * 31 + d * 7) % 97) as f32 / 97.0 + 0.01)
+                .collect();
+            properties.insert("embedding".to_string(), CoreValue::Vec(embedding));
+            writer
+                .upsert_node_with_labels(
+                    ["Doc".to_string()],
+                    NodeId::new(),
+                    &NodeWriteRecord {
+                        properties,
+                        schema_version: 0,
+                        labels: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+        writer.flush(schema()).await.unwrap();
+    }
+    Graph {
+        writer,
+        latency_us,
+        reads,
+    }
+}
+
+fn query_vector(value: f32) -> Params {
+    let mut params = Params::new();
+    params.insert(
+        "v".into(),
+        namidb_query::RuntimeValue::Vector(vec![value; DIM]),
+    );
+    params
+}
+
+/// With no vector index the search is the exact flat scan of the label.
+const FLAT_COSINE: &str =
+    "CALL search.vector({label: 'Doc', property: 'embedding', query: $v, k: 5}) \
+                           YIELD node, score RETURN node.k AS k, score";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flat_vector_scan_stops_at_its_deadline() {
+    let g = embedded_docs("flat-scan-deadline", 48).await;
+    let snap = g.writer.snapshot();
+    let plan = plan(FLAT_COSINE);
+    // A read in flight when the deadline passes still completes, so the
+    // overshoot is at least one SST's few reads; keep them short.
+    g.slow_down(Duration::from_millis(100));
+    let timeout = Duration::from_millis(300);
+    let start = Instant::now();
+    let err = execute_with_limits(
+        &plan,
+        &snap,
+        &query_vector(0.5),
+        Some(start + timeout),
+        None,
+    )
+    .await
+    .expect_err("48 SSTs at 100 ms a read cannot be scanned in 300 ms");
+    let elapsed = start.elapsed();
+    assert!(matches!(err, ExecError::Timeout), "{err:?}");
+    assert!(elapsed < timeout + GRACE, "timed out after {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_cosine_query_answers_empty_without_a_scan() {
+    let g = embedded_docs("zero-cosine", 3).await;
+    let snap = g.writer.snapshot();
+    g.slow_down(Duration::from_millis(250));
+    let before = g.reads.load(Ordering::Relaxed);
+    let rows = execute_with_limits(&plan(FLAT_COSINE), &snap, &query_vector(0.0), None, None)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "{rows:?}");
+    assert_eq!(
+        g.reads.load(Ordering::Relaxed),
+        before,
+        "a zero cosine query read the store"
+    );
 }

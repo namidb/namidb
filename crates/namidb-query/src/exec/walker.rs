@@ -7505,6 +7505,15 @@ async fn vector_search_rows(
                     .into(),
             ));
         }
+        // A zero-magnitude query has no cosine with any vector, so every
+        // candidate is dropped and the answer is empty on every route. Say
+        // so now instead of scanning the whole label to find out.
+        if distance == crate::plan::logical::VectorDistance::Cosine
+            && !components.is_empty()
+            && components.iter().all(|component| *component == 0.0)
+        {
+            return Ok(Vec::new());
+        }
     }
 
     // The flat path's selective-filter eligibility, once computed (by the
