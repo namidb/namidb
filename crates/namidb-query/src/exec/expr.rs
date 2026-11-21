@@ -211,16 +211,20 @@ pub fn evaluate(expr: &Expression, row: &Row, params: &Params) -> Result<Runtime
         }
         ExpressionKind::ListComprehension(lc) => eval_list_comprehension(lc, row, params),
         ExpressionKind::Quantifier(q) => eval_quantifier(q, row, params),
-        ExpressionKind::PatternComprehension(_) => Err(EvalError::new(
-            "pattern comprehension evaluation requires storage access — \
- must be hoisted to a PatternList operator before evaluate()",
+        // The planner turns these into operators where it supports them
+        // (a pattern comprehension as a top-level projection item, EXISTS as
+        // a predicate). One that reaches evaluation sits somewhere that is
+        // not supported yet: say so as a client-facing `unsupported`, like
+        // the planner's own rejection, not as an evaluation error with
+        // internal wording.
+        ExpressionKind::PatternComprehension(_) => Err(EvalError::unsupported(
+            "pattern comprehensions are only supported as top-level \
+             projection items (RETURN or WITH)",
             span,
         )),
-        ExpressionKind::Exists(_) | ExpressionKind::ExistsSubquery(_) => Err(EvalError::new(
-            "EXISTS pattern predicates require storage access — \
- must be hoisted to a SemiApply operator before evaluate()",
-            span,
-        )),
+        ExpressionKind::Exists(_) | ExpressionKind::ExistsSubquery(_) => Err(
+            EvalError::unsupported("EXISTS is not supported in this position", span),
+        ),
     }
 }
 

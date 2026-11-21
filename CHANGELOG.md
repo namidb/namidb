@@ -122,6 +122,13 @@ crates.io release will establish and document that API explicitly.
   has no answer (cosine is undefined for it, and every candidate was already
   dropped), but it still scanned the whole label to return nothing. It now
   returns no rows without reading anything.
+- **A pattern comprehension inside a predicate is `unsupported`.** Only a
+  top-level projection item is planned as a pattern comprehension. One nested
+  in a `WHERE` (`WHERE size([(n)-[:R]->() | 1]) > 0`) reached evaluation and
+  answered 400 `eval_error`, with text about internal operators. It now
+  answers 400 `unsupported` (Bolt `Neo.ClientError.Statement.NotSupported`), as
+  the same comprehension nested inside a `RETURN` expression already did. An
+  `EXISTS` left in a position the planner does not handle answers the same way.
 
 ### Tests
 
