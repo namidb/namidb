@@ -599,6 +599,24 @@ impl ServerBackend {
                 result: Err(persistence_degraded_error(&reason)),
             };
         }
+        // The type of an undeclared property is looked up before the writer
+        // lock is taken, so writes keep flowing meanwhile (see
+        // `create_index_off_lock` on the HTTP path).
+        let hint = if unique || properties.len() != 1 {
+            None
+        } else {
+            let pinned = self.state.snapshot.load();
+            match namidb_storage::PropertyTypeHint::infer(&pinned, label, &properties[0]).await {
+                Ok(hint) => Some(hint),
+                Err(e) => {
+                    return RunObservation {
+                        kind: Some(QueryKind::Write),
+                        elapsed: started.elapsed(),
+                        result: Err(map_storage_err(e)),
+                    }
+                }
+            }
+        };
         let Some(mut writer) = self.state.lock_writer_bounded(WriterLockKind::Bolt).await else {
             return RunObservation {
                 kind: Some(QueryKind::Write),
@@ -606,7 +624,21 @@ impl ServerBackend {
                 result: Err(writer_busy_error()),
             };
         };
-        let result = if unique {
+        let hinted = match &hint {
+            Some(hint) => Some(
+                writer
+                    .create_property_index_hinted(name, label, &properties[0], if_not_exists, hint)
+                    .await,
+            ),
+            None => None,
+        };
+        let result = if let Some(Ok(namidb_storage::HintedDdlOutcome::Committed(version))) = hinted
+        {
+            self.state.snapshot.store(writer.owned_snapshot());
+            Ok(version)
+        } else if let Some(Err(e)) = hinted {
+            Err(e)
+        } else if unique {
             crate::apply_create_constraint(
                 &mut writer,
                 &self.state.snapshot,

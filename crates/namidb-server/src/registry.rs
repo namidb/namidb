@@ -23,7 +23,7 @@ use namidb_storage::{Manifest, ManifestStore, NamespacePaths, SnapshotCell, Writ
 use object_store::ObjectStore;
 use tokio::sync::{watch, Mutex, OnceCell, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::maintenance::{request_compaction, CompactionScheduler};
 use crate::metrics::{CompactionTrigger, Metrics, WriterLockKind};
@@ -787,6 +787,51 @@ impl NamespaceRegistry {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 tick.tick().await; // first tick fires immediately; skip
+                                   // Work already due at open (a base rebuild a restart
+                                   // interrupted, a re-analysis) resumes now, not one interval
+                                   // from now.
+                if interval > crate::maintenance::RESUME_PASS_DELAY {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.wait_for(|evicted| *evicted) => return,
+                        _ = tokio::time::sleep(crate::maintenance::RESUME_PASS_DELAY) => {}
+                    }
+                    if crate::maintenance::resume_pass_due(&s.snapshot) {
+                        info!(
+                            namespace = %ns,
+                            "maintenance work is due at open; running the first pass now"
+                        );
+                        if let Some(handle) = request_compaction(
+                            &s.compaction_scheduler,
+                            CompactionTrigger::Periodic,
+                            &s.writer,
+                            &s.snapshot,
+                            &s.writer_health,
+                            &ns,
+                            &metrics,
+                            Some(s.cancel_tx.subscribe()),
+                        ) {
+                            if let Some(handle) = s.track_maintenance_task(handle) {
+                                handle.abort();
+                                let _ = handle.await;
+                            }
+                        }
+                        #[cfg(feature = "text-index")]
+                        if let Some(handle) = crate::maintenance::maybe_start_text_reanalysis(
+                            &s.compaction_scheduler,
+                            &s.writer,
+                            &s.snapshot,
+                            &s.writer_health,
+                            &ns,
+                            Some(s.cancel_tx.subscribe()),
+                        ) {
+                            if let Some(handle) = s.track_maintenance_task(handle) {
+                                handle.abort();
+                                let _ = handle.await;
+                            }
+                        }
+                    }
+                }
                 loop {
                     tokio::select! {
                         biased;

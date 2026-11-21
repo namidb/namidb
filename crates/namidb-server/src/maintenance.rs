@@ -896,6 +896,32 @@ async fn run_compaction_pass(
     Ok(pass)
 }
 
+/// How soon after a namespace opens the first maintenance pass runs when
+/// work is already due ([`resume_pass_due`]), instead of one maintenance
+/// interval (300 s by default) later. With no writes there is no flush to
+/// trigger it, so a base rebuild a restart interrupted (a native-filter
+/// rebuild, a RaBitQ backfill, a `BUILDING` activation) or a full-text
+/// re-analysis would otherwise wait out the whole first interval. Long
+/// enough for the open itself (pre-open, warm-up) to settle first.
+pub(crate) const RESUME_PASS_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether the published state already holds maintenance work: anything a
+/// compaction pass would do, or a pre-folding full-text index to re-analyse.
+/// Metadata only.
+pub(crate) fn resume_pass_due(snapshot: &SnapshotCell) -> bool {
+    let pinned = snapshot.load();
+    let manifest = &pinned.manifest().manifest;
+    #[cfg(feature = "text-index")]
+    let reanalysis_due = text_reanalysis_enabled()
+        && manifest
+            .text_indexes
+            .iter()
+            .any(|descriptor| descriptor.is_legacy_analyzer());
+    #[cfg(not(feature = "text-index"))]
+    let reanalysis_due = false;
+    reanalysis_due || namidb_storage::compaction_due(manifest)
+}
+
 /// Disables the background analyzer migration of pre-folding full-text
 /// indexes when set to `0`, `false` or `off`. Those indexes keep working
 /// with their original analyzer either way.

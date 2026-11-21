@@ -14,8 +14,33 @@
 //! next read it runs.
 //!
 //! `NAMIDB_BACKGROUND_NICE` sets the increment (0 keeps the normal priority).
+//!
+//! A lower priority only orders threads that wait for the same CPU. A
+//! container's CPU limit is a quota over every core of the host, so a
+//! maintenance thread on an idle core runs at full speed beside the query,
+//! spends the quota, and the kernel then throttles the whole container,
+//! queries included. Maintenance therefore also yields by itself:
+//!
+//! - **Build slots.** At most [`build_threads`] maintenance threads run at
+//!   once (`NAMIDB_INDEX_BUILD_THREADS`, default half the CPUs, at least
+//!   one); the others wait at their next [`pace`] point. A slot is taken for
+//!   a slice of work at a time, so a long build (a full-text re-analysis)
+//!   and a short one (a node compaction) share it instead of queueing.
+//! - **Yielding to queries.** While a statement runs ([`Foreground`]), a
+//!   maintenance thread works one short slice at a time and sleeps between
+//!   slices, leaving most of the CPU (and the disk) to the statement
+//!   (`NAMIDB_INDEX_BUILD_DUTY_PERCENT`, default
+//!   [`DEFAULT_FOREGROUND_DUTY_PERCENT`]); with no statement running it
+//!   works at full speed.
+//!
+//! Both act at [`pace`], which the hot loops of every build call (once per
+//! row, record or posting block): it costs a thread-local increment except
+//! every [`PACE_CHECK_EVERY`] calls.
 
-use std::sync::OnceLock;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Default nice increment of maintenance threads.
 pub const BACKGROUND_NICE: i32 = 10;
@@ -69,6 +94,7 @@ where
         .spawn(move || {
             let _entered = handle.as_ref().map(|handle| handle.enter());
             lower_current_thread_priority(nice);
+            let _maintenance = MaintenanceThread::enter();
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|panic| {
                     panic
@@ -88,9 +114,300 @@ where
     }
 }
 
+/// Default share of the time a maintenance thread works while a statement
+/// runs: one [`SLICE`] of work, then a pause four times as long.
+pub const DEFAULT_FOREGROUND_DUTY_PERCENT: u32 = 20;
+
+/// Work between two slot hand-offs (and, while a statement runs, between two
+/// pauses).
+const SLICE: Duration = Duration::from_millis(4);
+
+/// [`pace`] reads the clock once per this many calls.
+pub const PACE_CHECK_EVERY: u32 = 64;
+
+/// Longest wait for a build slot. A thread that waited this long runs
+/// anyway: slots bound CPU use, they must never be able to deadlock a
+/// maintenance thread that holds one while it waits on another.
+const MAX_SLOT_WAIT: Duration = Duration::from_millis(250);
+
+/// Maintenance threads allowed to run at once: `NAMIDB_INDEX_BUILD_THREADS`,
+/// else half the CPUs this process may use, at least one.
+pub fn build_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("NAMIDB_INDEX_BUILD_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|threads| *threads > 0)
+            .unwrap_or_else(|| default_build_threads(available_cpus()))
+    })
+}
+
+/// Half of `cpus`, at least one.
+pub fn default_build_threads(cpus: usize) -> usize {
+    (cpus / 2).max(1)
+}
+
+fn available_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// Percent of the time maintenance works while a statement runs
+/// (`NAMIDB_INDEX_BUILD_DUTY_PERCENT`, 1..=100; 100 turns yielding off).
+fn foreground_duty_percent() -> u32 {
+    static DUTY: OnceLock<u32> = OnceLock::new();
+    *DUTY.get_or_init(|| {
+        std::env::var("NAMIDB_INDEX_BUILD_DUTY_PERCENT")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map(|value| value.clamp(1, 100))
+            .unwrap_or(DEFAULT_FOREGROUND_DUTY_PERCENT)
+    })
+}
+
+/// The pause after each slice while a statement runs.
+fn foreground_pause() -> Duration {
+    let duty = foreground_duty_percent();
+    SLICE * (100 - duty) / duty
+}
+
+static FOREGROUND: AtomicUsize = AtomicUsize::new(0);
+
+/// Held for the run of a statement (query, write, DDL): maintenance yields
+/// while any is alive.
+#[derive(Debug)]
+pub struct Foreground(());
+
+impl Foreground {
+    pub fn new() -> Self {
+        FOREGROUND.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Default for Foreground {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        FOREGROUND.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether a statement is running.
+pub fn foreground_active() -> bool {
+    FOREGROUND.load(Ordering::Relaxed) > 0
+}
+
+/// Counting semaphore of build slots, for plain threads.
+struct BuildSlots {
+    free: Mutex<usize>,
+    released: Condvar,
+}
+
+fn build_slots() -> &'static BuildSlots {
+    static SLOTS: OnceLock<BuildSlots> = OnceLock::new();
+    SLOTS.get_or_init(|| BuildSlots {
+        free: Mutex::new(build_threads()),
+        released: Condvar::new(),
+    })
+}
+
+impl BuildSlots {
+    /// Take a slot, waiting at most [`MAX_SLOT_WAIT`]; `false` when the
+    /// thread goes on without one.
+    fn acquire(&self) -> bool {
+        let deadline = Instant::now() + MAX_SLOT_WAIT;
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if *free > 0 {
+                *free -= 1;
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            free = self
+                .released
+                .wait_timeout(free, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    fn release(&self) {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        *free += 1;
+        drop(free);
+        self.released.notify_one();
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SliceState {
+    holds_slot: bool,
+    slice_start: Instant,
+    calls: u32,
+}
+
+thread_local! {
+    /// Set on maintenance threads ([`spawn_blocking`]); [`pace`] is a no-op
+    /// elsewhere (a read that shares a decoder with a build never yields).
+    static MAINTENANCE: Cell<Option<SliceState>> = const { Cell::new(None) };
+}
+
+/// Marks the current thread as a maintenance thread for its lifetime and
+/// holds its build slot.
+struct MaintenanceThread;
+
+impl MaintenanceThread {
+    fn enter() -> Self {
+        let holds_slot = build_slots().acquire();
+        MAINTENANCE.with(|state| {
+            state.set(Some(SliceState {
+                holds_slot,
+                slice_start: Instant::now(),
+                calls: 0,
+            }))
+        });
+        Self
+    }
+}
+
+impl Drop for MaintenanceThread {
+    fn drop(&mut self) {
+        let state = MAINTENANCE.with(|state| state.take());
+        if state.is_some_and(|state| state.holds_slot) {
+            build_slots().release();
+        }
+    }
+}
+
+/// A yield point of maintenance work; call it from every hot loop of a
+/// build (per row, record, posting block). On a maintenance thread, at the
+/// end of each slice of work it hands its build slot on, pauses while a
+/// statement runs, and takes a slot again. Anywhere else it does nothing.
+#[inline]
+pub fn pace() {
+    MAINTENANCE.with(|cell| {
+        let Some(mut state) = cell.get() else {
+            return;
+        };
+        state.calls = state.calls.wrapping_add(1);
+        if state.calls % PACE_CHECK_EVERY != 0 {
+            cell.set(Some(state));
+            return;
+        }
+        if state.slice_start.elapsed() < SLICE {
+            cell.set(Some(state));
+            return;
+        }
+        cell.set(Some(yield_slice(state)));
+    })
+}
+
+#[cold]
+fn yield_slice(mut state: SliceState) -> SliceState {
+    if state.holds_slot {
+        build_slots().release();
+    }
+    if foreground_active() && foreground_duty_percent() < 100 {
+        std::thread::sleep(foreground_pause());
+    }
+    state.holds_slot = build_slots().acquire();
+    state.slice_start = Instant::now();
+    state
+}
+
+/// Run `wait` (a blocking wait for input: a channel receive) without holding
+/// a build slot, so another maintenance thread can work meanwhile.
+pub fn idle<T>(wait: impl FnOnce() -> T) -> T {
+    let held = MAINTENANCE.with(|cell| {
+        let mut state = cell.get()?;
+        let held = state.holds_slot;
+        state.holds_slot = false;
+        cell.set(Some(state));
+        Some(held)
+    });
+    if held == Some(true) {
+        build_slots().release();
+    }
+    let result = wait();
+    if held.is_some() {
+        let reacquired = build_slots().acquire();
+        MAINTENANCE.with(|cell| {
+            if let Some(mut state) = cell.get() {
+                state.holds_slot = reacquired;
+                state.slice_start = Instant::now();
+                cell.set(Some(state));
+            } else if reacquired {
+                build_slots().release();
+            }
+        });
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_threads_default_to_half_the_cpus() {
+        assert_eq!(default_build_threads(1), 1);
+        assert_eq!(default_build_threads(2), 1);
+        assert_eq!(default_build_threads(3), 1);
+        assert_eq!(default_build_threads(8), 4);
+        assert!(build_threads() >= 1);
+    }
+
+    #[test]
+    fn pace_is_a_no_op_off_maintenance_threads() {
+        let started = Instant::now();
+        for _ in 0..1_000_000 {
+            pace();
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Spin `for_how_long` on a maintenance thread, calling `pace` between
+    /// units of work; the number of units done.
+    async fn paced_units(for_how_long: Duration) -> u64 {
+        spawn_blocking(move || {
+            let started = Instant::now();
+            let mut units = 0u64;
+            while started.elapsed() < for_how_long {
+                // ~10 µs of work per unit.
+                let unit = Instant::now();
+                while unit.elapsed() < Duration::from_micros(10) {
+                    std::hint::spin_loop();
+                }
+                units += 1;
+                pace();
+            }
+            units
+        })
+        .await
+        .unwrap()
+    }
+
+    /// While a statement runs, maintenance works a fraction of the time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_yields_while_a_statement_runs() {
+        let alone = paced_units(Duration::from_millis(400)).await;
+        let statement = Foreground::new();
+        let beside = paced_units(Duration::from_millis(400)).await;
+        drop(statement);
+        // The default duty is 20%; leave room for a loaded test host.
+        assert!(
+            beside * 2 < alone,
+            "alone {alone} units, beside a statement {beside}"
+        );
+    }
 
     #[tokio::test]
     async fn returns_the_value_and_reports_a_panic() {

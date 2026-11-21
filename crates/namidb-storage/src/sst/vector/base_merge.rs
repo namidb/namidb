@@ -223,6 +223,7 @@ pub fn merge_vector_base(input: VectorBaseMergeInput<'_>) -> Result<VectorBaseMe
                 break;
             }
             heap.pop();
+            crate::background::pace();
             let (record, payload) = cursors[source].take()?;
             if record.node_id != node_id {
                 return Err(Error::invariant(

@@ -2132,6 +2132,7 @@ pub(super) fn kmeans_centroids(
         let centre = points[chosen].clone();
         let centre_norm = norms[chosen];
         for (point, d) in nearest.iter_mut().enumerate() {
+            crate::background::pace();
             *d = d.min(distance(point, &centre, centre_norm));
         }
         centroids.push(centre);
@@ -2142,6 +2143,7 @@ pub(super) fn kmeans_centroids(
         let mut changed = false;
         let mut worst: Vec<(f32, usize)> = Vec::with_capacity(points.len());
         for (point, slot) in assignment.iter_mut().enumerate() {
+            crate::background::pace();
             let best = nearest_centroid(&points[point], &centroids, &centre_norms, metric);
             if *slot != best {
                 *slot = best;
@@ -2152,6 +2154,7 @@ pub(super) fn kmeans_centroids(
         let mut sums = vec![vec![0.0f64; dim]; groups];
         let mut counts = vec![0usize; groups];
         for (point, group) in assignment.iter().enumerate() {
+            crate::background::pace();
             counts[*group] += 1;
             for (sum, value) in sums[*group].iter_mut().zip(&points[point]) {
                 *sum += f64::from(*value);

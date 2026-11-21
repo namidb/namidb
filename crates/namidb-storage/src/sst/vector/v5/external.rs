@@ -658,6 +658,7 @@ fn read_record(
     dim: usize,
     memory_budget: usize,
 ) -> Result<Option<SpoolRecord>, Error> {
+    crate::background::pace();
     let mut len_bytes = [0u8; 4];
     match file.read(&mut len_bytes) {
         Ok(0) => return Ok(None),

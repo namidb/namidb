@@ -1292,6 +1292,7 @@ impl QueryRegistry {
             registry: Arc::clone(self),
             id,
             cancel,
+            _foreground: namidb_storage::background::Foreground::new(),
         }
     }
 
@@ -1346,6 +1347,8 @@ pub struct RegisteredQuery {
     registry: Arc<QueryRegistry>,
     id: u64,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Background builds yield while a statement runs.
+    _foreground: namidb_storage::background::Foreground,
 }
 
 impl RegisteredQuery {

@@ -4760,11 +4760,12 @@ fn build_search_compactions_blocking(
                 break;
             }
             unopened.pop();
-            let (ordinal, body) = bodies.blocking_recv().ok_or_else(|| {
-                Error::invariant(
-                    "Search-LSM base fetch stream ended before all planned Nodes SSTs arrived",
-                )
-            })?;
+            let (ordinal, body) =
+                crate::background::idle(|| bodies.blocking_recv()).ok_or_else(|| {
+                    Error::invariant(
+                        "Search-LSM base fetch stream ended before all planned Nodes SSTs arrived",
+                    )
+                })?;
             if ordinal != source {
                 return Err(Error::invariant(
                     "Search-LSM base fetch delivery disagrees with activation order",
@@ -4801,6 +4802,7 @@ fn build_search_compactions_blocking(
         let Some(Reverse(entry)) = heap.pop() else {
             break;
         };
+        crate::background::pace();
         progress.scanned(1);
         let exhausted = {
             let source = cursors[entry.src]

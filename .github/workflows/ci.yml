@@ -89,6 +89,12 @@ jobs:
   test-features:
     name: test (vector-index + text-index)
     runs-on: ubuntu-latest
+    env:
+      # With full debuginfo the featured test binaries (one per integration
+      # test file) leave too little runner disk for the tests' own spool
+      # files: one more test file and the job fails with ENOSPC. Line tables
+      # keep file:line in panics and backtraces.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:

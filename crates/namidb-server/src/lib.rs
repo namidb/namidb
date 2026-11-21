@@ -1900,6 +1900,36 @@ pub async fn run_with_memory_limits(
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await; // first tick fires immediately; skip.
+                               // Work already due at open (a base rebuild a restart interrupted,
+                               // a re-analysis) resumes now, not one interval from now.
+            if interval > maintenance::RESUME_PASS_DELAY {
+                tokio::time::sleep(maintenance::RESUME_PASS_DELAY).await;
+                if maintenance::resume_pass_due(&state_for_maint.snapshot) {
+                    info!(
+                        namespace = %state_for_maint.namespace,
+                        "maintenance work is due at open; running the first pass now"
+                    );
+                    let _ = request_compaction(
+                        &state_for_maint.compaction_scheduler,
+                        CompactionTrigger::Periodic,
+                        &state_for_maint.writer,
+                        &state_for_maint.snapshot,
+                        &state_for_maint.writer_health,
+                        &state_for_maint.namespace,
+                        &state_for_maint.metrics,
+                        None,
+                    );
+                    #[cfg(feature = "text-index")]
+                    let _ = maintenance::maybe_start_text_reanalysis(
+                        &state_for_maint.compaction_scheduler,
+                        &state_for_maint.writer,
+                        &state_for_maint.snapshot,
+                        &state_for_maint.writer_health,
+                        &state_for_maint.namespace,
+                        None,
+                    );
+                }
+            }
             loop {
                 tick.tick().await;
                 // Enqueue into the same single-flight scheduler used by
@@ -4300,6 +4330,184 @@ async fn apply_create_composite_index(
     Ok(version)
 }
 
+/// A schema DDL statement's writer section, as [`ddl_writer_section`] runs
+/// it: the apply step on the locked session and its publish cell.
+type DdlApply<T> = Box<
+    dyn for<'a> FnOnce(
+            &'a mut WriterSession,
+            &'a SnapshotCell,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, namidb_storage::Error>> + Send + 'a>,
+        > + Send,
+>;
+
+/// How a schema DDL's writer section ended.
+enum DdlSection<T> {
+    /// The namespace was evicted before the statement took the writer lock.
+    Retired,
+    Done(Result<T, namidb_storage::Error>),
+}
+
+fn ddl_statement_name(unique: bool) -> &'static str {
+    if unique {
+        "CREATE CONSTRAINT"
+    } else {
+        "CREATE INDEX"
+    }
+}
+
+/// Take the writer lock and run `apply`; on an error, reopen a fenced or
+/// poisoned session in place under the same lock (a no-op for user errors
+/// such as a duplicate name).
+async fn ddl_writer_section<T>(
+    writer: &Arc<Mutex<WriterSession>>,
+    snapshot: &Arc<SnapshotCell>,
+    writer_health: &Arc<WriterHealth>,
+    namespace: &str,
+    namespace_state: Option<&Arc<NamespaceState>>,
+    apply: DdlApply<T>,
+) -> DdlSection<T> {
+    let retired = || namespace_state.is_some_and(|state| state.is_retired());
+    let mut w = writer.lock().await;
+    if retired() {
+        return DdlSection::Retired;
+    }
+    let result = apply(&mut w, snapshot).await;
+    if let Err(e) = &result {
+        if !retired() {
+            recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+        }
+    }
+    DdlSection::Done(result)
+}
+
+/// `CREATE INDEX` on one property: the type of an undeclared property is
+/// inferred on the published snapshot before the writer lock is taken, so
+/// writes keep flowing during the lookup; the commit re-validates it against
+/// the manifest it builds on and the lookup is retried once when the
+/// property's definition changed in between. A second change falls back to
+/// the lookup under the lock (a one-row projected scan either way).
+async fn create_index_off_lock<S, Fut>(
+    snapshot: &Arc<SnapshotCell>,
+    name: Option<&str>,
+    label: &str,
+    property: &str,
+    if_not_exists: bool,
+    section: S,
+) -> DdlSection<namidb_storage::HintedDdlOutcome>
+where
+    S: Fn(DdlApply<namidb_storage::HintedDdlOutcome>) -> Fut,
+    Fut: std::future::Future<Output = DdlSection<namidb_storage::HintedDdlOutcome>>,
+{
+    use namidb_storage::{HintedDdlOutcome, PropertyTypeHint};
+    for _attempt in 0..2 {
+        let hint = {
+            let pinned = snapshot.load();
+            match PropertyTypeHint::infer(&pinned, label, property).await {
+                Ok(hint) => hint,
+                Err(error) => return DdlSection::Done(Err(error)),
+            }
+        };
+        let (name, label, property) = (
+            name.map(str::to_string),
+            label.to_string(),
+            property.to_string(),
+        );
+        let end = section(Box::new(move |w, s| {
+            Box::pin(async move {
+                let outcome = w
+                    .create_property_index_hinted(
+                        name.as_deref(),
+                        &label,
+                        &property,
+                        if_not_exists,
+                        &hint,
+                    )
+                    .await?;
+                if matches!(outcome, HintedDdlOutcome::Committed(_)) {
+                    s.store(w.owned_snapshot());
+                }
+                Ok(outcome)
+            })
+        }))
+        .await;
+        match end {
+            DdlSection::Retired => return DdlSection::Retired,
+            DdlSection::Done(Err(error)) => return DdlSection::Done(Err(error)),
+            DdlSection::Done(Ok(HintedDdlOutcome::Committed(version))) => {
+                return DdlSection::Done(Ok(HintedDdlOutcome::Committed(version)))
+            }
+            DdlSection::Done(Ok(HintedDdlOutcome::BasisChanged)) => {}
+        }
+    }
+    let (name, label, property) = (
+        name.map(str::to_string),
+        label.to_string(),
+        property.to_string(),
+    );
+    section(Box::new(move |w, s| {
+        Box::pin(async move {
+            apply_create_index(w, s, name.as_deref(), &label, &property, if_not_exists)
+                .await
+                .map(HintedDdlOutcome::Committed)
+        })
+    }))
+    .await
+}
+
+/// Run a schema DDL on a task of its own and wait for its outcome.
+///
+/// A DDL holds the writer lock for its whole run and commits one manifest.
+/// Run inline, the HTTP request ceiling (408) or a disconnecting client
+/// dropped it wherever it was: before the commit the statement was lost with
+/// only "request timeout" to show for it, after the commit's CAS the session
+/// was left behind its own manifest. On its own task the statement always
+/// reaches its outcome; dropping the request only stops the wait. An outcome
+/// nobody is left to read is logged, and `SHOW INDEXES` / `SHOW CONSTRAINTS`
+/// show a committed one.
+async fn shielded_schema_ddl<T, Fut>(
+    namespace: &str,
+    statement: &'static str,
+    body: Fut,
+) -> DdlSection<T>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = DdlSection<T>> + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let namespace = namespace.to_string();
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        let end = body.await;
+        if let Err(end) = sender.send(end) {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match end {
+                DdlSection::Done(Ok(_)) => info!(
+                    namespace = %namespace,
+                    statement,
+                    elapsed_ms,
+                    "schema DDL committed after its request was dropped (HTTP request \
+                     ceiling or client disconnect); SHOW INDEXES / SHOW CONSTRAINTS show it"
+                ),
+                DdlSection::Done(Err(error)) => warn!(
+                    namespace = %namespace,
+                    statement,
+                    elapsed_ms,
+                    %error,
+                    "schema DDL failed after its request was dropped (HTTP request ceiling \
+                     or client disconnect)"
+                ),
+                DdlSection::Retired => {}
+            }
+        }
+    });
+    receiver.await.unwrap_or_else(|_| {
+        DdlSection::Done(Err(namidb_storage::Error::invariant(
+            "schema DDL task ended without an outcome",
+        )))
+    })
+}
+
 /// HTTP shape for `CREATE CONSTRAINT`/`CREATE INDEX`: gate on role + authz, run
 /// the schema DDL, return an empty `CypherResponse`. Mirrors the vector/fulltext
 /// DDL handlers. These are always-on (no Cargo feature).
@@ -4309,7 +4517,7 @@ async fn run_create_property_ddl(
     snapshot: &Arc<SnapshotCell>,
     writer_health: &Arc<WriterHealth>,
     namespace: &str,
-    namespace_state: Option<&NamespaceState>,
+    namespace_state: Option<&Arc<NamespaceState>>,
     authz: &Arc<dyn authz::AuthzHook>,
     compaction_scheduler: &Arc<CompactionScheduler>,
     metrics: &Arc<metrics::Metrics>,
@@ -4368,59 +4576,128 @@ async fn run_create_property_ddl(
             response: rejection,
         };
     }
-    let mut w = writer.lock().await;
-    if namespace_state.is_some_and(NamespaceState::is_retired) {
-        drop(w);
-        return namespace_retired_observation(started);
-    }
-    let result = if unique {
-        apply_create_constraint(&mut w, snapshot, name, label, properties, if_not_exists).await
-    } else if properties.len() > 1 {
-        apply_create_composite_index(&mut w, snapshot, name, label, properties, if_not_exists).await
-    } else {
-        apply_create_index(&mut w, snapshot, name, label, &properties[0], if_not_exists).await
-    };
-    if let Err(e) = &result {
-        // Same reopen-in-place as the other DDL handlers (no-op for user
-        // errors like a duplicate name).
-        if !namespace_state.is_some_and(NamespaceState::is_retired) {
-            recovery::recover_writer_if_needed(&mut w, snapshot, writer_health, namespace, e).await;
+    // Off the writer lock, the statement's own task: see `shielded_schema_ddl`.
+    let body = {
+        let (writer, snapshot, writer_health) = (
+            Arc::clone(writer),
+            Arc::clone(snapshot),
+            Arc::clone(writer_health),
+        );
+        let (compaction_scheduler, metrics) =
+            (Arc::clone(compaction_scheduler), Arc::clone(metrics));
+        let namespace = namespace.to_string();
+        let namespace_state = namespace_state.cloned();
+        let name = name.map(str::to_string);
+        let label = label.to_string();
+        let properties = properties.to_vec();
+        async move {
+            use namidb_storage::HintedDdlOutcome;
+            let section = |apply| {
+                ddl_writer_section(
+                    &writer,
+                    &snapshot,
+                    &writer_health,
+                    &namespace,
+                    namespace_state.as_ref(),
+                    apply,
+                )
+            };
+            let end = if unique {
+                let (name, label, properties) = (name.clone(), label.clone(), properties.clone());
+                section(Box::new(move |w, s| {
+                    Box::pin(async move {
+                        apply_create_constraint(
+                            w,
+                            s,
+                            name.as_deref(),
+                            &label,
+                            &properties,
+                            if_not_exists,
+                        )
+                        .await
+                        .map(HintedDdlOutcome::Committed)
+                    })
+                }))
+                .await
+            } else if properties.len() > 1 {
+                let (name, label, properties) = (name.clone(), label.clone(), properties.clone());
+                section(Box::new(move |w, s| {
+                    Box::pin(async move {
+                        apply_create_composite_index(
+                            w,
+                            s,
+                            name.as_deref(),
+                            &label,
+                            &properties,
+                            if_not_exists,
+                        )
+                        .await
+                        .map(HintedDdlOutcome::Committed)
+                    })
+                }))
+                .await
+            } else {
+                create_index_off_lock(
+                    &snapshot,
+                    name.as_deref(),
+                    &label,
+                    &properties[0],
+                    if_not_exists,
+                    &section,
+                )
+                .await
+            };
+            let end = match end {
+                DdlSection::Retired => DdlSection::Retired,
+                DdlSection::Done(result) => {
+                    DdlSection::Done(result.and_then(|outcome| match outcome {
+                        HintedDdlOutcome::Committed(version) => Ok(version),
+                        HintedDdlOutcome::BasisChanged => Err(namidb_storage::Error::invariant(
+                            "an index DDL ended on a changed type-hint basis",
+                        )),
+                    }))
+                }
+            };
+            if matches!(end, DdlSection::Done(Ok(_))) {
+                // The schema commit alone makes `needs_compaction()` true for
+                // every node SST whose descriptors lack the posting sidecar the
+                // new index requires. Without this request, materialization
+                // waits for the next periodic tick — or never happens when
+                // periodic compaction is disabled — leaving the "index" at
+                // full-scan speed on already-loaded data (item 38). An
+                // IF NOT EXISTS no-op re-request is harmless: the pass gates on
+                // metadata and answers Noop.
+                let _ = request_compaction(
+                    &compaction_scheduler,
+                    CompactionTrigger::Ddl,
+                    &writer,
+                    &snapshot,
+                    &writer_health,
+                    &namespace,
+                    &metrics,
+                    None,
+                );
+            }
+            end
         }
-    }
-    drop(w);
+    };
+    let result = match shielded_schema_ddl(namespace, ddl_statement_name(unique), body).await {
+        DdlSection::Retired => return namespace_retired_observation(started),
+        DdlSection::Done(result) => result,
+    };
     let elapsed = started.elapsed();
     match result {
-        Ok(_) => {
-            // The schema commit alone makes `needs_compaction()` true for
-            // every node SST whose descriptors lack the posting sidecar the
-            // new index requires. Without this request, materialization
-            // waits for the next periodic tick — or never happens when
-            // periodic compaction is disabled — leaving the "index" at
-            // full-scan speed on already-loaded data (item 38). An
-            // IF NOT EXISTS no-op re-request is harmless: the pass gates on
-            // metadata and answers Noop.
-            let _ = request_compaction(
-                compaction_scheduler,
-                CompactionTrigger::Ddl,
-                writer,
-                snapshot,
-                writer_health,
-                namespace,
-                metrics,
-                None,
-            );
-            ObservedQuery {
-                kind: Some(QueryKind::Write),
-                ok: true,
-                elapsed,
-                response: Json(CypherResponse {
-                    columns: vec![],
-                    rows: vec![],
-                    write_outcome: None,
-                })
-                .into_response(),
-            }
-        }
+        Ok(_) => ObservedQuery {
+            kind: Some(QueryKind::Write),
+            ok: true,
+            elapsed,
+            response: Json(CypherResponse {
+                columns: vec![],
+                rows: vec![],
+                write_outcome: None,
+            })
+            .into_response(),
+        },
         Err(e) => {
             // A pre-existing duplicate (constraint) is a user error (400); a
             // fence/lost CAS is a server condition (503).
@@ -7974,6 +8251,84 @@ mod tests {
             &app,
             "/v0/cypher",
             serde_json::json!({ "query": "CREATE (:After {ok: true})" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A schema DDL whose request is dropped (the HTTP request ceiling's
+    /// 408, a vanished client) still commits: it runs on a task of its own,
+    /// and SHOW INDEXES shows the index once the writer lock frees up. Before,
+    /// the dropped request took the statement with it, and only "request
+    /// timeout" told the client anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_index_ddl_still_commits() {
+        let (store, paths) = namidb_storage::parse_uri("memory://test").unwrap();
+        let writer = WriterSession::open(store, paths).await.unwrap();
+        let state = AppState::new(writer, None, "test".into());
+        let app = build_router(state.clone());
+        let (status, body) = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "UNWIND range(1, 50) AS i CREATE (:Doc {slug: 's' + toString(i), n: i})" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Hold the writer lock so the DDL cannot finish inside the request,
+        // then drop the request the way the TimeoutLayer does.
+        let held = state.writer.lock().await;
+        let ddl = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "CREATE INDEX FOR (d:Doc) ON (d.slug)" }),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), ddl)
+                .await
+                .is_err(),
+            "the DDL must still be waiting for the writer lock"
+        );
+        drop(held);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let (status, body) = post_json(
+                &app,
+                "/v0/cypher",
+                serde_json::json!({ "query": "SHOW INDEXES" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let committed = rows["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["labelsOrTypes"][0] == "Doc" && row["properties"][0] == "slug");
+            if committed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped DDL never committed: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The type was inferred off the lock from a live value, and the writer is free.
+        let manifest = state.snapshot.load().manifest().manifest.clone();
+        let slug = manifest
+            .schema
+            .label("Doc")
+            .and_then(|label| label.properties.iter().find(|p| p.name == "slug"))
+            .cloned()
+            .expect("slug declared");
+        assert!(slug.indexed && !slug.type_pending, "{slug:?}");
+        assert_eq!(slug.data_type, namidb_core::DataType::Utf8);
+        let (status, body) = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "CREATE (:Doc {slug: 'after'})" }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
