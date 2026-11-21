@@ -152,9 +152,30 @@ def seed(server):
     server.compact()
 
 
+# The first release whose full-text analyzer folds accents by default. It
+# reads the analyzer an index records, so it serves a folded index (one the
+# new server rebuilt) accent-insensitively; earlier releases serve it with
+# their lowercase-only analyzer.
+FOLDING_SINCE = (3, 5, 2)
+
+
+def release(tag):
+    """`v3.5.2` -> (3, 5, 2)."""
+    return tuple(int(part) for part in tag.lstrip("v").split(".")[:3])
+
+
+def folds_accents(tag):
+    return release(tag) >= FOLDING_SINCE
+
+
 def check_old_semantics(server, tag, extra_docs=0):
-    expect(server.hits("Doc", "pensión"), ROUNDS, f"{tag} Doc 'pensión' (lowercase-only analyzer)")
-    expect(server.hits("Doc", "pension"), ROUNDS, f"{tag} Doc 'pension'")
+    if folds_accents(tag):
+        # 'pensión' and 'pension' fold to one term: both groups of documents.
+        expect(server.hits("Doc", "pensión"), 2 * ROUNDS, f"{tag} Doc 'pensión' (folding analyzer)")
+        expect(server.hits("Doc", "pension"), 2 * ROUNDS, f"{tag} Doc 'pension' (folding analyzer)")
+    else:
+        expect(server.hits("Doc", "pensión"), ROUNDS, f"{tag} Doc 'pensión' (lowercase-only analyzer)")
+        expect(server.hits("Doc", "pension"), ROUNDS, f"{tag} Doc 'pension'")
     expect(server.hits("Note", "jubilación"), 1, f"{tag} Note 'jubilación'")
     expect(server.hits("Memo", "Educación"), 1, f"{tag} Memo 'Educación'")
     expect(server.nearest(), 3, f"{tag} vector top-3")
@@ -175,6 +196,11 @@ def main():
     os.makedirs(base)
 
     oldest_tag, oldest = olds[0]
+    if folds_accents(oldest_tag):
+        sys.exit(
+            f"the first --old ({oldest_tag}) seeds the legacy index and must predate "
+            f"accent folding (v{'.'.join(map(str, FOLDING_SINCE))}); give the releases oldest first"
+        )
     print(f"[1] {oldest_tag} seeds a legacy full-text index", flush=True)
     with Server(oldest, base, log) as server:
         seed(server)
