@@ -5872,6 +5872,10 @@ impl<'mt> Snapshot<'mt> {
     /// over this primitive.
     pub async fn lookup_node_by_id(&self, id: NodeId) -> Result<Option<NodeView>> {
         namidb_core::profile_scope!("Snapshot::lookup_node_by_id");
+        // One lookup can cost milliseconds on a cold store, and a path walk
+        // issues one per edge it visits: probing here keeps the walk within
+        // one lookup of its deadline or cancel, whatever its own probe stride.
+        crate::cancel::check()?;
         let id_bytes = *id.as_bytes();
         let dict = &self.manifest.manifest.label_dict;
         let mut winner: Option<(u64, Option<NodeView>)> = None;
@@ -5894,6 +5898,7 @@ impl<'mt> Snapshot<'mt> {
             .index
             .node_candidates(&self.manifest.manifest.ssts, &id_bytes);
         for idx in candidates {
+            crate::cancel::check()?;
             let desc = &self.manifest.manifest.ssts[idx];
             // Decoded row-group tier, shared with `batch_lookup_nodes`: when
             // this SST's footer metadata is already cached, resolve which row

@@ -81,6 +81,16 @@ crates.io release will establish and document that API explicitly.
   largest accepted dimension (1,048,576). Debug builds panicked there and
   release builds scored NaN. The lanes are unsigned now, and results do not
   change for any other input.
+- **A path walk into a bound endpoint stops at its deadline.** A
+  variable-length pattern that binds its path (`MATCH q = (a)-[*1..10]-(b)`
+  with `a` and `b` bound, in its plain, `CALL` subquery and `LIMIT` forms) and
+  an `allShortestPaths` that binds its path read the node reached at every
+  hop with one point lookup. The walk probed its deadline only every 4,096
+  edges, and the lookup on the ranged route (large SSTs) did not probe at
+  all, so when each lookup cost milliseconds the query ran for minutes past
+  its timeout, and kept a core busy after the client had gone. The point
+  lookup now probes the deadline and the cancel flag, so the walk stops
+  within one lookup of either.
 
 ### Tests
 
