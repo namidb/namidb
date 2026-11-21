@@ -129,6 +129,14 @@ crates.io release will establish and document that API explicitly.
   answers 400 `unsupported` (Bolt `Neo.ClientError.Statement.NotSupported`), as
   the same comprehension nested inside a `RETURN` expression already did. An
   `EXISTS` left in a position the planner does not handle answers the same way.
+- **A background count seed keeps a full count vector installed beside it.**
+  When the exact node counts were not known, a label count started a
+  background seed for that label and then reconciled the whole corpus. If the
+  reconciliation's complete vector was installed while the seed was finishing,
+  the seed could write its own partial counts over it. The counts stayed
+  exact, but the next count of another label, or of all nodes, scanned the
+  corpus again. The seed now merges into the cell's current contents under its
+  lock, so it never replaces or downgrades a vector installed meanwhile.
 
 ### Tests
 

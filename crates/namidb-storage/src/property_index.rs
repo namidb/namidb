@@ -538,6 +538,98 @@ impl ExactNodeCountCell {
             *guard = counts.filter(|counts| !counts.is_empty()).map(Arc::new);
         }
     }
+
+    /// Read-modify-write the counts under the write lock. `merge` sees what
+    /// the cell holds now (a full vector [`install`](Self::install) may have
+    /// written a moment ago, for instance) and returns what to keep, or
+    /// `None` to leave the cell unchanged. Reading and writing separately
+    /// would let a concurrent install land in between and be overwritten.
+    fn update<R>(
+        &self,
+        merge: impl FnOnce(Option<ExactNodeCounts>) -> (Option<Option<ExactNodeCounts>>, R),
+    ) -> Option<R> {
+        let mut guard = self.counts.write().ok()?;
+        let current = guard.as_ref().map(|counts| counts.as_ref().clone());
+        let (next, result) = merge(current);
+        if let Some(next) = next {
+            *guard = next.filter(|counts| !counts.is_empty()).map(Arc::new);
+        }
+        Some(result)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs in [`PropertyIndexCache::finish_count_seed`] once the
+    /// seed is claimed, right before its counts are merged into the cell.
+    static BEFORE_SEED_MERGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// What merging a finished seed into a cell's counts gave.
+enum SeedMerge {
+    /// The seed's counts were merged in.
+    Merged,
+    /// A label count the cell already knew disagrees with the seed: one of
+    /// them is wrong, so the cell must be cleared.
+    Disagrees,
+    /// The seed cannot be applied (missing scan results, an impossible roll
+    /// forward, or an inconsistent outcome): leave the cell as it is.
+    Unusable,
+}
+
+/// Roll `result` forward over the commits recorded while the seed scanned
+/// and merge it into `counts`, which hold the cell's current contents.
+fn merge_count_seed(
+    counts: &mut ExactNodeCounts,
+    seed: &CountSeed,
+    result: &CountSeedResult,
+) -> SeedMerge {
+    for label in &seed.labels {
+        let Some(scanned) = result.by_label.get(label) else {
+            return SeedMerge::Unusable;
+        };
+        let delta = seed.delta.by_label.get(label).copied().unwrap_or(0);
+        let Some(now) = roll_forward(*scanned, delta) else {
+            return SeedMerge::Unusable;
+        };
+        match counts.label(label) {
+            // Already known (and kept exact by every commit since): the
+            // two must agree, or one of them is wrong.
+            Some(known) if known != now => {
+                tracing::warn!(
+                    label,
+                    known,
+                    seeded = now,
+                    "node-count seed disagrees; discarding counts"
+                );
+                return SeedMerge::Disagrees;
+            }
+            Some(_) => {}
+            None => {
+                counts.by_label.insert(label.clone(), now);
+            }
+        }
+    }
+    for pair in &seed.pairs {
+        if counts.presence.len() >= MAX_TRACKED_PRESENCE_PAIRS
+            && !counts.presence.contains_key(pair)
+        {
+            break;
+        }
+        let Some(scanned) = result.presence.get(pair) else {
+            return SeedMerge::Unusable;
+        };
+        let delta = seed.delta.presence.get(pair).copied().unwrap_or(0);
+        let Some(now) = roll_forward(*scanned, delta) else {
+            return SeedMerge::Unusable;
+        };
+        counts.presence.insert(pair.clone(), now);
+    }
+    if !counts.consistent() {
+        return SeedMerge::Unusable;
+    }
+    SeedMerge::Merged
 }
 
 /// Apply a committed node batch to one exact cardinality vector.
@@ -1208,55 +1300,29 @@ impl PropertyIndexCache {
         let Some(cell) = self.node_count_cell_at(generation) else {
             return false;
         };
-        let mut counts = cell.snapshot().unwrap_or_default();
-        for label in &seed.labels {
-            let Some(scanned) = result.by_label.get(label) else {
-                return false;
-            };
-            let delta = seed.delta.by_label.get(label).copied().unwrap_or(0);
-            let Some(now) = roll_forward(*scanned, delta) else {
-                return false;
-            };
-            match counts.label(label) {
-                // Already known (and kept exact by every commit since): the
-                // two must agree, or one of them is wrong.
-                Some(known) if known != now => {
-                    tracing::warn!(
-                        label,
-                        known,
-                        seeded = now,
-                        "node-count seed disagrees; discarding counts"
-                    );
-                    cell.install_snapshot(None);
-                    return false;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_SEED_MERGE.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        // Merge onto what the cell holds at this moment, under its lock: a
+        // full reconciliation can install a complete vector while the seed
+        // finishes, and a separate read and write would discard it. Labels
+        // the cell already knows (all of them, for a complete vector) are
+        // checked, never replaced, so a seed cannot downgrade a vector.
+        let installed = cell
+            .update(|current| {
+                let mut counts = current.unwrap_or_default();
+                match merge_count_seed(&mut counts, &seed, &result) {
+                    SeedMerge::Merged => (Some(Some(counts)), true),
+                    SeedMerge::Disagrees => (Some(None), false),
+                    SeedMerge::Unusable => (None, false),
                 }
-                Some(_) => {}
-                None => {
-                    counts.by_label.insert(label.clone(), now);
-                }
-            }
+            })
+            .unwrap_or(false);
+        if installed {
+            self.count_seeds_installed.fetch_add(1, Ordering::Relaxed);
         }
-        for pair in &seed.pairs {
-            if counts.presence.len() >= MAX_TRACKED_PRESENCE_PAIRS
-                && !counts.presence.contains_key(pair)
-            {
-                break;
-            }
-            let Some(scanned) = result.presence.get(pair) else {
-                return false;
-            };
-            let delta = seed.delta.presence.get(pair).copied().unwrap_or(0);
-            let Some(now) = roll_forward(*scanned, delta) else {
-                return false;
-            };
-            counts.presence.insert(pair.clone(), now);
-        }
-        if !counts.consistent() {
-            return false;
-        }
-        cell.install_snapshot(Some(counts));
-        self.count_seeds_installed.fetch_add(1, Ordering::Relaxed);
-        true
+        installed
     }
 
     /// Ask the writer to start a seed after its next node commit.
@@ -1755,6 +1821,71 @@ mod tests {
 
     fn pair(label: &str, property: &str) -> (String, String) {
         (label.to_string(), property.to_string())
+    }
+
+    #[test]
+    fn a_seed_keeps_a_full_vector_installed_while_it_finishes() {
+        // A query's full reconciliation installs the complete vector right
+        // as the label seed it started finishes. The seed used to read the
+        // cell, then write it back with its label added: a vector installed
+        // in between was replaced by the seed's partial counts, and the next
+        // count of another label (or of all nodes) scanned the corpus again.
+        let cache = Arc::new(PropertyIndexCache::new());
+        let start = cache.generation();
+        let id = cache
+            .begin_count_seed(
+                start,
+                ["Doc".to_string()].into_iter().collect(),
+                BTreeSet::new(),
+            )
+            .expect("no commit moved the generation");
+        let reconciled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let cache = Arc::clone(&cache);
+            let reconciled = Arc::clone(&reconciled);
+            BEFORE_SEED_MERGE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    cache.insert_node_counts_at(
+                        start,
+                        12,
+                        HashMap::from([("Doc".to_string(), 10), ("Other".to_string(), 2)]),
+                    );
+                    reconciled.store(true, Ordering::Relaxed);
+                }));
+            });
+        }
+        assert!(cache.finish_count_seed(
+            id,
+            CountSeedResult {
+                by_label: HashMap::from([("Doc".to_string(), 10)]),
+                presence: HashMap::new(),
+            }
+        ));
+        assert!(reconciled.load(Ordering::Relaxed), "the hook ran");
+        // The full vector survives the seed, complete.
+        assert_eq!(cache.node_count_at(None, start), Some(12));
+        assert_eq!(cache.node_count_at(Some("Doc"), start), Some(10));
+        assert_eq!(cache.node_count_at(Some("Other"), start), Some(2));
+        assert_eq!(cache.node_count_at(Some("Absent"), start), Some(0));
+
+        // A seed that disagrees with the installed vector still clears it:
+        // one of the two is wrong.
+        let id = cache
+            .begin_count_seed(
+                start,
+                ["Other".to_string()].into_iter().collect(),
+                BTreeSet::new(),
+            )
+            .expect("no commit moved the generation");
+        assert!(!cache.finish_count_seed(
+            id,
+            CountSeedResult {
+                by_label: HashMap::from([("Other".to_string(), 3)]),
+                presence: HashMap::new(),
+            }
+        ));
+        assert_eq!(cache.node_count_at(None, start), None);
+        assert_eq!(cache.node_count_at(Some("Other"), start), None);
     }
 
     #[test]
