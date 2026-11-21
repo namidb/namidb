@@ -4,11 +4,12 @@
 //! few thousand edges, so on a store where each lookup costs milliseconds it
 //! ran minutes past its deadline, and kept running after the client had gone.
 //! The point lookup now probes the guards itself: the walk stops within one
-//! lookup of the deadline or of a cancel.
+//! lookup of the deadline or of a cancel. A deadline that fires inside a
+//! storage read is the query timeout, like one an executor probe sees.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,11 +55,11 @@ fn body(k: usize) -> String {
         .collect()
 }
 
-/// Delays every read while `slow` is set, like a cold remote store.
+/// Delays every read by `latency_us` (none at 0), like a cold remote store.
 #[derive(Debug)]
 struct SlowReads {
     inner: Arc<dyn ObjectStore>,
-    slow: Arc<AtomicBool>,
+    latency_us: Arc<AtomicU64>,
     reads: Arc<AtomicUsize>,
 }
 
@@ -92,9 +93,10 @@ impl ObjectStore for SlowReads {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        if self.slow.load(Ordering::Relaxed) {
+        let latency = self.latency_us.load(Ordering::Relaxed);
+        if latency > 0 {
             self.reads.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(READ_LATENCY).await;
+            tokio::time::sleep(Duration::from_micros(latency)).await;
         }
         self.inner.get_opts(location, options).await
     }
@@ -126,19 +128,27 @@ impl ObjectStore for SlowReads {
 
 struct Graph {
     writer: WriterSession,
-    slow: Arc<AtomicBool>,
+    latency_us: Arc<AtomicU64>,
     reads: Arc<AtomicUsize>,
+}
+
+impl Graph {
+    /// Every read from now on costs `latency`.
+    fn slow_down(&self, latency: Duration) {
+        self.latency_us
+            .store(latency.as_micros() as u64, Ordering::Relaxed);
+    }
 }
 
 /// The layered graph, flushed and uncached. Its snapshots read node rows
 /// with ranged requests, the route a large SST takes, so every point lookup
 /// pays the store's latency.
 async fn graph(name: &str) -> Graph {
-    let slow = Arc::new(AtomicBool::new(false));
+    let latency_us = Arc::new(AtomicU64::new(0));
     let reads = Arc::new(AtomicUsize::new(0));
     let store: Arc<dyn ObjectStore> = Arc::new(SlowReads {
         inner: Arc::new(InMemory::new()),
-        slow: Arc::clone(&slow),
+        latency_us: Arc::clone(&latency_us),
         reads: Arc::clone(&reads),
     });
     let paths = NamespacePaths::new("tenants", NamespaceId::new(name).unwrap());
@@ -151,6 +161,7 @@ async fn graph(name: &str) -> Graph {
         let id = NodeId::new();
         let mut properties = BTreeMap::new();
         properties.insert("k".to_string(), CoreValue::I64(k as i64));
+        properties.insert("name".to_string(), CoreValue::Str(format!("d{k}")));
         properties.insert("body".to_string(), CoreValue::Str(body(k)));
         writer
             .upsert_node_with_labels(
@@ -185,6 +196,9 @@ async fn graph(name: &str) -> Graph {
             name: "Doc".into(),
             properties: vec![
                 PropertyDef::new("k", DataType::Int64, true).unwrap(),
+                PropertyDef::new("name", DataType::Utf8, true)
+                    .unwrap()
+                    .with_unique(true),
                 PropertyDef::new("body", DataType::Utf8, true).unwrap(),
             ],
         })
@@ -193,7 +207,7 @@ async fn graph(name: &str) -> Graph {
     writer.flush(schema).await.unwrap();
     Graph {
         writer,
-        slow,
+        latency_us,
         reads,
     }
 }
@@ -239,7 +253,7 @@ fn queries() -> Vec<String> {
 async fn a_slow_path_walk_stops_at_its_deadline() {
     let g = graph("trail-deadline").await;
     let snap = g.writer.snapshot().with_ranged_reads(true);
-    g.slow.store(true, Ordering::Relaxed);
+    g.slow_down(READ_LATENCY);
     for query in queries() {
         let plan = plan(&query);
         let timeout = Duration::from_secs(1);
@@ -266,7 +280,7 @@ async fn a_slow_path_walk_stops_at_its_deadline() {
 async fn a_slow_path_walk_stops_when_cancelled() {
     let g = graph("trail-cancel").await;
     let snap = g.writer.snapshot().with_ranged_reads(true);
-    g.slow.store(true, Ordering::Relaxed);
+    g.slow_down(READ_LATENCY);
     for query in queries() {
         let plan = plan(&query);
         let flag = Arc::new(AtomicBool::new(false));
@@ -300,4 +314,50 @@ async fn a_slow_path_walk_stops_when_cancelled() {
             stopped.duration_since(cancelled_at)
         );
     }
+}
+
+/// A deadline that fires inside a storage read (here the batch property
+/// lookup behind `UNWIND $names ... MATCH (d {name: i})`) is the query's
+/// timeout. Storage reported it as its own timeout error, which bypassed the
+/// conversion and reached clients as a 500 with a transient, auto-retried
+/// code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deadline_inside_a_storage_read_is_a_timeout() {
+    let g = graph("storage-deadline").await;
+    let snap = g.writer.snapshot();
+    // With the unique constraint in the catalog the MATCH is one batch
+    // lookup of every name.
+    let plan = optimize(
+        lower(&parse("UNWIND $names AS i MATCH (d:Doc {name: i}) RETURN count(d) AS c").unwrap())
+            .unwrap(),
+        &StatsCatalog::from_manifest(&snap.manifest().manifest),
+    );
+    assert!(
+        namidb_query::explain(&plan).contains("NodeByPropertyValue"),
+        "{}",
+        namidb_query::explain(&plan)
+    );
+    let mut params = Params::new();
+    params.insert(
+        "names".into(),
+        namidb_query::RuntimeValue::List(
+            (0..LAYERS * WIDTH)
+                .map(|k| namidb_query::RuntimeValue::String(format!("d{k}")))
+                .collect(),
+        ),
+    );
+    // Every read outlasts the whole deadline, so it fires inside the first
+    // storage read the lookup makes, not at an executor probe before it.
+    g.slow_down(Duration::from_millis(400));
+    let start = Instant::now();
+    let err = execute_with_limits(
+        &plan,
+        &snap,
+        &params,
+        Some(start + Duration::from_millis(100)),
+        None,
+    )
+    .await
+    .expect_err("the lookup cannot finish in 100 ms");
+    assert!(matches!(err, ExecError::Timeout), "{err:?}");
 }

@@ -189,7 +189,7 @@ pub async fn execute_write_checked_with_deadline(
         // negatively-acked write durable. Nothing is durable until the manifest
         // CAS lands, so discarding here is safe.
         writer.discard_batch();
-        return Err(ExecError::Storage(e));
+        return Err(ExecError::from(e));
     }
     Ok(outcome)
 }
@@ -721,7 +721,7 @@ fn execute_write_inner_mode<'a>(
                         Some(l) => snap
                             .lookup_node(l, node_id)
                             .await
-                            .map_err(ExecError::Storage)?,
+                            .map_err(ExecError::from)?,
                         None => crate::exec::walker::scan_node_for_id(&snap, node_id).await?,
                     };
                     if let Some(view) = found {
@@ -825,7 +825,7 @@ fn execute_write_inner_mode<'a>(
                     } else {
                         snap.batch_lookup_nodes_by_property_any_label(property, &string_values)
                             .await
-                            .map_err(ExecError::Storage)?
+                            .map_err(ExecError::from)?
                     };
                     if batch_results.len() != string_values.len() {
                         return Err(ExecError::Runtime(format!(
@@ -904,12 +904,12 @@ fn execute_write_inner_mode<'a>(
                         writer
                             .seed_unique_string_candidates(label, property, &string_values)
                             .await
-                            .map_err(ExecError::Storage)?
+                            .map_err(ExecError::from)?
                     } else {
                         Some(
                             snap.batch_lookup_nodes_by_property(label, property, &string_values)
                                 .await
-                                .map_err(ExecError::Storage)?,
+                                .map_err(ExecError::from)?,
                         )
                     };
                     if let Some(results) = &batch_results {
@@ -990,7 +990,7 @@ fn execute_write_inner_mode<'a>(
                                     &string_values,
                                 )
                                 .await
-                                .map_err(ExecError::Storage)?,
+                                .map_err(ExecError::from)?,
                             )
                         }
                     } else {
@@ -1306,7 +1306,7 @@ async fn execute_discarded_correlated_node_set(
             writer
                 .batch_lookup_committed_unique_string_candidates(label, property, &string_values)
                 .await
-                .map_err(ExecError::Storage)?
+                .map_err(ExecError::from)?
         };
         if string_results.len() != string_values.len() {
             return Err(ExecError::Runtime(format!(
@@ -1330,7 +1330,7 @@ async fn execute_discarded_correlated_node_set(
                     match local_overlay.get(key) {
                         Some(id) => {
                             outcome.correlated_write_local_overlay_hits += 1;
-                            match writer.staged_node(*id).map_err(ExecError::Storage)? {
+                            match writer.staged_node(*id).map_err(ExecError::from)? {
                                 StagedValue::Upsert(view) => Some(view),
                                 StagedValue::Tombstone => None,
                                 StagedValue::Untouched => {
@@ -1383,7 +1383,7 @@ async fn execute_discarded_correlated_node_set(
                 // mutation may shadow the committed image, otherwise a repeated
                 // key in a later chunk resolves to an `Untouched` id.
                 if !matches!(
-                    writer.staged_node(node_id).map_err(ExecError::Storage)?,
+                    writer.staged_node(node_id).map_err(ExecError::from)?,
                     StagedValue::Untouched
                 ) {
                     local_overlay.insert(key.clone(), node_id);
@@ -1574,7 +1574,7 @@ async fn execute_discarded_correlated_single_node_merge(
                     &batched_values,
                 )
                 .await
-                .map_err(ExecError::Storage)?
+                .map_err(ExecError::from)?
         };
         if committed.len() != batched_values.len() {
             return Err(ExecError::Runtime(format!(
@@ -1605,7 +1605,7 @@ async fn execute_discarded_correlated_single_node_merge(
             let candidate = match local_overlay.get(lookup_key) {
                 Some(id) => {
                     outcome.correlated_write_local_overlay_hits += 1;
-                    match writer.staged_node(*id).map_err(ExecError::Storage)? {
+                    match writer.staged_node(*id).map_err(ExecError::from)? {
                         StagedValue::Upsert(view) => Some(view),
                         StagedValue::Tombstone => None,
                         StagedValue::Untouched => {
@@ -1666,7 +1666,7 @@ async fn execute_discarded_correlated_single_node_merge(
             // resolve to an `Untouched` id. Leaving it out keeps the key in the
             // next chunk's committed lookup, which returns the same node.
             if !matches!(
-                writer.staged_node(id).map_err(ExecError::Storage)?,
+                writer.staged_node(id).map_err(ExecError::from)?,
                 StagedValue::Untouched
             ) {
                 local_overlay.insert(lookup_key.clone(), id);
@@ -1778,7 +1778,7 @@ async fn lookup_unique_node_for_write(
         match writer
             .unique_probe(label, &refs, None)
             .await
-            .map_err(ExecError::Storage)?
+            .map_err(ExecError::from)?
         {
             UniqueProbe::Conflict(id) => {
                 candidate_ids.insert(id);
@@ -1801,7 +1801,7 @@ async fn lookup_unique_node_for_write(
         let Some(view) = snapshot
             .lookup_node(label, id)
             .await
-            .map_err(ExecError::Storage)?
+            .map_err(ExecError::from)?
         else {
             continue;
         };
@@ -2111,14 +2111,14 @@ async fn find_unique_conflict(
     match writer
         .unique_probe(label, &[(prop, value)], exclude)
         .await
-        .map_err(ExecError::Storage)?
+        .map_err(ExecError::from)?
     {
         UniqueProbe::Conflict(id) => Ok(Some(id)),
         UniqueProbe::NoConflict => Ok(None),
         UniqueProbe::Unindexable => {
             let snap = writer.overlay_snapshot();
             let mut found = None;
-            for node in snap.scan_label(label).await.map_err(ExecError::Storage)? {
+            for node in snap.scan_label(label).await.map_err(ExecError::from)? {
                 if Some(node.id) == exclude {
                     continue;
                 }
@@ -2263,14 +2263,14 @@ async fn find_composite_conflict(
     match writer
         .unique_probe(label, &pairs, exclude)
         .await
-        .map_err(ExecError::Storage)?
+        .map_err(ExecError::from)?
     {
         UniqueProbe::Conflict(id) => Ok(Some(id)),
         UniqueProbe::NoConflict => Ok(None),
         UniqueProbe::Unindexable => {
             let snap = writer.overlay_snapshot();
             let mut found = None;
-            for node in snap.scan_label(label).await.map_err(ExecError::Storage)? {
+            for node in snap.scan_label(label).await.map_err(ExecError::from)? {
                 if Some(node.id) == exclude {
                     continue;
                 }
@@ -2623,7 +2623,7 @@ async fn apply_create(
                 };
                 writer
                     .upsert_node_with_labels(labels.iter().cloned(), id, &record)
-                    .map_err(ExecError::Storage)?;
+                    .map_err(ExecError::from)?;
                 outcome.nodes_created += 1;
                 let node_value = NodeValue {
                     id,
@@ -2685,7 +2685,7 @@ async fn apply_create(
                 };
                 writer
                     .upsert_edge(edge_type.clone(), src, dst, &record)
-                    .map_err(ExecError::Storage)?;
+                    .map_err(ExecError::from)?;
                 outcome.edges_created += 1;
                 if let Some(name) = alias {
                     let rel_value = RelValue {
@@ -2804,7 +2804,7 @@ async fn apply_node_property_run(
     };
     writer
         .upsert_node_with_labels(node.labels.iter().cloned(), node.id, &record)
-        .map_err(ExecError::Storage)?;
+        .map_err(ExecError::from)?;
     outcome.properties_set += items.len() as u64;
     let updated = NodeValue {
         id: node.id,
@@ -2865,7 +2865,7 @@ fn refresh_staged_write_target(
 ) -> Result<(), ExecError> {
     match row.get(target_alias).cloned() {
         Some(RuntimeValue::Node(node)) => {
-            match writer.staged_node(node.id).map_err(ExecError::Storage)? {
+            match writer.staged_node(node.id).map_err(ExecError::from)? {
                 StagedValue::Untouched => {}
                 StagedValue::Tombstone => {
                     return Err(ExecError::Runtime(format!(
@@ -2879,7 +2879,7 @@ fn refresh_staged_write_target(
         }
         Some(RuntimeValue::Rel(rel)) => match writer
             .staged_edge(&rel.edge_type, rel.src, rel.dst)
-            .map_err(ExecError::Storage)?
+            .map_err(ExecError::from)?
         {
             StagedValue::Untouched => {}
             StagedValue::Tombstone => {
@@ -2965,7 +2965,7 @@ async fn apply_set(
                     // silently drop the others.
                     writer
                         .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
-                        .map_err(ExecError::Storage)?;
+                        .map_err(ExecError::from)?;
                     outcome.properties_set += 1;
                     let updated = NodeValue {
                         id: n.id,
@@ -2983,7 +2983,7 @@ async fn apply_set(
                     };
                     writer
                         .upsert_edge(r.edge_type.clone(), r.src, r.dst, &record)
-                        .map_err(ExecError::Storage)?;
+                        .map_err(ExecError::from)?;
                     r.properties.insert(key.clone(), new_val);
                     outcome.properties_set += 1;
                     synchronize_rel_bindings(&mut row, &r);
@@ -3059,7 +3059,7 @@ async fn apply_set(
                 };
                 writer
                     .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
-                    .map_err(ExecError::Storage)?;
+                    .map_err(ExecError::from)?;
                 outcome.labels_set += added_labels.len() as u64;
                 let updated = NodeValue {
                     id: n.id,
@@ -3169,7 +3169,7 @@ async fn apply_set_map(
             };
             writer
                 .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
-                .map_err(ExecError::Storage)?;
+                .map_err(ExecError::from)?;
             outcome.properties_set += incoming.len() as u64;
             let updated = NodeValue {
                 id: n.id,
@@ -3187,7 +3187,7 @@ async fn apply_set_map(
             };
             writer
                 .upsert_edge(r.edge_type.clone(), r.src, r.dst, &record)
-                .map_err(ExecError::Storage)?;
+                .map_err(ExecError::from)?;
             outcome.properties_set += incoming.len() as u64;
             r.properties = final_runtime;
             synchronize_rel_bindings(&mut row, &r);
@@ -3254,7 +3254,7 @@ fn apply_remove(
                 // keyed by id; a single-label upsert would drop the others).
                 writer
                     .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
-                    .map_err(ExecError::Storage)?;
+                    .map_err(ExecError::from)?;
                 n.properties.remove(key);
                 outcome.properties_set += 1;
                 synchronize_node_bindings(&mut row, &n);
@@ -3268,7 +3268,7 @@ fn apply_remove(
                 };
                 writer
                     .upsert_edge(r.edge_type.clone(), r.src, r.dst, &record)
-                    .map_err(ExecError::Storage)?;
+                    .map_err(ExecError::from)?;
                 r.properties.remove(key);
                 outcome.properties_set += 1;
                 synchronize_rel_bindings(&mut row, &r);
@@ -3295,7 +3295,7 @@ fn apply_remove(
                 };
                 writer
                     .upsert_node_with_labels(n.labels.iter().cloned(), n.id, &record)
-                    .map_err(ExecError::Storage)?;
+                    .map_err(ExecError::from)?;
                 outcome.labels_set += removed as u64;
                 synchronize_node_bindings(&mut row, &n);
             }
@@ -3351,13 +3351,13 @@ async fn apply_delete(
                 let any_label = n.labels.iter().next().cloned().unwrap_or_default();
                 writer
                     .tombstone_node(any_label, n.id)
-                    .map_err(ExecError::Storage)?;
+                    .map_err(ExecError::from)?;
                 outcome.nodes_deleted += 1;
             }
             RuntimeValue::Rel(r) => {
                 writer
                     .tombstone_edge(r.edge_type.clone(), r.src, r.dst)
-                    .map_err(ExecError::Storage)?;
+                    .map_err(ExecError::from)?;
                 outcome.edges_deleted += 1;
             }
             RuntimeValue::Null => {
@@ -3388,13 +3388,13 @@ async fn incident_edge_type(
         if !snap
             .out_edges(&et, node)
             .await
-            .map_err(ExecError::Storage)?
+            .map_err(ExecError::from)?
             .edges
             .is_empty()
             || !snap
                 .in_edges(&et, node)
                 .await
-                .map_err(ExecError::Storage)?
+                .map_err(ExecError::from)?
                 .edges
                 .is_empty()
         {
@@ -3418,14 +3418,11 @@ async fn detach_incident_edges(
         let mut to_delete: Vec<(NodeId, NodeId)> = Vec::new();
         {
             let snap = writer.overlay_snapshot();
-            let out_edges = snap
-                .out_edges(&et, node)
-                .await
-                .map_err(ExecError::Storage)?;
+            let out_edges = snap.out_edges(&et, node).await.map_err(ExecError::from)?;
             for e in &out_edges.edges {
                 to_delete.push((e.src, e.dst));
             }
-            let in_edges = snap.in_edges(&et, node).await.map_err(ExecError::Storage)?;
+            let in_edges = snap.in_edges(&et, node).await.map_err(ExecError::from)?;
             for e in &in_edges.edges {
                 to_delete.push((e.src, e.dst));
             }
@@ -3439,7 +3436,7 @@ async fn detach_incident_edges(
             }
             writer
                 .tombstone_edge(et.clone(), src, dst)
-                .map_err(ExecError::Storage)?;
+                .map_err(ExecError::from)?;
             outcome.edges_deleted += 1;
         }
     }
@@ -3527,7 +3524,7 @@ async fn prepare_single_node_merge_batch(
         if let Some(views) = writer
             .seed_unique_string_candidates(&label, &property, &values)
             .await
-            .map_err(ExecError::Storage)?
+            .map_err(ExecError::from)?
         {
             for view in views.into_iter().flatten() {
                 prefetched.insert(view.id, NodeValue::from(view));
@@ -3561,7 +3558,7 @@ async fn prepare_single_node_merge_batch(
             .transactional_overlay_snapshot()
             .batch_lookup_nodes_by_property_multi(&label, &property, &values)
             .await
-            .map_err(ExecError::Storage)?;
+            .map_err(ExecError::from)?;
         for view in groups.into_iter().flatten() {
             prefetched.insert(view.id, NodeValue::from(view));
         }
@@ -3586,7 +3583,7 @@ async fn prepare_single_node_merge_batch(
             let views = snapshot
                 .batch_lookup_nodes(&label, &ids)
                 .await
-                .map_err(ExecError::Storage)?;
+                .map_err(ExecError::from)?;
             if views.len() != ids.len() {
                 return Err(ExecError::Runtime(format!(
                     "batch MERGE hydration returned {} results for {} ids",
@@ -3748,7 +3745,7 @@ async fn prepare_bound_relationship_merge_batch(
         .overlay_snapshot()
         .batch_lookup_edges_via_sst(edge_type, &pairs)
         .await
-        .map_err(ExecError::Storage)?;
+        .map_err(ExecError::from)?;
     if views.len() != prepared.len() {
         return Err(ExecError::Runtime(format!(
             "batch relationship MERGE returned {} results for {} endpoint pairs",
@@ -3828,7 +3825,7 @@ fn refresh_prefetched_edge(
     let (edge_type, src, dst) = &expected.key;
     match writer
         .staged_edge(edge_type, *src, *dst)
-        .map_err(ExecError::Storage)?
+        .map_err(ExecError::from)?
     {
         StagedValue::Untouched => {}
         StagedValue::Tombstone => {
@@ -4055,7 +4052,7 @@ async fn find_merge_matches(
                         None => snap
                             .contains_edge_via_sst(rel_edge_type, physical_src, physical_dst)
                             .await
-                            .map_err(ExecError::Storage)?,
+                            .map_err(ExecError::from)?,
                     };
                     if !exists {
                         continue;
@@ -4075,7 +4072,7 @@ async fn find_merge_matches(
                         let Some(edge) = snap
                             .lookup_edge_via_sst(rel_edge_type, physical_src, physical_dst)
                             .await
-                            .map_err(ExecError::Storage)?
+                            .map_err(ExecError::from)?
                         else {
                             continue;
                         };
@@ -4118,7 +4115,7 @@ async fn find_merge_matches(
                     ));
                 }
             }
-            .map_err(ExecError::Storage)?;
+            .map_err(ExecError::from)?;
 
             for e in neighbours.edges {
                 let partner_id = match rel_direction {
@@ -4131,7 +4128,7 @@ async fn find_merge_matches(
                         let view = match snap
                             .lookup_node(merge_scan_label(pattern.labels), partner_id)
                             .await
-                            .map_err(ExecError::Storage)?
+                            .map_err(ExecError::from)?
                         {
                             Some(v) => v,
                             None => continue,
@@ -4433,7 +4430,7 @@ async fn merge_node_candidates_materialized(
         } else {
             snap.lookup_node(merge_scan_label(pattern.labels), id)
                 .await
-                .map_err(ExecError::Storage)?
+                .map_err(ExecError::from)?
         };
         return Ok(found
             .map(NodeValue::from)
@@ -4468,7 +4465,7 @@ async fn merge_node_candidates_materialized(
             let resolved = snap
                 .batch_lookup_nodes(&label, &unresolved)
                 .await
-                .map_err(ExecError::Storage)?;
+                .map_err(ExecError::from)?;
             for node in resolved.into_iter().flatten().map(NodeValue::from) {
                 if materialized_node_matches(&node, pattern.labels, expected) {
                     found.push(node);
@@ -4495,7 +4492,7 @@ async fn merge_node_candidates_materialized(
             if let Some((mut ids, mut resolved)) = snap
                 .transactional_string_postings(&label, &property, std::slice::from_ref(&value))
                 .await
-                .map_err(ExecError::Storage)?
+                .map_err(ExecError::from)?
             {
                 let ids = ids.pop().unwrap_or_default();
                 let mut found = Vec::with_capacity(ids.len());
@@ -4518,7 +4515,7 @@ async fn merge_node_candidates_materialized(
                     let views = snap
                         .batch_lookup_nodes(&label, &unresolved)
                         .await
-                        .map_err(ExecError::Storage)?;
+                        .map_err(ExecError::from)?;
                     for node in views.into_iter().flatten().map(NodeValue::from) {
                         if materialized_node_matches(&node, pattern.labels, expected) {
                             found.push(node);
@@ -4548,7 +4545,7 @@ async fn merge_node_candidates_materialized(
     let candidates = snap
         .scan_label(merge_scan_label(pattern.labels))
         .await
-        .map_err(ExecError::Storage)?;
+        .map_err(ExecError::from)?;
     Ok(candidates
         .into_iter()
         .map(NodeValue::from)
@@ -4579,7 +4576,7 @@ async fn probe_merge_unique_candidates(
             match writer
                 .unique_probe(&label, &refs, None)
                 .await
-                .map_err(ExecError::Storage)?
+                .map_err(ExecError::from)?
             {
                 UniqueProbe::Conflict(id) => {
                     candidate_ids.insert(id);

@@ -2403,7 +2403,11 @@ fn exec_error_classification(
 ) -> (StatusCode, Option<&'static str>) {
     use namidb_query::exec::ExecError;
     match e {
-        ExecError::Timeout => (StatusCode::GATEWAY_TIMEOUT, Some("timeout")),
+        // A storage read that hit the query's deadline is the same timeout,
+        // however the error reached here.
+        ExecError::Timeout | ExecError::Storage(namidb_storage::Error::Timeout) => {
+            (StatusCode::GATEWAY_TIMEOUT, Some("timeout"))
+        }
         // Retry once the index is online (SHOW INDEXES reports its progress).
         ExecError::IndexBuilding(_) => (StatusCode::SERVICE_UNAVAILABLE, Some("index_building")),
         ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
@@ -2461,7 +2465,9 @@ fn exec_error_classification(
 fn exec_error_taxonomy(e: &namidb_query::exec::ExecError) -> (&'static str, &'static str) {
     use namidb_query::exec::ExecError;
     match e {
-        ExecError::Timeout => ("Neo.ClientError.Transaction.TransactionTimedOut", "57014"),
+        ExecError::Timeout | ExecError::Storage(namidb_storage::Error::Timeout) => {
+            ("Neo.ClientError.Transaction.TransactionTimedOut", "57014")
+        }
         ExecError::IndexBuilding(_) => ("Neo.TransientError.General.DatabaseUnavailable", "53000"),
         ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
             ("Neo.TransientError.Transaction.Terminated", "57014")
@@ -9256,6 +9262,27 @@ mod tests {
         let (status, text) = post_json(&app, "/v0/cypher", embedding_batch_body()).await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{text}");
         assert!(text.contains("NAMIDB_HTTP_MAX_BODY_BYTES"), "{text}");
+    }
+
+    /// A deadline that fired inside a storage read is a 504 timeout with the
+    /// timeout taxonomy, never a 500 with a transient (auto-retried) code.
+    #[test]
+    fn a_storage_deadline_is_an_http_504_timeout() {
+        for error in [
+            namidb_query::exec::ExecError::Timeout,
+            namidb_query::exec::ExecError::Storage(namidb_storage::Error::Timeout),
+        ] {
+            assert_eq!(
+                exec_error_classification(&error),
+                (StatusCode::GATEWAY_TIMEOUT, Some("timeout")),
+                "{error:?}"
+            );
+            assert_eq!(
+                exec_error_taxonomy(&error),
+                ("Neo.ClientError.Transaction.TransactionTimedOut", "57014"),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]

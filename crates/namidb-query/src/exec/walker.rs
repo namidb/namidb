@@ -516,7 +516,9 @@ fn execute_operator<'a>(
                     .batch_lookup_nodes(label.as_deref().unwrap_or(""), &ids)
                     .await?;
                 let mut out = Vec::with_capacity(keyed.len());
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for ((mut row, _), view) in keyed.into_iter().zip(found) {
+                    guard.tick()?;
                     if let Some(view) = view {
                         row.set(
                             alias.clone(),
@@ -601,7 +603,7 @@ fn execute_operator<'a>(
                         snapshot
                             .batch_lookup_nodes_by_property_any_label(property, &string_values)
                             .await
-                            .map_err(ExecError::Storage)?
+                            .map_err(ExecError::from)?
                     };
                     if batch_results.len() != string_values.len() {
                         return Err(ExecError::Runtime(format!(
@@ -613,7 +615,9 @@ fn execute_operator<'a>(
 
                     let mut batch_results = batch_results.into_iter();
                     let mut out = Vec::new();
+                    let mut guard = crate::exec::limits::DeadlineProbe::new();
                     for (row, lookup_value) in evaluated_rows {
+                        guard.tick()?;
                         let matches = match lookup_value {
                             RuntimeValue::String(_) => batch_results.next().ok_or_else(|| {
                                 ExecError::Runtime(
@@ -662,7 +666,7 @@ fn execute_operator<'a>(
                         snapshot
                             .batch_lookup_nodes_by_property(label, property, &string_values)
                             .await
-                            .map_err(ExecError::Storage)?
+                            .map_err(ExecError::from)?
                     };
                     if batch_results.len() != string_values.len() {
                         return Err(ExecError::Runtime(format!(
@@ -674,7 +678,11 @@ fn execute_operator<'a>(
 
                     let mut batch_results = batch_results.into_iter();
                     let mut out = Vec::with_capacity(evaluated_rows.len());
+                    // Materialising each found node is the costly step once
+                    // the lookup batch is in: probe the guards as it runs.
+                    let mut guard = crate::exec::limits::DeadlineProbe::new();
                     for (row, lookup_value) in evaluated_rows {
+                        guard.tick()?;
                         let found = if matches!(&lookup_value, RuntimeValue::String(_)) {
                             batch_results.next().ok_or_else(|| {
                                 ExecError::Runtime(
@@ -727,7 +735,7 @@ fn execute_operator<'a>(
                                         &string_values,
                                     )
                                     .await
-                                    .map_err(ExecError::Storage)?,
+                                    .map_err(ExecError::from)?,
                             )
                         }
                     } else {
@@ -736,7 +744,9 @@ fn execute_operator<'a>(
                 let mut batched_multi = batched_multi.map(|groups| groups.into_iter());
 
                 let mut out = Vec::with_capacity(input_rows.len());
+                let mut guard = crate::exec::limits::DeadlineProbe::new();
                 for row in input_rows {
+                    guard.tick()?;
                     let lookup_val = evaluate(value, &row, params)?;
                     if *multi {
                         // Non-unique indexed property: fan out one row per
@@ -3983,7 +3993,7 @@ async fn db_schema_procedure(
             vec!["propertyKey"],
             snapshot
                 .observed_property_keys()
-                .map_err(ExecError::Storage)?
+                .map_err(ExecError::from)?
                 .into_iter()
                 .map(|k| vec![RuntimeValue::String(k)])
                 .collect(),
@@ -4025,7 +4035,7 @@ async fn db_schema_procedure(
             let endpoints = snapshot
                 .observed_edge_endpoints()
                 .await
-                .map_err(ExecError::Storage)?;
+                .map_err(ExecError::from)?;
             let relationships: Vec<RuntimeValue> = endpoints
                 .into_iter()
                 .filter_map(|e| {
@@ -9422,7 +9432,7 @@ async fn try_index_search(
     let fresh = if source_filter.is_none() {
         snapshot
             .vector_fresh_candidates(label, property, &qv, k)
-            .map_err(ExecError::Storage)?
+            .map_err(ExecError::from)?
     } else {
         None
     };
@@ -9431,7 +9441,7 @@ async fn try_index_search(
     } else {
         snapshot
             .vector_fresh_delta(label, property)
-            .map_err(ExecError::Storage)?
+            .map_err(ExecError::from)?
     };
     let delta_set: BTreeSet<NodeId> = delta.iter().map(|(id, _)| *id).collect();
     let delta_contains = |id: &NodeId| match &fresh {
@@ -12575,7 +12585,7 @@ fn execute_factor_operator<'a>(
                         snapshot
                             .batch_lookup_nodes_by_property_any_label(property, &string_values)
                             .await
-                            .map_err(ExecError::Storage)?
+                            .map_err(ExecError::from)?
                     };
                     if results.len() != string_values.len() {
                         return Err(ExecError::Runtime(format!(

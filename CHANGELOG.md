@@ -91,6 +91,18 @@ crates.io release will establish and document that API explicitly.
   its timeout, and kept a core busy after the client had gone. The point
   lookup now probes the deadline and the cancel flag, so the walk stops
   within one lookup of either.
+- **A deadline inside a storage read is a timeout, not a 500.** When the
+  query deadline fired inside a batch property lookup (`UNWIND $ids AS i
+  MATCH (n:Doc {id: i})`, a key join), the vector search's fresh delta, a
+  write's commit or a schema procedure, the error skipped the conversion to
+  the executor's timeout. HTTP answered 500 with
+  `Neo.TransientError.General.DatabaseUnavailable` and no `code`, and Bolt
+  sent the same transient code, which drivers retry automatically. Every
+  storage error now goes through that conversion, and both protocols also map
+  a storage timeout that reaches them directly to the timeout: HTTP 504
+  `timeout` and `Neo.ClientError.Transaction.TransactionTimedOut`. Turning
+  the lookups' results into rows now probes the deadline too, so a key join
+  over many rows answers close to its timeout.
 
 ### Tests
 

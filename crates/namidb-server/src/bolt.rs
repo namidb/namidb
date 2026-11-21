@@ -1954,7 +1954,11 @@ fn map_exec_err_ref(e: &ExecError) -> BackendError {
         // must be able to tell "this query is too expensive" from "this
         // query is malformed" without string-matching the message, and must
         // NOT auto-retry either (a re-run exceeds the same budget again).
-        ExecError::Timeout => BackendError::Timeout("query exceeded the configured timeout".into()),
+        // A deadline that fired inside a storage read is the same timeout:
+        // not the transient storage class, which drivers would retry.
+        ExecError::Timeout | ExecError::Storage(namidb_storage::Error::Timeout) => {
+            BackendError::Timeout("query exceeded the configured timeout".into())
+        }
         // Transient: drivers retry, and the index serves once online.
         ExecError::IndexBuilding(message) => BackendError::Storage(message.clone()),
         ExecError::Cancelled | ExecError::Storage(namidb_storage::Error::Cancelled) => {
@@ -2923,6 +2927,22 @@ mod tests {
         drop(write);
         assert_eq!(pool.reserved_bytes(), 0);
         backend.rollback_tx().await.unwrap();
+    }
+
+    /// A deadline that fired inside a storage read is the timeout ClientError
+    /// on Bolt, which drivers do not retry, not the transient storage class.
+    #[test]
+    fn a_storage_deadline_is_a_bolt_timeout() {
+        for error in [
+            ExecError::Timeout,
+            ExecError::Storage(namidb_storage::Error::Timeout),
+        ] {
+            assert_eq!(
+                map_exec_err_ref(&error).code(),
+                "Neo.ClientError.Transaction.TransactionTimedOut",
+                "{error:?}"
+            );
+        }
     }
 
     /// Rows dropped before any commit were not applied: Bolt reports them
