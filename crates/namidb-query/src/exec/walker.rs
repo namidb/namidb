@@ -1120,13 +1120,27 @@ fn execute_operator<'a>(
                     execute_inner_with_routing(input, snapshot, params, outer, routing).await?;
                 let mut out = Vec::new();
                 let mut meter = crate::exec::memory::GrowthMeter::new();
-                for row in rows {
+                // `UNWIND xs AS x` where nothing after reads `xs`: take the
+                // list out of the row rather than copy it onto every
+                // element's row (quadratic in the list's length).
+                let consumed = match &list.kind {
+                    crate::parser::ExpressionKind::Variable(ident)
+                        if routing.unwind_consumes(&ident.name) =>
+                    {
+                        Some(ident.name.as_str())
+                    }
+                    _ => None,
+                };
+                for mut row in rows {
                     // A huge `UNWIND range(...)` is a pure-CPU expansion with
                     // no scan underneath — without a probe here it could
                     // neither time out nor be cancelled (found by the item-56
                     // cancel test).
                     crate::exec::limits::check_deadline()?;
-                    let v = evaluate(list, &row, params)?;
+                    let v = match consumed.and_then(|name| row.bindings.remove(name)) {
+                        Some(v) => v,
+                        None => evaluate(list, &row, params)?,
+                    };
                     match v {
                         RuntimeValue::List(items) => {
                             // The list's buffer stays allocated until the
@@ -1135,6 +1149,18 @@ fn execute_operator<'a>(
                                 .capacity()
                                 .saturating_mul(std::mem::size_of::<RuntimeValue>());
                             meter.add(buffer)?;
+                            // Every element's row is a copy of this one, so
+                            // charge the copies often enough that a wide row
+                            // (one still holding a large list) meets the
+                            // budget after a few copies, not a thousand.
+                            let observe_every = if meter.active() {
+                                let row_bytes =
+                                    crate::exec::memory::estimate_row_bytes(&row).max(1);
+                                (crate::exec::memory::METER_FLUSH_BYTES / row_bytes)
+                                    .clamp(1, namidb_storage::cancel::CHECK_STRIDE)
+                            } else {
+                                namidb_storage::cancel::CHECK_STRIDE
+                            };
                             for item in items {
                                 if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
                                     crate::exec::limits::check_deadline()?;
@@ -1144,6 +1170,8 @@ fn execute_operator<'a>(
                                     // the post-loop check let a 4 GB
                                     // container OOM between 3M and 5M rows).
                                     crate::exec::limits::check_row_cap(out.len())?;
+                                }
+                                if out.len() % observe_every == 0 {
                                     // A row cap counts rows, not bytes: the
                                     // working-memory budget bounds wide or
                                     // numerous rows under the cap (#203).
@@ -10721,7 +10749,7 @@ fn collect_identity_only_aliases(
     // suppressed; `identity` is just those counts. An alias qualifies only if
     // it appears in the second and never in the first.
     let mut full: BTreeSet<String> = BTreeSet::new();
-    collect_plan_references(plan, &mut full, true, true);
+    collect_plan_references(plan, &mut full, true, true, false);
     let mut identity: BTreeSet<String> = BTreeSet::new();
     collect_identity_count_args(plan, &mut identity);
     // Referenced, seen at least once in an identity-only position, and never
@@ -14588,6 +14616,12 @@ pub(crate) struct PlanRouting {
     /// Edge-only DELETE/CREATE plans keep this false and retain SST-sidecar
     /// point reads for sparse sweeps.
     transactional_property_reads: bool,
+    /// Variables that are the bare list of exactly one UNWIND and are read
+    /// nowhere else in the statement, which returns only what its final
+    /// projection names. That UNWIND may move the list out of each input row
+    /// instead of copying it onto every element's row: a 20,000-item list
+    /// would otherwise be copied 20,000 times.
+    dead_unwind_sources: BTreeSet<String>,
 }
 
 impl PlanRouting {
@@ -14605,7 +14639,14 @@ impl PlanRouting {
             value_referenced_aliases: value_refs,
             row_label_aliases,
             transactional_property_reads: plan_requires_transactional_property_reads(plan),
+            dead_unwind_sources: collect_dead_unwind_sources(plan),
         }
+    }
+
+    /// Whether the UNWIND over the bare variable `name` is its last reader
+    /// (see `dead_unwind_sources`).
+    fn unwind_consumes(&self, name: &str) -> bool {
+        self.dead_unwind_sources.contains(name)
     }
 
     pub(crate) fn transactional_property_reads(&self) -> bool {
@@ -14858,21 +14899,24 @@ fn collect_plan_node_aliases(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
 }
 
 pub(crate) fn collect_plan_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
-    collect_plan_references(plan, out, true, false);
+    collect_plan_references(plan, out, true, false, false);
 }
 
 /// Same plan walk as [`collect_plan_referenced_variables`], except a bare
 /// `DELETE <alias>` is treated as an identity-only use. Every other expression
 /// remains conservative and requires the full value.
 fn collect_plan_value_referenced_variables(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
-    collect_plan_references(plan, out, false, false);
+    collect_plan_references(plan, out, false, false, false);
 }
 
+/// `skip_bare_unwind_lists` leaves out the list of an UNWIND that is a bare
+/// variable (`UNWIND xs AS x`), for the analysis that asks who else reads it.
 fn collect_plan_references(
     plan: &LogicalPlan,
     out: &mut BTreeSet<String>,
     delete_needs_full_value: bool,
     skip_identity_counts: bool,
+    skip_bare_unwind_lists: bool,
 ) {
     use crate::plan::logical::{AggregateExpr, CreateElement, RemoveOp};
 
@@ -14941,8 +14985,13 @@ fn collect_plan_references(
                 collect_referenced_variables(value, out);
             }
         }
-        LogicalPlan::VectorSearch { query, .. } => {
+        LogicalPlan::VectorSearch {
+            query, post_filter, ..
+        } => {
             collect_referenced_variables(query, out);
+            if let Some(filter) = post_filter {
+                collect_referenced_variables(filter, out);
+            }
         }
         LogicalPlan::CallProcedure { args, .. } => {
             for a in args {
@@ -14950,7 +14999,10 @@ fn collect_plan_references(
             }
         }
         LogicalPlan::Unwind { list, .. } => {
-            collect_referenced_variables(list, out);
+            let bare = matches!(list.kind, crate::parser::ExpressionKind::Variable(_));
+            if !(skip_bare_unwind_lists && bare) {
+                collect_referenced_variables(list, out);
+            }
         }
         LogicalPlan::Foreach { list, .. } => {
             // The body (a child) is walked by the generic children() recursion
@@ -15050,8 +15102,69 @@ fn collect_plan_references(
     }
 
     for child in plan.children() {
-        collect_plan_references(child, out, delete_needs_full_value, skip_identity_counts);
+        collect_plan_references(
+            child,
+            out,
+            delete_needs_full_value,
+            skip_identity_counts,
+            skip_bare_unwind_lists,
+        );
     }
+}
+
+/// See `PlanRouting::dead_unwind_sources`. Conservative: a name used as the
+/// bare list of more than one UNWIND, or read anywhere else (a projection,
+/// `RETURN *` once lowered, a subquery import, a predicate, a write), stays
+/// bound; so does everything when the result could carry bindings its final
+/// projection does not name.
+fn collect_dead_unwind_sources(plan: &LogicalPlan) -> BTreeSet<String> {
+    use std::collections::BTreeMap;
+
+    fn count_bare_sources(plan: &LogicalPlan, out: &mut BTreeMap<String, usize>) {
+        if let LogicalPlan::Unwind { list, .. } = plan {
+            if let crate::parser::ExpressionKind::Variable(ident) = &list.kind {
+                *out.entry(ident.name.clone()).or_default() += 1;
+            }
+        }
+        for child in plan.children() {
+            count_bare_sources(child, out);
+        }
+    }
+    // Rows reach the client only through a RETURN projection, an aggregate
+    // or a write's discarded result; any other root hands back whatever its
+    // rows bind.
+    fn result_names_its_columns(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Project {
+                discard_input_bindings: true,
+                ..
+            }
+            | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::DiscardResult { .. } => true,
+            LogicalPlan::TopN { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Filter { input, .. } => result_names_its_columns(input),
+            LogicalPlan::Union { left, right, .. } => {
+                result_names_its_columns(left) && result_names_its_columns(right)
+            }
+            _ => false,
+        }
+    }
+    if !result_names_its_columns(plan) {
+        return BTreeSet::new();
+    }
+    let mut sources = BTreeMap::new();
+    count_bare_sources(plan, &mut sources);
+    if sources.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut read_elsewhere = BTreeSet::new();
+    collect_plan_references(plan, &mut read_elsewhere, true, false, true);
+    sources
+        .into_iter()
+        .filter(|(name, uses)| *uses == 1 && !read_elsewhere.contains(name))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 fn visit_set_op(s: &crate::plan::logical::SetOp, out: &mut BTreeSet<String>) {

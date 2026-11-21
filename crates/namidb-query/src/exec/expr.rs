@@ -1564,9 +1564,12 @@ fn eval_reduce(
         }
     };
     let mut acc = evaluate(&r.init, row, params)?;
+    // One scope for every element: copying the row per element copied the
+    // list too when the row binds it (`WITH range(..) AS xs`), quadratic in
+    // its length. Each step overwrites the accumulator and the variable.
+    let mut local = row.clone();
     for (index, item) in items.into_iter().enumerate() {
         probe_interrupt(index, r.list.span)?;
-        let mut local = row.clone();
         local.set(r.accumulator.name.clone(), acc);
         local.set(r.variable.name.clone(), item);
         acc = evaluate(&r.expression, &local, params)?;
@@ -1594,9 +1597,10 @@ fn eval_list_comprehension(
         }
     };
     let mut out = Vec::with_capacity(items.len());
+    // One scope for every element (see `eval_reduce`).
+    let mut local = row.clone();
     for (index, item) in items.into_iter().enumerate() {
         probe_interrupt(index, lc.list.span)?;
-        let mut local = row.clone();
         local.set(lc.variable.name.clone(), item.clone());
         if let Some(pred) = &lc.predicate {
             let v = evaluate(pred, &local, params)?;
@@ -1636,9 +1640,10 @@ fn eval_quantifier(
 
     let mut true_count = 0usize;
     let mut any_null = false;
+    // One scope for every element (see `eval_reduce`).
+    let mut local = row.clone();
     for (index, item) in items.into_iter().enumerate() {
         probe_interrupt(index, q.list.span)?;
-        let mut local = row.clone();
         local.set(q.variable.name.clone(), item);
         match evaluate(&q.predicate, &local, params)?.as_bool() {
             Some(true) => {

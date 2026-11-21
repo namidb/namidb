@@ -103,6 +103,16 @@ crates.io release will establish and document that API explicitly.
   `timeout` and `Neo.ClientError.Transaction.TransactionTimedOut`. Turning
   the lookups' results into rows now probes the deadline too, so a key join
   over many rows answers close to its timeout.
+- **Loops over a list bound in an earlier `WITH` are linear.** UNWIND,
+  `reduce`, list comprehensions and `all`/`any`/`none`/`single` copied the
+  whole row once per element, and the row still held the list. The work was
+  quadratic: `WITH range(1, 20000) AS xs UNWIND xs AS x RETURN count(x)` ran
+  out of a 2.6 GB query budget, and a `reduce` over 40,000 items took 13 s
+  against 14 ms with the list inline. The expression loops now reuse one scope.
+  An UNWIND whose source list nothing later reads moves the list out of the
+  row. A list that is still read stays bound on every row as before, and its
+  copies are now charged to the memory budget often enough to stop a large
+  one within a few rows.
 
 ### Tests
 
