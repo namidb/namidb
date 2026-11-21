@@ -195,6 +195,11 @@ pub struct PreparedCompaction {
     /// Full Search-LSM bases built and uploaded off-lock. Install replaces
     /// only their captured physical prefix and preserves append-only flushes.
     search_compactions: Vec<PreparedSearchCompaction>,
+    /// The registration of the base build behind `search_compactions`, held
+    /// until this prepare installs or drops: the build counts as in flight
+    /// through its upload and install, not only while it scans.
+    #[allow(dead_code)] // Held for its drop.
+    search_build_hold: search_lsm_compact::SearchBuildHold,
     search_build_states: Vec<crate::manifest::SearchIndexBuildState>,
     /// 2.0.6-interop markers certifying each full base a BasePrefix
     /// Search-LSM consolidation installs. A downgraded writer drops the
@@ -741,7 +746,7 @@ impl CompactionBasis {
             self.base.pointer_version.clone(),
             derived,
         );
-        let search_compactions = search_lsm_compact::prepare_text_reanalysis(
+        let (search_compactions, search_build_hold) = search_lsm_compact::prepare_text_reanalysis(
             self.manifest_store.store().clone(),
             self.manifest_store.paths(),
             &derived,
@@ -791,6 +796,7 @@ impl CompactionBasis {
             base_search_lsm: derived.manifest.search_lsm.clone(),
             node_rewrites: Vec::new(),
             search_compactions,
+            search_build_hold,
             search_build_states: Vec::new(),
             consolidated_base_markers,
             unadoptable_search_markers: Vec::new(),
@@ -1137,6 +1143,7 @@ async fn prepare_node_layout_rewrite(
             output: Some(descriptor),
         }],
         search_compactions: Vec::new(),
+        search_build_hold: None,
         search_build_states: Vec::new(),
         consolidated_base_markers: Vec::new(),
         unadoptable_search_markers: Vec::new(),
@@ -2700,13 +2707,14 @@ async fn prepare_leveled_scoped(
         }
         !overlaps
     });
-    let search_compactions = search_lsm_compact::prepare_search_compactions(
-        store.clone(),
-        paths,
-        base,
-        search_selections,
-    )
-    .await?;
+    let (search_compactions, search_build_hold) =
+        search_lsm_compact::prepare_search_compactions_held(
+            store.clone(),
+            paths,
+            base,
+            search_selections,
+        )
+        .await?;
     for search in &search_compactions {
         removed_ids.extend(search.selection.selected_ids());
         if let Some(output) = search.output_descriptor() {
@@ -2813,6 +2821,7 @@ async fn prepare_leveled_scoped(
         base_search_lsm: base.manifest.search_lsm.clone(),
         node_rewrites,
         search_compactions,
+        search_build_hold,
         search_build_states,
         consolidated_base_markers,
         unadoptable_search_markers,
@@ -6717,6 +6726,7 @@ mod tests {
             base_search_lsm: current.manifest.search_lsm.clone(),
             node_rewrites: vec![rewrite],
             search_compactions: Vec::new(),
+            search_build_hold: None,
             search_build_states: Vec::new(),
             consolidated_base_markers: Vec::new(),
             unadoptable_search_markers: Vec::new(),
@@ -6792,6 +6802,7 @@ mod tests {
             base_search_lsm: basis.manifest.search_lsm.clone(),
             node_rewrites: vec![rewrite],
             search_compactions: Vec::new(),
+            search_build_hold: None,
             search_build_states: Vec::new(),
             consolidated_base_markers: Vec::new(),
             unadoptable_search_markers: Vec::new(),
@@ -6864,6 +6875,7 @@ mod tests {
             base_search_lsm: basis.manifest.search_lsm.clone(),
             node_rewrites: vec![rewrite],
             search_compactions: Vec::new(),
+            search_build_hold: None,
             search_build_states: Vec::new(),
             consolidated_base_markers: Vec::new(),
             unadoptable_search_markers: Vec::new(),
@@ -6925,6 +6937,7 @@ mod tests {
             base_search_lsm: basis.manifest.search_lsm.clone(),
             node_rewrites: vec![rewrite],
             search_compactions: Vec::new(),
+            search_build_hold: None,
             search_build_states: Vec::new(),
             consolidated_base_markers: Vec::new(),
             unadoptable_search_markers: Vec::new(),

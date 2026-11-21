@@ -39,7 +39,8 @@ pub use show::{
 pub use value::{NodeValue, RelValue, RuntimeValue};
 pub use walker::{
     eligibility_cache_hits, execute, execute_factor_path, execute_flat_path, execute_with_limits,
-    filter_membership_ids_for_tests, filter_membership_paths, ExecError,
+    filter_membership_ids_for_tests, filter_membership_paths, filter_membership_seek_ids_for_tests,
+    filter_membership_seeks, set_filter_membership_seek_enabled, ExecError,
 };
 pub use writer::{
     enforce_node_unique_constraints, execute_write, execute_write_checked_with_deadline,

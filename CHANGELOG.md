@@ -15,6 +15,37 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+### Changed
+
+- **Selective equality filters resolve through the property index.** A
+  search filter (`search.bm25`, `search.vector`, `search.hybrid`) whose
+  equality or `IN`
+  conjunct is on a property with a RANGE index now builds its membership
+  set from that property's equality postings instead of reading the
+  filter's column over the whole label. Each candidate is confirmed on its
+  current version (unflushed rows, deletes, moved values and a write
+  transaction's own rows included), and any other conjunct is evaluated on
+  exactly those nodes, so results are unchanged. A selective equality
+  filter on a high-cardinality indexed property used to pay a full column
+  read for every new value (its cache key is the bound value); it now
+  costs one posting lookup and the confirmation of the nodes it admits.
+  Numbers keep Cypher equality (`1 = 1.0`); inside a write transaction a
+  numeric value takes the column read as before. The route serves a set
+  of at most `NAMIDB_FILTER_MEMBERSHIP_SEEK_CAP` nodes (default 4096, `0`
+  disables it); a larger posting, or a filter without an indexed equality
+  conjunct, keeps the column read and its cross-statement cache. Counted
+  by `namidb_filter_membership_seek_total{outcome="served"|"declined"}`.
+
+### Fixed
+
+- **`namidb_search_index_builds_in_flight` covers the upload and install.**
+  A search index base build (a new index's activation, a native-filter
+  rebuild, a RaBitQ backfill, a base folded from segments, the full-text
+  re-analysis) stayed registered only while it built, so the gauge read 0
+  for the seconds its output was still uploading and installing, and an
+  idle stop in that window threw the upload away. The registration now
+  lasts until the output is installed (or discarded).
+
 ## [3.5.2] - 2026-11-21
 
 ### Changed

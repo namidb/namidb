@@ -1181,6 +1181,20 @@ impl Metrics {
                 "namidb_filter_membership_total{{path=\"{path}\"}} {value}"
             );
         }
+        let (seek_served, seek_declined) = namidb_query::filter_membership_seeks();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_filter_membership_seek_total Search filter membership sets with an \
+             equality or IN conjunct, by whether a property index resolved them (served) or the \
+             filter's columns were read instead (declined: no index, or a posting over the cap)."
+        );
+        let _ = writeln!(out, "# TYPE namidb_filter_membership_seek_total counter");
+        for (outcome, value) in [("served", seek_served), ("declined", seek_declined)] {
+            let _ = writeln!(
+                out,
+                "namidb_filter_membership_seek_total{{outcome=\"{outcome}\"}} {value}"
+            );
+        }
         let _ = writeln!(
             out,
             "# HELP namidb_property_lookup_route_total Graph property lookups by physical route. \

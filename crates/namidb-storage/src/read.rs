@@ -278,6 +278,10 @@ fn snapshot_local_cache_max_bytes(name: &str) -> usize {
     }
 }
 
+/// A predicate over a confirmed node, see
+/// [`Snapshot::indexed_node_ids_by_property_value_capped_where`].
+pub type IndexedNodeFilter<'a> = dyn Fn(&NodeView) -> bool + Send + Sync + 'a;
+
 /// Projection of a node row materialised by the read path.
 ///
 /// A node carries a *set* of labels. Today the set always has exactly one
@@ -1495,7 +1499,9 @@ impl<'mt> Snapshot<'mt> {
     ) -> Result<Option<Vec<NodeId>>> {
         Ok(
             match self
-                .indexed_node_ids_by_property_value_inner(label, property, value, None, None, None)
+                .indexed_node_ids_by_property_value_inner(
+                    label, property, value, None, None, None, None,
+                )
                 .await?
             {
                 IndexedPropertyLookup::Available(ids) => Some(ids),
@@ -1530,6 +1536,7 @@ impl<'mt> Snapshot<'mt> {
                     Some(limit),
                     None,
                     Some(posting_read_limit),
+                    None,
                 )
                 .await?
             {
@@ -1571,6 +1578,7 @@ impl<'mt> Snapshot<'mt> {
                     None,
                     Some(max_candidates),
                     None,
+                    None,
                 )
                 .await?
             {
@@ -1578,6 +1586,54 @@ impl<'mt> Snapshot<'mt> {
                 IndexedPropertyLookup::Unavailable | IndexedPropertyLookup::Truncated => None,
             },
         )
+    }
+
+    /// [`Self::indexed_node_ids_by_property_value_capped`], keeping only the
+    /// confirmed nodes `keep` accepts. `keep` sees each candidate's current
+    /// last-write-wins view (the one the equality was confirmed on), once, so
+    /// a caller decides a further predicate without looking the node up again.
+    /// The cap still bounds the posting set before any hydration.
+    pub async fn indexed_node_ids_by_property_value_capped_where(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+        max_candidates: usize,
+        keep: &IndexedNodeFilter<'_>,
+    ) -> Result<Option<Vec<NodeId>>> {
+        Ok(
+            match self
+                .indexed_node_ids_by_property_value_inner(
+                    label,
+                    property,
+                    value,
+                    None,
+                    Some(max_candidates),
+                    None,
+                    Some(keep),
+                )
+                .await?
+            {
+                IndexedPropertyLookup::Available(ids) => Some(ids),
+                IndexedPropertyLookup::Unavailable | IndexedPropertyLookup::Truncated => None,
+            },
+        )
+    }
+
+    /// Live `label` rows, for sizing decisions, with no I/O: exact when the
+    /// manifest proves it (see [`Self::metadata_node_count`]), otherwise the
+    /// manifest's per-label row counts plus every unflushed node row, an
+    /// upper bound.
+    pub fn label_population_estimate(&self, label: &str) -> u64 {
+        if let Some(count) = self.metadata_node_count(Some(label)) {
+            return count;
+        }
+        let unflushed = self
+            .node_entries()
+            .filter(|(key, _)| matches!(key, MemKey::Node { .. }))
+            .count();
+        self.live_row_estimate(label)
+            .saturating_add(u64::try_from(unflushed).unwrap_or(u64::MAX))
     }
 
     /// Live node ids satisfying a conjunction of RANGE predicates on one
@@ -2102,6 +2158,7 @@ impl<'mt> Snapshot<'mt> {
         limit: Option<usize>,
         candidate_cap: Option<usize>,
         posting_read_limit: Option<usize>,
+        keep: Option<&IndexedNodeFilter<'_>>,
     ) -> Result<IndexedPropertyLookup> {
         namidb_core::profile_scope!("Snapshot::indexed_node_ids_by_property_value");
 
@@ -2315,6 +2372,7 @@ impl<'mt> Snapshot<'mt> {
                     view.properties
                         .get(property)
                         .is_some_and(|current| crate::cache::cypher_scalar_equal(current, value))
+                        && keep.is_none_or(|keep| keep(view))
                 }) {
                     confirmed.push(id);
                     if confirmed.len() == target {

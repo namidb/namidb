@@ -1643,7 +1643,6 @@ fn delta_run_position(
 struct SearchNodeSourcePlan {
     min_key: [u8; 16],
     size_bytes: u64,
-    row_count: u64,
     label_def: LabelDef,
     scope: String,
 }
@@ -2507,6 +2506,25 @@ impl<'a> TermDeltaRunMerge<'a> {
     }
 }
 
+/// [`prepare_search_compactions_held`] without the build registration.
+#[cfg(test)]
+pub(super) async fn prepare_search_compactions(
+    store: Arc<dyn ObjectStore>,
+    paths: &NamespacePaths,
+    base: &LoadedManifest,
+    selections: Vec<SearchCompactionSelection>,
+) -> Result<Vec<PreparedSearchCompaction>> {
+    prepare_search_compactions_held(store, paths, base, selections)
+        .await
+        .map(|(prepared, _build)| prepared)
+}
+
+/// The registration of a base build that has produced and uploaded its
+/// output but not installed it yet: the build stays counted in
+/// [`crate::search_progress::builds_in_flight`] until this drops, so an idle
+/// stop does not discard an upload the manifest is about to reference.
+pub(crate) type SearchBuildHold = Option<Arc<crate::search_progress::BuildGuard>>;
+
 /// Build and upload selected physical Search-LSM rewrites without holding the
 /// writer lock.
 ///
@@ -2514,12 +2532,14 @@ impl<'a> TermDeltaRunMerge<'a> {
 /// work instead scrubs and k-way merges only its selected version tables, then
 /// point-reads the touched IDs from this exact [`LoadedManifest`]. Immutable
 /// data objects are uploaded before the returned plan can reach manifest CAS.
-pub(super) async fn prepare_search_compactions(
+/// Also returns the base build's registration, for the caller to hold until
+/// the install (see [`SearchBuildHold`]).
+pub(super) async fn prepare_search_compactions_held(
     store: Arc<dyn ObjectStore>,
     paths: &NamespacePaths,
     base: &LoadedManifest,
     selections: Vec<SearchCompactionSelection>,
-) -> Result<Vec<PreparedSearchCompaction>> {
+) -> Result<(Vec<PreparedSearchCompaction>, SearchBuildHold)> {
     prepare_search_compactions_with(store, paths, base, selections, true, true, false).await
 }
 
@@ -2598,7 +2618,7 @@ pub(super) async fn prepare_text_reanalysis(
     paths: &NamespacePaths,
     base: &LoadedManifest,
     selection: SearchCompactionSelection,
-) -> Result<Vec<PreparedSearchCompaction>> {
+) -> Result<(Vec<PreparedSearchCompaction>, SearchBuildHold)> {
     prepare_search_compactions_with(store, paths, base, vec![selection], true, false, true).await
 }
 
@@ -2962,14 +2982,35 @@ async fn prepare_search_compactions_with(
     vector_segment_merge: bool,
     text_segment_merge: bool,
     reanalysis: bool,
-) -> Result<Vec<PreparedSearchCompaction>> {
+) -> Result<(Vec<PreparedSearchCompaction>, SearchBuildHold)> {
     if selections.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let manifest = &base.manifest;
     let (base_selections, delta_selections): (Vec<_>, Vec<_>) = selections
         .into_iter()
         .partition(|selection| selection.mode == SearchCompactionMode::BasePrefix);
+    // One registration for every base of the pass, folded from segments or
+    // scanned from the nodes, from before the gate until the caller installs
+    // (or drops) the result. `SHOW INDEXES` reports a Building generation's
+    // progress from it.
+    let progress = (!base_selections.is_empty()).then(|| {
+        Arc::new(crate::search_progress::begin_build(
+            base_selections.iter().map(|selection| {
+                (
+                    selection.captured_state.generation_id,
+                    selection.captured_state.index_name.clone(),
+                )
+            }),
+            manifest
+                .ssts
+                .iter()
+                .filter(|descriptor| descriptor.kind == SstKind::Nodes)
+                .fold(0u64, |total, descriptor| {
+                    total.saturating_add(descriptor.row_count)
+                }),
+        ))
+    });
     // Base rebuilds run one at a time per process: each is bounded by the
     // index-build memory and spool budgets, so several namespaces rebuilding
     // at once (every pre-3.5.1 vector base after an upgrade, say) would
@@ -3079,7 +3120,6 @@ async fn prepare_search_compactions_with(
             plan.push(SearchNodeSourcePlan {
                 min_key: descriptor.min_key,
                 size_bytes: descriptor.size_bytes,
-                row_count: descriptor.row_count,
                 label_def,
                 scope: descriptor.scope.clone(),
             });
@@ -3101,6 +3141,9 @@ async fn prepare_search_compactions_with(
         let (sender, receiver) =
             tokio::sync::mpsc::channel::<(usize, Bytes)>(SEARCH_BASE_FETCH_LOOKAHEAD);
         let build_manifest = manifest.clone();
+        let build_progress = progress
+            .clone()
+            .ok_or_else(|| Error::invariant("Search-LSM base build is not registered"))?;
         let started = Instant::now();
         tracing::info!(
             input_bytes,
@@ -3116,6 +3159,7 @@ async fn prepare_search_compactions_with(
                 receiver,
                 input_bytes,
                 started,
+                &build_progress,
             )
         });
         let producer_result: Result<()> = async {
@@ -3143,6 +3187,10 @@ async fn prepare_search_compactions_with(
         built.extend(build_result?);
     }
 
+    if let Some(progress) = &progress {
+        progress.scan_finished();
+        progress.finished();
+    }
     drop(base_gate);
     #[cfg(feature = "text-index")]
     drop(reanalysis_active.take());
@@ -3201,7 +3249,7 @@ async fn prepare_search_compactions_with(
         );
         prepared.push(built.prepared);
     }
-    Ok(prepared)
+    Ok((prepared, progress))
 }
 
 #[cfg(any(feature = "vector-index", feature = "text-index"))]
@@ -4625,21 +4673,11 @@ fn build_search_compactions_blocking(
     mut bodies: tokio::sync::mpsc::Receiver<(usize, Bytes)>,
     input_bytes: u64,
     started: Instant,
+    progress: &crate::search_progress::BuildGuard,
 ) -> Result<Vec<BuiltSearchCompaction>> {
     let per_builder_memory = shared_build_memory(
         super::per_collector_index_build_memory_bytes(selections.len())?
             .ok_or_else(|| Error::invariant("Search-LSM compaction has no build memory share"))?,
-    );
-    // `SHOW INDEXES` reports a Building generation's progress from this.
-    let progress = crate::search_progress::begin_build(
-        selections.iter().map(|selection| {
-            (
-                selection.captured_state.generation_id,
-                selection.captured_state.index_name.clone(),
-            )
-        }),
-        plan.iter()
-            .fold(0u64, |total, entry| total.saturating_add(entry.row_count)),
     );
     let mut works = Vec::with_capacity(selections.len());
     for selection in selections {
@@ -4847,7 +4885,6 @@ fn build_search_compactions_blocking(
     for built in &mut finished {
         built.prepared.metrics.peak_resident_input_bytes = peak_resident_input_bytes;
     }
-    progress.finished();
     Ok(finished)
 }
 
@@ -4859,6 +4896,7 @@ fn build_search_compactions_blocking(
     _bodies: tokio::sync::mpsc::Receiver<(usize, Bytes)>,
     _input_bytes: u64,
     _started: Instant,
+    _progress: &crate::search_progress::BuildGuard,
 ) -> Result<Vec<BuiltSearchCompaction>> {
     if selections.is_empty() {
         Ok(Vec::new())

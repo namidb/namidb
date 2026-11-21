@@ -122,9 +122,9 @@ pub use range_cache::{
 #[cfg(feature = "vector-index")]
 pub use read::VectorFilterSearch;
 pub use read::{
-    property_index_population, EdgeListView, EdgeScanCursor, EdgeView, NodeDataIdentity,
-    NodeDataLineage, NodeScanCursor, NodeSstSpan, NodeView, OwnedSnapshot, PinnedSnapshot,
-    PrefetchSummary, Snapshot, SnapshotCell, VersionPin, PREFETCH_NODE_SST_LIMIT,
+    property_index_population, EdgeListView, EdgeScanCursor, EdgeView, IndexedNodeFilter,
+    NodeDataIdentity, NodeDataLineage, NodeScanCursor, NodeSstSpan, NodeView, OwnedSnapshot,
+    PinnedSnapshot, PrefetchSummary, Snapshot, SnapshotCell, VersionPin, PREFETCH_NODE_SST_LIMIT,
 };
 pub use reader::ReaderSession;
 pub use recovery::{

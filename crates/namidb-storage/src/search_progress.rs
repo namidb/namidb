@@ -6,7 +6,10 @@
 //! - **Base builds in flight**, keyed by the Search-LSM generation they
 //!   build. A build registers itself with the indexes it builds and the
 //!   number of Nodes rows it will scan, and advances as it scans them; the
-//!   registration ends when the build finishes or fails. A Building
+//!   registration ends when the build's output is installed, or when the
+//!   build fails or its output is discarded, not when the build itself
+//!   finishes: uploading and installing a large base takes seconds more,
+//!   and an idle stop in that window would throw the upload away. A Building
 //!   generation's progress, and a legacy base migration's, is read from here,
 //!   and the server lists the builds in flight in its health report so an
 //!   idle stop can wait for them. Each build logs its start, every tenth of
@@ -58,7 +61,8 @@ fn builds() -> &'static Mutex<HashMap<Uuid, Arc<BuildProgress>>> {
     BUILDS.get_or_init(Default::default)
 }
 
-/// One registered base build. Dropping it ends the registration.
+/// One registered base build. Dropping it ends the registration; the
+/// compaction that built it holds it until its install.
 #[derive(Debug)]
 pub struct BuildGuard {
     generations: Vec<Uuid>,
@@ -100,8 +104,9 @@ impl BuildGuard {
         self.progress.scan_done.store(true, Ordering::Relaxed);
     }
 
-    /// The build produced its output (installing it is the caller's next
-    /// step). Without this, dropping the guard logs an abandoned build.
+    /// The build produced its output (uploading and installing it are the
+    /// caller's next steps, and the build stays in flight through them).
+    /// Without this, dropping the guard logs an abandoned build.
     pub fn finished(&self) {
         if !self.finished.swap(true, Ordering::Relaxed) {
             tracing::info!(
@@ -126,6 +131,12 @@ impl Drop for BuildGuard {
                 scanned_rows = self.progress.scanned.load(Ordering::Relaxed),
                 elapsed_ms = elapsed_ms(self.progress.started),
                 "search index base build ended without output; it is planned again"
+            );
+        } else {
+            tracing::info!(
+                indexes = %self.progress.indexes.join(","),
+                elapsed_ms = elapsed_ms(self.progress.started),
+                "search index base build no longer in flight (installed or discarded)"
             );
         }
         let mut map = builds().lock().unwrap_or_else(|poison| poison.into_inner());
