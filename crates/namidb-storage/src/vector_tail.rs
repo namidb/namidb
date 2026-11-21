@@ -258,6 +258,30 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    /// [`dot_i8`] equals the exact integer dot on every length class, over
+    /// the whole `i8` range, and scores the common prefix of buffers of
+    /// different lengths.
+    #[test]
+    fn kernel_dot_i8_matches_the_exact_integer_dot_on_every_length() {
+        use crate::kernel_test_support::{random_i8, test_lengths, test_rng};
+        use rand::Rng;
+        let mut rng = test_rng("vector_tail dot_i8");
+        for len in test_lengths(&mut rng) {
+            let other = if rng.gen_ratio(1, 4) {
+                rng.gen_range(0..=2100)
+            } else {
+                len
+            };
+            let (a, b) = (random_i8(&mut rng, len), random_i8(&mut rng, other));
+            let exact: i64 = a.iter().zip(&b).map(|(x, y)| *x as i64 * *y as i64).sum();
+            assert_eq!(dot_i8(&a, &b), exact, "{len}/{other}");
+            assert_eq!(dot_i8(&b, &a), exact, "{other}/{len}");
+        }
+        // Worst case per 64-wide chunk: every product 128 * 128.
+        let extreme = vec![i8::MIN; 4096];
+        assert_eq!(dot_i8(&extreme, &extreme), 4096 * 128 * 128);
+    }
+
     fn id(n: u64) -> NodeId {
         NodeId::from_uuid(Uuid::from_u64_pair(0, n))
     }

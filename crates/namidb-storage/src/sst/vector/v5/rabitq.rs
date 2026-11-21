@@ -1887,6 +1887,9 @@ impl VectorV5Reader {
 }
 
 #[cfg(test)]
+mod kernel_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
