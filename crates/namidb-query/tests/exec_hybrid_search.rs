@@ -550,13 +550,12 @@ mod indexed_sparse_filter {
         }
     }
 
-    /// Cache-free probes must GET the immutable `.ft` once per widening round.
-    /// Counting those GETs makes the indexed route observable without relying on
-    /// execution time or on a corpus scan returning a different logical answer.
+    /// Counts generation-barrier pins, which make the indexed route
+    /// observable without relying on execution time or on a corpus scan
+    /// returning a different logical answer.
     #[derive(Debug)]
     struct TextGetProbe {
         inner: Arc<dyn ObjectStore>,
-        text_gets: AtomicUsize,
         /// Generation-barrier pins. Every `search_lsm_read` coordinator
         /// invocation pins its `.slb` barrier exactly once via `store.head()`,
         /// so this counts query-side probes on the NATIVE route only — a flat
@@ -572,13 +571,8 @@ mod indexed_sparse_filter {
             namidb_storage::range_cache::disable_create_only_head_cache_for_tests();
             Self {
                 inner: Arc::new(InMemory::new()),
-                text_gets: AtomicUsize::new(0),
                 barrier_pins: AtomicUsize::new(0),
             }
-        }
-
-        fn text_gets(&self) -> usize {
-            self.text_gets.load(Ordering::SeqCst)
         }
 
         fn barrier_pins(&self) -> usize {
@@ -618,12 +612,6 @@ mod indexed_sparse_filter {
         ) -> object_store::Result<object_store::GetResult> {
             if options.head && location.as_ref().ends_with(".slb") {
                 self.barrier_pins.fetch_add(1, Ordering::SeqCst);
-            }
-            // Legacy monolithic bodies and native FT4 segments are both text
-            // index traffic; kept for the stale/corrupt tests, whose gates
-            // fire before any index fetch on either route.
-            if location.as_ref().ends_with(".ft") || location.as_ref().ends_with(".ft4") {
-                self.text_gets.fetch_add(1, Ordering::SeqCst);
             }
             self.inner.get_opts(location, options).await
         }
@@ -1057,7 +1045,7 @@ mod indexed_sparse_filter {
     }
 
     #[tokio::test]
-    async fn hybrid_filtered_bm25_stale_ft_falls_back_to_fresh_corpus() {
+    async fn hybrid_filtered_bm25_merges_unflushed_documents_into_the_ft() {
         let _cap = CapEnvGuard::set(64);
         let docs = vec![
             ("old-a", "other", "alpha alpha"),
@@ -1070,10 +1058,11 @@ mod indexed_sparse_filter {
         properties.insert("title".into(), CoreValue::Str("fresh".into()));
         properties.insert("tenant".into(), CoreValue::Str("acme".into()));
         properties.insert("body".into(), CoreValue::Str("zebra".into()));
+        let fresh = NodeId::new();
         writer
             .upsert_node(
                 "Doc",
-                NodeId::new(),
+                fresh,
                 &NodeWriteRecord {
                     properties,
                     schema_version: 1,
@@ -1082,17 +1071,20 @@ mod indexed_sparse_filter {
             )
             .unwrap();
         writer.commit_batch().await.unwrap();
-        assert!(
-            writer
-                .snapshot()
-                .text_search(INDEX_NAME, "Doc", &parse_query("zebra"), Some(8))
-                .await
-                .unwrap()
-                .is_none(),
-            "a same-label delta must make the persisted .ft non-authoritative"
+        // The persisted .ft does not hold the unflushed document; the read
+        // merges it instead of serving the index alone.
+        let hits = writer
+            .snapshot()
+            .text_search(INDEX_NAME, "Doc", &parse_query("zebra"), Some(8))
+            .await
+            .unwrap()
+            .expect("the unflushed document is merged into the .ft read");
+        assert_eq!(
+            hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![fresh]
         );
 
-        let before = probe.text_gets();
+        let before = probe.barrier_pins();
         let rows = run(
             &writer,
             "CALL search.hybrid({ label: 'Doc', query_text: 'zebra', \
@@ -1103,10 +1095,9 @@ mod indexed_sparse_filter {
         )
         .await;
         assert_eq!(titles(&rows), vec!["fresh".to_string()]);
-        assert_eq!(
-            probe.text_gets() - before,
-            0,
-            "the freshness gate must reject stale .ft before fetching its body"
+        assert!(
+            probe.barrier_pins() > before,
+            "the filtered text leg is served by the index, not the flat scan"
         );
     }
 

@@ -4261,8 +4261,8 @@ async fn bm25_ranked(
     }
 
     // (`text-index`): serve from a registered full-text index that covers
-    // (label, props) and is authoritative for the corpus; `text_search` returns
-    // None (→ flat scan) when it is not, keeping fresh writes visible.
+    // (label, props); `text_search` merges unflushed documents in exactly, and
+    // returns None (→ flat scan) when it cannot.
     #[cfg(feature = "text-index")]
     {
         let index_name = snapshot
@@ -8100,8 +8100,18 @@ async fn filter_membership(
             return Ok(cached);
         }
     }
+    let fresh_key = key.clone();
     let compute = || async {
-        compute_filter_membership(snapshot, label, alias, &properties, filter, params).await
+        compute_fresh_filter_membership(
+            snapshot,
+            label,
+            alias,
+            &properties,
+            filter,
+            params,
+            &fresh_key,
+        )
+        .await
     };
     let cell = MEMBERSHIP_MEMO
         .try_with(|memo| {
@@ -8120,6 +8130,97 @@ async fn filter_membership(
         membership_cache_put(snapshot_key, membership.clone());
     }
     Ok(membership)
+}
+
+/// Unflushed rows a membership set is patched with instead of rescanned
+/// (`NAMIDB_FILTER_MEMBERSHIP_FRESH_MAX_ROWS`, default 50 000).
+fn filter_membership_fresh_max_rows() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("NAMIDB_FILTER_MEMBERSHIP_FRESH_MAX_ROWS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(50_000)
+    })
+}
+
+/// The membership of the snapshot's corpus, unflushed rows included.
+///
+/// The set over the flushed corpus is cached per manifest; each snapshot
+/// then re-evaluates only its unflushed rows (from their memtable or
+/// transaction-overlay values) on top of it. Keyed by the full snapshot
+/// identity, every write invalidated the set and the next filtered search
+/// re-read the filter's columns of the whole label.
+async fn compute_fresh_filter_membership(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    alias: &str,
+    properties: &BTreeSet<String>,
+    filter: &Expression,
+    params: &Params,
+    key: &str,
+) -> Result<Option<Arc<FilterMembership>>, ExecError> {
+    let unflushed = snapshot.unflushed_node_ids();
+    let persisted_identity = snapshot.persisted_node_data_identity();
+    let Some(persisted_identity) = persisted_identity
+        .filter(|_| !unflushed.is_empty() && unflushed.len() <= filter_membership_fresh_max_rows())
+    else {
+        return compute_filter_membership(snapshot, label, alias, properties, filter, params).await;
+    };
+    let persisted_key = (persisted_identity, key.to_string());
+    let base = match membership_cache_get(&persisted_key) {
+        Some(base) => base,
+        None => {
+            let persisted = snapshot.persisted_only();
+            let base =
+                compute_filter_membership(&persisted, label, alias, properties, filter, params)
+                    .await?;
+            membership_cache_put(persisted_key, base.clone());
+            base
+        }
+    };
+    let Some(base) = base else {
+        return Ok(None);
+    };
+    let mut admitted = Vec::new();
+    let mut visited_fresh = 0usize;
+    for chunk in unflushed.chunks(256) {
+        crate::exec::limits::check_deadline()?;
+        let views = snapshot.batch_lookup_nodes(label, chunk).await?;
+        for view in views.into_iter().flatten() {
+            if !view.labels.contains(label) {
+                continue;
+            }
+            visited_fresh += 1;
+            let id = view.id;
+            let mut row = Row::new();
+            row.set(
+                alias.to_string(),
+                RuntimeValue::Node(Box::new(NodeValue::from(view))),
+            );
+            if evaluate(filter, &row, params)?.as_bool() == Some(true) {
+                admitted.push(id);
+            }
+        }
+    }
+    let mut ids = base
+        .ids
+        .iter()
+        .copied()
+        .filter(|id| unflushed.binary_search(id).is_err())
+        .collect::<Vec<_>>();
+    ids.extend(admitted);
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.len() > filter_membership_max_ids() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(FilterMembership {
+        ids: Arc::new(ids),
+        // Selectivity only sizes search rounds: the flushed count plus the
+        // unflushed label rows bounds the live label from above.
+        visited: base.visited.saturating_add(visited_fresh),
+    })))
 }
 
 async fn compute_filter_membership(

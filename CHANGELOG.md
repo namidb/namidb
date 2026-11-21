@@ -51,6 +51,29 @@ crates.io release will establish and document that API explicitly.
   re-analysis), the first maintenance pass runs 20 s after the open instead
   of one maintenance interval (300 s by default) later; with no writes,
   nothing else triggered it.
+- **A write no longer turns the next full-text search into a corpus scan.**
+  Until the memtable was flushed (about 30 s), any unflushed document of an
+  indexed label made `search.bm25`, the text leg of `search.hybrid` and the
+  filtered variants scan every node of the label (seconds per query on a
+  large label, under a steady write load every query). The index now
+  serves, with the unflushed documents merged in: the index's versions of
+  rewritten, deleted or relabeled documents are dropped, the corpus
+  statistics (document count, average length, document frequencies) are
+  corrected for both sides, and each unflushed document is scored, and its
+  native filter values checked, from its memtable values. The answer is
+  exactly the scan's, ids and scores, also inside a transaction that sees
+  its own writes. Past `NAMIDB_SEARCH_FRESH_TEXT_MAX_DOCS` unflushed
+  documents of the label (default 5 000), or when one changes a `prefix*`
+  expansion, the read still takes the exact scan; an overflow is counted
+  (`namidb_search_text_fresh_total{outcome="overflow"}`), logged once per
+  snapshot, and requests an early flush, which restores the native route.
+- **A write no longer makes the next filtered search re-read the label.**
+  The set of nodes a property filter admits was cached per snapshot, so
+  every write invalidated it and the next filtered `search.vector`,
+  `search.bm25` or `search.hybrid` re-read the filter's columns of the whole
+  label. The set is now cached per flushed corpus and patched with the
+  unflushed rows, evaluated on their memtable values
+  (`NAMIDB_FILTER_MEMBERSHIP_FRESH_MAX_ROWS`, default 50 000).
 - **Filtered and new-query search latency.** On a 386k × 1024
   production-shaped synthetic namespace with 20–40 ms simulated store
   latency, a never-seen hybrid search with a property filter on a

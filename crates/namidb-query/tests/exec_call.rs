@@ -1720,21 +1720,23 @@ async fn text_index_gate_is_label_scoped() {
         "tombstone of a non-corpus id must not disable the index"
     );
 
-    // Relabel of an INDEXED document (upsert without :Note): the index would
-    // serve the stale doc and its removal shifts the corpus stats → flat scan.
+    // Relabel of an INDEXED document (upsert without :Note): the index still
+    // serves, without the stale doc, its removal reflected in the corpus stats.
     writer
         .upsert_node("Other", ids[0], &node_with_body("fox the cat"))
         .unwrap();
     writer.commit_batch().await.unwrap();
     let snap = writer.snapshot();
+    let merged = snap
+        .text_search("note_ft", "Note", &fox, Some(5))
+        .await
+        .unwrap()
+        .expect("a relabeled corpus document is merged, not scanned");
     assert!(
-        snap.text_search("note_ft", "Note", &fox, Some(5))
-            .await
-            .unwrap()
-            .is_none(),
-        "a dirty id inside the corpus must force the flat scan"
+        merged.iter().all(|(id, _)| *id != ids[0]),
+        "the relabeled doc must not be served"
     );
-    // End-to-end parity: the flat fallback no longer finds the relabeled doc.
+    // End-to-end: search.bm25 no longer finds the relabeled doc.
     let rows = run(
         &snap,
         "CALL search.bm25({label: 'Note', text_property: 'body', query: 'fox'}) \

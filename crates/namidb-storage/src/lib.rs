@@ -41,6 +41,7 @@ pub mod reader;
 pub mod recovery;
 pub mod restore_point;
 pub mod route_telemetry;
+pub mod search_freshness;
 pub mod search_lsm;
 pub(crate) mod search_lsm_flush;
 pub mod search_progress;

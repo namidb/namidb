@@ -2,9 +2,9 @@
 //! alone. An embedding-only `SET` (or any write to properties the index does
 //! not cover) rewrites the whole row into the memtable; the index already
 //! holds exactly that document, so `text_search` must keep serving natively,
-//! with the same hits as before the write. Any write that changes indexed
-//! text or label membership must still decline (the caller then runs the
-//! exact scan), across commits, until a flush makes the index cover it.
+//! with the same hits as before the write. A write that changes indexed text
+//! or label membership is merged in from its memtable values (see
+//! `search_fresh_merge_parity` in namidb-query for the exactness proof).
 #![cfg(feature = "text-index")]
 
 use std::collections::BTreeMap;
@@ -120,22 +120,22 @@ async fn unchanged_indexed_text_keeps_bm25_on_the_index() {
         "carried across commits"
     );
 
-    // Changing an indexed value declines, and stays declined even when a
-    // later commit writes the old text back (the row is not proven equal
-    // to its persisted version any more).
+    // Changing an indexed value is merged in from the memtable, also when a
+    // later commit writes the old text back (the row is not proven equal to
+    // its persisted version any more, so it keeps being merged).
     writer
         .upsert_node("Doc", ids[1], &doc("delta", "t1", 1))
         .unwrap();
     writer.commit_batch().await.unwrap();
     assert!(
-        search(&writer, "alpha").await.is_none(),
-        "changed text declines"
+        search(&writer, "alpha").await.is_some(),
+        "changed text is merged, not scanned"
     );
     writer
         .upsert_node("Doc", ids[1], &doc("beta gamma", "t1", 1))
         .unwrap();
     writer.commit_batch().await.unwrap();
-    assert!(search(&writer, "alpha").await.is_none(), "still declined");
+    assert!(search(&writer, "alpha").await.is_some(), "still merged");
 
     // A flush folds the change into the index; serving resumes.
     writer.flush(schema()).await.unwrap();
@@ -145,15 +145,17 @@ async fn unchanged_indexed_text_keeps_bm25_on_the_index() {
         "served after flush"
     );
 
-    // A brand-new document carrying the label declines.
+    // A brand-new document carrying the label is served at once, ranked
+    // first (two occurrences in the shortest document).
+    let fresh = NodeId::new();
     writer
-        .upsert_node("Doc", NodeId::new(), &doc("alpha alpha", "new", 99))
+        .upsert_node("Doc", fresh, &doc("alpha alpha", "new", 99))
         .unwrap();
     writer.commit_batch().await.unwrap();
-    assert!(
-        search(&writer, "alpha").await.is_none(),
-        "a new document declines"
-    );
+    let merged = search(&writer, "alpha")
+        .await
+        .expect("a new document is merged, not scanned");
+    assert_eq!(merged[0].0, fresh);
     writer.flush(schema()).await.unwrap();
 
     // A fresh memtable whose first write to the index's label is unchanged

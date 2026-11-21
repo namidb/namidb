@@ -76,7 +76,8 @@ async fn route_counters_track_native_serves_and_freshness_fallbacks() {
         "a native serve must move the native counter"
     );
 
-    // Dirty memtable: the freshness gate declines and FALLBACK moves.
+    // Dirty memtable: the fresh document is merged into the native answer
+    // and both the native and the merged counters move.
     writer
         .upsert_node("Doc", NodeId::new(), &doc("gamma three"))
         .unwrap();
@@ -92,7 +93,27 @@ async fn route_counters_track_native_serves_and_freshness_fallbacks() {
         )
         .await
         .unwrap();
-    assert!(outcome.is_none(), "the dirty snapshot must decline");
+    assert!(outcome.is_some(), "the dirty snapshot merges, not scans");
+    let after = route_telemetry::snapshot();
+    assert!(after.text_native > before.text_native);
+    assert!(
+        after.text_fresh_merged > before.text_fresh_merged,
+        "a merged serve must move the fresh-merged counter"
+    );
+
+    // A fresh document that changes a prefix expansion declines, and
+    // FALLBACK moves.
+    let before = route_telemetry::snapshot();
+    let outcome = snapshot
+        .text_search(
+            "doc_ft",
+            "Doc",
+            &namidb_storage::text::parse_query("gam*"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(outcome.is_none(), "a touched prefix expansion must decline");
     let after = route_telemetry::snapshot();
     assert!(
         after.text_fallback > before.text_fallback,

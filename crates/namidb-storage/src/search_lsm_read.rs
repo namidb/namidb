@@ -771,7 +771,37 @@ async fn open_text_generation(
     snapshot: &Snapshot<'_>,
     index_name: &str,
 ) -> Result<ActiveSearch<OpenedTextGeneration>> {
-    let (state, barrier_sst_id) = match active_state(snapshot, SearchLsmKind::Text, index_name) {
+    open_text_generation_with(snapshot, index_name, false).await
+}
+
+/// [`open_text_generation`]; with `legacy_base`, a generation whose only
+/// segment is a wrapped V3 base opens here too (instead of `NotActive`,
+/// which sends the caller to the legacy base reader). A read that merges
+/// unflushed documents needs the generation's coordinator for that.
+#[cfg(feature = "text-index")]
+async fn open_text_generation_with(
+    snapshot: &Snapshot<'_>,
+    index_name: &str,
+    legacy_base: bool,
+) -> Result<ActiveSearch<OpenedTextGeneration>> {
+    let active = match active_state(snapshot, SearchLsmKind::Text, index_name) {
+        ActiveSearch::NotActive if legacy_base => {
+            match select_search_read_plan(
+                &snapshot.manifest.manifest,
+                SearchLsmKind::Text,
+                index_name,
+            ) {
+                SearchReadPlan::ActiveLegacyBase {
+                    state,
+                    barrier_sst_id,
+                    ..
+                } => ActiveSearch::Ready((state, barrier_sst_id)),
+                _ => ActiveSearch::NotActive,
+            }
+        }
+        other => other,
+    };
+    let (state, barrier_sst_id) = match active {
         ActiveSearch::NotActive => return Ok(ActiveSearch::NotActive),
         ActiveSearch::Unavailable => return Ok(ActiveSearch::Unavailable),
         ActiveSearch::Ready(value) => value,
@@ -1765,52 +1795,6 @@ async fn global_text_stats(
 }
 
 #[cfg(feature = "text-index")]
-async fn text_generation_contains_live(
-    generation: &OpenedTextGeneration,
-    node_ids: &[[u8; 16]],
-) -> Result<Option<bool>> {
-    let v3_base = generation
-        .segments
-        .first()
-        .and_then(|segment| match &segment.reader {
-            OpenedTextReader::V3Base(reader) => Some(reader),
-            OpenedTextReader::V4(_) => None,
-        });
-    for chunk in node_ids.chunks(WINNER_PROBE_BATCH) {
-        let winners = probe_winners(
-            generation
-                .segments
-                .iter()
-                .rev()
-                .filter_map(OpenedTextSegment::version_reader),
-            chunk,
-        )
-        .await?;
-        if winners.conflict {
-            return Ok(None);
-        }
-        let mut unversioned = Vec::new();
-        for (node_id, record) in chunk.iter().zip(winners.records) {
-            match record {
-                Some(record) if matches!(record.operation, SearchVersionOperation::Live { .. }) => {
-                    return Ok(Some(true));
-                }
-                Some(_) => {}
-                None => unversioned.push(*node_id),
-            }
-        }
-        // No delta mentions these ids: a V3 base still holds them live if
-        // it contains them at all.
-        if let Some(base) = v3_base {
-            if base.contains_any_doc(&unversioned).await? {
-                return Ok(Some(true));
-            }
-        }
-    }
-    Ok(Some(false))
-}
-
-#[cfg(feature = "text-index")]
 async fn reconcile_text_candidates(
     generation: &OpenedTextGeneration,
     candidates: &[TextCandidate],
@@ -1856,41 +1840,405 @@ async fn reconcile_text_candidates(
     Ok(Some(accepted))
 }
 
+/// One unflushed document of an indexed label, as a full-text read scores
+/// it: from its memtable (or transaction overlay) values.
+#[cfg(feature = "text-index")]
+#[derive(Debug, Clone)]
+pub(crate) struct FreshTextDoc {
+    pub(crate) id: NodeId,
+    /// The string values of the indexed properties, in the index's property
+    /// order (the order the flat scan and the index concatenate them in).
+    pub(crate) fields: Vec<String>,
+    /// The values of the properties the read's native filter groups name.
+    pub(crate) filters: BTreeMap<String, Value>,
+}
+
+/// The unflushed rows a full-text read must reconcile with the index.
+#[cfg(feature = "text-index")]
+#[derive(Debug, Default)]
+pub(crate) struct TextFreshness {
+    pub(crate) label: String,
+    /// The indexed properties, canonical (sorted, deduplicated).
+    pub(crate) properties: Vec<String>,
+    /// Every unflushed id whose persisted version the index may hold but must
+    /// not serve: deletes, relabels, and rewritten documents.
+    pub(crate) shadowed: Vec<[u8; 16]>,
+    /// The unflushed documents that carry the label and at least one string
+    /// value of an indexed property.
+    pub(crate) current: Vec<FreshTextDoc>,
+    /// Shadowed ids that still carry the label (rewritten documents).
+    pub(crate) rewritten: usize,
+}
+
+#[cfg(feature = "text-index")]
+impl TextFreshness {
+    /// Some unflushed row may differ from what the index holds.
+    pub(crate) fn is_dirty(&self) -> bool {
+        !self.shadowed.is_empty() || !self.current.is_empty()
+    }
+}
+
+/// The shadowed ids the index holds live, with the indexed text of the
+/// persisted version it holds for each.
+#[cfg(feature = "text-index")]
+struct ShadowedTextDocs {
+    live: Vec<[u8; 16]>,
+    persisted: Vec<Vec<String>>,
+}
+
+/// Which of `node_ids` the generation holds live.
+#[cfg(feature = "text-index")]
+async fn live_text_ids(
+    generation: &OpenedTextGeneration,
+    node_ids: &[[u8; 16]],
+) -> Result<Option<Vec<[u8; 16]>>> {
+    let v3_base = generation
+        .segments
+        .first()
+        .and_then(|segment| match &segment.reader {
+            OpenedTextReader::V3Base(reader) => Some(reader),
+            OpenedTextReader::V4(_) => None,
+        });
+    let mut live = Vec::new();
+    for chunk in node_ids.chunks(WINNER_PROBE_BATCH) {
+        crate::cancel::check()?;
+        let winners = probe_winners(
+            generation
+                .segments
+                .iter()
+                .rev()
+                .filter_map(OpenedTextSegment::version_reader),
+            chunk,
+        )
+        .await?;
+        if winners.conflict {
+            return Ok(None);
+        }
+        let mut unversioned = Vec::new();
+        for (node_id, record) in chunk.iter().zip(winners.records) {
+            match record {
+                Some(record) if matches!(record.operation, SearchVersionOperation::Live { .. }) => {
+                    live.push(*node_id);
+                }
+                Some(_) => {}
+                None => unversioned.push(*node_id),
+            }
+        }
+        // No delta mentions these ids: a V3 base still holds them live if
+        // it contains them at all.
+        if let Some(base) = v3_base {
+            if base.contains_any_doc(&unversioned).await? {
+                for node_id in unversioned {
+                    if base.contains_any_doc(&[node_id]).await? {
+                        live.push(node_id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(live))
+}
+
+/// Resolve which shadowed ids the index serves and the version it holds of
+/// each; `None` when the read must take the exact scan instead.
+#[cfg(feature = "text-index")]
+async fn shadowed_text_docs(
+    snapshot: &Snapshot<'_>,
+    generation: &OpenedTextGeneration,
+    index_name: &str,
+    fresh: &TextFreshness,
+) -> Result<Option<ShadowedTextDocs>> {
+    if fresh.shadowed.is_empty() {
+        return Ok(Some(ShadowedTextDocs {
+            live: Vec::new(),
+            persisted: Vec::new(),
+        }));
+    }
+    let Some(live) = live_text_ids(generation, &fresh.shadowed).await? else {
+        return Ok(None);
+    };
+    let fresh_documents = live.len().saturating_add(fresh.current.len());
+    if fresh_documents > crate::search_freshness::fresh_text_max_docs() {
+        snapshot.note_fresh_text_overflow(index_name, fresh_documents);
+        return Ok(None);
+    }
+    if live.is_empty() {
+        return Ok(Some(ShadowedTextDocs {
+            live,
+            persisted: Vec::new(),
+        }));
+    }
+    let ids = live
+        .iter()
+        .map(|id| NodeId(Uuid::from_bytes(*id)))
+        .collect::<Vec<_>>();
+    let persisted = snapshot
+        .persisted_text_fields(&fresh.label, &fresh.properties, &ids)
+        .await?;
+    let mut fields = Vec::with_capacity(persisted.len());
+    for document in persisted {
+        // The index covers exactly the persisted corpus: a document it holds
+        // live without a persisted searchable version means the two diverge.
+        let Some(document) = document else {
+            tracing::warn!(
+                index = index_name,
+                "full-text index holds a document the persisted corpus does not; exact scan"
+            );
+            return Ok(None);
+        };
+        fields.push(document);
+    }
+    Ok(Some(ShadowedTextDocs {
+        live,
+        persisted: fields,
+    }))
+}
+
+/// One fresh or shadowed document, tokenized the way the flat scan does.
+#[cfg(feature = "text-index")]
+struct FreshTextAnalysis {
+    len: u64,
+    /// Term frequency of each scored term, aligned with the scored terms.
+    tf: Vec<u32>,
+    phrases_match: bool,
+}
+
+/// Tokenize `fields`; `None` when a token carries one of the query's
+/// prefixes (the prefix expansion itself may differ from the index's then).
+#[cfg(feature = "text-index")]
+fn analyse_fresh_text(
+    analyzer: crate::text::TextAnalyzer,
+    fields: &[String],
+    scored: &[&str],
+    phrases: &[Vec<String>],
+    prefixes: &[String],
+) -> Option<FreshTextAnalysis> {
+    let mut tf = vec![0u32; scored.len()];
+    let mut tokens = Vec::new();
+    let mut touches_prefix = false;
+    let mut len = 0u64;
+    for field in fields {
+        let emitted = match crate::text::try_visit_tokens_with(analyzer, field, |token| {
+            if let Ok(position) = scored.binary_search(&token) {
+                tf[position] = tf[position].saturating_add(1);
+            }
+            if prefixes
+                .iter()
+                .any(|prefix| token.starts_with(prefix.as_str()))
+            {
+                touches_prefix = true;
+            }
+            if !phrases.is_empty() {
+                tokens.push(token.to_owned());
+            }
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(emitted) => emitted,
+            Err(never) => match never {},
+        };
+        len = len.saturating_add(emitted as u64);
+    }
+    if touches_prefix {
+        return None;
+    }
+    let phrases_match = phrases
+        .iter()
+        .all(|phrase| crate::text::contains_phrase(&tokens, phrase));
+    Some(FreshTextAnalysis {
+        len,
+        tf,
+        phrases_match,
+    })
+}
+
+/// The index's corpus statistics with the shadowed versions removed and the
+/// fresh documents added, plus the analysis of each fresh document. `None`
+/// when the merge cannot reproduce the flat scan exactly.
+#[cfg(feature = "text-index")]
+struct FreshTextMerge {
+    global: crate::sst::text::v4::TextV4GlobalStats,
+    scored: Vec<String>,
+    current: Vec<Option<FreshTextAnalysis>>,
+}
+
+#[cfg(feature = "text-index")]
+impl FreshTextMerge {
+    fn new(
+        query: &crate::text::TextQuery,
+        expanded: &crate::text::TextQuery,
+        global: &crate::sst::text::v4::TextV4GlobalStats,
+        shadowed: &ShadowedTextDocs,
+        fresh: &TextFreshness,
+    ) -> Option<Self> {
+        let scored = expanded
+            .base_terms()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let scored_refs = scored.iter().map(String::as_str).collect::<Vec<_>>();
+        let analyse = |fields: &[String]| {
+            analyse_fresh_text(
+                query.analyzer,
+                fields,
+                &scored_refs,
+                &expanded.phrases,
+                &query.prefixes,
+            )
+        };
+        let mut document_count = global.document_count;
+        let mut total_document_len = global.total_document_len;
+        let mut document_frequency = scored
+            .iter()
+            .map(|term| global.document_frequency.get(term).copied())
+            .collect::<Option<Vec<u64>>>()?;
+        for fields in &shadowed.persisted {
+            let analysis = analyse(fields)?;
+            document_count = document_count.checked_sub(1)?;
+            total_document_len = total_document_len.checked_sub(analysis.len)?;
+            for (df, tf) in document_frequency.iter_mut().zip(&analysis.tf) {
+                if *tf > 0 {
+                    *df = df.checked_sub(1)?;
+                }
+            }
+        }
+        let max_document_bytes = crate::search_workspace::bm25_max_document_bytes();
+        let mut current = Vec::with_capacity(fresh.current.len());
+        for document in &fresh.current {
+            let bytes = document
+                .fields
+                .iter()
+                .fold(0usize, |sum, field| sum.saturating_add(field.len()));
+            // The flat scan refuses an oversized document; let it.
+            if bytes > max_document_bytes {
+                return None;
+            }
+            let analysis = analyse(&document.fields)?;
+            document_count = document_count.checked_add(1)?;
+            total_document_len = total_document_len.checked_add(analysis.len)?;
+            for (df, tf) in document_frequency.iter_mut().zip(&analysis.tf) {
+                if *tf > 0 {
+                    *df = df.checked_add(1)?;
+                }
+            }
+            current.push(Some(analysis));
+        }
+        Some(Self {
+            global: crate::sst::text::v4::TextV4GlobalStats {
+                document_count,
+                total_document_len,
+                document_frequency: scored.iter().cloned().zip(document_frequency).collect(),
+            },
+            scored,
+            current,
+        })
+    }
+
+    /// BM25 of every fresh document that passes the phrases and `groups`,
+    /// with the corrected statistics and the flat scan's term order.
+    fn score_current(
+        &self,
+        fresh: &TextFreshness,
+        groups: &[(String, Vec<SearchFilterValue>)],
+    ) -> Vec<(NodeId, f64)> {
+        let n_docs = usize::try_from(self.global.document_count).unwrap_or(usize::MAX);
+        let avg_len = crate::text::avg_len(self.global.total_document_len, n_docs);
+        let idfs = self
+            .scored
+            .iter()
+            .map(|term| {
+                let df = self
+                    .global
+                    .document_frequency
+                    .get(term)
+                    .copied()
+                    .unwrap_or(0);
+                crate::text::bm25_idf(n_docs, usize::try_from(df).unwrap_or(usize::MAX))
+            })
+            .collect::<Vec<_>>();
+        let mut hits = Vec::new();
+        for (document, analysis) in fresh.current.iter().zip(&self.current) {
+            let Some(analysis) = analysis else {
+                continue;
+            };
+            if !analysis.phrases_match || !fresh_doc_matches_groups(document, groups) {
+                continue;
+            }
+            let mut score = 0.0f64;
+            for (idf, tf) in idfs.iter().zip(&analysis.tf) {
+                score += crate::text::bm25_term_score(*idf, *tf, analysis.len as usize, avg_len);
+            }
+            if score > 0.0 && score.is_finite() {
+                hits.push((document.id, score));
+            }
+        }
+        hits
+    }
+}
+
+/// Native filter groups evaluated on a fresh document's own values: OR
+/// within a property, AND across properties, the index's value identity.
+#[cfg(feature = "text-index")]
+fn fresh_doc_matches_groups(
+    document: &FreshTextDoc,
+    groups: &[(String, Vec<SearchFilterValue>)],
+) -> bool {
+    groups.iter().all(|(property, values)| {
+        document
+            .filters
+            .get(property)
+            .and_then(SearchFilterValue::from_value)
+            .is_some_and(|value| values.binary_search(&value).is_ok())
+    })
+}
+
 /// The query as the active generation expands it plus its corpus-wide BM25
-/// statistics, without scoring any document. Same availability contract as
-/// [`text_search`]: anything that would make it fall back is `Unavailable`.
+/// statistics, without scoring any document: the statistics of the corpus
+/// the flat scan would see, the unflushed documents in `fresh` included.
+/// Same availability contract as [`text_search`].
 #[cfg(feature = "text-index")]
 pub(super) async fn text_query_stats(
     snapshot: &Snapshot<'_>,
     index_name: &str,
     query: &crate::text::TextQuery,
-    dirty_ids: &[[u8; 16]],
+    fresh: &TextFreshness,
 ) -> Result<
     ActiveSearch<(
         crate::text::TextQuery,
         crate::sst::text::v4::TextV4GlobalStats,
     )>,
 > {
-    let generation = match open_text_generation(snapshot, index_name).await? {
+    let generation = match open_text_generation_with(snapshot, index_name, fresh.is_dirty()).await?
+    {
         ActiveSearch::NotActive => return Ok(ActiveSearch::NotActive),
         ActiveSearch::Unavailable => return Ok(ActiveSearch::Unavailable),
         ActiveSearch::Ready(generation) => generation,
     };
-    if !dirty_ids.is_empty() {
-        match text_generation_contains_live(&generation, dirty_ids).await? {
-            Some(false) => {}
-            Some(true) | None => return Ok(ActiveSearch::Unavailable),
-        }
-    }
+    let Some(shadowed) = shadowed_text_docs(snapshot, &generation, index_name, fresh).await? else {
+        return Ok(ActiveSearch::Unavailable);
+    };
     let Some(expanded) = globally_expanded_text_query(&generation, query).await? else {
         return Ok(ActiveSearch::Unavailable);
     };
     let Some(global) = global_text_stats(&generation, &expanded).await? else {
         return Ok(ActiveSearch::Unavailable);
     };
-    Ok(ActiveSearch::Ready((expanded, global)))
+    if shadowed.live.is_empty() && fresh.current.is_empty() {
+        return Ok(ActiveSearch::Ready((expanded, global)));
+    }
+    match FreshTextMerge::new(query, &expanded, &global, &shadowed, fresh) {
+        Some(merge) => Ok(ActiveSearch::Ready((expanded, merge.global))),
+        None => Ok(ActiveSearch::Unavailable),
+    }
 }
 
+/// BM25 top-`k` of the active generation, exact against the flat scan of the
+/// corpus the snapshot sees. Unflushed documents of the label (`fresh`) are
+/// merged in: the index's versions of the ids they shadow are dropped, the
+/// corpus statistics are corrected for both, and each fresh document is
+/// scored from its own values (its native filter values included). Past
+/// [`crate::search_freshness::fresh_text_max_docs`] such documents, or when a
+/// fresh document changes a prefix expansion, the read is `Unavailable` and
+/// the caller takes the exact scan.
 #[cfg(feature = "text-index")]
 pub(super) async fn text_search(
     snapshot: &Snapshot<'_>,
@@ -1898,23 +2246,22 @@ pub(super) async fn text_search(
     query: &crate::text::TextQuery,
     k: Option<usize>,
     groups: &[(String, Vec<Value>)],
-    dirty_ids: &[[u8; 16]],
+    fresh: &TextFreshness,
 ) -> Result<ActiveSearch<Vec<(NodeId, f64)>>> {
-    let generation = match open_text_generation(snapshot, index_name).await? {
+    let generation = match open_text_generation_with(snapshot, index_name, fresh.is_dirty()).await?
+    {
         ActiveSearch::NotActive => return Ok(ActiveSearch::NotActive),
         ActiveSearch::Unavailable => return Ok(ActiveSearch::Unavailable),
         ActiveSearch::Ready(generation) => generation,
     };
-    if !dirty_ids.is_empty() {
-        match text_generation_contains_live(&generation, dirty_ids).await {
-            Ok(Some(false)) => {}
-            Ok(Some(true) | None) => return Ok(ActiveSearch::Unavailable),
-            Err(error) if optional_accelerator_fallback(&error) => {
-                return Ok(ActiveSearch::Unavailable);
-            }
-            Err(error) => return Err(error),
+    let shadowed = match shadowed_text_docs(snapshot, &generation, index_name, fresh).await {
+        Ok(Some(shadowed)) => shadowed,
+        Ok(None) => return Ok(ActiveSearch::Unavailable),
+        Err(error) if optional_accelerator_fallback(&error) => {
+            return Ok(ActiveSearch::Unavailable);
         }
-    }
+        Err(error) => return Err(error),
+    };
     let Some(canonical_groups) = canonical_search_filter_groups(groups) else {
         return Ok(ActiveSearch::Unavailable);
     };
@@ -1926,7 +2273,8 @@ pub(super) async fn text_search(
     }) {
         return Ok(ActiveSearch::Unavailable);
     }
-    if query.is_empty() || k == Some(0) || generation.document_count == 0 {
+    let merging = !shadowed.live.is_empty() || !fresh.current.is_empty();
+    if query.is_empty() || k == Some(0) || (!merging && generation.document_count == 0) {
         return Ok(ActiveSearch::Ready(Vec::new()));
     }
     let expanded = match globally_expanded_text_query(&generation, query).await {
@@ -1938,6 +2286,11 @@ pub(super) async fn text_search(
         Err(error) => return Err(error),
     };
     if expanded.is_empty() {
+        // Only prefixes the index does not expand: no indexed document
+        // matches, but an unflushed one may.
+        if merging {
+            return Ok(ActiveSearch::Unavailable);
+        }
         return Ok(ActiveSearch::Ready(Vec::new()));
     }
     let global = match global_text_stats(&generation, &expanded).await {
@@ -1948,6 +2301,89 @@ pub(super) async fn text_search(
         }
         Err(error) => return Err(error),
     };
+    if !merging {
+        return search_text_generation(
+            &generation,
+            index_name,
+            &expanded,
+            &global,
+            k,
+            &canonical_groups,
+        )
+        .await;
+    }
+    let Some(merge) = FreshTextMerge::new(query, &expanded, &global, &shadowed, fresh) else {
+        tracing::debug!(
+            index = index_name,
+            "fresh documents change a prefix expansion or exceed the document bound; exact scan"
+        );
+        return Ok(ActiveSearch::Unavailable);
+    };
+    // Every shadowed document the index holds may rank inside the top-k it
+    // returns; fetch past them so dropping them leaves k exact hits.
+    let fetch = k.map(|k| k.saturating_add(shadowed.live.len()));
+    let mut hits = if generation.document_count == 0 {
+        Vec::new()
+    } else {
+        match search_text_generation(
+            &generation,
+            index_name,
+            &expanded,
+            &merge.global,
+            fetch,
+            &canonical_groups,
+        )
+        .await?
+        {
+            ActiveSearch::Ready(hits) => hits,
+            other => return Ok(other),
+        }
+    };
+    let shadowed_ids = fresh.shadowed.iter().copied().collect::<BTreeSet<_>>();
+    hits.retain(|(id, _)| !shadowed_ids.contains(id.0.as_bytes()));
+    hits.extend(merge.score_current(fresh, &canonical_groups));
+    hits.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    match k {
+        Some(k) => hits.truncate(k),
+        None => {
+            let result_cap = crate::search_workspace::search_max_text_result_hits();
+            if hits.len() > result_cap {
+                return Err(Error::SearchResultLimitExceeded {
+                    index_kind: "full-text",
+                    estimated_bytes: hits.len().saturating_mul(
+                        crate::search_workspace::MATERIALISED_TEXT_RESULT_BYTES_PER_HIT,
+                    ),
+                    limit_bytes: crate::search_workspace::search_max_result_bytes(),
+                });
+            }
+        }
+    }
+    crate::route_telemetry::record_text_fresh_merged();
+    tracing::debug!(
+        index = index_name,
+        shadowed = shadowed.live.len(),
+        fresh = fresh.current.len(),
+        returned = hits.len(),
+        "Search-LSM text query merged unflushed documents"
+    );
+    Ok(ActiveSearch::Ready(hits))
+}
+
+/// The ranked search of the generation itself under `global` statistics.
+#[cfg(feature = "text-index")]
+async fn search_text_generation(
+    generation: &OpenedTextGeneration,
+    index_name: &str,
+    expanded: &crate::text::TextQuery,
+    global: &crate::sst::text::v4::TextV4GlobalStats,
+    k: Option<usize>,
+    canonical_groups: &[(String, Vec<SearchFilterValue>)],
+) -> Result<ActiveSearch<Vec<(NodeId, f64)>>> {
     let result_cap = crate::search_workspace::search_max_text_result_hits();
     let segment_limit_cap = result_cap.saturating_add(1);
     let retained = match k {
@@ -1967,11 +2403,11 @@ pub(super) async fn text_search(
         return Ok(ActiveSearch::Unavailable);
     }
     if let Some((base, base_reader)) = generation
-        .authoritative_single_base(dirty_ids)
+        .authoritative_single_base(&[])
         .and_then(|base| base.v4().map(|reader| (base, reader)))
     {
         let result = match base_reader
-            .search_query_base_block_max_exact(&expanded, &global, retained, &canonical_groups)
+            .search_query_base_block_max_exact(expanded, global, retained, canonical_groups)
             .await
         {
             Ok(result) => result,
@@ -2049,10 +2485,10 @@ pub(super) async fn text_search(
                 // without reading the posting blocks that cannot reach it.
                 OpenedTextReader::V4(reader) => reader
                     .search_query_segment_block_max_exact(
-                        &expanded,
-                        &global,
+                        expanded,
+                        global,
                         segment_limit,
-                        &canonical_groups,
+                        canonical_groups,
                     )
                     .await
                     .map(|result| {
@@ -2079,7 +2515,7 @@ pub(super) async fn text_search(
                 // Filter groups never reach a V3 base: it advertises no
                 // filter property, so a filtered query was refused above.
                 OpenedTextReader::V3Base(reader) if canonical_groups.is_empty() => reader
-                    .search_query_global(&expanded, &global, segment_limit)
+                    .search_query_global(expanded, global, segment_limit)
                     .await
                     .map(|hits| {
                         Some(
@@ -2110,7 +2546,7 @@ pub(super) async fn text_search(
             };
             let matching_exhausted =
                 local_documents <= segment_limit || candidates.len() < segment_limit;
-            let accepted = match reconcile_text_candidates(&generation, &candidates).await {
+            let accepted = match reconcile_text_candidates(generation, &candidates).await {
                 Ok(Some(accepted)) => accepted,
                 Ok(None) => return Ok(ActiveSearch::Unavailable),
                 Err(error) if optional_accelerator_fallback(&error) => {

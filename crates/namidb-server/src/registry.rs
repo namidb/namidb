@@ -549,7 +549,16 @@ impl NamespaceRegistry {
                         _ = tick.tick() => {}
                         _ = s.flush_notify.notified() => {}
                         _ = crate::memory::pressure_flush_requested() => {}
+                        // A full-text read found more unflushed documents
+                        // than it merges; only this namespace's request flushes.
+                        _ = namidb_storage::search_freshness::flush_requested() => {
+                            if !namidb_storage::search_freshness::take_flush_request(&ns) {
+                                continue;
+                            }
+                        }
                     }
+                    // Any flush satisfies a pending early-flush request.
+                    namidb_storage::search_freshness::take_flush_request(&ns);
                     if retry_after.is_some_and(|at| Instant::now() < at) {
                         continue;
                     }
