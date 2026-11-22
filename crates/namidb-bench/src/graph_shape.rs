@@ -160,7 +160,7 @@ impl ShapeConfig {
             Kind::Call => {
                 p.insert("ts".into(), Value::I64(ts));
                 p.insert("duration".into(), Value::I64((h % 3_600) as i64));
-                let dir = if h % 2 == 0 { "in" } else { "out" };
+                let dir = if h.is_multiple_of(2) { "in" } else { "out" };
                 p.insert("direction".into(), Value::Str(dir.into()));
                 p.insert(
                     "number".into(),

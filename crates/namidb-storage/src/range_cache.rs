@@ -516,7 +516,7 @@ impl RangeCacheConfig {
                 "range cache page bytes must be at least {PAGE_BYTES}"
             )));
         }
-        if self.page_size_bytes % PAGE_BYTES != 0 {
+        if !self.page_size_bytes.is_multiple_of(PAGE_BYTES) {
             return Err(RangeCacheError::Configuration(format!(
                 "range cache page bytes must be aligned to {PAGE_BYTES}"
             )));
@@ -603,7 +603,7 @@ impl RangeCacheConfig {
                         "NVMe write buffer must be at least {PAGE_BYTES} bytes"
                     )));
                 }
-                if self.write_buffer_bytes % PAGE_BYTES != 0 {
+                if !self.write_buffer_bytes.is_multiple_of(PAGE_BYTES) {
                     return Err(RangeCacheError::Configuration(format!(
                         "NVMe write buffer must be aligned to {PAGE_BYTES}"
                     )));
@@ -761,6 +761,15 @@ pub struct SharedRangeCacheSnapshot {
 /// leave every later user awaiting workers that no longer exist. The pure
 /// in-memory cache has no workers and therefore no runtime affinity, so the
 /// default (RAM-only) tier is safe to share for the life of the process.
+///
+/// Every key reaches Foyer through one tier. Foyer joins concurrent callers
+/// of a key into one in-flight fetch and runs the fetch a joiner brought
+/// with the leader's context, whose type differs between the hybrid API and
+/// its memory tier: a key reached through both panics when a hybrid lookup's
+/// device probe misses while a memory read-through of the key waits on it.
+/// A hybrid cache therefore routes each key by its length alone
+/// ([`ImmutableRangeCache::memory_only`]), so lookups, read-throughs and
+/// inserts of one key always use the same tier.
 #[derive(Clone)]
 enum RangeCacheBackend {
     Memory(Cache<String, Bytes>),
@@ -820,10 +829,20 @@ impl RangeCacheBackend {
         }
     }
 
-    /// Look up a resident value and where it came from.
-    async fn get(&self, key: &str) -> Result<Option<(Bytes, Source)>, RangeCacheError> {
+    /// Look up a resident value and where it came from. `memory_only`
+    /// keeps a hybrid cache's lookup in its memory tier, where such a key
+    /// lives, so it never joins a memory read-through of the same key.
+    async fn get(
+        &self,
+        key: &str,
+        memory_only: bool,
+    ) -> Result<Option<(Bytes, Source)>, RangeCacheError> {
         match self {
             Self::Memory(cache) => Ok(cache
+                .get(key)
+                .map(|entry| (entry.value().clone(), entry.source()))),
+            Self::Hybrid(cache) if memory_only => Ok(cache
+                .memory()
                 .get(key)
                 .map(|entry| (entry.value().clone(), entry.source()))),
             Self::Hybrid(cache) => Ok(cache
@@ -1327,7 +1346,9 @@ impl ImmutableRangeCache {
             return Ok(None);
         }
         let storage_key = self.storage_key(key);
-        let Some((value, source)) = self.cache.get(&storage_key).await? else {
+        let memory_only =
+            self.memory_only(usize::try_from(key.len()).expect("key validation checked usize"));
+        let Some((value, source)) = self.cache.get(&storage_key, memory_only).await? else {
             self.counters.misses.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
@@ -3673,6 +3694,130 @@ mod tests {
         assert_eq!(source.read_range(0..16).await.unwrap(), body);
         let seen = spy.seen_if_match.lock().unwrap().clone();
         assert_eq!(seen, vec![None::<String>]);
+    }
+
+    /// Foyer joins concurrent callers of one key into a single in-flight
+    /// fetch and runs the fetch a joiner brought with the leader's context.
+    /// A plain hybrid lookup and a memory-tier read-through carry different
+    /// context types, so a range below the device floor must never reach
+    /// Foyer through both: a lookup whose device probe misses while a
+    /// read-through of the same range waits would otherwise panic.
+    #[tokio::test]
+    async fn a_lookup_and_a_read_through_of_one_memory_range_share_a_fetch() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ImmutableRangeCache::open(hybrid_config(directory.path()))
+            .await
+            .unwrap();
+        assert!(cache.is_hybrid());
+        for round in 0..64u64 {
+            let key =
+                ImmutableRangeKey::new("objects/small", "etag", round * 1024..(round + 1) * 1024)
+                    .unwrap();
+            assert!(cache.memory_only(1024));
+            // Start the lookup, then the read-through, before either finishes.
+            let mut lookup = Box::pin(cache.get_key(&key));
+            let first = futures::poll!(&mut lookup);
+            let fetch = cache.get_or_fetch_key(&key, move || async move {
+                tokio::task::yield_now().await;
+                Ok::<_, anyhow::Error>(Bytes::from(vec![round as u8; 1024]))
+            });
+            let mut fetch = Box::pin(fetch);
+            let _ = futures::poll!(&mut fetch);
+            let looked_up = match first {
+                std::task::Poll::Ready(found) => found.unwrap(),
+                std::task::Poll::Pending => lookup.await.unwrap(),
+            };
+            let fetched = fetch.await.unwrap();
+            assert_eq!(fetched, Bytes::from(vec![round as u8; 1024]));
+            if let Some(found) = looked_up {
+                assert_eq!(found, fetched);
+            }
+        }
+        cache.close().await.unwrap();
+    }
+
+    /// Many tasks look up and read through overlapping ranges on both sides
+    /// of the device floor of one cache, with removals keeping the ranges
+    /// cold and a small memory tier evicting. Every read returns the
+    /// authoritative bytes and no task panics.
+    async fn stress_lookups_and_read_throughs(cache: ImmutableRangeCache) {
+        const TASKS: u64 = 32;
+        const ROUNDS: u64 = 1_000;
+        const KEYS: u64 = 8;
+        // 1 KiB ranges stay in memory; 32 KiB ranges may reach a device.
+        let ranges: Vec<Range<u64>> = (0..KEYS)
+            .map(|i| {
+                let len = if i % 2 == 0 { 1024 } else { 32 * 1024 };
+                i * 65_536..i * 65_536 + len
+            })
+            .collect();
+        let body = |range: &Range<u64>| {
+            Bytes::from(vec![
+                (range.start / 65_536) as u8 + 1;
+                (range.end - range.start) as usize
+            ])
+        };
+        let tasks: Vec<_> = (0..TASKS)
+            .map(|task| {
+                let cache = cache.clone();
+                let ranges = ranges.clone();
+                tokio::spawn(async move {
+                    for round in 0..ROUNDS {
+                        let range = ranges[((task + round) % KEYS) as usize].clone();
+                        let expected = body(&range);
+                        let key =
+                            ImmutableRangeKey::new("objects/mixed", "etag", range.clone()).unwrap();
+                        match (task * 7 + round) % 5 {
+                            0 | 1 => {
+                                if let Some(found) = cache.get_key(&key).await.unwrap() {
+                                    assert_eq!(found, expected);
+                                }
+                            }
+                            2 | 3 => {
+                                let value = expected.clone();
+                                let fetched = cache
+                                    .get_or_fetch_key(&key, move || async move {
+                                        tokio::task::yield_now().await;
+                                        Ok::<_, anyhow::Error>(value)
+                                    })
+                                    .await
+                                    .unwrap();
+                                assert_eq!(fetched, expected);
+                            }
+                            _ => {
+                                cache.remove("objects/mixed", "etag", range).unwrap();
+                            }
+                        }
+                        if round % 16 == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.expect("no range-cache caller panics");
+        }
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_lookups_and_read_throughs_on_both_tiers_never_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ImmutableRangeCache::open(hybrid_config(directory.path()))
+            .await
+            .unwrap();
+        assert!(cache.memory_only(1024) && !cache.memory_only(32 * 1024));
+        stress_lookups_and_read_throughs(cache).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_lookups_and_read_throughs_in_memory_never_panic() {
+        let cache = ImmutableRangeCache::open(memory_config(256 * 1024))
+            .await
+            .unwrap();
+        assert!(!cache.is_hybrid());
+        stress_lookups_and_read_throughs(cache).await;
     }
 
     #[tokio::test]

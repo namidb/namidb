@@ -53,7 +53,7 @@ fn embedding(ordinal: u64, version: u64) -> Vec<f32> {
 }
 
 fn body(ordinal: u64, version: u64) -> String {
-    if (ordinal + version) % 3 == 0 {
+    if (ordinal + version).is_multiple_of(3) {
         format!("alpha content {ordinal} v{version}")
     } else {
         format!("plain content {ordinal} v{version}")

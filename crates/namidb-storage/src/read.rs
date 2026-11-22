@@ -249,6 +249,53 @@ fn shared_edge_reader_cache() -> &'static Mutex<SnapshotByteCache<String, Arc<Pa
     })
 }
 
+/// Process-wide memo of equality posting lengths, keyed by store, sidecar path
+/// and probe key: the length a probe advertised. An immutable sidecar's
+/// posting never changes, so a capped lookup can decline from these lengths
+/// without opening the sidecars again. About 4 MiB at most.
+fn shared_posting_lengths() -> &'static Mutex<SnapshotByteCache<String, usize>> {
+    static CACHE: std::sync::OnceLock<Mutex<SnapshotByteCache<String, usize>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(SnapshotByteCache::new(4 * 1024 * 1024, 32 * 1024)))
+}
+
+/// One equality sidecar probe: the postings it found, the posting length it
+/// advertised, and whether the posting was read only in part.
+type SidecarProbe = (Arc<EqualityPropertySidecar>, usize, bool);
+
+static EQUALITY_SIDECAR_PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EQUALITY_POSTING_MEMO_DECLINES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Process totals of the equality sidecar probe path: sidecar probes issued,
+/// and capped lookups declined from remembered posting lengths alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EqualitySidecarProbeStats {
+    pub probes: u64,
+    pub memo_declines: u64,
+}
+
+pub fn equality_sidecar_probe_stats() -> EqualitySidecarProbeStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    EqualitySidecarProbeStats {
+        probes: EQUALITY_SIDECAR_PROBES.load(Relaxed),
+        memo_declines: EQUALITY_POSTING_MEMO_DECLINES.load(Relaxed),
+    }
+}
+
+/// Equality sidecars one lookup probes at a time
+/// (`NAMIDB_EQUALITY_SIDECAR_PROBE_CONCURRENCY`, default 8, at least 1).
+fn equality_sidecar_probe_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("NAMIDB_EQUALITY_SIDECAR_PROBE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1)
+    })
+}
+
 fn snapshot_local_cache_max_bytes(name: &str) -> usize {
     match std::env::var(name) {
         Ok(value) => match value.trim().parse::<usize>() {
@@ -1620,6 +1667,16 @@ impl<'mt> Snapshot<'mt> {
         )
     }
 
+    /// Flushed live `label` rows from the manifest alone (no I/O, no memtable
+    /// walk): exact when the manifest proves it (see
+    /// [`Self::metadata_node_count`]), otherwise its per-label row counts, an
+    /// upper bound. `None` when the manifest knows no such row.
+    pub fn manifest_label_population(&self, label: &str) -> Option<u64> {
+        self.metadata_node_count(Some(label))
+            .or_else(|| Some(self.live_row_estimate(label)))
+            .filter(|rows| *rows > 0)
+    }
+
     /// Live `label` rows, for sizing decisions, with no I/O: exact when the
     /// manifest proves it (see [`Self::metadata_node_count`]), otherwise the
     /// manifest's per-label row counts plus every unflushed node row, an
@@ -2270,23 +2327,72 @@ impl<'mt> Snapshot<'mt> {
             {
                 cursors.push(EqualityNodePostingCursor::memtable(memtable, memtable_key));
             }
-            for (_idx, sidecar) in sidecars {
-                let absolute = format!(
-                    "{}/{}",
-                    self.paths.namespace_prefix().as_ref(),
-                    sidecar.path
-                );
-                let probe = equality_sidecar_key(sidecar.key_encoding, value)
-                    .expect("sidecar compatibility checked above");
-                let read_limit = posting_read_limit.or(limit).or(candidate_cap);
-                let sidecar_probe = self
-                    .probe_equality_property_sidecar_limited(
-                        sidecar,
-                        &absolute,
-                        std::slice::from_ref(&probe),
-                        read_limit,
-                    )
-                    .await;
+            let probes: Vec<_> = sidecars
+                .into_iter()
+                .map(|(_idx, sidecar)| {
+                    let absolute = format!(
+                        "{}/{}",
+                        self.paths.namespace_prefix().as_ref(),
+                        sidecar.path
+                    );
+                    let probe = equality_sidecar_key(sidecar.key_encoding, value)
+                        .expect("sidecar compatibility checked above");
+                    (sidecar, absolute, probe)
+                })
+                .collect();
+            // A capped lookup declines once the postings it would merge exceed
+            // the cap. Posting lengths already seen by this process (sidecars
+            // are immutable) bound the sum from below: past the cap the lookup
+            // declines here, before any sidecar is opened.
+            if let Some(cap) = candidate_cap {
+                let known = probes
+                    .iter()
+                    .filter_map(|(_, absolute, probe)| {
+                        self.posting_length_memo_get(absolute, probe)
+                    })
+                    .fold(
+                        advertised_source_entries.unwrap_or(0),
+                        usize::saturating_add,
+                    );
+                if known > cap {
+                    EQUALITY_POSTING_MEMO_DECLINES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(IndexedPropertyLookup::Unavailable);
+                }
+            }
+            // The sidecars are probed concurrently (a probe is a few dependent
+            // range reads, so sequential probes add up round trips), at most
+            // `equality_sidecar_probe_concurrency()` at a time; results are
+            // taken in manifest order, as a sequential probe would.
+            let read_limit = posting_read_limit.or(limit).or(candidate_cap);
+            let results: Vec<_> = {
+                use futures::StreamExt;
+                let mut pending: Vec<futures::future::BoxFuture<'_, Result<SidecarProbe>>> =
+                    Vec::with_capacity(probes.len());
+                for (sidecar, absolute, probe) in &probes {
+                    let sidecar: &EqualityIndexDescriptor = sidecar;
+                    let absolute: &str = absolute;
+                    let probe: &String = probe;
+                    pending.push(Box::pin(async move {
+                        EQUALITY_SIDECAR_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.probe_equality_property_sidecar_limited(
+                            sidecar,
+                            absolute,
+                            std::slice::from_ref(probe),
+                            read_limit,
+                        )
+                        .await
+                    }));
+                }
+                futures::stream::iter(pending)
+                    .buffered(equality_sidecar_probe_concurrency())
+                    .collect()
+                    .await
+            };
+            for ((sidecar, absolute, probe), sidecar_probe) in probes.into_iter().zip(results) {
+                if let Ok((_, posting_len, _)) = &sidecar_probe {
+                    self.posting_length_memo_put(&absolute, &probe, *posting_len);
+                }
                 let (map, posting_len, truncated) = match sidecar_probe {
                     Ok(result) => result,
                     Err(error) if optional_accelerator_fallback(&error) => {
@@ -12535,6 +12641,31 @@ impl<'mt> Snapshot<'mt> {
         Ok(source)
     }
 
+    fn posting_length_memo_key(&self, absolute: &str, probe: &str) -> String {
+        format!(
+            "{}|{absolute}|{probe}",
+            crate::range_cache::cache_store_token(&self.store)
+        )
+    }
+
+    /// The posting length an earlier probe of this sidecar advertised for
+    /// `probe`, if this process remembers it.
+    fn posting_length_memo_get(&self, absolute: &str, probe: &str) -> Option<usize> {
+        let key = self.posting_length_memo_key(absolute, probe);
+        shared_posting_lengths().lock().unwrap().get(&key)
+    }
+
+    fn posting_length_memo_put(&self, absolute: &str, probe: &str, length: usize) {
+        let key = self.posting_length_memo_key(absolute, probe);
+        let weight = key
+            .len()
+            .saturating_add(SNAPSHOT_CACHE_ENTRY_OVERHEAD_BYTES);
+        shared_posting_lengths()
+            .lock()
+            .unwrap()
+            .insert(key, length, weight);
+    }
+
     /// Cache-aware fetch by absolute path. On hit, returns the cached
     /// `Bytes` (a cheap `Arc::clone`). On miss, GETs the object store
     /// and inserts the bytes back into the cache so the next reader on
@@ -20426,7 +20557,7 @@ mod tests {
                 .unwrap(),
             )
         };
-        let label_of = |i: u16| if i % 2 == 0 { DEVICE } else { OTHER };
+        let label_of = |i: u16| if i.is_multiple_of(2) { DEVICE } else { OTHER };
         let first = flush_batch_with_row_group_rows(
             32,
             &ms,

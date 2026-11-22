@@ -2780,7 +2780,7 @@ pub fn decode_all_equality(body: &Bytes) -> Result<BTreeMap<String, Vec<[u8; 16]
     }
     let mut out = BTreeMap::new();
     for page_id in 0..header.leaf_count {
-        if page_id as usize % crate::cancel::CHECK_STRIDE == 0 {
+        if (page_id as usize).is_multiple_of(crate::cancel::CHECK_STRIDE) {
             crate::cancel::check()?;
         }
         let range = page_range(page_id);
@@ -2989,7 +2989,7 @@ async fn equality_range_with_source(
             let LeafValue::External(offset, len, checksum) = entry.value else {
                 return Err(Error::invariant("equality range found inline value"));
             };
-            if len as usize % 16 != 0 {
+            if !(len as usize).is_multiple_of(16) {
                 return Err(Error::invariant("unaligned equality range posting"));
             }
             let full_ids = len as usize / 16;
@@ -3132,7 +3132,7 @@ async fn equality_prefix_with_source(
             let LeafValue::External(offset, len, checksum) = entry.value else {
                 return Err(Error::invariant("equality prefix found inline value"));
             };
-            if len as usize % 16 != 0 {
+            if !(len as usize).is_multiple_of(16) {
                 return Err(Error::invariant("unaligned equality prefix posting"));
             }
             let full_ids = len as usize / 16;

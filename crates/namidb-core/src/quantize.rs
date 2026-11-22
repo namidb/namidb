@@ -116,7 +116,7 @@ mod tests {
     fn dot_and_norm_kernels_match_f64_references_on_every_length() {
         let mut state = 0x4b45_524e_454c_5332u64;
         for len in kernel_lengths(&mut state) {
-            let other = if next(&mut state) % 4 == 0 {
+            let other = if next(&mut state).is_multiple_of(4) {
                 (next(&mut state) % 2101) as usize
             } else {
                 len

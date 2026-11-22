@@ -171,7 +171,7 @@ pub const EDGE_DECODE_MAX_BYTES_ENV: &str = "NAMIDB_EDGE_DECODE_MAX_BYTES";
 
 /// Binary-search a sorted sequence of contiguous 16-byte identifiers.
 pub fn binary_search_fixed_16(buf: &[u8], target: &[u8; 16]) -> Result<Option<usize>> {
-    if buf.len() % 16 != 0 {
+    if !buf.len().is_multiple_of(16) {
         return Err(Error::invariant(format!(
             "fixed-16 sequence length {} is not divisible by 16",
             buf.len()

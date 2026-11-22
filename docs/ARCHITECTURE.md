@@ -697,7 +697,7 @@ Determinism is itself a tested property: kernels are asserted to produce identic
 
 ### 9.4 Continuous integration gates
 
-The CI pipeline (`.github/workflows/ci.yml`) enforces, on every change to the main branch: `cargo fmt` formatting; Clippy with `-D warnings` under the **default feature set** (deliberately *without* the optional features, so a feature-gated item unused by a default build is caught as dead code); the full test suite on Linux and macOS with default features and again with the `vector-index,text-index` features enabled (the configuration the shipped server binary uses); and a minimum-supported-Rust-version (`1.85`) compilation check. The dual clippy/test runs — features off and on — are load-bearing because roughly half the search code is behind `#[cfg(feature = ...)]` gates and is compiled out of the default build.
+The CI pipeline (`.github/workflows/ci.yml`) enforces, on every change to the main branch: `cargo fmt` formatting; Clippy with `-D warnings` under the **default feature set** (deliberately *without* the optional features, so a feature-gated item unused by a default build is caught as dead code); the full test suite on Linux and macOS with default features and again with the `vector-index,text-index` features enabled (the configuration the shipped server binary uses); and a minimum-supported-Rust-version (`1.91`) compilation check. The dual clippy/test runs — features off and on — are load-bearing because roughly half the search code is behind `#[cfg(feature = ...)]` gates and is compiled out of the default build.
 
 ### 9.5 The 2.0.0 hardening audit
 

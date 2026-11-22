@@ -2613,7 +2613,7 @@ pub(crate) async fn execute_expand(
                         // deg^hop blowup itself, so probe the budgets every few
                         // thousand edges rather than once per hop.
                         guard_tick = guard_tick.wrapping_add(1);
-                        if guard_tick % 4096 == 0 {
+                        if guard_tick.is_multiple_of(4096) {
                             crate::exec::limits::check_deadline()?;
                             crate::exec::limits::check_row_cap(
                                 out.len() + hop_results.len() + next_frontier.len(),
@@ -3480,7 +3480,7 @@ async fn execute_expand_shortest_grouped(
             for (state, neighbours) in step_neighbours {
                 for edge in neighbours {
                     guard_tick = guard_tick.wrapping_add(1);
-                    if guard_tick % 4096 == 0 {
+                    if guard_tick.is_multiple_of(4096) {
                         crate::exec::limits::check_deadline()?;
                         crate::exec::limits::check_row_cap(out.len() + next_frontier.len())?;
                     }
@@ -7989,8 +7989,10 @@ pub(crate) struct FilterMembership {
     )]
     visited: usize,
     /// Resolved through a property index ([`seek_filter_membership`]) rather
-    /// than read from the filter's columns. Such a set is cheap to resolve
-    /// again, so it is shared within a statement but not cached across them.
+    /// than read from the filter's columns. Cached across statements like a
+    /// column set (resolving it again pays a posting read and a lookup per
+    /// candidate, remote fetches on a cold object-store cache), but answered
+    /// from the cache only while the index route is enabled.
     from_index: bool,
 }
 
@@ -8149,18 +8151,25 @@ async fn filter_membership(
         .map(|identity| (identity, key.clone()));
     if let Some(snapshot_key) = &snapshot_key {
         if let Some(cached) = membership_cache_get(snapshot_key) {
-            return Ok(cached);
+            // A set the index route built is not an answer once that route
+            // is turned off (`NAMIDB_FILTER_MEMBERSHIP_SEEK_CAP=0`): the
+            // column read below replaces it.
+            let from_index = cached.as_ref().is_some_and(|m| m.from_index);
+            if !(from_index && filter_membership_seek_cap() == 0) {
+                if from_index {
+                    MEMBERSHIP_SEEK_CACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(cached);
+            }
         }
     }
     let fresh_key = key.clone();
     let compute = || async {
-        // An equality/IN conjunct served by a property index names the few
-        // nodes it admits without reading the label's columns.
-        if let Some(membership) =
-            seek_filter_membership(snapshot, label, alias, &properties, filter, params).await?
-        {
-            return Ok(Some(membership));
-        }
+        // A set kept for this filter across flushes (built from the columns
+        // or through the index) is carried or patched before anything is
+        // looked up; a filter seen for the first time resolves through a
+        // property index when an equality/IN conjunct is served by one
+        // (`compute_fresh_filter_membership`).
         compute_fresh_filter_membership(
             snapshot,
             label,
@@ -8185,8 +8194,10 @@ async fn filter_membership(
         Some(cell) => cell.get_or_try_init(compute).await?.clone(),
         None => compute().await?,
     };
-    let from_index = membership.as_ref().is_some_and(|m| m.from_index);
-    if let (Some(snapshot_key), false) = (snapshot_key, from_index) {
+    // The key names the node data exactly (a committed mutation or a new
+    // manifest version changes it), so a set from either route stays valid
+    // for as long as the key matches.
+    if let Some(snapshot_key) = snapshot_key {
         membership_cache_put(snapshot_key, membership.clone());
     }
     Ok(membership)
@@ -8213,10 +8224,76 @@ fn filter_membership_seek_cap() -> usize {
             .unwrap_or(FILTERED_FLAT_ELIGIBLE_CAP)
     });
     if MEMBERSHIP_SEEK_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        0
-    } else {
-        cap
+        return 0;
     }
+    match SEEK_CAP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => cap,
+        overridden => overridden,
+    }
+}
+
+/// `usize::MAX`: no test override of the seek cap.
+static SEEK_CAP_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Test hook: the fixed seek cap (`None` restores the configured one).
+/// Process-wide; tests that use it must not run concurrently with others.
+#[doc(hidden)]
+pub fn set_filter_membership_seek_cap_for_tests(cap: Option<usize>) {
+    SEEK_CAP_OVERRIDE.store(
+        cap.unwrap_or(usize::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Smallest population-relative seek budget: below it either route is cheap.
+const FILTER_MEMBERSHIP_SEEK_MIN_BUDGET: usize = 256;
+
+/// `u64::MAX`: no test override of the population divisor.
+static SEEK_POPULATION_DIVISOR_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The share of a label a seek may examine is `1 / divisor`
+/// (`NAMIDB_FILTER_MEMBERSHIP_SEEK_POPULATION_DIVISOR`, default 64; `0`
+/// leaves only the fixed cap). Measured on a remote object store, a candidate
+/// lookup costs about a third of a fetch and a column read about
+/// `population / 150` fetches, so the routes break even near 1/50.
+fn filter_membership_seek_population_divisor() -> u64 {
+    let overridden = SEEK_POPULATION_DIVISOR_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if overridden != u64::MAX {
+        return overridden;
+    }
+    static DIVISOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DIVISOR.get_or_init(|| {
+        std::env::var("NAMIDB_FILTER_MEMBERSHIP_SEEK_POPULATION_DIVISOR")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(64)
+    })
+}
+
+/// Candidates a seek may examine: the fixed `cap`, lowered to a share of a
+/// known label `population` (never below
+/// [`FILTER_MEMBERSHIP_SEEK_MIN_BUDGET`]).
+#[doc(hidden)]
+pub fn filter_membership_seek_budget(cap: usize, population: Option<u64>, divisor: u64) -> usize {
+    match population {
+        Some(population) if divisor > 0 => {
+            let share = usize::try_from(population / divisor).unwrap_or(usize::MAX);
+            cap.min(share.max(FILTER_MEMBERSHIP_SEEK_MIN_BUDGET))
+        }
+        _ => cap,
+    }
+}
+
+/// Test hook: the population divisor (`None` restores the configured one).
+/// Process-wide; tests that use it must not run concurrently with others.
+#[doc(hidden)]
+pub fn set_filter_membership_seek_population_divisor(divisor: Option<u64>) {
+    SEEK_POPULATION_DIVISOR_OVERRIDE.store(
+        divisor.unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Under-filled widening rounds after which a filtered vector search with a
@@ -8261,12 +8338,34 @@ pub fn vector_member_scans() -> u64 {
 static MEMBERSHIP_SEEK_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static MEMBERSHIP_SEEK_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Statements a set the index route built answered without a new seek (from
+/// the per-snapshot cache, or carried or patched across flushes).
+static MEMBERSHIP_SEEK_CACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MEMBERSHIP_SEEK_DECLINED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Seeks declined because the label-relative budget, lower than the fixed
+/// cap, was exceeded: the columns were read instead.
+static MEMBERSHIP_SEEK_DECLINED_BUDGET: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Statements a set the index route built answered without a new seek: from
+/// the per-snapshot cache, or carried or patched across flushes and
+/// compactions.
+#[doc(hidden)]
+pub fn filter_membership_seek_cache_hits() -> u64 {
+    MEMBERSHIP_SEEK_CACHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Seeks declined by the label-relative budget (process total).
+#[doc(hidden)]
+pub fn filter_membership_seek_budget_declines() -> u64 {
+    MEMBERSHIP_SEEK_DECLINED_BUDGET.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Filter membership sets `(resolved through a property index, declined by
-/// it and read from the filter's columns instead)` (process totals). A filter
-/// with no equality/IN conjunct is counted in neither.
+/// it and read from the filter's columns instead)` (process totals; budget
+/// declines are counted apart). A filter with no equality/IN conjunct is
+/// counted in neither.
 #[doc(hidden)]
 pub fn filter_membership_seeks() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -8412,6 +8511,15 @@ async fn seek_filter_membership(
     let Some(plan) = filter_seek_plan(filter, alias, params) else {
         return Ok(None);
     };
+    // Each candidate costs a lookup of its current version, a column read
+    // costs in proportion to the label: past a share of the label the read
+    // is cheaper. The population comes from the manifest only; when it is
+    // unknown the fixed cap alone applies.
+    let budget = filter_membership_seek_budget(
+        cap,
+        snapshot.manifest_label_population(label),
+        filter_membership_seek_population_divisor(),
+    );
     let started = std::time::Instant::now();
     let failure: std::sync::Mutex<Option<ExecError>> = std::sync::Mutex::new(None);
     let examined = std::sync::atomic::AtomicUsize::new(0);
@@ -8457,7 +8565,7 @@ async fn seek_filter_membership(
         let mut complete = true;
         for value in alternatives {
             // A posting over the remaining budget declines before any lookup.
-            let remaining = cap.saturating_sub(examined.load(Relaxed));
+            let remaining = budget.saturating_sub(examined.load(Relaxed));
             match snapshot
                 .indexed_node_ids_by_property_value_capped_where(
                     label, property, value, remaining, &keep,
@@ -8502,8 +8610,111 @@ async fn seek_filter_membership(
             from_index: true,
         })));
     }
-    MEMBERSHIP_SEEK_DECLINED.fetch_add(1, Relaxed);
+    if budget < cap {
+        // The label-relative budget, not the fixed cap, was the bound.
+        MEMBERSHIP_SEEK_DECLINED_BUDGET.fetch_add(1, Relaxed);
+    } else {
+        MEMBERSHIP_SEEK_DECLINED.fetch_add(1, Relaxed);
+    }
     Ok(None)
+}
+
+static MEMBERSHIP_SPECULATIVE_USED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MEMBERSHIP_SPECULATIVE_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Speculative column reads started next to an index seek: `(used, because
+/// the seek declined; dropped, because the seek served)` (process totals).
+#[doc(hidden)]
+pub fn filter_membership_seek_speculation() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        MEMBERSHIP_SPECULATIVE_USED.load(Relaxed),
+        MEMBERSHIP_SPECULATIVE_DROPPED.load(Relaxed),
+    )
+}
+
+/// Whether a filter's column read starts together with its index seek.
+///
+/// Only where the label-relative budget, not the fixed cap, bounds the seek:
+/// the label is small enough that its column read is cheap, and the seek may
+/// decline after its posting probes. Reading the columns meanwhile hides the
+/// probes' round trips behind the read the decline needs anyway. On a larger
+/// label (or one of unknown size) the fixed cap binds, and a speculative read
+/// would cost real egress and memory for every first sighting the seek
+/// serves, so the routes run one after the other as before.
+fn speculate_column_read(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    alias: &str,
+    filter: &Expression,
+    params: &Params,
+) -> bool {
+    let cap = filter_membership_seek_cap();
+    let divisor = filter_membership_seek_population_divisor();
+    if cap == 0 || divisor == 0 || label.is_empty() {
+        return false;
+    }
+    let Some(population) = snapshot.manifest_label_population(label) else {
+        return false;
+    };
+    filter_membership_seek_budget(cap, Some(population), divisor) < cap
+        && filter_seek_plan(filter, alias, params).is_some()
+}
+
+/// A filter's membership resolved whole: through a property index when an
+/// equality/IN conjunct is served by one, otherwise from the filter's
+/// columns. The flag is `true` when the columns answered.
+///
+/// Where [`speculate_column_read`] allows, both routes start together (in this
+/// statement's task, under its memory account, deadline and cancel scope):
+/// the seek's answer wins and the column read is dropped unfinished; a
+/// declined seek takes the column read's answer.
+async fn seek_or_column_membership(
+    snapshot: &Snapshot<'_>,
+    label: &str,
+    alias: &str,
+    properties: &BTreeSet<String>,
+    filter: &Expression,
+    params: &Params,
+) -> Result<(Option<Arc<FilterMembership>>, bool), ExecError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !speculate_column_read(snapshot, label, alias, filter, params) {
+        if let Some(membership) =
+            seek_filter_membership(snapshot, label, alias, properties, filter, params).await?
+        {
+            return Ok((Some(membership), false));
+        }
+        let membership =
+            compute_filter_membership(snapshot, label, alias, properties, filter, params).await?;
+        return Ok((membership, true));
+    }
+    let seek = seek_filter_membership(snapshot, label, alias, properties, filter, params);
+    let column = compute_filter_membership(snapshot, label, alias, properties, filter, params);
+    tokio::pin!(seek);
+    tokio::pin!(column);
+    let mut column_done = None;
+    loop {
+        tokio::select! {
+            biased;
+            seeked = &mut seek => {
+                if let Some(membership) = seeked? {
+                    MEMBERSHIP_SPECULATIVE_DROPPED.fetch_add(1, Relaxed);
+                    return Ok((Some(membership), false));
+                }
+                MEMBERSHIP_SPECULATIVE_USED.fetch_add(1, Relaxed);
+                let membership = match column_done {
+                    Some(done) => done,
+                    None => column.await,
+                }?;
+                return Ok((membership, true));
+            }
+            read = &mut column, if column_done.is_none() => {
+                column_done = Some(read);
+            }
+        }
+    }
 }
 
 /// Unflushed rows a membership set is patched with instead of rescanned
@@ -8538,12 +8749,32 @@ async fn compute_fresh_filter_membership(
         .node_data_lineage()
         .filter(|_| unflushed.len() <= filter_membership_fresh_max_rows())
     else {
-        return compute_filter_membership(snapshot, label, alias, properties, filter, params).await;
+        // No set can be kept across statements for this snapshot (staged
+        // writes, or more unflushed rows than a patch reads): resolve it
+        // whole, through the index when it serves the filter.
+        return Ok(
+            seek_or_column_membership(snapshot, label, alias, properties, filter, params)
+                .await?
+                .0,
+        );
     };
-    let base = persisted_filter_membership(
+    let base = match persisted_filter_membership(
         snapshot, lineage, key, label, alias, properties, filter, params,
     )
-    .await?;
+    .await?
+    {
+        Kept::Set(base) => base,
+        Kept::Deferred => {
+            // The kept set is being carried in the background (or its carry
+            // backs off after failing): this statement resolves the filter
+            // whole, as for a filter seen for the first time.
+            return Ok(seek_or_column_membership(
+                snapshot, label, alias, properties, filter, params,
+            )
+            .await?
+            .0);
+        }
+    };
     let Some(base) = base else {
         return Ok(None);
     };
@@ -8551,7 +8782,7 @@ async fn compute_fresh_filter_membership(
         return Ok(Some(base));
     }
     let (ids, visited_fresh) = patch_membership_ids(
-        snapshot, &base.ids, &unflushed, label, alias, filter, params,
+        snapshot, &base.ids, &unflushed, label, alias, filter, params, false,
     )
     .await?;
     if ids.len() > filter_membership_max_ids() {
@@ -8562,13 +8793,15 @@ async fn compute_fresh_filter_membership(
         // Selectivity only sizes search rounds: the flushed count plus the
         // unflushed label rows bounds the live label from above.
         visited: base.visited.saturating_add(visited_fresh),
-        from_index: false,
+        from_index: base.from_index,
     })))
 }
 
 /// `base` with every id of `changed` (sorted) re-evaluated on its version
 /// in `snapshot`: removed, then re-admitted when that version carries
 /// `label` and passes `filter`. Also returns how many of them carry `label`.
+/// `pace`: background work (a carry), which yields to statements.
+#[allow(clippy::too_many_arguments)]
 async fn patch_membership_ids(
     snapshot: &Snapshot<'_>,
     base: &[NodeId],
@@ -8577,12 +8810,19 @@ async fn patch_membership_ids(
     alias: &str,
     filter: &Expression,
     params: &Params,
+    pace: bool,
 ) -> Result<(Vec<NodeId>, usize), ExecError> {
     let mut admitted = Vec::new();
     let mut visited = 0usize;
     for chunk in changed.chunks(256) {
         crate::exec::limits::check_deadline()?;
+        let started = std::time::Instant::now();
         let views = snapshot.batch_lookup_nodes(label, chunk).await?;
+        if pace {
+            let held =
+                (base.len() + changed.len() + admitted.len()) * std::mem::size_of::<NodeId>();
+            carry_pace(started.elapsed(), held).await?;
+        }
         for view in views.into_iter().flatten() {
             if !view.labels.contains(label) {
                 continue;
@@ -8635,6 +8875,15 @@ static MEMBERSHIP_REUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static MEMBERSHIP_CARRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MEMBERSHIP_PATCHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MEMBERSHIP_RECOMPUTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// SSTs whose row keys a carry or patch read from storage (process total).
+static SST_ROW_KEY_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// SSTs whose row keys a carry or patch read from storage (process total).
+#[doc(hidden)]
+pub fn filter_membership_sst_key_reads() -> u64 {
+    SST_ROW_KEY_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Flushed-corpus filter membership sets served `(reused, carried across a
 /// compaction, patched with newer rows, recomputed)` (process totals).
@@ -8778,6 +9027,7 @@ async fn sst_row_keys(
             }
         }
     }
+    SST_ROW_KEY_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let keys = Arc::new(snapshot.node_sst_row_keys(sst).await?);
     let budget = filter_cache_max_bytes();
     let bytes = entry_bytes(&keys);
@@ -8830,14 +9080,22 @@ async fn persisted_filter_membership(
     properties: &BTreeSet<String>,
     filter: &Expression,
     params: &Params,
-) -> Result<Option<Arc<FilterMembership>>, ExecError> {
+) -> Result<Kept, ExecError> {
     use std::sync::atomic::Ordering::Relaxed;
     let mut ssts = snapshot.persisted_node_ssts();
     ssts.sort_unstable_by_key(|span| span.id);
     let watermark = ssts.iter().map(|span| span.max_lsn).max().unwrap_or(0);
     let cache_key = (lineage, key.to_string());
     let persisted = snapshot.persisted_only();
-    if let Some(cached) = persisted_membership_get(&cache_key, watermark) {
+    // A set the index route built is not an answer once that route is turned
+    // off: the column read below replaces it.
+    let seek_off = filter_membership_seek_cap() == 0;
+    let cached = persisted_membership_get(&cache_key, watermark)
+        .filter(|cached| !(seek_off && cached.membership.as_ref().is_some_and(|m| m.from_index)));
+    if let Some(cached) = cached {
+        if cached.membership.as_ref().is_some_and(|m| m.from_index) {
+            MEMBERSHIP_SEEK_CACHED.fetch_add(1, Relaxed);
+        }
         let in_list = |list: &[namidb_storage::NodeSstSpan], id: uuid::Uuid| {
             list.binary_search_by_key(&id, |span| span.id).is_ok()
         };
@@ -8855,10 +9113,30 @@ async fn persisted_filter_membership(
         // an attach of rows the set never saw.
         let attach =
             removed.is_empty() && added.iter().any(|span| span.max_lsn <= cached.watermark);
+        // SSTs gone and every new one at or below `W`: a compaction rewrote
+        // only rows the set already reflects, so the newest version of each
+        // row, and the set, are unchanged. Carried without reading the new
+        // SSTs' keys: on a large label that read can outlast a statement,
+        // and a carry that never finishes is never kept.
+        // A compaction output keeps its inputs' high-water LSN, so one that
+        // consumed a newer row (a tombstone dropped with the row it shadows
+        // included) is above `W`; the removed SSTs are checked as well.
+        let rewrite_only = carry_is_rewrite_only(&removed, &added, cached.watermark);
+        tracing::debug!(
+            target: "namidb::search_timing",
+            label,
+            removed = removed.len(),
+            added = added.len(),
+            attach,
+            rewrite_only,
+            from = cached.watermark,
+            to = watermark,
+            "filter membership kept for an earlier corpus"
+        );
         if !attach {
             if removed.is_empty() && added.is_empty() {
                 MEMBERSHIP_REUSED.fetch_add(1, Relaxed);
-                return Ok(cached.membership.clone());
+                return Ok(Kept::Set(cached.membership.clone()));
             }
             if cached.membership.is_none() {
                 // Too large to keep: it stays declined until a recompute.
@@ -8871,92 +9149,79 @@ async fn persisted_filter_membership(
                         ssts,
                     }),
                 );
-                return Ok(None);
+                return Ok(Kept::Set(None));
             }
-            let mut changed = Vec::new();
-            let mut present = Vec::new();
-            for span in &added {
-                let keys = sst_row_keys(&persisted, span.id).await?;
-                debug_assert!(
-                    span.min_lsn <= cached.watermark
-                        || keys.iter().all(|(_, lsn)| *lsn > cached.watermark),
-                    "an SST whose min_lsn is above the watermark holds an older row"
+            if rewrite_only {
+                MEMBERSHIP_CARRIED.fetch_add(1, Relaxed);
+                tracing::debug!(
+                    target: "namidb::search_timing",
+                    label,
+                    added = added.len(),
+                    removed = removed.len(),
+                    from = cached.watermark,
+                    to = watermark,
+                    "filter membership carried over a rewrite of seen rows"
                 );
-                changed.extend(
-                    keys.iter()
-                        .filter(|(_, lsn)| *lsn > cached.watermark)
-                        .map(|(id, _)| *id),
+                persisted_membership_put(
+                    cache_key,
+                    Arc::new(PersistedMembership {
+                        membership: cached.membership.clone(),
+                        watermark,
+                        ssts,
+                    }),
                 );
-                if !removed.is_empty() {
-                    present.extend(keys.iter().map(|(id, _)| *id));
-                }
+                return Ok(Kept::Set(cached.membership.clone()));
             }
-            if let (Some(base), false) = (&cached.membership, removed.is_empty()) {
-                present.sort_unstable();
-                present.dedup();
-                let in_removed_range = |id: &NodeId| {
-                    let bytes = *id.as_bytes();
-                    removed
-                        .iter()
-                        .any(|span| span.min_key <= bytes && bytes <= span.max_key)
-                };
-                changed.extend(
-                    base.ids
-                        .iter()
-                        .copied()
-                        .filter(|id| in_removed_range(id) && present.binary_search(id).is_err()),
-                );
-            }
-            changed.sort_unstable();
-            changed.dedup();
-            let membership = match &cached.membership {
-                Some(base) if !changed.is_empty() => {
-                    // Newest version of each id: the flushed corpus merges
-                    // every SST, so a newer row always wins.
-                    let (ids, visited) = patch_membership_ids(
-                        &persisted, &base.ids, &changed, label, alias, filter, params,
-                    )
-                    .await?;
-                    (ids.len() <= filter_membership_max_ids()).then(|| {
-                        Arc::new(FilterMembership {
-                            visited: base.visited.max(ids.len()).max(visited),
-                            ids: Arc::new(ids),
-                            from_index: false,
-                        })
-                    })
-                }
-                other => other.clone(),
-            };
-            let counter = if changed.is_empty() {
-                &MEMBERSHIP_CARRIED
-            } else {
-                &MEMBERSHIP_PATCHED
-            };
-            counter.fetch_add(1, Relaxed);
-            tracing::debug!(
-                target: "namidb::search_timing",
-                label,
-                changed = changed.len(),
-                added = added.len(),
-                removed = removed.len(),
-                from = cached.watermark,
-                to = watermark,
-                "filter membership carried forward"
-            );
-            persisted_membership_put(
+            // Newer rows to read: a background job, so no statement waits
+            // past a short grace on it (see `carry_in_background`).
+            let job = CarryJob {
+                persisted: snapshot.persisted_only(),
+                removed: removed.into_iter().copied().collect(),
+                added: added.into_iter().copied().collect(),
+                cached: cached.clone(),
+                ssts,
+                watermark,
                 cache_key,
-                Arc::new(PersistedMembership {
-                    membership: membership.clone(),
-                    watermark,
-                    ssts,
-                }),
-            );
-            return Ok(membership);
+                label: label.to_string(),
+                alias: alias.to_string(),
+                filter: filter.clone(),
+                params: params.clone(),
+            };
+            return Ok(carry_in_background(job).await);
         }
     }
-    let membership =
-        compute_filter_membership(&persisted, label, alias, properties, filter, params).await?;
-    MEMBERSHIP_RECOMPUTED.fetch_add(1, Relaxed);
+    // Nothing kept for this lineage: the flushed corpus through the index
+    // when it serves the filter, else its columns. Either set is kept and
+    // carried forward the same way.
+    if tracing::enabled!(target: "namidb::search_timing", tracing::Level::DEBUG) {
+        let kept = persisted_membership_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            .iter()
+            .filter(|(cached, _)| cached.1 == cache_key.1)
+            .map(|(cached, entry)| {
+                format!(
+                    "lineage_match={} watermark={}",
+                    cached.0 == cache_key.0,
+                    entry.watermark
+                )
+            })
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            target: "namidb::search_timing",
+            label,
+            watermark,
+            ssts = ssts.len(),
+            ?kept,
+            "filter membership not kept for this corpus"
+        );
+    }
+    let (membership, from_columns) =
+        seek_or_column_membership(&persisted, label, alias, properties, filter, params).await?;
+    if from_columns {
+        MEMBERSHIP_RECOMPUTED.fetch_add(1, Relaxed);
+    }
     persisted_membership_put(
         cache_key,
         Arc::new(PersistedMembership {
@@ -8965,7 +9230,514 @@ async fn persisted_filter_membership(
             ssts,
         }),
     );
-    Ok(membership)
+    Ok(Kept::Set(membership))
+}
+
+/// Whether a change of flushed corpus from `removed` to `added` SSTs only
+/// rewrote rows at or below `watermark`: then the newest version of every
+/// row, and any set computed at `watermark`, are unchanged. Both sides are
+/// checked: a merge that consumed a newer row (a tombstone dropped together
+/// with the row it shadows) leaves no trace of it in its outputs' rows, only
+/// in its inputs.
+fn carry_is_rewrite_only(
+    removed: &[&namidb_storage::NodeSstSpan],
+    added: &[&namidb_storage::NodeSstSpan],
+    watermark: u64,
+) -> bool {
+    !removed.is_empty()
+        && removed.iter().all(|span| span.max_lsn <= watermark)
+        && added.iter().all(|span| span.max_lsn <= watermark)
+}
+
+/// What [`persisted_filter_membership`] answers: the flushed corpus's set
+/// (`None` when too large to keep), or `Deferred` while a carry or patch of
+/// the kept set runs in the background (or backs off after failing).
+enum Kept {
+    Set(Option<Arc<FilterMembership>>),
+    Deferred,
+}
+
+/// A carry or patch of a kept set to a newer flushed corpus, owned so it
+/// can run off the statement.
+struct CarryJob {
+    persisted: Snapshot<'static>,
+    cached: Arc<PersistedMembership>,
+    removed: Vec<namidb_storage::NodeSstSpan>,
+    added: Vec<namidb_storage::NodeSstSpan>,
+    ssts: Vec<namidb_storage::NodeSstSpan>,
+    watermark: u64,
+    cache_key: PersistedMembershipKey,
+    label: String,
+    alias: String,
+    filter: Expression,
+    params: Params,
+}
+
+enum CarryState {
+    /// In flight toward the corpus at `watermark`; `done` turns `true` when
+    /// it settles, `cancel` stops it at its next probe.
+    Running {
+        id: u64,
+        watermark: u64,
+        /// How many carries this one replaced as stale, in a row.
+        restarts: u32,
+        done: tokio::sync::watch::Receiver<bool>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    /// Failed `failures` times in a row; not retried before `retry_at`.
+    Failed {
+        failures: u32,
+        retry_at: std::time::Instant,
+    },
+}
+
+#[allow(clippy::type_complexity)]
+fn carry_states() -> &'static std::sync::Mutex<Vec<(PersistedMembershipKey, CarryState)>> {
+    static STATES: std::sync::OnceLock<
+        std::sync::Mutex<Vec<(PersistedMembershipKey, CarryState)>>,
+    > = std::sync::OnceLock::new();
+    STATES.get_or_init(Default::default)
+}
+
+/// How long a statement waits on a carry before answering without it
+/// (`NAMIDB_FILTER_MEMBERSHIP_CARRY_WAIT_MS`, default 1000). A patch after a
+/// flush reads one small SST and settles well within it.
+fn filter_membership_carry_wait() -> std::time::Duration {
+    let overridden = CARRY_WAIT_MS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let ms = if overridden != u64::MAX {
+        overridden
+    } else {
+        static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *WAIT.get_or_init(|| {
+            std::env::var("NAMIDB_FILTER_MEMBERSHIP_CARRY_WAIT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(1000)
+        })
+    };
+    std::time::Duration::from_millis(ms)
+}
+
+/// Most carries in flight at once across the engine
+/// (`NAMIDB_FILTER_MEMBERSHIP_CARRY_MAX`, default 2, `0` keeps every carry
+/// deferred). A carry over the cap is not queued: its statements answer
+/// without the kept set, and a later statement starts it when a slot is
+/// free.
+fn filter_membership_carry_max() -> usize {
+    let overridden = CARRY_MAX_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if overridden != u64::MAX {
+        return usize::try_from(overridden).unwrap_or(usize::MAX);
+    }
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("NAMIDB_FILTER_MEMBERSHIP_CARRY_MAX")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Cancel every carry of `namespace_prefix` (the namespace closes) and drop
+/// its kept sets and back-off records. A carry only fills a process cache,
+/// so stopping one at any point loses nothing durable.
+pub fn cancel_filter_membership_carries(namespace_prefix: &str) {
+    let mut states = carry_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    states.retain(|((lineage, _), state)| {
+        if lineage.0.as_ref() != namespace_prefix {
+            return true;
+        }
+        if let CarryState::Running { cancel, .. } = state {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        false
+    });
+    drop(states);
+    let mut guard = persisted_membership_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (entries, used) = &mut *guard;
+    entries.retain(|(key, entry)| {
+        let keep = key.0 .0.as_ref() != namespace_prefix;
+        if !keep {
+            *used = used.saturating_sub(entry.bytes());
+        }
+        keep
+    });
+}
+
+/// Back-off after `failures` failed carries in a row: 5 s doubling to 5 min.
+fn carry_backoff(failures: u32) -> std::time::Duration {
+    let base = match CARRY_BACKOFF_MS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => 5_000,
+        ms => ms,
+    };
+    std::time::Duration::from_millis(
+        base.saturating_mul(1u64 << failures.saturating_sub(1).min(6))
+            .min(300_000),
+    )
+}
+
+static CARRY_WAIT_MS_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static CARRY_BACKOFF_MS_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static CARRY_MAX_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static CARRY_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CARRY_CANCELLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CARRY_TEST_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CARRY_TEST_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CARRY_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CARRY_DEFERRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CARRY_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test hook: the carry wait, back-off base and concurrency cap (`None`
+/// restores the defaults), an injected delay before each background carry,
+/// and whether it fails. Process-wide; tests that use it must not run
+/// concurrently.
+#[doc(hidden)]
+pub fn set_filter_membership_carry_for_tests(
+    wait_ms: Option<u64>,
+    backoff_ms: Option<u64>,
+    max: Option<u64>,
+    delay_ms: u64,
+    fail: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    CARRY_MAX_OVERRIDE.store(max.unwrap_or(u64::MAX), Relaxed);
+    CARRY_WAIT_MS_OVERRIDE.store(wait_ms.unwrap_or(u64::MAX), Relaxed);
+    CARRY_BACKOFF_MS_OVERRIDE.store(backoff_ms.unwrap_or(u64::MAX), Relaxed);
+    CARRY_TEST_DELAY_MS.store(delay_ms, Relaxed);
+    CARRY_TEST_FAIL.store(fail, Relaxed);
+}
+
+/// Background carry totals (process-wide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FilterMembershipCarries {
+    /// Carries started.
+    pub started: u64,
+    /// Statements that answered without the kept set: its carry was in
+    /// flight, backing off, over the concurrency cap, or refused at the
+    /// memory ceiling.
+    pub deferred: u64,
+    /// Carries that failed (each starts a back-off).
+    pub failed: u64,
+    /// Carries stopped because a newer corpus replaced theirs or the
+    /// namespace closed.
+    pub cancelled: u64,
+}
+
+#[doc(hidden)]
+pub fn filter_membership_carries() -> FilterMembershipCarries {
+    use std::sync::atomic::Ordering::Relaxed;
+    FilterMembershipCarries {
+        started: CARRY_STARTED.load(Relaxed),
+        deferred: CARRY_DEFERRED.load(Relaxed),
+        failed: CARRY_FAILED.load(Relaxed),
+        cancelled: CARRY_CANCELLED.load(Relaxed),
+    }
+}
+
+/// Test hook: whether any background carry is in flight or backing off.
+#[doc(hidden)]
+pub fn filter_membership_carry_pending() -> bool {
+    carry_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(_, state)| matches!(state, CarryState::Running { .. }))
+}
+
+/// Run `job` once per kept set (single flight), on a task of its own that no
+/// statement deadline bounds, and wait at most
+/// [`filter_membership_carry_wait`] for it. A carry that settles in time
+/// answers; otherwise the statement answers without the kept set
+/// (`Kept::Deferred`). A finished carry is kept like any other set, so a
+/// later statement finds it.
+///
+/// Background work must not starve reads:
+/// - at most [`filter_membership_carry_max`] carries run at once; one over
+///   the cap is not started (nor queued);
+/// - a carry holds a memory account of its own, with the starting
+///   statement's per-query limit, shared pool and process probe, so it stops
+///   at the same ceilings and returns its reservation when it ends; it is
+///   not started while the process is at its ceiling;
+/// - its cancel token is its own: the starting statement's deadline,
+///   cancel or disconnect does not stop it;
+/// - it pauses between reads while statements run, as index builds do;
+/// - a failed carry backs off before it is tried again;
+/// - a carry toward a corpus a newer one replaced is cancelled once (a
+///   second replacement lets the running one finish, so a steady stream of
+///   flushes cannot keep a carry from ever finishing), and every carry of a
+///   namespace is cancelled when the namespace closes.
+///
+/// A carry does not count as maintenance for idle-stop: stopping the engine
+/// aborts it, which is safe because it only fills a process cache.
+async fn carry_in_background(job: CarryJob) -> Kept {
+    use std::sync::atomic::Ordering::Relaxed;
+    let key = job.cache_key.clone();
+    let watermark = job.watermark;
+    // The carry outlives the statement that starts it, so it takes an
+    // account of its own (same limit, pool and probe), not this one's.
+    let account =
+        crate::exec::memory::current_query_memory().map(|budget| budget.background_account());
+    let receiver = {
+        let mut states = carry_states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let position = states.iter().position(|(cached, _)| *cached == key);
+        // `Ok(receiver)`: wait on it; `Err((failures, restarts))`: start
+        // one; `None`: answer without the kept set now.
+        let decision = match position.map(|position| &states[position].1) {
+            Some(CarryState::Running {
+                watermark: running,
+                done,
+                ..
+            }) if *running == watermark => Some(Ok(done.clone())),
+            Some(CarryState::Running {
+                watermark: running,
+                restarts,
+                cancel,
+                ..
+            }) if *running < watermark && *restarts == 0 => {
+                cancel.store(true, Relaxed);
+                Some(Err((0, 1)))
+            }
+            Some(CarryState::Running { .. }) => None,
+            Some(CarryState::Failed { retry_at, .. }) if std::time::Instant::now() < *retry_at => {
+                None
+            }
+            Some(CarryState::Failed { failures, .. }) => Some(Err((*failures, 0))),
+            None => Some(Err((0, 0))),
+        };
+        let running = states
+            .iter()
+            .filter(|(cached, state)| *cached != key && matches!(state, CarryState::Running { .. }))
+            .count();
+        match decision {
+            None => None,
+            Some(Ok(receiver)) => Some(receiver),
+            Some(Err(_)) if running >= filter_membership_carry_max() => None,
+            Some(Err(_)) if account.as_ref().is_some_and(|a| a.at_process_ceiling()) => None,
+            Some(Err((failures, restarts))) => {
+                if let Some(position) = position {
+                    states.remove(position);
+                }
+                let id = CARRY_IDS.fetch_add(1, Relaxed);
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (sender, receiver) = tokio::sync::watch::channel(false);
+                states.push((
+                    key.clone(),
+                    CarryState::Running {
+                        id,
+                        watermark,
+                        restarts,
+                        done: receiver.clone(),
+                        cancel: cancel.clone(),
+                    },
+                ));
+                CARRY_STARTED.fetch_add(1, Relaxed);
+                let task_key = key.clone();
+                tokio::spawn(async move {
+                    use futures::FutureExt;
+                    // Its own cancel token and memory account: the starting
+                    // statement's deadline, cancel or disconnect does not
+                    // reach it (task-locals do not cross `spawn`), and the
+                    // account's reservation returns when it ends, however.
+                    let run = namidb_storage::cancel::with_cancel_flag(
+                        cancel.clone(),
+                        crate::exec::memory::with_query_memory(account, run_carry(job)),
+                    );
+                    let outcome = std::panic::AssertUnwindSafe(run)
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Err(ExecError::Runtime("carry panicked".into())));
+                    let mut states = carry_states()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    states.retain(|(cached, state)| {
+                        !(*cached == task_key
+                            && matches!(state, CarryState::Running { id: running, .. } if *running == id))
+                    });
+                    let ours = !states.iter().any(|(cached, _)| *cached == task_key);
+                    match outcome {
+                        Ok(()) => {}
+                        Err(_) if cancel.load(Relaxed) => {
+                            CARRY_CANCELLED.fetch_add(1, Relaxed);
+                        }
+                        Err(error) => {
+                            CARRY_FAILED.fetch_add(1, Relaxed);
+                            let failures = failures.saturating_add(1);
+                            tracing::warn!(
+                                %error,
+                                failures,
+                                "filter membership carry failed; answering without the kept set"
+                            );
+                            if ours {
+                                states.push((
+                                    task_key,
+                                    CarryState::Failed {
+                                        failures,
+                                        retry_at: std::time::Instant::now()
+                                            + carry_backoff(failures),
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    drop(states);
+                    let _ = sender.send(true);
+                });
+                Some(receiver)
+            }
+        }
+    };
+    if let Some(mut receiver) = receiver {
+        // Never past the statement's own deadline.
+        let wait = namidb_storage::cancel::current_deadline().map_or(
+            filter_membership_carry_wait(),
+            |deadline| {
+                filter_membership_carry_wait()
+                    .min(deadline.saturating_duration_since(std::time::Instant::now()))
+            },
+        );
+        let settled = tokio::time::timeout(wait, receiver.wait_for(|done| *done)).await;
+        if matches!(settled, Ok(Ok(_))) {
+            if let Some(kept) =
+                persisted_membership_get(&key, watermark).filter(|kept| kept.watermark == watermark)
+            {
+                return Kept::Set(kept.membership.clone());
+            }
+        }
+    }
+    CARRY_DEFERRED.fetch_add(1, Relaxed);
+    Kept::Deferred
+}
+
+/// Between two reads of a carry: charge the `held` bytes it keeps to its
+/// account, stop if cancelled or over a memory ceiling, and while
+/// statements run, pause for `worked` scaled by the maintenance duty cycle
+/// (see [`namidb_storage::background`]).
+async fn carry_pace(worked: std::time::Duration, held: usize) -> Result<(), ExecError> {
+    crate::exec::memory::hold_bytes(held)?;
+    crate::exec::limits::check_deadline()?;
+    namidb_storage::background::yield_to_foreground(worked).await;
+    crate::exec::limits::check_deadline()
+}
+
+/// The carry or patch itself: the keys of the new SSTs name the rows newer
+/// than the kept set's watermark (and, after a merge, members that vanished
+/// from the merged key ranges); those are re-evaluated on their newest
+/// version and the result is kept for the new corpus.
+async fn run_carry(job: CarryJob) -> Result<(), ExecError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let delay = CARRY_TEST_DELAY_MS.load(Relaxed);
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(delay);
+    while std::time::Instant::now() < until {
+        crate::exec::limits::check_deadline()?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if CARRY_TEST_FAIL.load(Relaxed) {
+        return Err(ExecError::Runtime("injected carry failure".into()));
+    }
+    let CarryJob {
+        persisted,
+        cached,
+        removed,
+        added,
+        ssts,
+        watermark,
+        cache_key,
+        label,
+        alias,
+        filter,
+        params,
+    } = job;
+    let (label, alias) = (label.as_str(), alias.as_str());
+    let mut changed = Vec::new();
+    let mut present = Vec::new();
+    for span in &added {
+        let started = std::time::Instant::now();
+        let keys = sst_row_keys(&persisted, span.id).await?;
+        let held = (changed.len() + present.len() + keys.len()) * std::mem::size_of::<NodeId>()
+            + cached.bytes();
+        carry_pace(started.elapsed(), held).await?;
+        debug_assert!(
+            span.min_lsn <= cached.watermark || keys.iter().all(|(_, lsn)| *lsn > cached.watermark),
+            "an SST whose min_lsn is above the watermark holds an older row"
+        );
+        changed.extend(
+            keys.iter()
+                .filter(|(_, lsn)| *lsn > cached.watermark)
+                .map(|(id, _)| *id),
+        );
+        if !removed.is_empty() {
+            present.extend(keys.iter().map(|(id, _)| *id));
+        }
+    }
+    if let (Some(base), false) = (&cached.membership, removed.is_empty()) {
+        present.sort_unstable();
+        present.dedup();
+        let in_removed_range = |id: &NodeId| {
+            let bytes = *id.as_bytes();
+            removed
+                .iter()
+                .any(|span| span.min_key <= bytes && bytes <= span.max_key)
+        };
+        changed.extend(
+            base.ids
+                .iter()
+                .copied()
+                .filter(|id| in_removed_range(id) && present.binary_search(id).is_err()),
+        );
+    }
+    changed.sort_unstable();
+    changed.dedup();
+    let membership = match &cached.membership {
+        Some(base) if !changed.is_empty() => {
+            // Newest version of each id: the flushed corpus merges every
+            // SST, so a newer row always wins.
+            let (ids, visited) = patch_membership_ids(
+                &persisted, &base.ids, &changed, label, alias, &filter, &params, true,
+            )
+            .await?;
+            (ids.len() <= filter_membership_max_ids()).then(|| {
+                Arc::new(FilterMembership {
+                    visited: base.visited.max(ids.len()).max(visited),
+                    ids: Arc::new(ids),
+                    from_index: base.from_index,
+                })
+            })
+        }
+        other => other.clone(),
+    };
+    let counter = if changed.is_empty() {
+        &MEMBERSHIP_CARRIED
+    } else {
+        &MEMBERSHIP_PATCHED
+    };
+    counter.fetch_add(1, Relaxed);
+    tracing::debug!(
+        target: "namidb::search_timing",
+        label,
+        changed = changed.len(),
+        added = added.len(),
+        removed = removed.len(),
+        from = cached.watermark,
+        to = watermark,
+        "filter membership carried forward"
+    );
+    persisted_membership_put(
+        cache_key,
+        Arc::new(PersistedMembership {
+            membership,
+            watermark,
+            ssts,
+        }),
+    );
+    Ok(())
 }
 
 /// Test hook: the `label` nodes a procedure-style `filter` map admits on
@@ -11172,7 +11944,7 @@ pub(crate) fn cross_product(left: Vec<Row>, right: Vec<Row>) -> Result<Vec<Row>,
     for l in &left {
         for r in &right {
             guard.tick()?;
-            if out.len() % METER_STRIDE == 0 {
+            if out.len().is_multiple_of(METER_STRIDE) {
                 crate::exec::limits::check_row_cap(out.len())?;
                 meter.observe(&out)?;
             }
@@ -13572,7 +14344,7 @@ async fn execute_expand_factor(
             for ((cur_parent, tail, rels), neighbours) in step_neighbours {
                 for edge in neighbours {
                     guard_tick = guard_tick.wrapping_add(1);
-                    if guard_tick % 4096 == 0 {
+                    if guard_tick.is_multiple_of(4096) {
                         crate::exec::limits::check_deadline()?;
                         crate::exec::limits::check_row_cap(
                             out_leaves.len()
@@ -15203,6 +15975,31 @@ fn visit_set_op(s: &crate::plan::logical::SetOp, out: &mut BTreeSet<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_carry_is_blind_only_when_every_removed_and_added_sst_is_at_or_below_the_watermark() {
+        let span = |max_lsn| namidb_storage::NodeSstSpan {
+            id: uuid::Uuid::new_v4(),
+            min_lsn: 1,
+            max_lsn,
+            min_key: [0; 16],
+            max_key: [0xff; 16],
+            row_count: 1,
+        };
+        let (old, newer) = (span(10), span(11));
+        let below = span(9);
+        assert!(super::carry_is_rewrite_only(&[&old], &[&below], 10));
+        // A merge that dropped a newer tombstone with the row it shadows:
+        // its output shows nothing above the watermark, its input does.
+        assert!(!super::carry_is_rewrite_only(
+            &[&old, &newer],
+            &[&below],
+            10
+        ));
+        assert!(!super::carry_is_rewrite_only(&[&old], &[&newer], 10));
+        // Nothing removed is a flush, not a rewrite.
+        assert!(!super::carry_is_rewrite_only(&[], &[&below], 10));
+    }
     use super::*;
     use namidb_core::id::{NamespaceId, NodeId};
     use namidb_core::value::Value as CoreValue;

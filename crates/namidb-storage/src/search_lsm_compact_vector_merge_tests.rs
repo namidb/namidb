@@ -88,7 +88,7 @@ fn embedding(ordinal: u64, version: u64) -> Vec<f32> {
 }
 
 fn tag(ordinal: u64) -> Option<&'static str> {
-    (ordinal % 7 != 0).then(|| TAGS[(ordinal % 3) as usize])
+    (!ordinal.is_multiple_of(7)).then(|| TAGS[(ordinal % 3) as usize])
 }
 
 /// About 3 KB of poorly compressible text per node, so the node tables are

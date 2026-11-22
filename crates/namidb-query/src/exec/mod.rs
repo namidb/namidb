@@ -38,10 +38,15 @@ pub use show::{
 };
 pub use value::{NodeValue, RelValue, RuntimeValue};
 pub use walker::{
-    eligibility_cache_hits, execute, execute_factor_path, execute_flat_path, execute_with_limits,
-    filter_membership_ids_for_tests, filter_membership_paths, filter_membership_seek_ids_for_tests,
-    filter_membership_seeks, set_filter_membership_seek_enabled, set_vector_member_scan_enabled,
-    vector_member_scans, ExecError,
+    cancel_filter_membership_carries, eligibility_cache_hits, execute, execute_factor_path,
+    execute_flat_path, execute_with_limits, filter_membership_carries,
+    filter_membership_carry_pending, filter_membership_ids_for_tests, filter_membership_paths,
+    filter_membership_seek_budget, filter_membership_seek_budget_declines,
+    filter_membership_seek_cache_hits, filter_membership_seek_ids_for_tests,
+    filter_membership_seek_speculation, filter_membership_seeks, filter_membership_sst_key_reads,
+    set_filter_membership_carry_for_tests, set_filter_membership_seek_cap_for_tests,
+    set_filter_membership_seek_enabled, set_filter_membership_seek_population_divisor,
+    set_vector_member_scan_enabled, vector_member_scans, ExecError, FilterMembershipCarries,
 };
 pub use writer::{
     enforce_node_unique_constraints, execute_write, execute_write_checked_with_deadline,

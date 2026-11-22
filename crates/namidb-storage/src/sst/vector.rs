@@ -937,7 +937,7 @@ fn validate_decoded_body(body: &VectorGraphBody, metric: VectorMetric) -> Result
                             "vector graph dense filter posting exceeds corpus",
                         ));
                     }
-                    if words.len() == posting_words && n % 64 != 0 {
+                    if words.len() == posting_words && !n.is_multiple_of(64) {
                         let valid_mask = (1u64 << (n % 64)) - 1;
                         if words.last().is_some_and(|word| word & !valid_mask != 0) {
                             return Err(Error::invariant(

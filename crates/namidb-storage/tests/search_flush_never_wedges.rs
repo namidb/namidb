@@ -57,7 +57,7 @@ fn article(ordinal: u64, texto: String) -> NodeWriteRecord {
     props.insert(
         "estado".into(),
         CoreValue::Str(
-            if ordinal % 4 == 0 {
+            if ordinal.is_multiple_of(4) {
                 "derogado"
             } else {
                 "vigente"

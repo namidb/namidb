@@ -1089,7 +1089,13 @@ impl NamespaceState {
                 // does not release this namespace's entries, so reclaim
                 // them eagerly.
                 if let Ok(ns_id) = NamespaceId::new(&self.namespace) {
-                    namidb_storage::prune_shared_caches(&NamespacePaths::new(root, ns_id));
+                    let paths = NamespacePaths::new(root, ns_id);
+                    namidb_storage::prune_shared_caches(&paths);
+                    // Background filter-membership carries of this namespace
+                    // stop with it.
+                    namidb_query::cancel_filter_membership_carries(
+                        paths.namespace_prefix().as_ref(),
+                    );
                 }
             })
             .await;

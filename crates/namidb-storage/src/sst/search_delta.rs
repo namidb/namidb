@@ -1367,7 +1367,7 @@ impl SearchSegmentWireBinding {
 }
 
 fn decode_directory(bytes: &[u8], header: &Header) -> Result<Vec<DirectoryEntry>> {
-    if bytes.len() % DIRECTORY_ENTRY_LEN != 0
+    if !bytes.len().is_multiple_of(DIRECTORY_ENTRY_LEN)
         || bytes.len() / DIRECTORY_ENTRY_LEN != header.page_count as usize
     {
         return Err(Error::invariant(

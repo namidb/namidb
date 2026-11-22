@@ -1181,18 +1181,73 @@ impl Metrics {
                 "namidb_filter_membership_total{{path=\"{path}\"}} {value}"
             );
         }
+        let carries = namidb_query::filter_membership_carries();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_filter_membership_carry_total Carries of a kept filter membership set \
+             to a newer flushed corpus that read new rows, run in the background: started, \
+             failed (retried after a back-off), cancelled (a newer corpus replaced it, or the \
+             namespace closed), and statements that answered without the kept set while its \
+             carry was in flight, backing off, over the concurrency cap or refused at the \
+             memory ceiling (carry_deferred)."
+        );
+        let _ = writeln!(out, "# TYPE namidb_filter_membership_carry_total counter");
+        for (outcome, value) in [
+            ("started", carries.started),
+            ("failed", carries.failed),
+            ("cancelled", carries.cancelled),
+            ("carry_deferred", carries.deferred),
+        ] {
+            let _ = writeln!(
+                out,
+                "namidb_filter_membership_carry_total{{outcome=\"{outcome}\"}} {value}"
+            );
+        }
         let (seek_served, seek_declined) = namidb_query::filter_membership_seeks();
+        let seek_cached = namidb_query::filter_membership_seek_cache_hits();
+        let seek_declined_budget = namidb_query::filter_membership_seek_budget_declines();
+        let (speculative_used, speculative_dropped) =
+            namidb_query::filter_membership_seek_speculation();
         let _ = writeln!(
             out,
             "# HELP namidb_filter_membership_seek_total Search filter membership sets with an \
              equality or IN conjunct, by whether a property index resolved them (served) or the \
-             filter's columns were read instead (declined: no index, or a posting over the cap)."
+             filter's columns were read instead (declined: no index, or a posting over the cap; \
+             declined_budget: a posting over the label-relative budget), and statements a set \
+             built that way answered without a new seek (cached). On a label small enough for the \
+             label-relative budget to bind, the column read starts next to the seek: \
+             speculative_used counts the declines it answered, speculative_dropped the reads \
+             dropped because the seek served."
         );
         let _ = writeln!(out, "# TYPE namidb_filter_membership_seek_total counter");
-        for (outcome, value) in [("served", seek_served), ("declined", seek_declined)] {
+        for (outcome, value) in [
+            ("served", seek_served),
+            ("declined", seek_declined),
+            ("declined_budget", seek_declined_budget),
+            ("cached", seek_cached),
+            ("speculative_used", speculative_used),
+            ("speculative_dropped", speculative_dropped),
+        ] {
             let _ = writeln!(
                 out,
                 "namidb_filter_membership_seek_total{{outcome=\"{outcome}\"}} {value}"
+            );
+        }
+        let probes = namidb_storage::equality_sidecar_probe_stats();
+        let _ = writeln!(
+            out,
+            "# HELP namidb_equality_sidecar_probe_total Equality-index sidecar probes issued \
+             (probed), and capped lookups declined from posting lengths this process already knew \
+             (memo_declined)."
+        );
+        let _ = writeln!(out, "# TYPE namidb_equality_sidecar_probe_total counter");
+        for (outcome, value) in [
+            ("probed", probes.probes),
+            ("memo_declined", probes.memo_declines),
+        ] {
+            let _ = writeln!(
+                out,
+                "namidb_equality_sidecar_probe_total{{outcome=\"{outcome}\"}} {value}"
             );
         }
         let _ = writeln!(
