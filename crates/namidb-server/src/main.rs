@@ -504,6 +504,9 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    // Before anything can panic: with `panic = "abort"` a panic on any thread
+    // ends the process, and this records why (see `NAMIDB_PANIC_LOG`).
+    namidb_server::panic_log::install_from_env();
 
     let cli = Cli::parse();
     let config = namidb_server::Config {

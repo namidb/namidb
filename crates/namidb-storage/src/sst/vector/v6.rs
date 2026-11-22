@@ -888,6 +888,18 @@ impl VectorV6Reader {
         k: usize,
         groups: &[(String, Vec<SearchFilterValue>)],
     ) -> Result<VectorV6SearchResult> {
+        self.search_exact_where(query, k, groups, None).await
+    }
+
+    /// [`Self::search_exact`] over only the rows whose NodeId `members`
+    /// admits, when given.
+    pub(crate) async fn search_exact_where(
+        &self,
+        query: &[f32],
+        k: usize,
+        groups: &[(String, Vec<SearchFilterValue>)],
+        members: Option<&super::v5::VectorMemberFilter<'_>>,
+    ) -> Result<VectorV6SearchResult> {
         validate_query(query, self.footer.dim)?;
         if k == 0 || self.footer.binding.segment.live_payload_count == 0 {
             return Ok(VectorV6SearchResult {
@@ -958,6 +970,9 @@ impl VectorV6Reader {
                         .as_ref()
                         .is_some_and(|mask| !mask.contains(row.ordinal))
                     {
+                        continue;
+                    }
+                    if members.is_some_and(|members| !members(&row.node_id)) {
                         continue;
                     }
                     eligible_rows_seen = eligible_rows_seen.saturating_add(1);

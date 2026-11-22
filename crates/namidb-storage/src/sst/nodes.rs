@@ -50,7 +50,7 @@ use arrow_schema::{
 };
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::{FutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use memmap2::MmapOptions;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -1885,10 +1885,19 @@ async fn ranged_scan_selected_row_groups(
         .build()
         .map_err(|e| Error::invariant(format!("parquet build async {path}: {e}")))?;
 
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .map_err(|e| Error::invariant(format!("parquet stream collect async {path}: {e}")))?;
+    // One decoded batch at a time, probing the query's guards between them:
+    // a wide row group decodes for a second or more, and a path walk issues
+    // one of these per node it reaches.
+    let mut stream = stream;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    while let Some(batch) = stream.next().await {
+        batches.push(
+            batch.map_err(|e| {
+                Error::invariant(format!("parquet stream collect async {path}: {e}"))
+            })?,
+        );
+        crate::cancel::check()?;
+    }
     Ok((batches, md))
 }
 

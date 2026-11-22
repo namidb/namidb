@@ -211,16 +211,20 @@ pub fn evaluate(expr: &Expression, row: &Row, params: &Params) -> Result<Runtime
         }
         ExpressionKind::ListComprehension(lc) => eval_list_comprehension(lc, row, params),
         ExpressionKind::Quantifier(q) => eval_quantifier(q, row, params),
-        ExpressionKind::PatternComprehension(_) => Err(EvalError::new(
-            "pattern comprehension evaluation requires storage access — \
- must be hoisted to a PatternList operator before evaluate()",
+        // The planner turns these into operators where it supports them
+        // (a pattern comprehension as a top-level projection item, EXISTS as
+        // a predicate). One that reaches evaluation sits somewhere that is
+        // not supported yet: say so as a client-facing `unsupported`, like
+        // the planner's own rejection, not as an evaluation error with
+        // internal wording.
+        ExpressionKind::PatternComprehension(_) => Err(EvalError::unsupported(
+            "pattern comprehensions are only supported as top-level \
+             projection items (RETURN or WITH)",
             span,
         )),
-        ExpressionKind::Exists(_) | ExpressionKind::ExistsSubquery(_) => Err(EvalError::new(
-            "EXISTS pattern predicates require storage access — \
- must be hoisted to a SemiApply operator before evaluate()",
-            span,
-        )),
+        ExpressionKind::Exists(_) | ExpressionKind::ExistsSubquery(_) => Err(
+            EvalError::unsupported("EXISTS is not supported in this position", span),
+        ),
     }
 }
 
@@ -1564,9 +1568,12 @@ fn eval_reduce(
         }
     };
     let mut acc = evaluate(&r.init, row, params)?;
+    // One scope for every element: copying the row per element copied the
+    // list too when the row binds it (`WITH range(..) AS xs`), quadratic in
+    // its length. Each step overwrites the accumulator and the variable.
+    let mut local = row.clone();
     for (index, item) in items.into_iter().enumerate() {
         probe_interrupt(index, r.list.span)?;
-        let mut local = row.clone();
         local.set(r.accumulator.name.clone(), acc);
         local.set(r.variable.name.clone(), item);
         acc = evaluate(&r.expression, &local, params)?;
@@ -1594,9 +1601,10 @@ fn eval_list_comprehension(
         }
     };
     let mut out = Vec::with_capacity(items.len());
+    // One scope for every element (see `eval_reduce`).
+    let mut local = row.clone();
     for (index, item) in items.into_iter().enumerate() {
         probe_interrupt(index, lc.list.span)?;
-        let mut local = row.clone();
         local.set(lc.variable.name.clone(), item.clone());
         if let Some(pred) = &lc.predicate {
             let v = evaluate(pred, &local, params)?;
@@ -1636,9 +1644,10 @@ fn eval_quantifier(
 
     let mut true_count = 0usize;
     let mut any_null = false;
+    // One scope for every element (see `eval_reduce`).
+    let mut local = row.clone();
     for (index, item) in items.into_iter().enumerate() {
         probe_interrupt(index, q.list.span)?;
-        let mut local = row.clone();
         local.set(q.variable.name.clone(), item);
         match evaluate(&q.predicate, &local, params)?.as_bool() {
             Some(true) => {

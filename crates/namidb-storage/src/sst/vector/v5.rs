@@ -130,6 +130,9 @@ impl Default for VectorV5BuildOptions {
     }
 }
 
+/// A NodeId predicate restricting a vector search to a caller's member set.
+pub type VectorMemberFilter<'a> = dyn Fn(&[u8; 16]) -> bool + Send + Sync + 'a;
+
 /// Query controls for hierarchical probing and exact reranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorV5SearchOptions {
@@ -913,6 +916,43 @@ impl VectorV5Reader {
             }
             _ => self.search_int8(query, k, options, groups).await,
         }
+    }
+
+    /// The exact top-`k` of the rows whose NodeId `members` admits, ranked
+    /// from every page's RaBitQ codes and re-ranked with the stored vectors
+    /// (the same candidate bound and re-rank as [`Self::search_filter_groups`],
+    /// over all pages instead of the probed leaves). The cost is one pass over
+    /// the code and id blocks, whatever the members' distance to the query,
+    /// so a caller holding a complete member set that ANN probing keeps
+    /// missing gets its answer in one bounded step. `None` when the base has
+    /// no RaBitQ section, or for a zero cosine query; the caller then keeps
+    /// its other routes.
+    pub async fn search_members(
+        &self,
+        query: &[f32],
+        k: usize,
+        rerank_factor: usize,
+        members: &VectorMemberFilter<'_>,
+    ) -> Result<Option<VectorV5SearchResult>, Error> {
+        if let Some(empty) = self.validate_query(query, k)? {
+            return Ok(Some(empty));
+        }
+        let zero_cosine =
+            self.metric == VectorMetric::Cosine && query.iter().all(|value| *value == 0.0);
+        let RabitqState::Present(index) = &self.rabitq else {
+            return Ok(None);
+        };
+        if zero_cosine {
+            return Ok(None);
+        }
+        let options = VectorV5SearchOptions {
+            nprobe: self.footer.pages.len(),
+            max_nprobe: self.footer.pages.len(),
+            rerank_factor: rerank_factor.max(1),
+        };
+        self.search_rabitq_where(index, query, k, options, &[], Some(members))
+            .await
+            .map(Some)
     }
 
     /// Search through the int8 navigation pages even when the base carries a
@@ -2512,14 +2552,18 @@ fn approximate_score(
         }
         VectorMetric::Cosine => {
             let mut dot = [0.0f32; LANES];
-            let mut code_norm = [0i32; LANES];
+            // Unsigned: a lane sums up to `MAX_DIM / LANES` squares of at
+            // most 128² (a decoded page may hold -128), exactly 2^31 at
+            // `MAX_DIM`, one past `i32::MAX`.
+            let mut code_norm = [0u32; LANES];
             for (q, c) in query[..split]
                 .chunks_exact(LANES)
                 .zip(codes[..split].chunks_exact(LANES))
             {
                 for lane in 0..LANES {
                     dot[lane] += q[lane] * c[lane] as f32;
-                    code_norm[lane] += c[lane] as i32 * c[lane] as i32;
+                    let magnitude = u32::from(c[lane].unsigned_abs());
+                    code_norm[lane] += magnitude * magnitude;
                 }
             }
             let mut dot_sum = dot.iter().sum::<f32>();
@@ -3310,6 +3354,9 @@ fn validate_tree_reachability(footer: &Footer) -> Result<(), Error> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod kernel_tests;
 
 #[cfg(test)]
 mod tests {

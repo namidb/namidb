@@ -2425,6 +2425,34 @@ async fn not_exists_left_of_and_hoists_to_semiapply() {
 }
 
 #[tokio::test]
+async fn a_pattern_comprehension_inside_a_predicate_is_unsupported() {
+    // Only a top-level projection item is planned as a pattern list. Nested
+    // inside a WHERE it reached evaluation and failed as an evaluation error
+    // whose text named internal operators; it is an `unsupported` feature,
+    // like the same comprehension nested inside a RETURN expression.
+    let mut writer = WriterSession::open(store(), paths("exec-patcomp-where"))
+        .await
+        .unwrap();
+    build_friend_graph(&mut writer).await;
+    let snapshot = writer.snapshot();
+    let q = "MATCH (a:Person) WHERE size([(a)-[:KNOWS]->() | 1]) > 0 RETURN count(a) AS n";
+    let plan = lower(&parse(q).unwrap()).unwrap();
+    let err = execute(&plan, &snapshot, &Params::new())
+        .await
+        .expect_err("a nested pattern comprehension is not evaluated");
+    assert!(err.is_unsupported(), "{err:?}");
+    let message = err.to_string();
+    assert!(!message.contains("hoisted"), "{message}");
+    assert!(!message.contains("PatternList"), "{message}");
+    // The supported spelling of the same question still answers.
+    let q = "MATCH (a:Person) WITH a, [(a)-[:KNOWS]->() | 1] AS out \
+             WHERE size(out) > 0 RETURN count(a) AS n";
+    let plan = lower(&parse(q).unwrap()).unwrap();
+    let rows = execute(&plan, &snapshot, &Params::new()).await.unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
 async fn call_subquery_uncorrelated_aggregation() {
     let mut writer = WriterSession::open(store(), paths("exec-call-agg"))
         .await

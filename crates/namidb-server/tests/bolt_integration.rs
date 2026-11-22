@@ -133,6 +133,34 @@ fn decode_response(body: &[u8]) -> Response {
     }
 }
 
+/// A loopback address for a server this file boots.
+///
+/// The server binds addresses, not listeners. Reserving a port with
+/// `bind(0)` and dropping the listener before the server binds it again
+/// races every other test in this binary: a concurrent `bind(0)` can be
+/// handed the same port in between, the server's Bolt bind then fails, and
+/// the test speaks Bolt to some other test's HTTP listener. These ports come
+/// from below the kernel's ephemeral range, which `bind(0)` never hands out,
+/// and each is used once per process; one that is already taken on the
+/// machine is skipped.
+fn reserve_addr() -> std::net::SocketAddr {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const FIRST: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    // Concurrent test processes start at different offsets.
+    let offset = std::process::id() % SPAN;
+    for _ in 0..SPAN {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = (FIRST + (offset + n) % SPAN) as u16;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        if std::net::TcpListener::bind(addr).is_ok() {
+            return addr;
+        }
+    }
+    panic!("no free loopback port in {FIRST}..{}", FIRST + SPAN);
+}
+
 async fn handshake(stream: &mut TcpStream) {
     // 0x6060B017 magic + Bolt 5.4 only.
     let bytes = [
@@ -151,12 +179,8 @@ async fn handshake(stream: &mut TcpStream) {
 /// Boot with RFC-034 group commit enabled (2 ms window) — exercises the
 /// committer task `run()` spawns plus the Bolt grouped auto-commit path.
 async fn boot_bolt_grouped(ns: &str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bolt_addr = listener.local_addr().unwrap();
-    drop(listener);
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
+    let bolt_addr = reserve_addr();
+    let http_addr = reserve_addr();
     let config = namidb_server::Config {
         store_uri: format!("memory://{ns}"),
         listen: http_addr,
@@ -267,12 +291,8 @@ async fn boot_bolt_multi(
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let tokens_path = std::env::temp_dir().join(format!("namidb-bolt-mt-tokens-{ns_prefix}.json"));
     std::fs::write(&tokens_path, tokens_json).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bolt_addr = listener.local_addr().unwrap();
-    drop(listener);
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
+    let bolt_addr = reserve_addr();
+    let http_addr = reserve_addr();
     let config = namidb_server::Config {
         store_uri: format!("memory://{ns_prefix}"),
         listen: http_addr,
@@ -716,12 +736,8 @@ async fn boot_bolt_memory(
     query_row_cap: usize,
     query_memory_max_bytes: usize,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bolt_addr = listener.local_addr().unwrap();
-    drop(listener);
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
+    let bolt_addr = reserve_addr();
+    let http_addr = reserve_addr();
 
     let config = namidb_server::Config {
         store_uri: format!("memory://{ns}"),
@@ -790,12 +806,8 @@ async fn boot_bolt_tokens(
     let tokens_path = std::env::temp_dir().join(format!("namidb-bolt-tokens-{ns}.json"));
     std::fs::write(&tokens_path, tokens_json).unwrap();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bolt_addr = listener.local_addr().unwrap();
-    drop(listener);
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
+    let bolt_addr = reserve_addr();
+    let http_addr = reserve_addr();
 
     let config = namidb_server::Config {
         store_uri: format!("memory://{ns}"),
@@ -1050,13 +1062,8 @@ async fn bolt_create_then_match_roundtrip() {
         .with_test_writer()
         .try_init();
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bolt_addr = listener.local_addr().unwrap();
-    drop(listener); // free the port; server will rebind it
-
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
+    let bolt_addr = reserve_addr();
+    let http_addr = reserve_addr();
 
     let config = namidb_server::Config {
         store_uri: "memory://bolt-test".into(),
@@ -1149,13 +1156,8 @@ async fn bolt_create_then_match_roundtrip() {
 
 #[tokio::test]
 async fn bolt_bad_token_yields_failure() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bolt_addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
+    let bolt_addr = reserve_addr();
+    let http_addr = reserve_addr();
 
     let config = namidb_server::Config {
         store_uri: "memory://bolt-bad-auth".into(),
@@ -1326,13 +1328,8 @@ async fn bolt_memgraph_introspection_populates_schema() {
     // procedures on connect. The Cypher parser has no CALL clause, so
     // the `introspect` shim must answer them from the live snapshot
     // before the parser would reject them as a syntax error.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bolt_addr = listener.local_addr().unwrap();
-    drop(listener);
-
-    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_addr = http_listener.local_addr().unwrap();
-    drop(http_listener);
+    let bolt_addr = reserve_addr();
+    let http_addr = reserve_addr();
 
     let config = namidb_server::Config {
         store_uri: "memory://bolt-introspect".into(),

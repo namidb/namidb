@@ -278,6 +278,10 @@ fn snapshot_local_cache_max_bytes(name: &str) -> usize {
     }
 }
 
+/// A predicate over a confirmed node, see
+/// [`Snapshot::indexed_node_ids_by_property_value_capped_where`].
+pub type IndexedNodeFilter<'a> = dyn Fn(&NodeView) -> bool + Send + Sync + 'a;
+
 /// Projection of a node row materialised by the read path.
 ///
 /// A node carries a *set* of labels. Today the set always has exactly one
@@ -1495,7 +1499,9 @@ impl<'mt> Snapshot<'mt> {
     ) -> Result<Option<Vec<NodeId>>> {
         Ok(
             match self
-                .indexed_node_ids_by_property_value_inner(label, property, value, None, None, None)
+                .indexed_node_ids_by_property_value_inner(
+                    label, property, value, None, None, None, None,
+                )
                 .await?
             {
                 IndexedPropertyLookup::Available(ids) => Some(ids),
@@ -1530,6 +1536,7 @@ impl<'mt> Snapshot<'mt> {
                     Some(limit),
                     None,
                     Some(posting_read_limit),
+                    None,
                 )
                 .await?
             {
@@ -1571,6 +1578,7 @@ impl<'mt> Snapshot<'mt> {
                     None,
                     Some(max_candidates),
                     None,
+                    None,
                 )
                 .await?
             {
@@ -1578,6 +1586,54 @@ impl<'mt> Snapshot<'mt> {
                 IndexedPropertyLookup::Unavailable | IndexedPropertyLookup::Truncated => None,
             },
         )
+    }
+
+    /// [`Self::indexed_node_ids_by_property_value_capped`], keeping only the
+    /// confirmed nodes `keep` accepts. `keep` sees each candidate's current
+    /// last-write-wins view (the one the equality was confirmed on), once, so
+    /// a caller decides a further predicate without looking the node up again.
+    /// The cap still bounds the posting set before any hydration.
+    pub async fn indexed_node_ids_by_property_value_capped_where(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+        max_candidates: usize,
+        keep: &IndexedNodeFilter<'_>,
+    ) -> Result<Option<Vec<NodeId>>> {
+        Ok(
+            match self
+                .indexed_node_ids_by_property_value_inner(
+                    label,
+                    property,
+                    value,
+                    None,
+                    Some(max_candidates),
+                    None,
+                    Some(keep),
+                )
+                .await?
+            {
+                IndexedPropertyLookup::Available(ids) => Some(ids),
+                IndexedPropertyLookup::Unavailable | IndexedPropertyLookup::Truncated => None,
+            },
+        )
+    }
+
+    /// Live `label` rows, for sizing decisions, with no I/O: exact when the
+    /// manifest proves it (see [`Self::metadata_node_count`]), otherwise the
+    /// manifest's per-label row counts plus every unflushed node row, an
+    /// upper bound.
+    pub fn label_population_estimate(&self, label: &str) -> u64 {
+        if let Some(count) = self.metadata_node_count(Some(label)) {
+            return count;
+        }
+        let unflushed = self
+            .node_entries()
+            .filter(|(key, _)| matches!(key, MemKey::Node { .. }))
+            .count();
+        self.live_row_estimate(label)
+            .saturating_add(u64::try_from(unflushed).unwrap_or(u64::MAX))
     }
 
     /// Live node ids satisfying a conjunction of RANGE predicates on one
@@ -2094,6 +2150,7 @@ impl<'mt> Snapshot<'mt> {
             .unwrap_or_default())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn indexed_node_ids_by_property_value_inner(
         &self,
         label: &str,
@@ -2102,6 +2159,7 @@ impl<'mt> Snapshot<'mt> {
         limit: Option<usize>,
         candidate_cap: Option<usize>,
         posting_read_limit: Option<usize>,
+        keep: Option<&IndexedNodeFilter<'_>>,
     ) -> Result<IndexedPropertyLookup> {
         namidb_core::profile_scope!("Snapshot::indexed_node_ids_by_property_value");
 
@@ -2315,6 +2373,7 @@ impl<'mt> Snapshot<'mt> {
                     view.properties
                         .get(property)
                         .is_some_and(|current| crate::cache::cypher_scalar_equal(current, value))
+                        && keep.is_none_or(|keep| keep(view))
                 }) {
                     confirmed.push(id);
                     if confirmed.len() == target {
@@ -5813,6 +5872,10 @@ impl<'mt> Snapshot<'mt> {
     /// over this primitive.
     pub async fn lookup_node_by_id(&self, id: NodeId) -> Result<Option<NodeView>> {
         namidb_core::profile_scope!("Snapshot::lookup_node_by_id");
+        // One lookup can cost milliseconds on a cold store, and a path walk
+        // issues one per edge it visits: probing here keeps the walk within
+        // one lookup of its deadline or cancel, whatever its own probe stride.
+        crate::cancel::check()?;
         let id_bytes = *id.as_bytes();
         let dict = &self.manifest.manifest.label_dict;
         let mut winner: Option<(u64, Option<NodeView>)> = None;
@@ -5835,6 +5898,7 @@ impl<'mt> Snapshot<'mt> {
             .index
             .node_candidates(&self.manifest.manifest.ssts, &id_bytes);
         for idx in candidates {
+            crate::cancel::check()?;
             let desc = &self.manifest.manifest.ssts[idx];
             // Decoded row-group tier, shared with `batch_lookup_nodes`: when
             // this SST's footer metadata is already cached, resolve which row
@@ -6408,6 +6472,10 @@ impl<'mt> Snapshot<'mt> {
         }))
         .buffered(projection_scan_fanout());
         while let Some((idx, views)) = projected.next().await {
+            // The visitor probes the deadline per row, but a row group's
+            // decode happens before it sees any: probe between SSTs and row
+            // groups too, or a scan overshoots by whole decodes.
+            crate::cancel::check().map_err(E::from)?;
             if let Some(views) = views.map_err(E::from)? {
                 for view in views {
                     visitor(view)?;
@@ -6440,6 +6508,7 @@ impl<'mt> Snapshot<'mt> {
                     .scan_iter_with_predicates_and_projection(&[], Some(projection))
                     .map_err(E::from)?;
                 for batch in batches {
+                    crate::cancel::check().map_err(E::from)?;
                     let mut rows = Vec::new();
                     consume_limited_node_batches(
                         std::iter::once(batch),
@@ -6475,6 +6544,7 @@ impl<'mt> Snapshot<'mt> {
                     }
                 }
                 while let Some(batches) = stream.next_row_group().await.map_err(E::from)? {
+                    crate::cancel::check().map_err(E::from)?;
                     for batch in batches {
                         let mut rows = Vec::new();
                         consume_limited_node_batches(
@@ -6532,7 +6602,11 @@ impl<'mt> Snapshot<'mt> {
                     let mut views = Vec::new();
                     let mut next_ordinal = 0_u64;
                     while let Some(batches) = stream.next_row_group().await? {
+                        // A whole SST decodes here before the visitor sees
+                        // a row: probe per row group.
+                        crate::cancel::check()?;
                         for batch in batches {
+                            crate::cancel::check()?;
                             let batch = batch.map_err(|error| {
                                 Error::invariant(format!("projected Parquet visitor read: {error}"))
                             })?;
@@ -10260,6 +10334,103 @@ impl<'mt> Snapshot<'mt> {
         }
         all.truncate(k);
         Ok(Some((all, point_count)))
+    }
+
+    /// The exact top-`k` persisted vectors among the nodes `members` admits.
+    ///
+    /// Every row of the active generation is considered: a V5 base ranks its
+    /// admitted rows from the RaBitQ codes of every page and re-ranks the
+    /// best of them with the stored vectors; a VG6 delta scores its admitted
+    /// rows exactly; versions reconcile as on every other route. The cost is
+    /// one pass over the codes, independent of how far the admitted rows sit
+    /// from the query, which is what an ANN probe restricted by a filter it
+    /// cannot read pays for: it keeps widening until it reaches them.
+    ///
+    /// Returns the hits, the persisted point count, and whether the hits are
+    /// provably every admitted persisted vector when fewer than `k`. `Ok(None)`
+    /// when the index cannot answer this way (a base without RaBitQ codes, a
+    /// legacy graph body, a zero cosine query, an unavailable generation); the
+    /// caller keeps its other routes.
+    #[cfg(feature = "vector-index")]
+    pub async fn try_vector_search_members(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        members: &(dyn Fn(&NodeId) -> bool + Send + Sync),
+    ) -> Result<Option<(Vec<(NodeId, f32)>, u64, bool)>> {
+        let by_bytes = |id: &[u8; 16]| members(&NodeId(Uuid::from_bytes(*id)));
+        match search_lsm_read::vector_search_where(
+            self,
+            index_name,
+            query,
+            k,
+            k,
+            &[],
+            Some(&by_bytes),
+        )
+        .await?
+        {
+            search_lsm_read::ActiveSearch::Ready(
+                search_lsm_read::CoordinatedVectorFilterResult::Applied(result),
+            ) => {
+                let complete = result.eligible_count != usize::MAX;
+                return Ok(Some((result.hits, result.point_count, complete)));
+            }
+            search_lsm_read::ActiveSearch::Ready(
+                search_lsm_read::CoordinatedVectorFilterResult::Unsupported,
+            )
+            | search_lsm_read::ActiveSearch::Unavailable => return Ok(None),
+            search_lsm_read::ActiveSearch::NotActive => {}
+        }
+        let Some(selected) = self
+            .select_search_base(SearchLsmKind::Vector, index_name)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let desc = &self.manifest.manifest.ssts[selected.descriptor_index];
+        let Some(idx) = self.fetch_vector_search_index(desc).await? else {
+            return Ok(None);
+        };
+        if selected
+            .active_segment
+            .as_ref()
+            .is_some_and(|segment| !active_vector_base_matches(&idx, desc, segment))
+        {
+            return Ok(None);
+        }
+        let point_count = idx.point_count();
+        let VectorSearchIndex::Ranged(reader) = idx else {
+            return Ok(None);
+        };
+        let rerank_factor = vector_v5_search_options(&reader, k).rerank_factor;
+        let result = match reader
+            .search_members(query, k, rerank_factor, &by_bytes)
+            .await
+        {
+            Ok(Some(result)) => result,
+            Ok(None) => return Ok(None),
+            Err(error) if optional_accelerator_fallback(&error) => {
+                tracing::warn!(
+                    path = %desc.path,
+                    error = %error,
+                    "vector member search page is corrupt; falling back"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        // Every admitted row was ranked; at most `k` of them, all returned,
+        // proves there are no more.
+        let complete =
+            result.eligible_rows_seen <= k && result.hits.len() == result.eligible_rows_seen;
+        let hits = result
+            .hits
+            .into_iter()
+            .map(|(id, score)| (NodeId(Uuid::from_bytes(id)), score))
+            .collect();
+        Ok(Some((hits, point_count, complete)))
     }
 
     /// Filter-aware vector-index probe.
@@ -18198,6 +18369,32 @@ mod tests {
                     SNAPSHOT_NODE_PROPERTY_READER_CACHE_MAX_BYTES_ENV,
                 )
         );
+    }
+
+    /// The projected visit probes the query's guards between row groups
+    /// itself. A visitor that never probes (or a decode that takes longer
+    /// than the visitor's rows) used to let a scan run whole SST decodes past
+    /// its deadline.
+    #[tokio::test]
+    async fn projected_visit_stops_at_the_deadline_without_the_visitors_help() {
+        let store = make_store();
+        let paths = make_paths("node-property-visit-deadline");
+        let committed = object_native_doc_fixture(&store, &paths, 64, 2048).await;
+        let empty = Memtable::new();
+        let empty_view = empty.snapshot_view();
+        let snapshot = Snapshot::new(committed, &empty_view, store, paths);
+        let mut visited = 0usize;
+        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let result = crate::cancel::with_deadline(
+            Some(expired),
+            snapshot.visit_label_with_projection::<_, Error>("Doc", &["title".into()], |_| {
+                visited += 1;
+                Ok(())
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Timeout)), "{result:?}");
+        assert_eq!(visited, 0);
     }
 
     #[tokio::test]

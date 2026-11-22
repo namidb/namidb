@@ -53,6 +53,8 @@ pub(crate) mod test_support;
 pub mod text;
 pub mod unique_index;
 // Commits maintain the tail in every build; only vector search reads it.
+#[cfg(test)]
+pub(crate) mod kernel_test_support;
 pub mod uri;
 #[cfg_attr(not(feature = "vector-index"), allow(dead_code))]
 pub(crate) mod vector_tail;
@@ -122,9 +124,9 @@ pub use range_cache::{
 #[cfg(feature = "vector-index")]
 pub use read::VectorFilterSearch;
 pub use read::{
-    property_index_population, EdgeListView, EdgeScanCursor, EdgeView, NodeDataIdentity,
-    NodeDataLineage, NodeScanCursor, NodeSstSpan, NodeView, OwnedSnapshot, PinnedSnapshot,
-    PrefetchSummary, Snapshot, SnapshotCell, VersionPin, PREFETCH_NODE_SST_LIMIT,
+    property_index_population, EdgeListView, EdgeScanCursor, EdgeView, IndexedNodeFilter,
+    NodeDataIdentity, NodeDataLineage, NodeScanCursor, NodeSstSpan, NodeView, OwnedSnapshot,
+    PinnedSnapshot, PrefetchSummary, Snapshot, SnapshotCell, VersionPin, PREFETCH_NODE_SST_LIMIT,
 };
 pub use reader::ReaderSession;
 pub use recovery::{

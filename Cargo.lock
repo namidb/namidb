@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "namidb"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "namidb-core",
  "namidb-graph",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-ann"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "namidb-core",
  "rand 0.8.6",
@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-bench"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2275,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-bolt"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2295,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-cli"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-core"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-graph"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-markdown"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2377,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-mcp"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-py"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "bytes",
  "chrono",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-query"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2441,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-server"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "namidb-storage"
-version = "3.5.2"
+version = "3.5.3"
 dependencies = [
  "anyhow",
  "arrow",

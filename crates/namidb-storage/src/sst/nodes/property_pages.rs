@@ -1940,6 +1940,7 @@ impl NodePropertyPageReader {
                 .read_payload_pages(&selected_pages[cursor..end])
                 .await?;
             for (page, encoded) in selected_pages[cursor..end].iter().zip(encoded_pages) {
+                crate::cancel::check()?;
                 walk_page_rows(
                     &encoded,
                     page,
@@ -2024,6 +2025,9 @@ impl NodePropertyPageReader {
                     .copied()
                     .zip(encoded_pages)
                 {
+                    // A projected scan decodes page after page before its
+                    // caller sees a row: probe the query's guards per page.
+                    crate::cancel::check()?;
                     payload_pages += 1;
                     payload_bytes = payload_bytes
                         .checked_add(page.encoded_len)
@@ -2133,6 +2137,9 @@ impl NodePropertyPageReader {
                     .copied()
                     .zip(encoded_pages)
                 {
+                    // A projected scan decodes page after page before its
+                    // caller sees a row: probe the query's guards per page.
+                    crate::cancel::check()?;
                     payload_pages += 1;
                     payload_bytes = payload_bytes
                         .checked_add(page.encoded_len)
@@ -2279,6 +2286,9 @@ impl NodePropertyPageReader {
                 let end = next_payload_batch_end(&page_refs, cursor, &self.config);
                 let encoded_pages = self.read_payload_pages(&page_refs[cursor..end]).await?;
                 for (page, encoded) in page_refs[cursor..end].iter().zip(encoded_pages) {
+                    // Verification decodes every page of the projection before
+                    // a projected scan yields its first row.
+                    crate::cancel::check()?;
                     let rows = decode_page_selected(
                         &encoded,
                         page,

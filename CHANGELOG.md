@@ -15,6 +15,142 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.5.3] - 2026-11-21
+
+### Added
+
+- **Panic records survive the process.** The server installs a panic hook at
+  startup. Release builds abort on panic, and an abort under concurrent search
+  load left no message once the container was gone. Every panic now logs
+  `panic: <message>` at ERROR with the thread, `file:line:col` and a forced
+  backtrace. With `NAMIDB_PANIC_LOG=<path>` set, the hook also appends the
+  same record, with a UTC timestamp and the pid, to that file in one
+  `O_APPEND` write. Past 16 MiB the file rotates once to `<path>.1`. The
+  default hook still prints to stderr. Point the variable at a persistent
+  volume that is not emptied at start: a spool directory is not one. A stack
+  overflow or an allocation failure aborts without a panic, so it still
+  reaches only stderr.
+
+### Changed
+
+- **Selective equality filters resolve through the property index.** A
+  search filter (`search.bm25`, `search.vector`, `search.hybrid`) whose
+  equality or `IN`
+  conjunct is on a property with a RANGE index now builds its membership
+  set from that property's equality postings instead of reading the
+  filter's column over the whole label. Each candidate is confirmed on its
+  current version (unflushed rows, deletes, moved values and a write
+  transaction's own rows included), and any other conjunct is evaluated on
+  exactly those nodes, so results are unchanged. A selective equality
+  filter on a high-cardinality indexed property used to pay a full column
+  read for every new value (its cache key is the bound value); it now
+  costs one posting lookup and the confirmation of the nodes it admits.
+  Numbers keep Cypher equality (`1 = 1.0`); inside a write transaction a
+  numeric value takes the column read as before. The route serves a set
+  of at most `NAMIDB_FILTER_MEMBERSHIP_SEEK_CAP` nodes (default 4096, `0`
+  disables it); a larger posting, or a filter without an indexed equality
+  conjunct, keeps the column read and its cross-statement cache. Counted
+  by `namidb_filter_membership_seek_total{outcome="served"|"declined"}`.
+- **A filtered vector search that its first round under-fills ranks the
+  filter's members from the index's codes.** `search.vector` (and the
+  dense leg of `search.hybrid`) with a filter the vector index cannot apply
+  itself, for example a range on an unindexed property, over-fetches from
+  the index and widens up to four rounds before an exact scan of every
+  node. When the filter admits more nodes than the exact flat route takes
+  but sits far from the query, those rounds found few or none of them and
+  the scan of every node ran into the query timeout. After one under-filled
+  round, the search now ranks exactly the filter's members from every
+  page's RaBitQ codes, re-ranks the best of them with the stored vectors,
+  and merges unflushed writes as before: one pass over the codes, whatever
+  the members' distance to the query. Scores are exact; a member is missed
+  only on an estimate error about four times the codes' stated bound.
+  Bases without RaBitQ codes keep widening. `NAMIDB_VECTOR_MEMBER_SCAN_AFTER_ROUNDS`
+  (default 1, `0` disables it) sets the round; counted by
+  `namidb_vector_member_scan_total`.
+
+### Fixed
+
+- **`namidb_search_index_builds_in_flight` covers the upload and install.**
+  A search index base build (a new index's activation, a native-filter
+  rebuild, a RaBitQ backfill, a base folded from segments, the full-text
+  re-analysis) stayed registered only while it built, so the gauge read 0
+  for the seconds its output was still uploading and installing, and an
+  idle stop in that window threw the upload away. The registration now
+  lasts until the output is installed (or discarded).
+- **The int8 cosine scorer's code norm could overflow.** A lane summed
+  `i32` squares of the codes, and with every code at -128 (possible in a
+  decoded page, never written by the quantizer) it reached exactly 2^31 at the
+  largest accepted dimension (1,048,576). Debug builds panicked there and
+  release builds scored NaN. The lanes are unsigned now, and results do not
+  change for any other input.
+- **A path walk into a bound endpoint stops at its deadline.** A
+  variable-length pattern that binds its path (`MATCH q = (a)-[*1..10]-(b)`
+  with `a` and `b` bound, in its plain, `CALL` subquery and `LIMIT` forms) and
+  an `allShortestPaths` that binds its path read the node reached at every
+  hop with one point lookup. The walk probed its deadline only every 4,096
+  edges, and the lookup on the ranged route (large SSTs) did not probe at
+  all, so when each lookup cost milliseconds the query ran for minutes past
+  its timeout, and kept a core busy after the client had gone. The point
+  lookup now probes the deadline and the cancel flag, so the walk stops
+  within one lookup of either.
+- **A deadline inside a storage read is a timeout, not a 500.** When the
+  query deadline fired inside a batch property lookup (`UNWIND $ids AS i
+  MATCH (n:Doc {id: i})`, a key join), the vector search's fresh delta, a
+  write's commit or a schema procedure, the error skipped the conversion to
+  the executor's timeout. HTTP answered 500 with
+  `Neo.TransientError.General.DatabaseUnavailable` and no `code`, and Bolt
+  sent the same transient code, which drivers retry automatically. Every
+  storage error now goes through that conversion, and both protocols also map
+  a storage timeout that reaches them directly to the timeout: HTTP 504
+  `timeout` and `Neo.ClientError.Transaction.TransactionTimedOut`. Turning
+  the lookups' results into rows now probes the deadline too, so a key join
+  over many rows answers close to its timeout.
+- **Loops over a list bound in an earlier `WITH` are linear.** UNWIND,
+  `reduce`, list comprehensions and `all`/`any`/`none`/`single` copied the
+  whole row once per element, and the row still held the list. The work was
+  quadratic: `WITH range(1, 20000) AS xs UNWIND xs AS x RETURN count(x)` ran
+  out of a 2.6 GB query budget, and a `reduce` over 40,000 items took 13 s
+  against 14 ms with the list inline. The expression loops now reuse one scope.
+  An UNWIND whose source list nothing later reads moves the list out of the
+  row. A list that is still read stays bound on every row as before, and its
+  copies are now charged to the memory budget often enough to stop a large
+  one within a few rows.
+- **A flat vector scan stops near its deadline, and a zero cosine query
+  answers at once.** The scan of a label's embeddings decodes a whole SST, row
+  group by row group, before its visitor sees the first row, and only the
+  visitor probed the deadline, so a flat cosine `ORDER BY ... LIMIT` with a
+  3 s timeout got its 504 after about 26 s. The label visit now probes before
+  each SST and each row group. A cosine search with an all-zero query vector
+  has no answer (cosine is undefined for it, and every candidate was already
+  dropped), but it still scanned the whole label to return nothing. It now
+  returns no rows without reading anything.
+- **A pattern comprehension inside a predicate is `unsupported`.** Only a
+  top-level projection item is planned as a pattern comprehension. One nested
+  in a `WHERE` (`WHERE size([(n)-[:R]->() | 1]) > 0`) reached evaluation and
+  answered 400 `eval_error`, with text about internal operators. It now
+  answers 400 `unsupported` (Bolt `Neo.ClientError.Statement.NotSupported`), as
+  the same comprehension nested inside a `RETURN` expression already did. An
+  `EXISTS` left in a position the planner does not handle answers the same way.
+- **A background count seed keeps a full count vector installed beside it.**
+  When the exact node counts were not known, a label count started a
+  background seed for that label and then reconciled the whole corpus. If the
+  reconciliation's complete vector was installed while the seed was finishing,
+  the seed could write its own partial counts over it. The counts stayed
+  exact, but the next count of another label, or of all nodes, scanned the
+  corpus again. The seed now merges into the cell's current contents under its
+  lock, so it never replaces or downgrades a vector installed meanwhile.
+
+### Tests
+
+- The vector kernels (int8 navigation scores and norm, RaBitQ rotation, sign
+  coding and lookup-table code dot, the tail scorer's int8 dot, the core
+  asymmetric dot) are checked against scalar references. The checks cover
+  lengths 0 to 2100, every lane-tail class, unaligned slices and mismatched
+  buffer lengths. They are bit-exact where the summation order is fixed.
+  These kernels are portable Rust with no architecture-specific code.
+  CI also runs them on amd64 at `opt-level = 3`, where the compiler
+  vectorises them, and logs the x86 features the runner reports.
+
 ## [3.5.2] - 2026-11-21
 
 ### Changed
@@ -5810,7 +5946,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.2...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.3...HEAD
+[3.5.3]: https://github.com/namidb/namidb/compare/v3.5.2...v3.5.3
 [3.5.2]: https://github.com/namidb/namidb/compare/v3.5.1...v3.5.2
 [3.5.1]: https://github.com/namidb/namidb/compare/v3.5.0...v3.5.1
 [3.5.0]: https://github.com/namidb/namidb/compare/v3.4.3...v3.5.0
