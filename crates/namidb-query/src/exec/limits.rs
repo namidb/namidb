@@ -124,7 +124,7 @@ impl DeadlineProbe {
     #[inline]
     pub(crate) fn tick(&mut self) -> Result<(), ExecError> {
         self.ticks = self.ticks.wrapping_add(1);
-        if self.ticks % PROBE_STRIDE == 0 {
+        if self.ticks.is_multiple_of(PROBE_STRIDE) {
             check_deadline()
         } else {
             Ok(())

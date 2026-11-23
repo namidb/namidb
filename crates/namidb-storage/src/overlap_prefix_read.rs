@@ -695,7 +695,7 @@ impl NodeScanCursor {
                 match merge.next_live(snap).await? {
                     Merged::Live(_) => {
                         count += 1;
-                        if count % 4096 == 0 {
+                        if count.is_multiple_of(4096) {
                             tokio::task::yield_now().await;
                         }
                     }
@@ -1006,7 +1006,7 @@ impl Snapshot<'_> {
                 count += 1;
             }
             settled += 1;
-            if settled % 4096 == 0 {
+            if settled.is_multiple_of(4096) {
                 crate::cancel::check()?;
                 tokio::task::yield_now().await;
             }

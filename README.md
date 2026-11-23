@@ -11,7 +11,7 @@
 Point it at a bucket (or a local folder, or nothing at all), write Cypher, and you have a property graph with vector search and hybrid retrieval. The same engine embeds in Python, runs as an HTTP/Bolt server, and speaks the Model Context Protocol so your agents can query it directly.
 
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-1f6feb.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.85%2B-dea584.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.91%2B-dea584.svg?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![PyPI](https://img.shields.io/badge/PyPI-namidb-3776ab.svg?logo=pypi&logoColor=white)](https://pypi.org/project/namidb/)
 [![Docker Hub](https://img.shields.io/docker/v/namidb/namidb-server?sort=semver&label=Docker&logo=docker&logoColor=white&color=2496ed)](https://hub.docker.com/r/namidb/namidb-server)
 [![Website](https://img.shields.io/badge/Website-namidb.com-0a7ea4.svg)](https://namidb.com)

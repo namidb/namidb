@@ -131,7 +131,7 @@ impl Model {
             title: self.words.text(3),
             body: Some(self.words.text(18)),
             n: ordinal as i64,
-            vigente: ordinal % 3 != 0,
+            vigente: !ordinal.is_multiple_of(3),
             embedding: self.words.embedding(),
         }
     }

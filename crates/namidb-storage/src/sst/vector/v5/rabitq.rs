@@ -1362,7 +1362,7 @@ fn decode_filters(
     for values in filters.values() {
         for bitmap in values.values() {
             if bitmap.len() != words
-                || (rows % 64 != 0
+                || (!rows.is_multiple_of(64)
                     && bitmap
                         .last()
                         .is_some_and(|word| word & !((1u64 << (rows % 64)) - 1) != 0))

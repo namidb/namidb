@@ -15,8 +15,12 @@ use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
 use namidb_core::value::Value as CoreValue;
 use namidb_query::{
-    filter_membership_ids_for_tests, filter_membership_seek_ids_for_tests, filter_membership_seeks,
-    RuntimeValue,
+    filter_membership_ids_for_tests, filter_membership_seek_budget,
+    filter_membership_seek_budget_declines, filter_membership_seek_cache_hits,
+    filter_membership_seek_ids_for_tests, filter_membership_seek_speculation,
+    filter_membership_seeks, set_filter_membership_seek_cap_for_tests,
+    set_filter_membership_seek_population_divisor, with_query_memory, QueryMemoryBudget,
+    QueryMemoryPool, RuntimeValue,
 };
 use namidb_storage::{NamespacePaths, NodeWriteRecord, Snapshot, WriterSession};
 use object_store::memory::InMemory;
@@ -242,7 +246,9 @@ fn model_ids(docs: &BTreeMap<NodeId, Section>, filter: &RuntimeValue) -> Vec<Nod
 }
 
 /// Every filter: the index route, when it serves, names exactly the nodes
-/// the column read does, and both agree with the model.
+/// the column read does, the set kept across statements (built either way,
+/// then carried or patched over writes, flushes, compactions and reopens)
+/// names them too, and all agree with the model.
 async fn assert_exact(
     snapshot: &Snapshot<'_>,
     docs: &BTreeMap<NodeId, Section>,
@@ -261,6 +267,14 @@ async fn assert_exact(
             exact.as_deref(),
             Some(model.as_slice()),
             "{context}: column read {filter:?}"
+        );
+        let kept = filter_membership_ids_for_tests(snapshot, LABEL, &filter, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            kept.as_deref(),
+            Some(model.as_slice()),
+            "{context}: kept set {filter:?}"
         );
         // A write transaction keys numbers apart, so storage declines a
         // numeric probe there; everything else is served.
@@ -422,11 +436,16 @@ async fn randomized(seed: u64) {
 async fn the_index_route_names_the_same_nodes_as_the_column_read() {
     let _serial = SERIAL.lock().await;
     let (served_before, _) = filter_membership_seeks();
+    let cached_before = filter_membership_seek_cache_hits();
     for seed in [3, 11, 42, 2024, 77777] {
         randomized(seed).await;
     }
     let (served, _) = filter_membership_seeks();
     assert!(served > served_before);
+    assert!(
+        filter_membership_seek_cache_hits() > cached_before,
+        "index-built sets were carried or patched instead of seeked again"
+    );
 }
 
 /// A value whose posting set exceeds the cap declines before any node is
@@ -435,6 +454,8 @@ async fn the_index_route_names_the_same_nodes_as_the_column_read() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_value_over_the_cap_falls_back_to_the_column_read() {
     let _serial = SERIAL.lock().await;
+    // The fixed cap alone: no label-relative budget.
+    set_filter_membership_seek_population_divisor(Some(0));
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut writer = WriterSession::open(store, paths("membership-seek-cap"))
         .await
@@ -471,6 +492,95 @@ async fn a_value_over_the_cap_falls_back_to_the_column_read() {
     check_cap(&writer.snapshot(), &docs).await;
     writer.compact_l0(&schema()).await.unwrap();
     check_cap(&writer.snapshot(), &docs).await;
+    set_filter_membership_seek_population_divisor(None);
+}
+
+/// The budget is the fixed cap lowered to a share of a known label
+/// population, never below a floor, and the cap alone when the population is
+/// unknown or the share is turned off.
+#[test]
+fn the_seek_budget_is_a_share_of_a_known_population() {
+    assert_eq!(filter_membership_seek_budget(4096, None, 64), 4096);
+    assert_eq!(filter_membership_seek_budget(4096, Some(30_086), 0), 4096);
+    // A 30 086-node label: 470 candidates, not 4096.
+    assert_eq!(filter_membership_seek_budget(4096, Some(30_086), 64), 470);
+    // A 411 082-node label: the cap binds.
+    assert_eq!(filter_membership_seek_budget(4096, Some(411_082), 64), 4096);
+    // Small labels keep the floor.
+    assert_eq!(filter_membership_seek_budget(4096, Some(1_000), 64), 256);
+    assert_eq!(filter_membership_seek_budget(100, Some(1_000), 64), 100);
+}
+
+/// A value admitting more than the label-relative budget reads the columns
+/// (counted as a budget decline) and answers the same nodes; a selective
+/// value of the same property keeps the index route, flushed and compacted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_value_over_the_population_budget_reads_the_columns() {
+    let _serial = SERIAL.lock().await;
+    // A quarter of the label: 1000 nodes allow max(250, 256) = 256.
+    set_filter_membership_seek_population_divisor(Some(4));
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut writer = WriterSession::open(store, paths("membership-seek-budget"))
+        .await
+        .unwrap();
+    let section = |parent: usize| Section {
+        label: LABEL,
+        parent,
+        rank: 0,
+        level: 1,
+        active: true,
+    };
+    let mut docs = BTreeMap::new();
+    for n in 0..1000 {
+        let id = NodeId::new();
+        // p0: 400 nodes; p1..p3: 200 each.
+        let doc = section(if n < 400 { 0 } else { 1 + n % 3 });
+        writer.upsert_node(LABEL, id, &doc.record()).unwrap();
+        docs.insert(id, doc);
+    }
+    writer.commit_batch().await.unwrap();
+    let broad = map(&[("parentId", string("p0"))]);
+    let narrow = map(&[("parentId", string("p1"))]);
+    // Nothing flushed yet: the manifest knows no population (the budget then
+    // falls back to the fixed cap, see the budget test).
+    assert!(writer.snapshot().manifest_label_population(LABEL).is_none());
+    // The flush also installs the schema that declares the index.
+    writer.flush(schema()).await.unwrap();
+    for stage in ["flushed", "compacted"] {
+        if stage == "compacted" {
+            writer.compact_l0(&schema()).await.unwrap();
+        }
+        let snapshot = writer.snapshot();
+        assert_eq!(
+            snapshot.manifest_label_population(LABEL),
+            Some(1000),
+            "{stage}"
+        );
+        let budget_before = filter_membership_seek_budget_declines();
+        assert_eq!(
+            filter_membership_seek_ids_for_tests(&snapshot, LABEL, &broad)
+                .await
+                .unwrap(),
+            None,
+            "{stage}: 400 of 1000 nodes exceed the budget"
+        );
+        assert_eq!(filter_membership_seek_budget_declines(), budget_before + 1);
+        assert_eq!(
+            filter_membership_ids_for_tests(&snapshot, LABEL, &broad, true)
+                .await
+                .unwrap(),
+            Some(model_ids(&docs, &broad)),
+            "{stage}: the column read answers"
+        );
+        assert_eq!(
+            filter_membership_seek_ids_for_tests(&snapshot, LABEL, &narrow)
+                .await
+                .unwrap(),
+            Some(model_ids(&docs, &narrow)),
+            "{stage}: 200 nodes stay on the index route"
+        );
+    }
+    set_filter_membership_seek_population_divisor(None);
 }
 
 async fn check_cap(snapshot: &Snapshot<'_>, docs: &BTreeMap<NodeId, Section>) {
@@ -545,7 +655,8 @@ mod search_legs {
     use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
     use namidb_core::value::Value as CoreValue;
     use namidb_query::{
-        execute, filter_membership_paths, filter_membership_seeks, lower, optimize, parse,
+        execute, filter_membership_ids_for_tests, filter_membership_paths,
+        filter_membership_seek_cache_hits, filter_membership_seeks, lower, optimize, parse,
         set_filter_membership_seek_enabled, Params, RuntimeValue, StatsCatalog,
     };
     use namidb_storage::manifest::{
@@ -883,9 +994,10 @@ mod search_legs {
         assert_parity(&writer.snapshot(), &mut model, "merged").await;
     }
 
-    /// A fresh parent value per statement resolves through the index on every
-    /// leg and never recomputes a membership set from the columns; a filter with
-    /// no indexed equality still does.
+    /// A fresh parent value resolves through the index (once: the other legs
+    /// with the same value reuse the cached set) and never recomputes a
+    /// membership set from the columns; a filter with no indexed equality
+    /// still does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fresh_values_never_recompute_a_column_set() {
         let _serial = SERIAL.lock().await;
@@ -910,10 +1022,11 @@ mod search_legs {
             "no column set was recomputed"
         );
         assert!(
-            seeks >= seeks_before + statements,
-            "every statement resolved through the index ({} of {statements})",
+            seeks >= seeks_before + PARENTS as u64,
+            "every value resolved through the index ({} seeks, {PARENTS} values)",
             seeks - seeks_before
         );
+        assert!(statements > PARENTS);
 
         let text = model.words.text(2);
         let vector = model.words.embedding();
@@ -924,6 +1037,178 @@ mod search_legs {
         assert!(
             recomputed > recomputed_before,
             "a filter with no indexed equality reads its column"
+        );
+    }
+    /// The legs' answers with the index route on, and how many index seeks
+    /// they took.
+    async fn served_and_seeks(
+        snapshot: &Snapshot<'_>,
+        legs: &[(String, Params)],
+    ) -> (Vec<Vec<(NodeId, u64)>>, u64, u64) {
+        let (before, _) = filter_membership_seeks();
+        let hits_before = filter_membership_seek_cache_hits();
+        let mut out = Vec::new();
+        for (cypher, params) in legs {
+            out.push(run(snapshot, cypher, params).await);
+        }
+        let (after, _) = filter_membership_seeks();
+        (
+            out,
+            after - before,
+            filter_membership_seek_cache_hits() - hits_before,
+        )
+    }
+
+    /// The legs' answers with the index route off (no seek may happen).
+    async fn column_answers(
+        snapshot: &Snapshot<'_>,
+        legs: &[(String, Params)],
+    ) -> Vec<Vec<(NodeId, u64)>> {
+        set_filter_membership_seek_enabled(false);
+        let (before, _) = filter_membership_seeks();
+        let mut out = Vec::new();
+        for (cypher, params) in legs {
+            out.push(run(snapshot, cypher, params).await);
+        }
+        let (after, _) = filter_membership_seeks();
+        set_filter_membership_seek_enabled(true);
+        assert_eq!(after, before, "the index route is off");
+        out
+    }
+
+    /// A set the index route built is kept across statements like a column
+    /// set: the same filter again does not seek (a cache hit), a committed
+    /// write patches it and a flush or a compaction carries it, still without
+    /// a seek, and every answer equals the column route's. With the route off
+    /// the kept index set is not used.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_index_set_is_kept_and_carried_like_a_column_set() {
+        let _serial = SERIAL.lock().await;
+        set_filter_membership_seek_enabled(true);
+        let (mut writer, mut model) = indexed_corpus("seek-kept").await;
+        let filter = "{parentId: 'p3', level: {lte: 5}}";
+
+        let snapshot = writer.snapshot();
+        let text = model.words.text(2);
+        let vector = model.words.embedding();
+        let first = legs(filter, 10, &text, &vector);
+        let (served, seeks, _) = served_and_seeks(&snapshot, &first).await;
+        assert!(
+            seeks >= 1,
+            "the first statement resolves the set through the index"
+        );
+        let (again, seeks, hits) = served_and_seeks(&snapshot, &first).await;
+        assert_eq!(seeks, 0, "the same filter on the same data does not seek");
+        assert!(hits >= 1, "it is a cache hit");
+        assert_eq!(again, served);
+        let text = model.words.text(2);
+        let vector = model.words.embedding();
+        let other_query = legs(filter, 3, &text, &vector);
+        let (other_served, seeks, _) = served_and_seeks(&snapshot, &other_query).await;
+        assert_eq!(
+            seeks, 0,
+            "another query with the same filter reuses the set"
+        );
+        // The route off: the kept index set is replaced by a column read, and
+        // the answers are the same.
+        assert_eq!(
+            column_answers(&snapshot, &first).await,
+            served,
+            "kept index set vs columns"
+        );
+        assert_eq!(column_answers(&snapshot, &other_query).await, other_served);
+        drop(snapshot);
+
+        // Build the set through the index again for a value the column
+        // passes above did not touch, then change the data under it.
+        let filter = "{parentId: 'p5', level: {lte: 5}}";
+        let snapshot = writer.snapshot();
+        let text = model.words.text(2);
+        let vector = model.words.embedding();
+        let (_, seeks, _) = served_and_seeks(&snapshot, &legs(filter, 10, &text, &vector)).await;
+        assert!(seeks >= 1);
+        drop(snapshot);
+        let ids = model.ids();
+        // A new member, a member moved out, a non-member moved in, a delete.
+        let mut doc = model.new_doc();
+        doc.parent = 5;
+        doc.level = 1;
+        model.write(&mut writer, NodeId::new(), doc);
+        let member = ids
+            .iter()
+            .copied()
+            .find(|id| model.docs[id].parent == 5 && model.docs[id].level <= 5);
+        if let Some(id) = member {
+            let mut doc = model.docs[&id].clone();
+            doc.parent = 6;
+            model.write(&mut writer, id, doc);
+        }
+        let outsider = ids.iter().copied().find(|id| model.docs[id].parent == 2);
+        if let Some(id) = outsider {
+            let mut doc = model.docs[&id].clone();
+            doc.parent = 5;
+            doc.level = 2;
+            model.write(&mut writer, id, doc);
+        }
+        let gone = ids
+            .iter()
+            .copied()
+            .find(|id| model.docs[id].parent == 5 && Some(*id) != member);
+        if let Some(id) = gone {
+            let doc = model.docs.remove(&id).unwrap();
+            writer.tombstone_node(doc.label, id).unwrap();
+        }
+        writer.commit_batch().await.unwrap();
+        // The same filter as a procedure map, for the membership hooks (which
+        // neither read nor fill the statement caches when `exact`).
+        let filter_value = super::map(&[
+            ("parentId", super::string("p5")),
+            ("level", super::map(&[("lte", RuntimeValue::Integer(5))])),
+        ]);
+        let mut last = None;
+        for context in ["after writes", "after a flush", "after a compaction"] {
+            match context {
+                "after a flush" => {
+                    writer.flush(schema()).await.unwrap();
+                }
+                "after a compaction" => {
+                    writer.compact_l0(&schema()).await.unwrap();
+                }
+                _ => {}
+            }
+            let snapshot = writer.snapshot();
+            let text = model.words.text(2);
+            let vector = model.words.embedding();
+            let legs = legs(filter, 10, &text, &vector);
+            let (served, seeks, hits) = served_and_seeks(&snapshot, &legs).await;
+            assert_eq!(
+                seeks, 0,
+                "{context}: the kept set is patched or carried, not seeked again"
+            );
+            assert!(hits >= 1, "{context}: a cache hit");
+            let exact = filter_membership_ids_for_tests(&snapshot, LABEL, &filter_value, true)
+                .await
+                .unwrap();
+            let mut expected: Vec<NodeId> = model
+                .docs
+                .iter()
+                .filter(|(_, d)| d.label == LABEL && d.parent == 5 && d.level <= 5)
+                .map(|(id, _)| *id)
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(
+                exact.as_deref(),
+                Some(expected.as_slice()),
+                "{context}: model"
+            );
+            last = Some((legs, served));
+        }
+        // Once at the end: a column read with the route off replaces the kept set.
+        let (legs, served) = last.unwrap();
+        assert_eq!(
+            column_answers(&writer.snapshot(), &legs).await,
+            served,
+            "compacted, vs columns"
         );
     }
 }
@@ -1201,4 +1486,175 @@ mod member_scan {
         writer.compact_l0(&schema()).await.unwrap();
         assert_parity(&writer.snapshot(), &mut rng, "merged").await;
     }
+}
+
+/// 1000 flushed `LABEL` nodes: `p0` admits 400, `p1`..`p3` 200 each.
+async fn speculation_fixture(name: &str) -> (WriterSession, BTreeMap<NodeId, Section>) {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut writer = WriterSession::open(store, paths(name)).await.unwrap();
+    let mut docs = BTreeMap::new();
+    for n in 0..1000 {
+        let id = NodeId::new();
+        let doc = Section {
+            label: LABEL,
+            parent: if n < 400 { 0 } else { 1 + n % 3 },
+            rank: (n % 7) as i64,
+            level: 1 + (n % 2) as i64,
+            active: true,
+        };
+        writer.upsert_node(LABEL, id, &doc.record()).unwrap();
+        docs.insert(id, doc);
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+    (writer, docs)
+}
+
+fn speculation_pool() -> &'static Arc<QueryMemoryPool> {
+    static POOL: std::sync::OnceLock<Arc<QueryMemoryPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| Arc::new(QueryMemoryPool::new(1 << 30)))
+}
+
+/// One first sighting of `filter` (the route a search statement takes) under
+/// a pooled memory account; the pool must be back at its baseline after.
+async fn first_sighting(writer: &WriterSession, filter: &RuntimeValue) -> Option<Vec<NodeId>> {
+    let snapshot = writer.snapshot();
+    let budget = Arc::new(QueryMemoryBudget::new(256 << 20).with_pool(speculation_pool().clone()));
+    let ids = with_query_memory(
+        Some(budget.clone()),
+        filter_membership_ids_for_tests(&snapshot, LABEL, filter, false),
+    )
+    .await
+    .unwrap();
+    drop(budget);
+    assert_eq!(
+        speculation_pool().reserved_bytes(),
+        0,
+        "the statement's account (the speculative read's included) is released"
+    );
+    ids
+}
+
+/// On a label small enough for the label-relative budget to bind, the column
+/// read starts next to the seek. A seek that declines (one value over the
+/// budget, or a later IN alternative that overruns what the earlier ones
+/// left) takes the column read's answer; a seek that serves drops the column
+/// read. Either way the answer is exact and the memory comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_small_label_reads_its_columns_while_the_seek_decides() {
+    let _serial = SERIAL.lock().await;
+    // 1000 nodes / 4: a budget of max(250, 256) = 256, below the 4096 cap.
+    set_filter_membership_seek_population_divisor(Some(4));
+    let (writer, docs) = speculation_fixture("membership-speculation").await;
+    let cases = [
+        (
+            "one value over the budget",
+            map(&[("parentId", string("p0"))]),
+            false,
+        ),
+        (
+            "a later alternative overruns the budget",
+            map(&[(
+                "parentId",
+                RuntimeValue::List(vec![string("p1"), string("p0")]),
+            )]),
+            false,
+        ),
+        (
+            "a value the seek serves",
+            map(&[("parentId", string("p2"))]),
+            true,
+        ),
+    ];
+    for (context, filter, served) in cases {
+        let (used0, dropped0) = filter_membership_seek_speculation();
+        let (served0, _) = filter_membership_seeks();
+        let budget0 = filter_membership_seek_budget_declines();
+        let ids = first_sighting(&writer, &filter).await;
+        assert_eq!(ids, Some(model_ids(&docs, &filter)), "{context}: exact");
+        let (used, dropped) = filter_membership_seek_speculation();
+        let (served_now, _) = filter_membership_seeks();
+        if served {
+            assert_eq!(
+                (used, dropped),
+                (used0, dropped0 + 1),
+                "{context}: read dropped"
+            );
+            assert_eq!(served_now, served0 + 1, "{context}: the seek served");
+        } else {
+            assert_eq!(
+                (used, dropped),
+                (used0 + 1, dropped0),
+                "{context}: read used"
+            );
+            assert_eq!(
+                filter_membership_seek_budget_declines(),
+                budget0 + 1,
+                "{context}: a budget decline"
+            );
+        }
+    }
+    set_filter_membership_seek_population_divisor(None);
+}
+
+/// Where the fixed cap binds (a large label, here a cap below the label's
+/// share), the routes run one after the other: no column read is started
+/// next to the seek, served or declined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_label_the_cap_bounds_never_speculates() {
+    let _serial = SERIAL.lock().await;
+    // 1000 nodes / 1 = 1000 > the 300 cap: the cap binds.
+    set_filter_membership_seek_population_divisor(Some(1));
+    set_filter_membership_seek_cap_for_tests(Some(300));
+    let (writer, docs) = speculation_fixture("membership-no-speculation").await;
+    let before = filter_membership_seek_speculation();
+    for filter in [
+        map(&[("parentId", string("p0"))]),
+        map(&[("parentId", string("p1"))]),
+    ] {
+        let ids = first_sighting(&writer, &filter).await;
+        assert_eq!(ids, Some(model_ids(&docs, &filter)));
+    }
+    assert_eq!(
+        filter_membership_seek_speculation(),
+        before,
+        "no speculative read"
+    );
+    set_filter_membership_seek_cap_for_tests(None);
+    set_filter_membership_seek_population_divisor(None);
+}
+
+/// A posting length a probe advertised is remembered for the process: a
+/// later statement with a different filter sharing the over-budget value
+/// declines that value without opening the sidecars again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_known_posting_length_declines_without_probing() {
+    let _serial = SERIAL.lock().await;
+    set_filter_membership_seek_population_divisor(Some(4));
+    let (writer, docs) = speculation_fixture("membership-posting-memo").await;
+    let first = map(&[("parentId", string("p0"))]);
+    let probes0 = namidb_storage::equality_sidecar_probe_stats();
+    assert_eq!(
+        first_sighting(&writer, &first).await,
+        Some(model_ids(&docs, &first))
+    );
+    let probes1 = namidb_storage::equality_sidecar_probe_stats();
+    assert!(probes1.probes > probes0.probes, "the first sighting probes");
+    // A different filter (its own kept set) that shares parentId = 'p0'.
+    let second = map(&[
+        ("parentId", string("p0")),
+        ("active", RuntimeValue::Bool(true)),
+    ]);
+    assert_eq!(
+        first_sighting(&writer, &second).await,
+        Some(model_ids(&docs, &second))
+    );
+    let probes2 = namidb_storage::equality_sidecar_probe_stats();
+    assert_eq!(probes2.probes, probes1.probes, "no sidecar is probed again");
+    assert_eq!(
+        probes2.memo_declines,
+        probes1.memo_declines + 1,
+        "declined from the remembered length"
+    );
+    set_filter_membership_seek_population_divisor(None);
 }

@@ -1528,6 +1528,7 @@ mod indexed {
            }) YIELD node, score RETURN node.title AS title";
         let q = vec![1.0, 0.0, 0.0, 0.0];
         let equality_lookups = w.property_index_cache().equality_lookup_calls();
+        let seeks = namidb_query::filter_membership_seeks().0;
         let got = titles(&run(&w, cypher, q.clone()).await);
         let eligible: Vec<(String, Vec<f32>)> = owned
             .iter()
@@ -1537,12 +1538,20 @@ mod indexed {
         assert_eq!(got, exact_topk(&eligible, &q, 3));
         assert_eq!(got.len(), 3, "selective metadata filter must still fill k");
         // The filter's membership set (which sizes the first round and
-        // filters the fresh delta) resolves through the equality index: one
-        // posting lookup. Native `.vg` filtering itself adds none.
+        // filters the fresh delta) resolves through the equality index. It is
+        // kept across statements, so it is looked up on the flushed corpus
+        // alone, a snapshot without this writer's property-index cache: that
+        // lookup is counted with the index-served memberships (a process
+        // total, which concurrent tests only advance), not on the cache.
+        assert!(
+            namidb_query::filter_membership_seeks().0 > seeks,
+            "the membership must resolve through the equality index"
+        );
+        // Native `.vg` filtering itself opens no equality sidecar.
         assert_eq!(
             w.property_index_cache().equality_lookup_calls(),
-            equality_lookups + 1,
-            "v4 native filtering must not open equality sidecars beyond the membership's one lookup"
+            equality_lookups,
+            "v4 native filtering must not open equality sidecars"
         );
     }
 

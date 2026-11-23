@@ -122,6 +122,11 @@ pub async fn with_memory_hook<F: Future>(hook: Option<Arc<dyn MemoryHook>>, fut:
     }
 }
 
+/// The deadline in scope, if any.
+pub fn current_deadline() -> Option<Instant> {
+    CTX.try_with(|ctx| ctx.deadline).ok().flatten()
+}
+
 /// The memory hook in scope, if any — for re-scoping onto a spawned task.
 pub fn current_memory_hook() -> Option<Arc<dyn MemoryHook>> {
     CTX.try_with(|ctx| ctx.memory.clone()).ok().flatten()

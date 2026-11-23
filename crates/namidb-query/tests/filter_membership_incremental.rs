@@ -12,7 +12,10 @@ use std::sync::Arc;
 use namidb_core::id::{NamespaceId, NodeId};
 use namidb_core::schema::{DataType, LabelDef, PropertyDef, Schema, SchemaBuilder};
 use namidb_core::value::Value as CoreValue;
-use namidb_query::{filter_membership_ids_for_tests, filter_membership_paths, RuntimeValue};
+use namidb_query::{
+    filter_membership_ids_for_tests, filter_membership_paths, filter_membership_sst_key_reads,
+    RuntimeValue,
+};
 use namidb_storage::{NamespacePaths, NodeWriteRecord, WriterSession};
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
@@ -20,6 +23,10 @@ use object_store::ObjectStore;
 const LABEL: &str = "Doc";
 const OTHER: &str = "Other";
 const TIERS: usize = 5;
+
+/// The path and key-read counters are process-wide: the tests that read
+/// them run one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn schema() -> Schema {
     let props = || {
@@ -248,6 +255,7 @@ async fn randomized(seed: u64) {
 
 #[tokio::test]
 async fn randomized_writes_flushes_and_compactions_keep_the_set_exact() {
+    let _serial = SERIAL.lock().await;
     let (_, _, patched_before, recomputed_before) = filter_membership_paths();
     for seed in [1, 7, 42, 1234, 99991] {
         randomized(seed).await;
@@ -261,6 +269,7 @@ async fn randomized_writes_flushes_and_compactions_keep_the_set_exact() {
 /// the random walk misses it.
 #[tokio::test]
 async fn each_flush_and_compaction_takes_the_expected_path() {
+    let _serial = SERIAL.lock().await;
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let mut writer = WriterSession::open(store.clone(), paths("membership-paths"))
         .await
@@ -297,12 +306,19 @@ async fn each_flush_and_compaction_takes_the_expected_path() {
     let after = filter_membership_paths();
     assert!(after.2 > before.2, "a flush of new rows patches");
 
-    // A compaction of rows the set already reflects: carried.
+    // A compaction of rows the set already reflects: carried, without
+    // reading the rewritten SSTs' keys.
     writer.compact_l0(&schema()).await.unwrap();
     let before = filter_membership_paths();
+    let reads_before = filter_membership_sst_key_reads();
     assert_exact(&writer, &docs, "after a seen compaction").await;
     let after = filter_membership_paths();
     assert!(after.1 > before.1, "a compaction of seen rows carries");
+    assert_eq!(
+        filter_membership_sst_key_reads(),
+        reads_before,
+        "a rewrite of seen rows is carried without reading keys"
+    );
 
     // Two flushes (deletes) and a compaction with no read in between: the
     // merge may drop a member's tombstone with its row, so members inside
@@ -336,4 +352,64 @@ async fn each_flush_and_compaction_takes_the_expected_path() {
     assert_exact(&writer, &docs, "after a restart").await;
     let after = filter_membership_paths();
     assert!(after.3 > before.3, "a new writer session recomputes");
+}
+
+/// A member deleted after its set was built, then a merge that drops the
+/// tombstone together with the row it shadows, with no read in between:
+/// the new corpus holds neither, so nothing in the merge's output names the
+/// node. The set must not be carried as is; the answer excludes the node.
+#[tokio::test]
+async fn a_merge_that_drops_a_newer_tombstone_is_not_carried_blindly() {
+    let _serial = SERIAL.lock().await;
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut writer = WriterSession::open(store, paths("membership-tombstone-drop"))
+        .await
+        .unwrap();
+    let mut docs = BTreeMap::new();
+    for n in 0..60 {
+        let id = NodeId::new();
+        let doc = Doc {
+            label: LABEL,
+            vigente: n % 2 == 0,
+            tier: n as usize % TIERS,
+            n,
+        };
+        writer.upsert_node(LABEL, id, &doc.record()).unwrap();
+        docs.insert(id, doc);
+    }
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+    writer.compact_l0(&schema()).await.unwrap();
+    // The set is built at this watermark.
+    assert_exact(&writer, &docs, "built").await;
+
+    let member = docs
+        .iter()
+        .find(|(_, doc)| doc.vigente)
+        .map(|(id, _)| *id)
+        .unwrap();
+    docs.remove(&member);
+    writer.tombstone_node(LABEL, member).unwrap();
+    writer.commit_batch().await.unwrap();
+    writer.flush(schema()).await.unwrap();
+    // The only level below: the merge drops the tombstone and the row.
+    writer.compact_l0(&schema()).await.unwrap();
+
+    let reads_before = filter_membership_sst_key_reads();
+    let snapshot = writer.snapshot();
+    let served = filter_membership_ids_for_tests(
+        &snapshot,
+        LABEL,
+        &filter(&[("vigente", RuntimeValue::Bool(true))]),
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!served.contains(&member), "a dropped member is not served");
+    assert!(
+        filter_membership_sst_key_reads() > reads_before,
+        "a merge that consumed a newer row reads the new SSTs' keys"
+    );
+    assert_exact(&writer, &docs, "after the tombstone was dropped").await;
 }

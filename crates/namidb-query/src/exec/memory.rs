@@ -459,6 +459,24 @@ impl QueryMemoryBudget {
     }
 }
 
+impl QueryMemoryBudget {
+    /// A fresh account for background work a statement starts (a filter
+    /// membership carry), which outlives the statement: the same per-query
+    /// limit, shared pool and process probe, but its own reservation and
+    /// refusal state. Dropping it returns its pool reservation.
+    pub(crate) fn background_account(&self) -> Arc<QueryMemoryBudget> {
+        let mut account = QueryMemoryBudget::new(self.limit);
+        account.pool = self.pool.clone();
+        account.probe = self.probe.clone();
+        Arc::new(account)
+    }
+
+    /// Whether the process probe reports the process at its ceiling now.
+    pub(crate) fn at_process_ceiling(&self) -> bool {
+        self.probe.as_ref().is_some_and(|probe| probe().is_some())
+    }
+}
+
 impl Drop for QueryMemoryBudget {
     fn drop(&mut self) {
         if let Some(pool) = &self.pool {
@@ -537,6 +555,22 @@ fn with_budget<R>(f: impl FnOnce(&QueryMemoryBudget) -> R) -> Option<R> {
 /// is charged for every row it ever read, as if it had kept them all.
 pub(crate) fn release_storage_rows() {
     let _ = with_budget(|budget| budget.storage_bytes.store(0, Ordering::Release));
+}
+
+/// Hold exactly `bytes` charged for background work with no operator
+/// boundary (a filter membership carry): what it keeps between reads. The
+/// rows storage reported since the last call are replaced by it.
+pub(crate) fn hold_bytes(bytes: usize) -> Result<(), ExecError> {
+    let outcome = with_budget(|budget| -> Result<(), QueryMemoryExceeded> {
+        budget.storage_bytes.store(0, Ordering::Release);
+        budget.ensure(bytes)?;
+        budget.set_used(bytes);
+        Ok(())
+    });
+    match outcome {
+        Some(Err(exceeded)) => Err(ExecError::MemoryLimit(exceeded)),
+        _ => Ok(()),
+    }
 }
 
 /// Whether a budget is scoped on this task.
@@ -808,7 +842,7 @@ fn page_size() -> usize {
             .ok()
             .and_then(|auxv| {
                 // AT_PAGESZ = 6; entries are (u64 key, u64 value) pairs.
-                auxv.chunks_exact(16).find_map(|entry| {
+                auxv.as_chunks::<16>().0.iter().find_map(|entry| {
                     let key = u64::from_ne_bytes(entry[..8].try_into().ok()?);
                     let value = u64::from_ne_bytes(entry[8..].try_into().ok()?);
                     (key == 6).then_some(value as usize)

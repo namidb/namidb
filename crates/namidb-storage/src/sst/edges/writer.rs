@@ -880,7 +880,7 @@ impl EdgeSstWriter {
         self.degree_histogram.observe(degree);
         self.key_ids.write_all(&key)?;
         let stride = u64::from(self.options.fence_stride.max(1));
-        if self.key_count % stride == 0 {
+        if self.key_count.is_multiple_of(stride) {
             self.fence_entries.write_all(&key)?;
             self.fence_entries
                 .write_all(&self.key_count.saturating_mul(16).to_le_bytes())?;

@@ -1527,7 +1527,7 @@ fn range_fn(args: &[RuntimeValue], span: SourceSpan) -> Result<RuntimeValue, Eva
 /// million-element `reduce` used to outlive the query timeout.
 #[inline]
 fn probe_interrupt(index: usize, span: SourceSpan) -> Result<(), EvalError> {
-    if index % namidb_storage::cancel::CHECK_STRIDE != 0 {
+    if !index.is_multiple_of(namidb_storage::cancel::CHECK_STRIDE) {
         return Ok(());
     }
     match namidb_storage::cancel::interrupted() {

@@ -202,6 +202,21 @@ pub fn foreground_active() -> bool {
     FOREGROUND.load(Ordering::Relaxed) > 0
 }
 
+/// For maintenance that runs as an async task (its reads await on the
+/// runtime) rather than on a maintenance thread: called after each read,
+/// with how long it took. While a statement runs, it sleeps for `worked`
+/// scaled by the duty cycle (`NAMIDB_INDEX_BUILD_DUTY_PERCENT`), at most a
+/// second, as a maintenance thread pauses between slices; otherwise it
+/// returns at once.
+pub async fn yield_to_foreground(worked: Duration) {
+    let duty = foreground_duty_percent();
+    if !foreground_active() || duty >= 100 {
+        return;
+    }
+    let pause = worked.max(SLICE) * (100 - duty) / duty;
+    tokio::time::sleep(pause.min(Duration::from_secs(1))).await;
+}
+
 /// Counting semaphore of build slots, for plain threads.
 struct BuildSlots {
     free: Mutex<usize>,

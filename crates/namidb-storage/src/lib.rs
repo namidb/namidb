@@ -12,6 +12,11 @@
 
 #![warn(rust_2018_idioms)]
 #![deny(missing_debug_implementations)]
+// MSRV 1.91 enables this lint. The fixed-size `chunks_exact` loops decode
+// on-disk little-endian words; rewriting them to `as_chunks` is left for a
+// release that is not a patch.
+// TODO(3.6): move the decode loops to `as_chunks` and drop this allow.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 pub mod adjacency;
 pub mod background;
@@ -121,12 +126,14 @@ pub use range_cache::{
     DEFAULT_RAM_PAGE_CACHE_MAX_BYTES, DEFAULT_RANGE_CACHE_MAX_ENTRY_BYTES,
     DEFAULT_RANGE_CACHE_PAGE_BYTES,
 };
+pub use read::EqualitySidecarProbeStats;
 #[cfg(feature = "vector-index")]
 pub use read::VectorFilterSearch;
 pub use read::{
-    property_index_population, EdgeListView, EdgeScanCursor, EdgeView, IndexedNodeFilter,
-    NodeDataIdentity, NodeDataLineage, NodeScanCursor, NodeSstSpan, NodeView, OwnedSnapshot,
-    PinnedSnapshot, PrefetchSummary, Snapshot, SnapshotCell, VersionPin, PREFETCH_NODE_SST_LIMIT,
+    equality_sidecar_probe_stats, property_index_population, EdgeListView, EdgeScanCursor,
+    EdgeView, IndexedNodeFilter, NodeDataIdentity, NodeDataLineage, NodeScanCursor, NodeSstSpan,
+    NodeView, OwnedSnapshot, PinnedSnapshot, PrefetchSummary, Snapshot, SnapshotCell, VersionPin,
+    PREFETCH_NODE_SST_LIMIT,
 };
 pub use reader::ReaderSession;
 pub use recovery::{

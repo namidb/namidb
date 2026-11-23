@@ -4,7 +4,7 @@
 # BuildKit still selects linux/amd64 or linux/arm64 while every release rebuild
 # consumes byte-identical base manifests.
 # ─── builder ───────────────────────────────────────────────────────────
-FROM rust:1.85.1-slim-bookworm@sha256:9f841bbe9e7d8e37ceb96ed907265a3a0df7f44e3737d0b100e7907a679acb36 AS builder
+FROM rust:1.91.1-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a021b94b9d35108c8efe6c79ca7dc1a65 AS builder
 
 WORKDIR /build
 

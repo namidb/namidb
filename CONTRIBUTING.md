@@ -35,7 +35,7 @@ RFC:
 
 ## Coding standards
 
-- **Rust edition 2021**, MSRV 1.85 (kept current).
+- **Rust edition 2021**, MSRV 1.91 (kept current).
 - `unsafe` only in hot paths with documented invariants and `// SAFETY:`
   comments.
 - All public APIs documented (`cargo doc --workspace --no-deps` must

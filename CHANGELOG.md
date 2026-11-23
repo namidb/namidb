@@ -15,6 +15,144 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.5.4] - 2026-11-22
+
+### Fixed
+
+- **A search filter resolved through the property index is kept across
+  statements.** 3.5.3 builds the membership set of a selective equality or
+  `IN` filter from the property's postings, but kept such a set only for the
+  statement that built it. Every later statement with the same filter looked
+  the postings and each candidate node up again. On an object store whose
+  range cache is under pressure, that meant hundreds of remote reads per
+  statement for a filter that 3.5.2 answered from its kept column set: a
+  filtered `search.bm25` over a few thousand candidates took 5-7 s per
+  statement instead of under 1.5 s. Index-built sets are now kept like
+  column-built ones. A set is cached per snapshot (any committed write
+  changes the key), kept across flushes by patching the rows written since,
+  and carried across compactions. A writer session, epoch, schema or index
+  definition change starts it over. A set already kept for a filter, built
+  either way, is reused before the index is asked. With the index route
+  turned off (`NAMIDB_FILTER_MEMBERSHIP_SEEK_CAP=0`), a kept index-built set
+  is not used and the filter's columns are read instead. Answers are
+  unchanged.
+- **A filter that admits a large share of its label reads its columns
+  instead of looking each candidate up.** The index route of 3.5.3 took any
+  equality or `IN` conjunct whose postings held at most
+  `NAMIDB_FILTER_MEMBERSHIP_SEEK_CAP` nodes (4096), whatever the size of the
+  label. Each candidate costs a lookup of its current version, so on a cold
+  remote cache a conjunct admitting 2 400 of 30 000 nodes took four times
+  the remote reads of a column read, and about 9 s instead of under 2 s, the
+  first time the filter was seen. A seek now also stays within a share of
+  the label's flushed population, taken from the manifest with no I/O:
+  `population / NAMIDB_FILTER_MEMBERSHIP_SEEK_POPULATION_DIVISOR` (default
+  64, never below 256 candidates, `0` turns the share off). When the
+  manifest knows no population, the fixed cap alone applies, as before.
+  Selective filters on large labels keep the index route.
+  Deciding a seek costs a probe of the property's index in every SST, and
+  a seek over that share declines only after its probes. On such a label
+  (one small enough for the share, not the fixed cap, to bound the seek),
+  the filter's columns are now read while the seek decides. A seek that
+  serves drops the read unfinished; one that declines answers from it, so a
+  first sighting costs about what one route costs, not both in turn. The
+  read runs inside the statement, under its memory limit and deadline.
+  Larger labels keep the routes in turn, so a served seek there reads
+  nothing more.
+- **An equality-index lookup probes its SSTs together.** A lookup reads a
+  few dependent ranges from each SST's index. 3.5.3 read one SST after the
+  other, so a lookup over five SSTs cost five chains of round trips on a
+  cold remote cache, about 1 s even when no node matched. Up to
+  `NAMIDB_EQUALITY_SIDECAR_PROBE_CONCURRENCY` SSTs (default 8) are now
+  probed at once, and the results are merged in the same order as before.
+  The process also remembers the length of each value's posting in the
+  index files it has probed (they never change), in a bounded memo of a few
+  MiB. A lookup over its candidate cap is then declined from those lengths,
+  with no read. Answers are unchanged.
+- **A compaction no longer stalls filtered search on a large label.** A
+  kept filter membership set is carried to the corpus a compaction
+  produces. 3.5.3 and earlier did so by reading the row keys of every new
+  SST. On a large label with a cold range cache, that read could take
+  longer than the query deadline, and a carry that never finishes is never
+  kept. If a compaction landed while a filter's set was being built, every
+  later statement with that filter retried the carry and timed out until
+  the engine restarted. A compaction that only rewrote rows the set already
+  reflects is now carried without any read: every input and every output
+  SST is at or below the set's watermark. A carry or patch that does read
+  new rows runs once per kept set, in the background, on no statement's
+  deadline. A statement waits at most
+  `NAMIDB_FILTER_MEMBERSHIP_CARRY_WAIT_MS` for it (default 1000). After
+  that wait, the statement resolves the filter whole, as for a filter seen
+  for the first time. It does the same while a failed carry backs off (5 s,
+  doubling up to 5 min). Background carries never starve reads:
+  - At most `NAMIDB_FILTER_MEMBERSHIP_CARRY_MAX` run at once (default 2).
+    A carry over the cap is not queued.
+  - A carry holds a memory account of its own, with the same per-query
+    limit, shared pool and process ceiling as a statement. The account is
+    released when the carry ends. A carry is not started while the
+    process is at its ceiling.
+  - The starting statement's deadline, cancel or disconnect does not stop
+    the carry.
+  - It pauses between reads while statements run, at the index-build duty
+    cycle.
+  - A carry toward a corpus that a newer one replaced is cancelled once.
+  - Closing a namespace cancels its carries.
+  - A carry does not keep an engine from idle-stop. Stopping aborts it
+    safely, because it only fills a process cache.
+
+  Answers are unchanged.
+- **The engine no longer aborts with the on-disk range-cache tier on.** With
+  `NAMIDB_NVME_CACHE_PATH` set, a lookup of a small range (below the
+  device's minimum entry size, kept in memory only) could join an in-flight
+  read-through of the same range across the hybrid cache and its memory
+  tier. The two carry different fetch contexts, so the cache library
+  panicked with `fetch context type mismatch`, and a release build aborts
+  on a panic. Each range now reaches the cache through a single tier,
+  chosen by its length, for lookups, read-throughs and inserts alike.
+  `foyer` is updated from 0.22.3 to 0.22.6, which fixes eviction-list
+  bookkeeping when concurrent fetches return a record that is already
+  resident. Under concurrent load, the on-disk tier of 3.5.3 and earlier
+  could therefore also return wrong bytes for a cached range. The default
+  RAM-only configuration was not affected by either defect.
+
+### Added
+
+- `namidb_filter_membership_seek_total{outcome="cached"}`: statements an
+  index-built membership set answered without a new index lookup.
+- `namidb_filter_membership_seek_total{outcome="declined_budget"}`: seeks
+  declined by the label-relative budget, whose filters read their columns.
+- `NAMIDB_FILTER_MEMBERSHIP_SEEK_POPULATION_DIVISOR` (default 64).
+- `namidb_filter_membership_carry_total{outcome="started"|"failed"|"cancelled"|"carry_deferred"}`:
+  background carries of kept filter membership sets, failed and cancelled
+  attempts, and statements that answered without the kept set. A statement
+  answers without it while its carry is in flight, backing off, over the
+  cap, or refused at the memory ceiling.
+- `NAMIDB_FILTER_MEMBERSHIP_CARRY_WAIT_MS` (default 1000) and
+  `NAMIDB_FILTER_MEMBERSHIP_CARRY_MAX` (default 2).
+- `namidb_filter_membership_seek_total{outcome="speculative_used"|"speculative_dropped"}`:
+  column reads started next to a seek, used because the seek declined or
+  dropped because it served.
+- `namidb_equality_sidecar_probe_total{outcome="probed"|"memo_declined"}`:
+  equality-index probes issued, and capped lookups declined from remembered
+  posting lengths.
+- `NAMIDB_EQUALITY_SIDECAR_PROBE_CONCURRENCY` (default 8).
+
+### Changed
+
+- `foyer` 0.22.3 -> 0.22.6 (range cache).
+- **Minimum supported Rust version is now 1.91** (was 1.85), as `foyer`
+  0.22.6 requires. Building from source, including the Python sdist, needs
+  Rust 1.91 or newer. The container image builds with Rust 1.91.1.
+
+### Known issues
+
+- The first statement that sees a new value of a filter on a small label,
+  where the property index declines the seek for the label's budget, can be
+  about 7 % slower than in 3.5.2. The column read that answers it runs next to
+  the declined seek and shares the statement's thread with it. Later
+  statements with the same filter reuse the kept set and are unaffected.
+  `NAMIDB_FILTER_MEMBERSHIP_SEEK_CAP=0` restores the 3.5.2 timing, but it
+  turns the property-index route off for every filter.
+
 ## [3.5.3] - 2026-11-21
 
 ### Added
@@ -5946,7 +6084,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.3...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.4...HEAD
+[3.5.4]: https://github.com/namidb/namidb/compare/v3.5.3...v3.5.4
 [3.5.3]: https://github.com/namidb/namidb/compare/v3.5.2...v3.5.3
 [3.5.2]: https://github.com/namidb/namidb/compare/v3.5.1...v3.5.2
 [3.5.1]: https://github.com/namidb/namidb/compare/v3.5.0...v3.5.1

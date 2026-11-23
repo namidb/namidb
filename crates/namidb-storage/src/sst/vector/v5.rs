@@ -2711,7 +2711,7 @@ fn decode_nav_page(
                     "vector v5 navigation filter bitmap length mismatch",
                 ));
             }
-            if rows % 64 != 0
+            if !rows.is_multiple_of(64)
                 && bitmap.last().is_some_and(|word| {
                     let mask = (1u64 << (rows % 64)) - 1;
                     word & !mask != 0
@@ -3852,7 +3852,7 @@ mod tests {
         for (node_id, _) in result.hits {
             let ordinal = id_value(&node_id);
             assert!(ordinal >= 96);
-            assert!(ordinal % 3 == 0 || ordinal % 3 == 1);
+            assert!(ordinal.is_multiple_of(3) || ordinal % 3 == 1);
         }
     }
 

@@ -1781,7 +1781,7 @@ impl LegacyMapSpool {
         posting: &mut std::fs::File,
         posting_len: u64,
     ) -> Result<()> {
-        if posting_len % 16 != 0 {
+        if !posting_len.is_multiple_of(16) {
             return Err(Error::invariant(
                 "legacy equality posting is not NodeId-aligned",
             ));

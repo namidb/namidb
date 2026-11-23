@@ -622,7 +622,11 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             words.push(WORDS[(state >> 33) as usize % WORDS.len()]);
         }
-        words.push(if version % 2 == 0 { "even" } else { "odd" });
+        words.push(if version.is_multiple_of(2) {
+            "even"
+        } else {
+            "odd"
+        });
         // Live documents with no tokens: a fresh build keeps them with
         // length zero and no postings, and so must a merge.
         let text = if matches!((node, version), (5, 2) | (61, 1)) {
@@ -637,7 +641,10 @@ mod tests {
                     "status".into(),
                     SearchFilterValue::String(format!("e{}", (node + version) % 3)),
                 ),
-                ("open".into(), SearchFilterValue::Bool(node % 4 != 0)),
+                (
+                    "open".into(),
+                    SearchFilterValue::Bool(!node.is_multiple_of(4)),
+                ),
             ]),
         }
     }
