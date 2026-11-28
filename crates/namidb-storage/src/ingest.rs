@@ -2263,7 +2263,17 @@ impl WriterSession {
         // behind; start it from exactly the generation just published.
         if committed_node_mutations {
             if let Some((labels, pairs)) = self.property_index_cache.take_count_seed_request() {
-                crate::read::spawn_count_seed(self.owned_snapshot(), labels, pairs);
+                // Another seed may still be running: keep the request for a
+                // later commit instead of dropping it, or the reader that
+                // asked would wait for a seed that never starts.
+                if !crate::read::spawn_count_seed(
+                    self.owned_snapshot(),
+                    labels.clone(),
+                    pairs.clone(),
+                ) && self.property_index_cache.count_seed_running()
+                {
+                    self.property_index_cache.request_count_seed(labels, pairs);
+                }
             }
         }
         // Every committed node mutation already passed through

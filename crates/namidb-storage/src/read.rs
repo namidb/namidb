@@ -5420,340 +5420,362 @@ impl<'mt> Snapshot<'mt> {
         // not turn one hydration into a burst of requests. Every overlapping
         // SST is probed either way (the newest LSN wins across all of them);
         // the results are consumed below in the original SST order.
+        // The probes run in waves of `EXACT_PROBE_FAN_OUT` SSTs, and each
+        // wave's records are decoded and folded into `winners` before the
+        // next wave is probed, so the encoded and decoded versions held at
+        // once are those of one wave, not of every SST that overlaps the ids
+        // (a deep L0 backlog of rewritten wide rows made that the largest
+        // unmetered allocation of a batch write). The governor's stop of the
+        // statement is observed between waves.
         const EXACT_PROBE_FAN_OUT: usize = 8;
-        let mut exact_probes: HashMap<usize, Result<_>> = {
-            let probes = sst_idxs.iter().filter_map(|&idx| {
-                let desc = &self.manifest.manifest.ssts[idx];
-                if !pending
-                    .iter()
-                    .any(|id| id >= &desc.min_key && id <= &desc.max_key)
-                    || !crate::manifest::node_locator_has_exact_records(desc)
-                {
-                    return None;
-                }
-                let locator = desc
-                    .node_locator
-                    .as_ref()
-                    .filter(|locator| locator.entry_count == desc.row_count)?;
-                let locator_absolute = format!(
-                    "{}/{}",
-                    self.paths.namespace_prefix().as_ref(),
-                    locator.path
-                );
-                let sorted_pending = &sorted_pending;
-                Some(async move {
-                    let probed = match self
-                        .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
-                        .await
+        let segments = batch_lookup_probe_segments(
+            &self.manifest.manifest,
+            &sst_idxs,
+            &pending,
+            EXACT_PROBE_FAN_OUT,
+        );
+        for segment in &segments {
+            if segments.len() > 1 {
+                crate::cancel::check()?;
+                BATCH_LOOKUP_PROBE_WAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let mut exact_probes: HashMap<usize, Result<_>> = {
+                let probes = segment.iter().filter_map(|&idx| {
+                    let desc = &self.manifest.manifest.ssts[idx];
+                    if !pending
+                        .iter()
+                        .any(|id| id >= &desc.min_key && id <= &desc.max_key)
+                        || !crate::manifest::node_locator_has_exact_records(desc)
                     {
-                        Ok(source) => {
-                            crate::sst::paged_index::probe_node_records_from_source(
-                                &source,
-                                sorted_pending,
-                            )
+                        return None;
+                    }
+                    let locator = desc
+                        .node_locator
+                        .as_ref()
+                        .filter(|locator| locator.entry_count == desc.row_count)?;
+                    let locator_absolute = format!(
+                        "{}/{}",
+                        self.paths.namespace_prefix().as_ref(),
+                        locator.path
+                    );
+                    let sorted_pending = &sorted_pending;
+                    Some(async move {
+                        let probed = match self
+                            .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
                             .await
-                        }
-                        Err(error) => Err(error),
-                    };
-                    (idx, probed)
-                })
-            });
-            let mut probes = probes.collect::<Vec<_>>().into_iter();
-            let mut probed = HashMap::new();
-            loop {
-                let wave = probes
-                    .by_ref()
-                    .take(EXACT_PROBE_FAN_OUT)
-                    .collect::<Vec<_>>();
-                if wave.is_empty() {
-                    break probed;
+                        {
+                            Ok(source) => {
+                                crate::sst::paged_index::probe_node_records_from_source(
+                                    &source,
+                                    sorted_pending,
+                                )
+                                .await
+                            }
+                            Err(error) => Err(error),
+                        };
+                        (idx, probed)
+                    })
+                });
+                let mut probes = probes.collect::<Vec<_>>().into_iter();
+                let mut probed = HashMap::new();
+                loop {
+                    let wave = probes
+                        .by_ref()
+                        .take(EXACT_PROBE_FAN_OUT)
+                        .collect::<Vec<_>>();
+                    if wave.is_empty() {
+                        break probed;
+                    }
+                    probed.extend(futures::future::join_all(wave).await);
                 }
-                probed.extend(futures::future::join_all(wave).await);
-            }
-        };
-        for idx in sst_idxs {
-            let desc = &self.manifest.manifest.ssts[idx];
-            // Cheap pre-filter: skip the SST if its [min_key, max_key]
-            // range is disjoint from every pending id. For typical
-            // LDBC IDs this still admits the SST (UUIDv7 hashes spread
-            // across the range), but it cheaply rules out partition
-            // scenarios where a label is split into per-tenant SSTs.
-            let min_key = desc.min_key;
-            let max_key = desc.max_key;
-            if !pending.iter().any(|id| id >= &min_key && id <= &max_key) {
-                continue;
-            }
-            let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
+            };
+            for &idx in segment {
+                let desc = &self.manifest.manifest.ssts[idx];
+                // Cheap pre-filter: skip the SST if its [min_key, max_key]
+                // range is disjoint from every pending id. For typical
+                // LDBC IDs this still admits the SST (UUIDv7 hashes spread
+                // across the range), but it cheaply rules out partition
+                // scenarios where a label is split into per-tenant SSTs.
+                let min_key = desc.min_key;
+                let max_key = desc.max_key;
+                if !pending.iter().any(|id| id >= &min_key && id <= &max_key) {
+                    continue;
+                }
+                let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
 
-            // Current `.nloc2` objects append an exact NodeId -> record B+tree
-            // after the backward-compatible ordinal locator. Prefer it before
-            // even opening the Parquet footer: a random existing-node update
-            // then fetches only that node's compressed JSON payload instead of
-            // decoding the 1 MiB `__overflow_json` page that happens to contain
-            // its row. At legal-corpus scale this is the difference between a
-            // few KiB and ~MiB of allocator high-water per updated node.
-            if crate::manifest::node_locator_has_exact_records(desc) {
+                // Current `.nloc2` objects append an exact NodeId -> record B+tree
+                // after the backward-compatible ordinal locator. Prefer it before
+                // even opening the Parquet footer: a random existing-node update
+                // then fetches only that node's compressed JSON payload instead of
+                // decoding the 1 MiB `__overflow_json` page that happens to contain
+                // its row. At legal-corpus scale this is the difference between a
+                // few KiB and ~MiB of allocator high-water per updated node.
+                if crate::manifest::node_locator_has_exact_records(desc) {
+                    if let Some(locator) = desc
+                        .node_locator
+                        .as_ref()
+                        .filter(|locator| locator.entry_count == desc.row_count)
+                    {
+                        let probed = exact_probes.remove(&idx).ok_or_else(|| {
+                            Error::invariant("exact node-record probe was not scheduled")
+                        })?;
+                        match probed {
+                            Ok((records, stats)) if stats.index_entries == locator.entry_count => {
+                                let decoded = records
+                                    .into_iter()
+                                    .map(|(id_bytes, encoded)| {
+                                        let (lsn, record) = decode_exact_node_record(&encoded)?;
+                                        let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
+                                        let view = record.map(|record| NodeView {
+                                            id,
+                                            labels: labels_from_ids(
+                                                &record.labels,
+                                                &self.manifest.manifest.label_dict,
+                                                &desc.scope,
+                                            ),
+                                            properties: record.properties,
+                                            lsn,
+                                            schema_version: record.schema_version,
+                                        });
+                                        Ok((id_bytes, lsn, view))
+                                    })
+                                    .collect::<Result<Vec<_>>>();
+                                match decoded {
+                                    Ok(decoded) => {
+                                        if let Some(cache) = &self.cache {
+                                            cache.record_node_locator_probe(stats);
+                                        }
+                                        for (id_bytes, lsn, view) in decoded {
+                                            match winners.get(&id_bytes) {
+                                                Some((existing_lsn, _)) if *existing_lsn >= lsn => {
+                                                }
+                                                _ => {
+                                                    winners.insert(id_bytes, (lsn, view));
+                                                }
+                                            }
+                                        }
+                                        // Matching keys were returned and checked;
+                                        // all other requested keys are authoritative
+                                        // misses because both sidecar trees cover
+                                        // exactly `row_count` entries.
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            path = %locator.path,
+                                            error = %error,
+                                            "exact node-record index is corrupt; falling back to Parquet"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok((_records, _stats)) => {
+                                // Count disagreement means the extension cannot be
+                                // authoritative for absence. Retain the compatible
+                                // ordinal/Parquet fallback below.
+                            }
+                            Err(error) if optional_accelerator_fallback(&error) => {
+                                tracing::warn!(
+                                    path = %locator.path,
+                                    error = %error,
+                                    "exact node-record index unavailable; falling back to Parquet"
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+
+                let label_def = self.label_def_for_node_sst(desc);
+                let md = self.node_sst_metadata(desc, &absolute).await?;
                 if let Some(locator) = desc
                     .node_locator
                     .as_ref()
                     .filter(|locator| locator.entry_count == desc.row_count)
                 {
-                    let probed = exact_probes.remove(&idx).ok_or_else(|| {
-                        Error::invariant("exact node-record probe was not scheduled")
-                    })?;
-                    match probed {
-                        Ok((records, stats)) if stats.index_entries == locator.entry_count => {
-                            let decoded = records
-                                .into_iter()
-                                .map(|(id_bytes, encoded)| {
-                                    let (lsn, record) = decode_exact_node_record(&encoded)?;
-                                    let id = NodeId::from_uuid(Uuid::from_bytes(id_bytes));
-                                    let view = record.map(|record| NodeView {
-                                        id,
-                                        labels: labels_from_ids(
-                                            &record.labels,
-                                            &self.manifest.manifest.label_dict,
-                                            &desc.scope,
-                                        ),
-                                        properties: record.properties,
-                                        lsn,
-                                        schema_version: record.schema_version,
-                                    });
-                                    Ok((id_bytes, lsn, view))
-                                })
-                                .collect::<Result<Vec<_>>>();
-                            match decoded {
-                                Ok(decoded) => {
-                                    if let Some(cache) = &self.cache {
-                                        cache.record_node_locator_probe(stats);
-                                    }
-                                    for (id_bytes, lsn, view) in decoded {
-                                        match winners.get(&id_bytes) {
-                                            Some((existing_lsn, _)) if *existing_lsn >= lsn => {}
-                                            _ => {
-                                                winners.insert(id_bytes, (lsn, view));
-                                            }
-                                        }
-                                    }
-                                    // Matching keys were returned and checked;
-                                    // all other requested keys are authoritative
-                                    // misses because both sidecar trees cover
-                                    // exactly `row_count` entries.
+                    let locator_absolute = format!(
+                        "{}/{}",
+                        self.paths.namespace_prefix().as_ref(),
+                        locator.path
+                    );
+                    let located = match self
+                        .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
+                        .await
+                    {
+                        Ok(source) => {
+                            crate::sst::paged_index::probe_node_locator_from_source(
+                                &source,
+                                &sorted_pending,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    match located {
+                        Ok((located, locator_stats)) => {
+                            if locator_stats.index_entries != locator.entry_count {
+                                // A partial/stale locator is only an accelerator,
+                                // never an authority for absence.
+                            } else {
+                                if let Some(cache) = &self.cache {
+                                    cache.record_node_locator_probe(locator_stats);
+                                }
+                                if located.is_empty() {
                                     continue;
                                 }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        path = %locator.path,
-                                        error = %error,
-                                        "exact node-record index is corrupt; falling back to Parquet"
-                                    );
+                                let mut ordinals: Vec<u64> = located.values().copied().collect();
+                                ordinals.sort_unstable();
+                                ordinals.dedup();
+                                if ordinals.iter().all(|ordinal| *ordinal < desc.row_count) {
+                                    let batches = self
+                                        .decode_node_rows_by_ordinals(
+                                            desc, &absolute, &label_def, &md, &ordinals,
+                                        )
+                                        .await?;
+                                    let decoded_ids: BTreeSet<[u8; 16]> = batches
+                                        .iter()
+                                        .filter_map(|batch| {
+                                            batch.column_by_name(COL_NODE_ID).and_then(|column| {
+                                                column
+                                                    .as_any()
+                                                    .downcast_ref::<FixedSizeBinaryArray>()
+                                            })
+                                        })
+                                        .flat_map(|ids| {
+                                            (0..ids.len())
+                                                .filter_map(|row| ids.value(row).try_into().ok())
+                                        })
+                                        .collect();
+                                    if decoded_ids.len() == located.len()
+                                        && located.keys().all(|id| decoded_ids.contains(id))
+                                    {
+                                        batch_harvest_node_rows(
+                                            &batches,
+                                            &label_def,
+                                            &self.manifest.manifest.label_dict,
+                                            &desc.scope,
+                                            &pending,
+                                            &mut winners,
+                                        )?;
+                                        continue;
+                                    }
                                 }
+                                // A valid-looking locator that maps a key to the wrong
+                                // or out-of-bounds ordinal is not authoritative. Fall
+                                // through to the row-group path rather than returning
+                                // a false miss.
                             }
-                        }
-                        Ok((_records, _stats)) => {
-                            // Count disagreement means the extension cannot be
-                            // authoritative for absence. Retain the compatible
-                            // ordinal/Parquet fallback below.
                         }
                         Err(error) if optional_accelerator_fallback(&error) => {
                             tracing::warn!(
                                 path = %locator.path,
                                 error = %error,
-                                "exact node-record index unavailable; falling back to Parquet"
+                                "node locator unavailable; falling back to authoritative Parquet"
                             );
                         }
                         Err(error) => return Err(error),
                     }
                 }
-            }
-
-            let label_def = self.label_def_for_node_sst(desc);
-            let md = self.node_sst_metadata(desc, &absolute).await?;
-            if let Some(locator) = desc
-                .node_locator
-                .as_ref()
-                .filter(|locator| locator.entry_count == desc.row_count)
-            {
-                let locator_absolute = format!(
-                    "{}/{}",
-                    self.paths.namespace_prefix().as_ref(),
-                    locator.path
-                );
-                let located = match self
-                    .pinned_sidecar_source(&locator_absolute, Some(locator.size_bytes))
-                    .await
-                {
-                    Ok(source) => {
-                        crate::sst::paged_index::probe_node_locator_from_source(
-                            &source,
-                            &sorted_pending,
-                        )
-                        .await
+                let needed = row_groups_for_keys(&md, &sorted_pending)?;
+                if needed.is_empty() {
+                    continue;
+                }
+                // Decoded row-group cache: process-wide + byte-budgeted when an
+                // SstCache is attached, per-snapshot fallback otherwise. Either
+                // way it amortises the Parquet decode across the N batch calls a
+                // factor-path Expand chain issues (one per parent_leaf); without
+                // it, SF1 IC09 cold pays the decode ~150 times. Probe the
+                // fallback map in a bounded scope so the MutexGuard is released
+                // before the decode await below.
+                let mut decoded: Vec<Arc<Vec<RecordBatch>>> = Vec::with_capacity(needed.len());
+                let mut missing: Vec<usize> = Vec::new();
+                for &rg in &needed {
+                    let hit = match &self.cache {
+                        Some(cache) => cache.get_decoded_node_row_group(&absolute, rg),
+                        None => self
+                            .decoded_node_row_groups
+                            .lock()
+                            .unwrap()
+                            .get(&(absolute.clone(), rg)),
+                    };
+                    match hit {
+                        Some(b) => decoded.push(b),
+                        None => missing.push(rg),
                     }
-                    Err(error) => Err(error),
-                };
-                match located {
-                    Ok((located, locator_stats)) => {
-                        if locator_stats.index_entries != locator.entry_count {
-                            // A partial/stale locator is only an accelerator,
-                            // never an authority for absence.
-                        } else {
-                            if let Some(cache) = &self.cache {
-                                cache.record_node_locator_probe(locator_stats);
-                            }
-                            if located.is_empty() {
-                                continue;
-                            }
-                            let mut ordinals: Vec<u64> = located.values().copied().collect();
-                            ordinals.sort_unstable();
-                            ordinals.dedup();
-                            if ordinals.iter().all(|ordinal| *ordinal < desc.row_count) {
-                                let batches = self
-                                    .decode_node_rows_by_ordinals(
-                                        desc, &absolute, &label_def, &md, &ordinals,
-                                    )
-                                    .await?;
-                                let decoded_ids: BTreeSet<[u8; 16]> = batches
-                                    .iter()
-                                    .filter_map(|batch| {
-                                        batch.column_by_name(COL_NODE_ID).and_then(|column| {
-                                            column.as_any().downcast_ref::<FixedSizeBinaryArray>()
-                                        })
-                                    })
-                                    .flat_map(|ids| {
-                                        (0..ids.len())
-                                            .filter_map(|row| ids.value(row).try_into().ok())
-                                    })
-                                    .collect();
-                                if decoded_ids.len() == located.len()
-                                    && located.keys().all(|id| decoded_ids.contains(id))
-                                {
-                                    batch_harvest_node_rows(
-                                        &batches,
-                                        &label_def,
-                                        &self.manifest.manifest.label_dict,
-                                        &desc.scope,
-                                        &pending,
-                                        &mut winners,
-                                    )?;
-                                    continue;
+                }
+                if !missing.is_empty() {
+                    let missing_rows = missing.iter().fold(0_usize, |total, &rg| {
+                        total.saturating_add(md.row_group(rg).num_rows() as usize)
+                    });
+                    // A large id-primary SST can have very wide rows (overflow
+                    // JSON, embeddings, text). When a small set of MERGE hits is
+                    // spread over most row groups, caching/decompressing every
+                    // complete row recreates a corpus-sized scan. Let Parquet
+                    // evaluate a narrow node_id RowFilter first and materialise
+                    // only matching payloads. Dense scans still populate the
+                    // decoded row-group cache, preserving traversal locality.
+                    let sparse = missing_rows > sorted_pending.len().saturating_mul(8)
+                        && missing_rows > 8 * 1024;
+                    if sparse {
+                        let batches = self
+                            .decode_node_rows_for_keys(
+                                desc,
+                                &absolute,
+                                &label_def,
+                                &md,
+                                &missing,
+                                Arc::new(pending.clone()),
+                            )
+                            .await?;
+                        batch_harvest_node_rows(
+                            &batches,
+                            &label_def,
+                            &self.manifest.manifest.label_dict,
+                            &desc.scope,
+                            &pending,
+                            &mut winners,
+                        )?;
+                    } else {
+                        let fresh = self
+                            .decode_node_row_groups(desc, &absolute, &label_def, &md, &missing)
+                            .await?;
+                        for (rg, batches) in fresh {
+                            let batches = Arc::new(batches);
+                            // Last write wins on a race because both threads
+                            // decoded identical bytes.
+                            match &self.cache {
+                                Some(cache) => {
+                                    cache.insert_decoded_node_row_group(
+                                        absolute.clone(),
+                                        rg,
+                                        batches.clone(),
+                                    );
+                                }
+                                None => {
+                                    let key = (absolute.clone(), rg);
+                                    let weight =
+                                        crate::cache::decoded_node_row_group_weight(&key, &batches);
+                                    self.decoded_node_row_groups.lock().unwrap().insert(
+                                        key,
+                                        batches.clone(),
+                                        weight,
+                                    );
                                 }
                             }
-                            // A valid-looking locator that maps a key to the wrong
-                            // or out-of-bounds ordinal is not authoritative. Fall
-                            // through to the row-group path rather than returning
-                            // a false miss.
+                            decoded.push(batches);
                         }
                     }
-                    Err(error) if optional_accelerator_fallback(&error) => {
-                        tracing::warn!(
-                            path = %locator.path,
-                            error = %error,
-                            "node locator unavailable; falling back to authoritative Parquet"
-                        );
-                    }
-                    Err(error) => return Err(error),
                 }
-            }
-            let needed = row_groups_for_keys(&md, &sorted_pending)?;
-            if needed.is_empty() {
-                continue;
-            }
-            // Decoded row-group cache: process-wide + byte-budgeted when an
-            // SstCache is attached, per-snapshot fallback otherwise. Either
-            // way it amortises the Parquet decode across the N batch calls a
-            // factor-path Expand chain issues (one per parent_leaf); without
-            // it, SF1 IC09 cold pays the decode ~150 times. Probe the
-            // fallback map in a bounded scope so the MutexGuard is released
-            // before the decode await below.
-            let mut decoded: Vec<Arc<Vec<RecordBatch>>> = Vec::with_capacity(needed.len());
-            let mut missing: Vec<usize> = Vec::new();
-            for &rg in &needed {
-                let hit = match &self.cache {
-                    Some(cache) => cache.get_decoded_node_row_group(&absolute, rg),
-                    None => self
-                        .decoded_node_row_groups
-                        .lock()
-                        .unwrap()
-                        .get(&(absolute.clone(), rg)),
-                };
-                match hit {
-                    Some(b) => decoded.push(b),
-                    None => missing.push(rg),
-                }
-            }
-            if !missing.is_empty() {
-                let missing_rows = missing.iter().fold(0_usize, |total, &rg| {
-                    total.saturating_add(md.row_group(rg).num_rows() as usize)
-                });
-                // A large id-primary SST can have very wide rows (overflow
-                // JSON, embeddings, text). When a small set of MERGE hits is
-                // spread over most row groups, caching/decompressing every
-                // complete row recreates a corpus-sized scan. Let Parquet
-                // evaluate a narrow node_id RowFilter first and materialise
-                // only matching payloads. Dense scans still populate the
-                // decoded row-group cache, preserving traversal locality.
-                let sparse = missing_rows > sorted_pending.len().saturating_mul(8)
-                    && missing_rows > 8 * 1024;
-                if sparse {
-                    let batches = self
-                        .decode_node_rows_for_keys(
-                            desc,
-                            &absolute,
-                            &label_def,
-                            &md,
-                            &missing,
-                            Arc::new(pending.clone()),
-                        )
-                        .await?;
+                for batches in &decoded {
                     batch_harvest_node_rows(
-                        &batches,
+                        batches,
                         &label_def,
                         &self.manifest.manifest.label_dict,
                         &desc.scope,
                         &pending,
                         &mut winners,
                     )?;
-                } else {
-                    let fresh = self
-                        .decode_node_row_groups(desc, &absolute, &label_def, &md, &missing)
-                        .await?;
-                    for (rg, batches) in fresh {
-                        let batches = Arc::new(batches);
-                        // Last write wins on a race because both threads
-                        // decoded identical bytes.
-                        match &self.cache {
-                            Some(cache) => {
-                                cache.insert_decoded_node_row_group(
-                                    absolute.clone(),
-                                    rg,
-                                    batches.clone(),
-                                );
-                            }
-                            None => {
-                                let key = (absolute.clone(), rg);
-                                let weight =
-                                    crate::cache::decoded_node_row_group_weight(&key, &batches);
-                                self.decoded_node_row_groups.lock().unwrap().insert(
-                                    key,
-                                    batches.clone(),
-                                    weight,
-                                );
-                            }
-                        }
-                        decoded.push(batches);
-                    }
                 }
-            }
-            for batches in &decoded {
-                batch_harvest_node_rows(
-                    batches,
-                    &label_def,
-                    &self.manifest.manifest.label_dict,
-                    &desc.scope,
-                    &pending,
-                    &mut winners,
-                )?;
             }
         }
 
@@ -7230,6 +7252,29 @@ impl<'mt> Snapshot<'mt> {
                 }
             }
             return Ok(count);
+        }
+        // A label count waits for (and speeds up) the label's background
+        // seed instead of reconciling every node of every label in the
+        // foreground: under writes that full scan competed with the seed and
+        // outlasted the query timeout, so the first count after an open
+        // failed while the seed finished alone a minute later. The seed's
+        // count is exact at its snapshot and rolled forward over the commits
+        // made while it ran. When no seed can serve (no ledger attached, a
+        // commit outran this snapshot and no later commit picked the request
+        // up), the count reads only this label's structural columns, as the
+        // seed does.
+        if let Some(label) = label {
+            if count_waits_for_seed() {
+                if let Some(count) = self.await_count_seed(label, None).await? {
+                    COUNT_SEED_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    namidb_core::profile::record("Snapshot::count_nodes.seed", 0);
+                    return Ok(count);
+                }
+                COUNT_SEED_WAIT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                namidb_core::profile_scope!("Snapshot::count_nodes.label_scan");
+                let cursor = self.label_scan_cursor(label).await?;
+                return cursor.count_rest(self).await;
+            }
         }
         // Seed this label in the background so later counts survive commits
         // that land during the exact reconciliation below.
@@ -10727,7 +10772,7 @@ impl<'mt> Snapshot<'mt> {
                 .into_iter()
                 .take(PREFETCH_NODE_SST_LIMIT)
             {
-                crate::cancel::check()?;
+                prefetch_check()?;
                 let desc = &self.manifest.manifest.ssts[idx];
                 let absolute = format!("{}/{}", self.paths.namespace_prefix().as_ref(), desc.path);
                 self.node_sst_metadata(desc, &absolute).await?;
@@ -10744,7 +10789,7 @@ impl<'mt> Snapshot<'mt> {
                 .into_iter()
                 .take(PREFETCH_NODE_SST_LIMIT)
             {
-                crate::cancel::check()?;
+                prefetch_check()?;
                 let desc = &self.manifest.manifest.ssts[idx];
                 if !crate::manifest::node_locator_has_exact_records(desc) {
                     continue;
@@ -10787,7 +10832,7 @@ impl<'mt> Snapshot<'mt> {
             for desc in descs {
                 let absolute = format!("{}/{}", prefix.as_ref(), desc.path);
                 opens.push(Box::pin(async move {
-                    crate::cancel::check()?;
+                    prefetch_check()?;
                     self.bloom_filter(desc).await?;
                     self.fetch_paged_edge_reader(&absolute).await?;
                     Ok(())
@@ -10857,7 +10902,7 @@ impl<'mt> Snapshot<'mt> {
             if !seen.insert(Arc::as_ptr(reader) as usize) {
                 continue;
             }
-            crate::cancel::check()?;
+            prefetch_check()?;
             let report = reader.prefetch_resident_codes(remaining).await?;
             remaining = remaining.saturating_sub(report.loaded_bytes);
             loaded = loaded.saturating_add(report.loaded_bytes);
@@ -10898,7 +10943,7 @@ impl<'mt> Snapshot<'mt> {
             .filter(|reader| seen.insert(Arc::as_ptr(reader) as usize))
             .collect::<Vec<_>>();
         for reader in &segments {
-            crate::cancel::check()?;
+            prefetch_check()?;
             let bytes = reader.prefetch_read_metadata(remaining).await?;
             remaining = remaining.saturating_sub(bytes);
             loaded = loaded.saturating_add(bytes);
@@ -10906,7 +10951,7 @@ impl<'mt> Snapshot<'mt> {
         // Then the heads of the posting lists, with what is left.
         let mut heads = 0u64;
         for reader in &segments {
-            crate::cancel::check()?;
+            prefetch_check()?;
             let bytes = reader.prefetch_posting_heads(remaining).await?;
             remaining = remaining.saturating_sub(bytes);
             heads = heads.saturating_add(bytes);
@@ -14126,6 +14171,115 @@ fn property_present(view: &NodeView, property: &str) -> bool {
     view.properties
         .get(property)
         .is_some_and(|value| !matches!(value, Value::Null))
+}
+
+/// Waves of batch node lookups run since start (see
+/// [`batch_lookup_probe_segments`]).
+static BATCH_LOOKUP_PROBE_WAVES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Waves of exact-record probes batch node lookups ran (metrics).
+pub fn batch_lookup_probe_waves() -> u64 {
+    BATCH_LOOKUP_PROBE_WAVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether batch node lookups probe and fold SSTs wave by wave
+/// (`NAMIDB_BATCH_LOOKUP_WAVES`, default on; `0` probes every SST before
+/// folding any, as 3.5.4 did).
+fn batch_lookup_waves_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::background::env_flag_off("NAMIDB_BATCH_LOOKUP_WAVES"))
+}
+
+/// Split `sst_idxs` (in order) into consecutive segments that each hold at
+/// most `fan_out` SSTs with an exact-record index overlapping `pending`, the
+/// ones a batch lookup probes concurrently. One segment of everything when
+/// waves are off.
+fn batch_lookup_probe_segments(
+    manifest: &crate::manifest::Manifest,
+    sst_idxs: &[usize],
+    pending: &std::collections::HashSet<[u8; 16]>,
+    fan_out: usize,
+) -> Vec<Vec<usize>> {
+    if !batch_lookup_waves_enabled() {
+        return vec![sst_idxs.to_vec()];
+    }
+    let mut segments: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut probes = 0usize;
+    for &idx in sst_idxs {
+        let desc = &manifest.ssts[idx];
+        let probed = crate::manifest::node_locator_has_exact_records(desc)
+            && desc
+                .node_locator
+                .as_ref()
+                .is_some_and(|locator| locator.entry_count == desc.row_count)
+            && pending
+                .iter()
+                .any(|id| id >= &desc.min_key && id <= &desc.max_key);
+        if probed && probes == fan_out.max(1) {
+            segments.push(std::mem::take(&mut current));
+            probes = 0;
+        }
+        if probed {
+            probes += 1;
+        }
+        current.push(idx);
+    }
+    if !current.is_empty() || segments.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Label counts answered by waiting for the label's seed, and label counts
+/// that fell back to a label scan (see `Snapshot::count_nodes`).
+static COUNT_SEED_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COUNT_SEED_WAIT_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(label counts the seed served after a wait, label counts that scanned
+/// the label instead)` since start.
+pub fn count_seed_wait_stats() -> (u64, u64) {
+    (
+        COUNT_SEED_WAITS.load(std::sync::atomic::Ordering::Relaxed),
+        COUNT_SEED_WAIT_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Whether an uncached label count waits for the label's seed
+/// (`NAMIDB_COUNT_WAIT_FOR_SEED`, default on; `0` reconciles every node in
+/// the foreground, as 3.5.4 did).
+fn count_waits_for_seed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::background::env_flag_off("NAMIDB_COUNT_WAIT_FOR_SEED"))
+}
+
+/// Open-time prefetches stopped by memory pressure since start.
+static PREFETCH_PRESSURE_STOPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Open-time prefetches stopped because the process was over its memory
+/// reclaim threshold (metrics).
+pub fn prefetch_pressure_stops() -> u64 {
+    PREFETCH_PRESSURE_STOPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The prefetch's yield point: the caller's cancel/deadline check, and a
+/// stop once the process is over its memory reclaim threshold. The prefetch
+/// only warms caches, so under pressure it gives way to what must run (the
+/// first statements, compaction catching up after an open) instead of
+/// filling caches the governor is about to clear. `NAMIDB_PREFETCH_MEMORY_GATE=0`
+/// keeps it running whatever the pressure (3.5.4).
+fn prefetch_check() -> Result<()> {
+    crate::cancel::check()?;
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let gate =
+        *GATE.get_or_init(|| !crate::background::env_flag_off("NAMIDB_PREFETCH_MEMORY_GATE"));
+    if gate && crate::background::memory_pressure() >= crate::background::MemoryPressure::Reclaim {
+        PREFETCH_PRESSURE_STOPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Err(Error::MemoryLimit);
+    }
+    Ok(())
 }
 
 /// Presence pairs a seed of `label` counts: the requested property plus the
