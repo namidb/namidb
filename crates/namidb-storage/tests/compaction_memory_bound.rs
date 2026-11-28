@@ -208,12 +208,12 @@ async fn capped_l0_merges_converge_and_keep_last_writer_wins() {
     for file in 0..FILES {
         for (key, id) in ids.iter().enumerate() {
             // Each file rewrites a different subset; some files delete.
-            if (key as u64 + file) % 3 == 0 {
+            if (key as u64 + file).is_multiple_of(3) {
                 writer
                     .upsert_node("Chunk", *id, &versioned(key as u64, file))
                     .unwrap();
                 model.insert(key, Some(file));
-            } else if (key as u64 * 7 + file) % 11 == 0 && model.contains_key(&key) {
+            } else if (key as u64 * 7 + file).is_multiple_of(11) && model.contains_key(&key) {
                 writer.tombstone_node("Chunk", *id).unwrap();
                 model.insert(key, None);
             }
@@ -291,12 +291,12 @@ async fn overlapping_backlog(
     let mut model: BTreeMap<usize, Option<u64>> = BTreeMap::new();
     for file in 0..files {
         for (key, id) in ids.iter().enumerate() {
-            if (key as u64 + file) % 3 == 0 {
+            if (key as u64 + file).is_multiple_of(3) {
                 writer
                     .upsert_node("Chunk", *id, &versioned(key as u64, file))
                     .unwrap();
                 model.insert(key, Some(file));
-            } else if (key as u64 * 7 + file) % 11 == 0 && model.contains_key(&key) {
+            } else if (key as u64 * 7 + file).is_multiple_of(11) && model.contains_key(&key) {
                 writer.tombstone_node("Chunk", *id).unwrap();
                 model.insert(key, None);
             }
