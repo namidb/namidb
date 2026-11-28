@@ -14248,11 +14248,20 @@ pub fn count_seed_wait_stats() -> (u64, u64) {
 }
 
 /// Whether an uncached label count waits for the label's seed
-/// (`NAMIDB_COUNT_WAIT_FOR_SEED`, default on; `0` reconciles every node in
-/// the foreground, as 3.5.4 did).
+/// (`NAMIDB_COUNT_WAIT_FOR_SEED=1`) instead of the one exact reconciliation
+/// that caches every label's count together (the default, as in 3.5.4). The
+/// seed reads only one label but costs a pass per label counted, so it pays
+/// off only where one label is counted out of a large namespace.
 fn count_waits_for_seed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !crate::background::env_flag_off("NAMIDB_COUNT_WAIT_FOR_SEED"))
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("NAMIDB_COUNT_WAIT_FOR_SEED")
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Ok("1" | "true" | "on" | "yes")
+        )
+    })
 }
 
 /// Open-time prefetches stopped by memory pressure since start.

@@ -85,16 +85,14 @@ crates.io release will establish and document that API explicitly.
   to the statement's memory budget as they are added.
   `NAMIDB_BATCH_LOOKUP_WAVES=0` restores probing everything first. Counted as
   `namidb_batch_lookup_probe_waves_total`.
-- **The first label count after an open no longer times out under writes.**
-  With overlapping SSTs and unflushed writes, `MATCH (n:L) RETURN count(n)`
-  started a background seed of the label's count and then reconciled every
-  node of every label in the foreground, competing with the seed; on a large
-  namespace that scan outlasted the query timeout. The count now waits for
-  (and speeds up) the label's seed, which is exact and rolled forward over
-  concurrent commits; when no seed can serve, it reads only the label's
-  structural columns. A seed request that met another running seed is now
-  kept for a later commit instead of being dropped. `NAMIDB_COUNT_WAIT_FOR_SEED=0`
-  restores the full reconciliation. Counted as
+- **A label count right after an open is not left without its seed.** A
+  label's background count seed requested while another seed was running
+  was dropped, so the label kept paying the exact reconciliation; the
+  request is now kept for a later commit. An uncached label count can also
+  wait for (and speed up) the label's own seed, which reads only that
+  label, instead of reconciling every node of every label:
+  `NAMIDB_COUNT_WAIT_FOR_SEED=1` (off by default, since the one
+  reconciliation caches every label's count together). Counted as
   `namidb_label_count_route_total{route="seed"|"label_scan"}`.
 - **The open-time metadata prefetch stops under memory pressure.** It only
   warms caches, so once the process is over its reclaim threshold it now

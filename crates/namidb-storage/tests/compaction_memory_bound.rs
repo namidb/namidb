@@ -347,10 +347,11 @@ async fn batch_lookup_over_many_overlapping_ssts_folds_in_waves() {
 }
 
 /// Right after an open, with overlapping SSTs and unflushed writes (no
-/// manifest count can answer), a label count waits for the label's seed
-/// instead of reconciling every node, and is exact.
+/// manifest count can answer), a label count is exact: by the one
+/// reconciliation by default, and by the label's seed with
+/// `NAMIDB_COUNT_WAIT_FOR_SEED=1`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn label_count_after_open_is_served_by_the_seed_and_exact() {
+async fn label_count_after_open_is_exact() {
     let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(LocalFileObjectStore::new(dir.path()).unwrap());
@@ -381,9 +382,9 @@ async fn label_count_after_open_is_served_by_the_seed_and_exact() {
     assert_eq!(count, live);
     assert_eq!(writer.snapshot().count_nodes(Some("Doc")).await.unwrap(), 7);
     let (seeded, scanned) = namidb_storage::read::count_seed_wait_stats();
-    if !matches!(
+    if matches!(
         std::env::var("NAMIDB_COUNT_WAIT_FOR_SEED").as_deref(),
-        Ok("0")
+        Ok("1")
     ) {
         assert!(
             seeded + scanned > seeded_before + scanned_before,
