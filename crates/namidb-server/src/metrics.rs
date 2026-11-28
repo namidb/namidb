@@ -160,10 +160,14 @@ pub enum CompactionStatus {
     PrepareError = 4,
     InstallError = 5,
     Cancelled = 6,
+    /// Put off by the maintenance memory gate: the process was at its
+    /// memory ceiling when the pass would start, or stayed there while it
+    /// ran, so it gave its memory back and is retried later.
+    Deferred = 7,
 }
 
 impl CompactionStatus {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Applied,
         Self::Noop,
         Self::Stale,
@@ -171,6 +175,7 @@ impl CompactionStatus {
         Self::PrepareError,
         Self::InstallError,
         Self::Cancelled,
+        Self::Deferred,
     ];
 
     fn as_str(self) -> &'static str {
@@ -182,6 +187,7 @@ impl CompactionStatus {
             Self::PrepareError => "prepare_error",
             Self::InstallError => "install_error",
             Self::Cancelled => "cancelled",
+            Self::Deferred => "deferred",
         }
     }
 }
@@ -1233,6 +1239,7 @@ impl Metrics {
                 "namidb_filter_membership_seek_total{{outcome=\"{outcome}\"}} {value}"
             );
         }
+        render_memory_bound_counters(&mut out);
         let probes = namidb_storage::equality_sidecar_probe_stats();
         let _ = writeln!(
             out,
@@ -1507,6 +1514,121 @@ fn sanitize_query(query: &str) -> String {
         end -= 1;
     }
     format!("{}...", &collapsed[..end])
+}
+
+/// Counters of the bounded-memory maintenance and write paths (3.5.5).
+fn render_memory_bound_counters(out: &mut String) {
+    use std::fmt::Write as _;
+    let (pauses, throttles, deferrals) = namidb_storage::background::memory_gate_stats();
+    let _ = writeln!(
+        out,
+        "# HELP namidb_maintenance_memory_gate_total Maintenance slices throttled over the \
+         memory reclaim threshold (throttle), stops at the memory ceiling (pause), and passes \
+         given up there (deferral)."
+    );
+    let _ = writeln!(out, "# TYPE namidb_maintenance_memory_gate_total counter");
+    for (event, value) in [
+        ("throttle", throttles),
+        ("pause", pauses),
+        ("deferral", deferrals),
+    ] {
+        let _ = writeln!(
+            out,
+            "namidb_maintenance_memory_gate_total{{event=\"{event}\"}} {value}"
+        );
+    }
+    let (tiered, released) = namidb_storage::compact::compaction_bound_stats();
+    let _ = writeln!(
+        out,
+        "# HELP namidb_compaction_bounded_total Merges of a capped run of L0 SSTs written back \
+         to L0 (tiered_l0_merge), merge inputs released as soon as they were consumed \
+         (input_released), and node row groups closed by their byte bound (row_group_byte_bound)."
+    );
+    let _ = writeln!(out, "# TYPE namidb_compaction_bounded_total counter");
+    for (event, value) in [
+        ("tiered_l0_merge", tiered),
+        ("input_released", released),
+        (
+            "row_group_byte_bound",
+            namidb_storage::sst::nodes::byte_bounded_row_groups(),
+        ),
+    ] {
+        let _ = writeln!(
+            out,
+            "namidb_compaction_bounded_total{{event=\"{event}\"}} {value}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP namidb_compaction_max_l0_inputs L0 SSTs one merge may take now (0 = no cap); \
+         lowered while merges are deferred at the memory ceiling."
+    );
+    let _ = writeln!(out, "# TYPE namidb_compaction_max_l0_inputs gauge");
+    let _ = writeln!(
+        out,
+        "namidb_compaction_max_l0_inputs {}",
+        namidb_storage::compact::max_l0_inputs()
+    );
+    let _ = writeln!(
+        out,
+        "# HELP namidb_relief_flush_skipped_total Relief flushes the memory governor did not \
+         request because a compaction was preparing."
+    );
+    let _ = writeln!(out, "# TYPE namidb_relief_flush_skipped_total counter");
+    let _ = writeln!(
+        out,
+        "namidb_relief_flush_skipped_total {}",
+        crate::memory::relief_flushes_skipped()
+    );
+    let (waited, refused) = crate::write_hard_stall_stats();
+    let _ = writeln!(
+        out,
+        "# HELP namidb_write_hard_stall_total Data writes that waited for compaction to bring \
+         L0 under its hard bound and then ran (waited), or were refused with a retryable 503 \
+         (refused)."
+    );
+    let _ = writeln!(out, "# TYPE namidb_write_hard_stall_total counter");
+    for (outcome, value) in [("waited", waited), ("refused", refused)] {
+        let _ = writeln!(
+            out,
+            "namidb_write_hard_stall_total{{outcome=\"{outcome}\"}} {value}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP namidb_batch_lookup_probe_waves_total Waves of exact-record probes batch node \
+         lookups ran, each folded before the next."
+    );
+    let _ = writeln!(out, "# TYPE namidb_batch_lookup_probe_waves_total counter");
+    let _ = writeln!(
+        out,
+        "namidb_batch_lookup_probe_waves_total {}",
+        namidb_storage::read::batch_lookup_probe_waves()
+    );
+    let (seeded, scanned) = namidb_storage::read::count_seed_wait_stats();
+    let _ = writeln!(
+        out,
+        "# HELP namidb_label_count_route_total Uncached label counts answered by the label's \
+         background seed (seed) or by a scan of the label (label_scan)."
+    );
+    let _ = writeln!(out, "# TYPE namidb_label_count_route_total counter");
+    for (route, value) in [("seed", seeded), ("label_scan", scanned)] {
+        let _ = writeln!(
+            out,
+            "namidb_label_count_route_total{{route=\"{route}\"}} {value}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP namidb_prefetch_pressure_stops_total Open-time metadata prefetches stopped \
+         because the process was over its memory reclaim threshold."
+    );
+    let _ = writeln!(out, "# TYPE namidb_prefetch_pressure_stops_total counter");
+    let _ = writeln!(
+        out,
+        "namidb_prefetch_pressure_stops_total {}",
+        namidb_storage::read::prefetch_pressure_stops()
+    );
 }
 
 #[cfg(test)]
