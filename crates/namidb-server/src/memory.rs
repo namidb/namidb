@@ -935,6 +935,7 @@ impl MemoryGovernor {
             return None;
         };
         self.resident_bytes.store(resident, Ordering::Relaxed);
+        self.publish_pressure(resident);
 
         let new_pressure_episode = resident >= self.reclaim_bytes
             && self
@@ -949,6 +950,7 @@ impl MemoryGovernor {
             if let Some(after) = sample_resident_bytes() {
                 resident = after;
                 self.resident_bytes.store(after, Ordering::Relaxed);
+                self.publish_pressure(after);
             }
             self.finish_reclaim(resident);
         }
@@ -959,11 +961,33 @@ impl MemoryGovernor {
             // Caches are gone and the allocator trimmed, yet the process is
             // still over the reclaim threshold: what remains reconstructible
             // is the memtables. Flush them rather than reject queries until
-            // a periodic tick happens to.
-            request_pressure_flush();
+            // a periodic tick happens to — unless a compaction is preparing:
+            // the pressure is then most likely its working set, which the
+            // maintenance memory gate pauses, and a flush would add another
+            // SST build on top of it plus one more L0 for it to merge. The
+            // memtable keeps its own hard bound meanwhile.
+            if relief_flush_allowed() {
+                request_pressure_flush();
+            } else {
+                RELIEF_FLUSHES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         Some(resident)
+    }
+
+    /// Tell storage's maintenance memory gate what the last sample showed.
+    fn publish_pressure(&self, resident: usize) {
+        use namidb_storage::background::{set_memory_pressure, MemoryPressure};
+        set_memory_pressure(if self.max_bytes == 0 {
+            MemoryPressure::Normal
+        } else if resident >= self.max_bytes {
+            MemoryPressure::Ceiling
+        } else if resident >= self.reclaim_bytes {
+            MemoryPressure::Reclaim
+        } else {
+            MemoryPressure::Normal
+        });
     }
 
     /// Start the one process-wide pressure watchdog.
@@ -1151,6 +1175,30 @@ fn percent(value: usize, percentage: usize) -> usize {
 fn pressure_flush_notify() -> &'static tokio::sync::Notify {
     static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
     NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Relief flushes not requested because a compaction was preparing.
+static RELIEF_FLUSHES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Relief flushes skipped while a compaction prepared (metrics).
+pub fn relief_flushes_skipped() -> u64 {
+    RELIEF_FLUSHES_SKIPPED.load(Ordering::Relaxed)
+}
+
+/// Whether a reclaim pass may ask the flush loops for a relief flush: always
+/// with `NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION=1` (3.5.4 behaviour),
+/// otherwise only while no compaction prepare is in flight.
+fn relief_flush_allowed() -> bool {
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let always = *ALWAYS.get_or_init(|| {
+        matches!(
+            std::env::var("NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION")
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Ok("1" | "true" | "on" | "yes")
+        )
+    });
+    always || crate::maintenance::compaction_prepares_in_flight() == 0
 }
 
 /// Wake every flush loop now waiting (see [`pressure_flush_requested`]).

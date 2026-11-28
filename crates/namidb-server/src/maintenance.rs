@@ -1387,17 +1387,66 @@ async fn run_scoped_pass(
         return Ok(CompactionPass::Noop);
     }
 
+    // A long pass started at the memory ceiling would only add its working
+    // set to what the governor is already trying to give back.
+    if scope != PassScope::SearchDeltas && compaction_start_deferred() {
+        metrics.observe_compaction_result(
+            trigger,
+            CompactionStatus::Deferred,
+            l0_before,
+            l0_before,
+            0,
+            0,
+        );
+        info!(
+            namespace,
+            ?trigger,
+            ?scope,
+            "memory pressure: deferring a compaction pass"
+        );
+        return Ok(CompactionPass::Noop);
+    }
+
     // Storage moves the synchronous node/edge merges and Vamana/BM25 builds
     // to Tokio's blocking pool; this outer future retains async object-store
     // I/O without monopolising a reactor thread.
     let schema = basis.schema().clone();
     let prepare_started = Instant::now();
+    let in_flight_prepare = PrepareInFlight::enter();
     let prepared = match scope {
         PassScope::SearchDeltas => basis.prepare_search_deltas(&schema).await,
         PassScope::SearchOnly => basis.prepare_search_bases(&schema).await,
         PassScope::WithoutSearch => basis.prepare_without_search(&schema).await,
     };
+    drop(in_flight_prepare);
     let prepared = match prepared {
+        Err(namidb_storage::Error::MemoryLimit) => {
+            // The memory gate stopped the merge at the ceiling and it gave
+            // its memory back. Plan smaller merges until one completes; the
+            // next trigger retries.
+            metrics.observe_compaction_phase(
+                trigger,
+                CompactionPhase::Prepare,
+                prepare_started.elapsed(),
+            );
+            metrics.observe_compaction_result(
+                trigger,
+                CompactionStatus::Deferred,
+                l0_before,
+                l0_before,
+                0,
+                0,
+            );
+            namidb_storage::compact::note_compaction_memory_deferral();
+            warn!(
+                namespace,
+                ?trigger,
+                ?scope,
+                max_l0_inputs = namidb_storage::compact::max_l0_inputs(),
+                "memory pressure: compaction pass deferred at the memory ceiling"
+            );
+            return Ok(CompactionPass::Noop);
+        }
         Ok(prepared) => {
             metrics.observe_compaction_phase(
                 trigger,
@@ -1528,6 +1577,9 @@ async fn run_scoped_pass(
                 CompactionPhase::InstallHold,
                 install_started.elapsed(),
             );
+            if scope == PassScope::WithoutSearch {
+                namidb_storage::compact::note_compaction_completed();
+            }
             if outcome.source_ssts_removed > 0 {
                 Ok(CompactionPass::Applied {
                     outcome: Box::new(outcome),
@@ -1576,6 +1628,39 @@ async fn run_scoped_pass(
         discard_unreferenced_uploads(&store, &prefix, unreferenced, namespace).await;
     }
     result
+}
+
+/// Compaction prepares running in this process (every namespace).
+static PREPARES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many compaction prepares are running now. The memory governor holds
+/// its relief flush back while one is.
+pub(crate) fn compaction_prepares_in_flight() -> usize {
+    PREPARES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Counts one prepare in [`PREPARES_IN_FLIGHT`] for its lifetime.
+struct PrepareInFlight;
+
+impl PrepareInFlight {
+    fn enter() -> Self {
+        PREPARES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for PrepareInFlight {
+    fn drop(&mut self) {
+        PREPARES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a long compaction pass should not start now: the maintenance
+/// memory gate is on and the process is at its memory ceiling.
+fn compaction_start_deferred() -> bool {
+    namidb_storage::background::memory_gate_enabled()
+        && namidb_storage::background::memory_pressure()
+            == namidb_storage::background::MemoryPressure::Ceiling
 }
 
 fn is_cancelled(cancel: Option<&watch::Receiver<bool>>) -> bool {

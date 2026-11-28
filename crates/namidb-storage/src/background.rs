@@ -333,9 +333,165 @@ fn yield_slice(mut state: SliceState) -> SliceState {
     if foreground_active() && foreground_duty_percent() < 100 {
         std::thread::sleep(foreground_pause());
     }
+    wait_out_memory_pressure();
     state.holds_slot = build_slots().acquire();
     state.slice_start = Instant::now();
     state
+}
+
+// ── Memory gate ─────────────────────────────────────────────────────────
+//
+// Maintenance allocates outside every query account: a merge's decoders and
+// writers, a base build's buffers. The process memory governor (the server)
+// publishes what it last sampled through [`set_memory_pressure`]; at every
+// slice boundary a maintenance thread then
+//
+// - works at half speed while the process is over its reclaim threshold;
+// - stops while it is at its ceiling, for at most
+//   `NAMIDB_COMPACTION_PRESSURE_PAUSE` (default 10 s), and, when the ceiling
+//   still holds after that, marks the thread deferred: the merge loops see it
+//   through [`deferred`] and give their memory back by failing the pass with
+//   [`crate::Error::MemoryLimit`], which the caller retries later with a
+//   smaller plan instead of the kernel killing the process.
+//
+// `NAMIDB_COMPACTION_MEMORY_GATE=0` turns the gate off (3.5.4 behaviour).
+
+/// The process's memory state as the governor last sampled it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemoryPressure {
+    /// Below the reclaim threshold, or no governor.
+    Normal,
+    /// Over the reclaim threshold, under the ceiling.
+    Reclaim,
+    /// At or over the ceiling.
+    Ceiling,
+}
+
+static MEMORY_PRESSURE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PRESSURE_PAUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PRESSURE_THROTTLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PRESSURE_DEFERRALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish the process's memory state (the server's governor calls this on
+/// every sample).
+pub fn set_memory_pressure(level: MemoryPressure) {
+    let raw = match level {
+        MemoryPressure::Normal => 0,
+        MemoryPressure::Reclaim => 1,
+        MemoryPressure::Ceiling => 2,
+    };
+    MEMORY_PRESSURE.store(raw, Ordering::Relaxed);
+}
+
+/// The last published memory state.
+pub fn memory_pressure() -> MemoryPressure {
+    match MEMORY_PRESSURE.load(Ordering::Relaxed) {
+        0 => MemoryPressure::Normal,
+        1 => MemoryPressure::Reclaim,
+        _ => MemoryPressure::Ceiling,
+    }
+}
+
+/// Counters of the memory gate since start: `(pauses at the ceiling, slices
+/// throttled over the reclaim threshold, passes deferred)`.
+pub fn memory_gate_stats() -> (u64, u64, u64) {
+    (
+        PRESSURE_PAUSES.load(Ordering::Relaxed),
+        PRESSURE_THROTTLES.load(Ordering::Relaxed),
+        PRESSURE_DEFERRALS.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether the memory gate is on (`NAMIDB_COMPACTION_MEMORY_GATE`, default
+/// on; `0`, `false`, `off` or `no` turn it off).
+pub fn memory_gate_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !env_flag_off("NAMIDB_COMPACTION_MEMORY_GATE"))
+}
+
+/// `true` when `name` is set to `0`, `false`, `off` or `no`.
+pub fn env_flag_off(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no")
+    )
+}
+
+/// Longest stop at the memory ceiling before a maintenance pass is deferred.
+fn pressure_pause_limit() -> Duration {
+    static LIMIT: OnceLock<Duration> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("NAMIDB_COMPACTION_PRESSURE_PAUSE")
+            .ok()
+            .and_then(|value| humantime_secs(&value))
+            .unwrap_or(Duration::from_secs(10))
+    })
+}
+
+/// `"10s"`, `"500ms"` or plain seconds.
+fn humantime_secs(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    if let Some(ms) = raw.strip_suffix("ms") {
+        return ms.trim().parse::<u64>().ok().map(Duration::from_millis);
+    }
+    raw.strip_suffix('s')
+        .unwrap_or(raw)
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+const PRESSURE_POLL: Duration = Duration::from_millis(50);
+
+thread_local! {
+    /// Set on a maintenance thread whose pause at the memory ceiling ran
+    /// out (see [`deferred`]).
+    static DEFERRED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this maintenance thread was told to give up its pass because the
+/// process stayed at its memory ceiling. The merge loops check it after
+/// [`pace`] and fail with [`crate::Error::MemoryLimit`].
+#[inline]
+pub fn deferred() -> bool {
+    DEFERRED.with(|flag| flag.get())
+}
+
+fn wait_out_memory_pressure() {
+    if !memory_gate_enabled() {
+        return;
+    }
+    match memory_pressure() {
+        MemoryPressure::Normal => {}
+        MemoryPressure::Reclaim => {
+            PRESSURE_THROTTLES.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(SLICE);
+        }
+        MemoryPressure::Ceiling => {
+            if deferred() {
+                return;
+            }
+            PRESSURE_PAUSES.fetch_add(1, Ordering::Relaxed);
+            let started = Instant::now();
+            let limit = pressure_pause_limit();
+            while memory_pressure() == MemoryPressure::Ceiling {
+                if started.elapsed() >= limit {
+                    PRESSURE_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+                    DEFERRED.with(|flag| flag.set(true));
+                    tracing::warn!(
+                        paused_ms = started.elapsed().as_millis() as u64,
+                        "memory pressure: deferring a maintenance pass that is still at the \
+                         process memory ceiling"
+                    );
+                    return;
+                }
+                std::thread::sleep(PRESSURE_POLL);
+            }
+        }
+    }
 }
 
 /// Run `wait` (a blocking wait for input: a channel receive) without holding
