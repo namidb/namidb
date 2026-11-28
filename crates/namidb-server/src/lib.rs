@@ -3076,25 +3076,80 @@ pub(crate) async fn lock_writer_with_memtable_room<'w>(
     hard_bytes: usize,
     flush_notify: &tokio::sync::Notify,
 ) -> Option<tokio::sync::MutexGuard<'w, WriterSession>> {
+    lock_writer_with_room(
+        writer,
+        timeout,
+        hard_bytes,
+        write_hard_stall_l0(),
+        flush_notify,
+    )
+    .await
+}
+
+/// [`lock_writer_with_memtable_room`] with an explicit L0 hard bound (`0` =
+/// none): the writer is returned only while the memtable is below
+/// `hard_bytes` and every bucket holds fewer than `hard_l0` L0 SSTs.
+pub(crate) async fn lock_writer_with_room<'w>(
+    writer: &'w tokio::sync::Mutex<WriterSession>,
+    timeout: Duration,
+    hard_bytes: usize,
+    hard_l0: usize,
+    flush_notify: &tokio::sync::Notify,
+) -> Option<tokio::sync::MutexGuard<'w, WriterSession>> {
     let started = std::time::Instant::now();
     let mut warned = false;
+    let mut l0_waited = false;
     loop {
         let remaining = if timeout.is_zero() {
             Duration::ZERO
         } else {
             match timeout.checked_sub(started.elapsed()) {
                 Some(remaining) if !remaining.is_zero() => remaining,
-                _ => return None,
+                _ => {
+                    if l0_waited {
+                        WRITE_HARD_STALL_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return None;
+                }
             }
         };
-        let guard = lock_writer_bounded(writer, remaining).await?;
+        let guard = match lock_writer_bounded(writer, remaining).await {
+            Some(guard) => guard,
+            None => {
+                if l0_waited {
+                    WRITE_HARD_STALL_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return None;
+            }
+        };
         let bytes = guard.memtable_bytes();
-        if hard_bytes == 0 || bytes < hard_bytes {
+        let l0 = if hard_l0 > 0 {
+            guard.max_l0_bucket_len()
+        } else {
+            0
+        };
+        let memtable_full = hard_bytes > 0 && bytes >= hard_bytes;
+        let l0_full = hard_l0 > 0 && l0 >= hard_l0;
+        if !memtable_full && !l0_full {
+            if l0_waited {
+                WRITE_HARD_STALL_WAITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return Some(guard);
         }
         drop(guard);
+        // A flush pass also re-checks the L0 high-water mark and asks the
+        // compaction worker for a pass: waking it is how a write held back by
+        // L0 debt gets compaction going even when no other write flushes.
         flush_notify.notify_one();
-        if !warned {
+        if l0_full && !l0_waited {
+            l0_waited = true;
+            tracing::warn!(
+                l0,
+                hard_l0,
+                "write waits for compaction: L0 is at its hard bound"
+            );
+        }
+        if memtable_full && !warned {
             warned = true;
             tracing::warn!(
                 memtable_bytes = bytes,
@@ -3102,8 +3157,64 @@ pub(crate) async fn lock_writer_with_memtable_room<'w>(
                 "write waits for a flush: the memtable is at its hard bound"
             );
         }
-        tokio::time::sleep(MEMTABLE_ROOM_POLL).await;
+        tokio::time::sleep(if l0_full {
+            WRITE_HARD_STALL_POLL
+        } else {
+            MEMTABLE_ROOM_POLL
+        })
+        .await;
     }
+}
+
+/// How often a write held back by L0 debt re-checks it.
+const WRITE_HARD_STALL_POLL: Duration = Duration::from_millis(250);
+
+/// Default L0 SSTs per bucket at which data writes stop being admitted
+/// (`NAMIDB_WRITE_HARD_STALL_L0`).
+pub const DEFAULT_WRITE_HARD_STALL_L0: usize = 64;
+
+static WRITE_HARD_STALL_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_HARD_STALL_REFUSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(writes admitted after waiting for L0 debt, writes refused by it)`.
+pub fn write_hard_stall_stats() -> (u64, u64) {
+    (
+        WRITE_HARD_STALL_WAITED.load(std::sync::atomic::Ordering::Relaxed),
+        WRITE_HARD_STALL_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// L0 SSTs in one bucket at which a data write waits, without the writer,
+/// for compaction to drain L0 below it, and answers the retryable 503 of a
+/// writer-lock timeout when that does not happen within the lock bound
+/// (`NAMIDB_WRITE_HARD_STALL_L0`, default [`DEFAULT_WRITE_HARD_STALL_L0`];
+/// `0` disables it, the 3.5.4 behaviour). The soft stall only delays a
+/// committed write, which a serial client barely notices, so L0 could grow
+/// without bound while every read and merge paid for each extra SST. The
+/// hard bound is also off when reactive and periodic compaction are both
+/// configured off (`NAMIDB_COMPACTION_L0_TRIGGER=0` and
+/// `NAMIDB_COMPACTION_INTERVAL=0s`): nothing would drain L0 then.
+pub(crate) fn write_hard_stall_l0() -> usize {
+    static HARD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *HARD.get_or_init(|| {
+        let configured = std::env::var("NAMIDB_WRITE_HARD_STALL_L0")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_WRITE_HARD_STALL_L0);
+        let trigger_off = std::env::var("NAMIDB_COMPACTION_L0_TRIGGER")
+            .ok()
+            .is_some_and(|value| value.trim() == "0");
+        let interval_off = std::env::var("NAMIDB_COMPACTION_INTERVAL")
+            .ok()
+            .and_then(|value| humantime::parse_duration(value.trim()).ok())
+            .is_some_and(|interval| interval.is_zero());
+        if trigger_off && interval_off {
+            0
+        } else {
+            configured
+        }
+    })
 }
 
 /// Outcome of awaiting a group-commit ACK under the write deadline.
@@ -3456,15 +3567,17 @@ fn write_intake_rejection(health: &recovery::WriterHealth) -> Option<Response> {
 
 /// The uniform 503 body for a foreground writer-lock timeout.
 fn writer_busy_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorBody {
-            error: "writer is busy: could not acquire the write lock within the \
-                    configured bound; retry"
-                .into(),
-        }),
+    with_retry_after(
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorBody {
+                error: "writer is busy: could not acquire the write lock within the \
+                        configured bound; retry"
+                    .into(),
+            }),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 /// The uniform 503 body returned when a multi-tenant request waited on a
@@ -11587,6 +11700,96 @@ mod tests {
                 .wait_for_memtable_room(Duration::from_millis(100))
                 .await
         );
+    }
+
+    /// A serial writer only noticed the soft L0 stall as a short delay, so
+    /// L0 grew without bound while compaction could not keep up. At the hard
+    /// L0 bound a data write waits, without the writer, for compaction to
+    /// drain L0, answers the retryable writer-busy timeout when it does not,
+    /// and runs once a merge brings L0 back under the bound.
+    #[tokio::test]
+    async fn an_l0_backlog_at_the_hard_bound_holds_writes_until_compaction_drains_it() {
+        let (store, paths) = namidb_storage::parse_uri("memory://test-l0-hard").unwrap();
+        let state = AppState::new(
+            WriterSession::open(store, paths).await.unwrap(),
+            None,
+            "t".into(),
+        );
+        const HARD_L0: usize = 3;
+        {
+            let mut w = state.writer.lock().await;
+            for i in 0..HARD_L0 {
+                let mut properties = std::collections::BTreeMap::new();
+                properties.insert("n".to_string(), namidb_core::value::Value::I64(i as i64));
+                w.upsert_node(
+                    "P",
+                    namidb_core::id::NodeId::new(),
+                    &namidb_storage::NodeWriteRecord {
+                        properties,
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                w.commit_batch().await.unwrap();
+                let schema = w.snapshot().manifest().manifest.schema.clone();
+                w.flush(schema).await.unwrap();
+            }
+            assert_eq!(w.max_l0_bucket_len(), HARD_L0);
+        }
+        let (waited_before, refused_before) = write_hard_stall_stats();
+        let started = std::time::Instant::now();
+        let refused = lock_writer_with_room(
+            &state.writer,
+            Duration::from_millis(300),
+            0,
+            HARD_L0,
+            &state.flush_notify,
+        )
+        .await;
+        assert!(refused.is_none(), "a write at the hard L0 bound is refused");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(write_hard_stall_stats().1 > refused_before);
+        tokio::time::timeout(Duration::from_secs(1), state.flush_notify.notified())
+            .await
+            .expect("a held-back write must wake the flush loop, which requests compaction");
+        // DDL and maintenance are not held back.
+        assert!(state
+            .lock_writer_bounded(WriterLockKind::Http)
+            .await
+            .is_some());
+
+        // A merge that lands while the write waits lets it through.
+        let writer = Arc::clone(&state.writer);
+        let compactor = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut w = writer.lock().await;
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.compact_l0(&schema).await.unwrap();
+        });
+        let admitted = lock_writer_with_room(
+            &state.writer,
+            Duration::from_secs(10),
+            0,
+            HARD_L0,
+            &state.flush_notify,
+        )
+        .await;
+        assert!(admitted.is_some(), "the write runs once L0 is drained");
+        assert!(admitted.unwrap().max_l0_bucket_len() < HARD_L0);
+        compactor.await.unwrap();
+        assert!(write_hard_stall_stats().0 > waited_before);
+
+        // A bound of zero is the 3.5.4 behaviour: no L0 wait at all.
+        assert!(lock_writer_with_room(
+            &state.writer,
+            Duration::from_millis(50),
+            0,
+            0,
+            &state.flush_notify
+        )
+        .await
+        .is_some());
     }
 
     #[tokio::test]
