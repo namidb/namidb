@@ -15,6 +15,93 @@ crates.io release will establish and document that API explicitly.
 
 ## [Unreleased]
 
+## [3.5.5] - 2026-11-27
+
+### Fixed
+
+- **A node compaction over a deep L0 backlog no longer grows until the
+  process is killed.** One merge took every L0 SST of a bucket at once, and
+  each input it had finished reading kept its Parquet decoder (dictionary
+  pages, column buffers) and body mapping until the whole merge ended, so the
+  merge's heap grew with every input it consumed. With a few hundred L0 files
+  of wide rows (embeddings, long texts) that working set exceeded a 3 GiB
+  container and the merge never finished; every restart started it over.
+  Now:
+  - an input releases its decoder and mapping as soon as it is exhausted
+    (`NAMIDB_COMPACTION_RELEASE_EXHAUSTED_INPUTS=0` restores the old
+    behaviour);
+  - one pass takes at most `NAMIDB_COMPACTION_MAX_L0_INPUTS` L0 files
+    (default 32; `0` = no cap). A deeper backlog is merged one run at a time
+    back into L0 (the run of consecutive files with the fewest bytes, so an
+    earlier run's output is not rewritten while smaller runs remain); once at
+    most the cap remain, the usual merge drains them into L1. Reads stay
+    exactly last-writer-wins: L0 LSN ranges are disjoint, so a run's output
+    takes its place in LSN order, and a run keeps its tombstones. When L0 LSN
+    ranges overlap, the whole L0 merges as before;
+  - an open node row group is closed at `NAMIDB_NODE_SST_ROW_GROUP_MAX_BYTES`
+    of encoded data (default 32 MiB; `0` = row count only), and the rows a
+    writer buffers before encoding are bounded by
+    `NAMIDB_COMPACTION_MERGE_CHUNK_BYTES` (default 8 MiB; `0` = row count
+    only). Readers take row groups from the footer, so the format is
+    unchanged.
+  Counted as `namidb_compaction_bounded_total{event="tiered_l0_merge"|
+  "input_released"|"row_group_byte_bound"}`, with the cap in force as
+  `namidb_compaction_max_l0_inputs`.
+- **Maintenance gives way at the memory ceiling instead of being killed.**
+  The memory governor could only stop queries; a merge or index build kept
+  allocating past the ceiling. The governor now publishes its samples to the
+  maintenance threads: over the reclaim threshold they work at half speed,
+  and at the ceiling they stop. A pass still at the ceiling after
+  `NAMIDB_COMPACTION_PRESSURE_PAUSE` (default 10 s) gives its memory back and
+  is retried later with half the L0 fan-in (restored as passes complete), and
+  a long pass does not start while the process is at its ceiling.
+  `NAMIDB_COMPACTION_MEMORY_GATE=0` turns this off. Counted as
+  `namidb_maintenance_memory_gate_total{event="throttle"|"pause"|"deferral"}`
+  and `namidb_compactions_total{status="deferred"}`.
+- **No relief flush on top of a running compaction.** When reclaiming caches
+  left the process over its reclaim threshold, the governor asked every
+  namespace to flush its memtable, which built another SST beside the merge
+  and added one more L0 file for it. While a compaction prepares, it no
+  longer does (the memtable keeps its own hard bound);
+  `NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION=1` restores it. Counted as
+  `namidb_relief_flush_skipped_total`.
+- **Writes get real backpressure from L0 debt.** Past `NAMIDB_WRITE_STALL_L0`
+  a committed write was only delayed by 50 ms, which a serial client barely
+  notices, so L0 could grow without bound. At `NAMIDB_WRITE_HARD_STALL_L0`
+  L0 files in one bucket (default 64; `0` = off) a data write now waits,
+  without holding the writer, for compaction to bring L0 back under the
+  bound, and answers the retryable `503` of a writer-lock timeout (now with
+  `Retry-After`) when that does not happen within `NAMIDB_WRITER_LOCK_TIMEOUT`.
+  Schema DDL and maintenance are not held back. The bound is off when both
+  reactive and periodic compaction are configured off. Counted as
+  `namidb_write_hard_stall_total{outcome="waited"|"refused"}`.
+- **A batch lookup over many overlapping SSTs holds one wave of results.**
+  A batch write that looks up thousands of nodes by id probed every
+  overlapping node SST before folding any result, so it held the encoded and
+  decoded versions found in all of them at once, outside any memory account.
+  Probes now run eight SSTs at a time and each wave is folded before the next
+  starts; the governor's stop of the statement takes effect between waves.
+  The nodes a write's property lookup attaches to its rows are also charged
+  to the statement's memory budget as they are added.
+  `NAMIDB_BATCH_LOOKUP_WAVES=0` restores probing everything first. Counted as
+  `namidb_batch_lookup_probe_waves_total`.
+- **The first label count after an open no longer times out under writes.**
+  With overlapping SSTs and unflushed writes, `MATCH (n:L) RETURN count(n)`
+  started a background seed of the label's count and then reconciled every
+  node of every label in the foreground, competing with the seed; on a large
+  namespace that scan outlasted the query timeout. The count now waits for
+  (and speeds up) the label's seed, which is exact and rolled forward over
+  concurrent commits; when no seed can serve, it reads only the label's
+  structural columns. A seed request that met another running seed is now
+  kept for a later commit instead of being dropped. `NAMIDB_COUNT_WAIT_FOR_SEED=0`
+  restores the full reconciliation. Counted as
+  `namidb_label_count_route_total{route="seed"|"label_scan"}`.
+- **The open-time metadata prefetch stops under memory pressure.** It only
+  warms caches, so once the process is over its reclaim threshold it now
+  stops rather than compete with the statements and the compaction that
+  follow an open. `NAMIDB_PREFETCH_MEMORY_GATE=0` keeps it running. Counted as
+  `namidb_prefetch_pressure_stops_total`.
+
 ## [3.5.4] - 2026-11-22
 
 ### Fixed
@@ -6084,7 +6171,8 @@ Change License: Apache License 2.0).
 - LDBC-shaped synthetic benchmark harness with a paired Kùzu runner
   under [`bench/`](./bench/).
 
-[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.4...HEAD
+[Unreleased]: https://github.com/namidb/namidb/compare/v3.5.5...HEAD
+[3.5.5]: https://github.com/namidb/namidb/compare/v3.5.4...v3.5.5
 [3.5.4]: https://github.com/namidb/namidb/compare/v3.5.3...v3.5.4
 [3.5.3]: https://github.com/namidb/namidb/compare/v3.5.2...v3.5.3
 [3.5.2]: https://github.com/namidb/namidb/compare/v3.5.1...v3.5.2
