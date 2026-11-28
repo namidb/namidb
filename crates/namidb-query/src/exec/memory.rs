@@ -724,7 +724,78 @@ pub(crate) struct GrowthMeter {
     checked: usize,
 }
 
+/// Whether a write statement's node lookups count the nodes they add to its
+/// rows against the statement's working-memory budget
+/// (`NAMIDB_WRITE_LOOKUP_METER`, default on; `0`, `false`, `off` or `no`
+/// leave them uncounted, as in 3.5.4).
+pub(crate) fn write_lookup_meter_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !namidb_storage::background::env_flag_off("NAMIDB_WRITE_LOOKUP_METER"))
+}
+
+/// Write statements stopped by their node lookups' meter.
+static WRITE_LOOKUP_METER_STOPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Write statements whose node lookups' rows exceeded the statement's
+/// working-memory budget, since start (metrics).
+pub fn write_lookup_meter_stops() -> u64 {
+    WRITE_LOOKUP_METER_STOPS.load(Ordering::Relaxed)
+}
+
+/// Every [`CHECK_STRIDE`](namidb_storage::cancel::CHECK_STRIDE) rows of a
+/// write lookup's output: account the rows added since the last call.
+#[inline]
+pub(crate) fn observe_write_lookup(
+    meter: &mut GrowthMeter,
+    rows: &Vec<Row>,
+) -> Result<(), ExecError> {
+    if !rows
+        .len()
+        .is_multiple_of(namidb_storage::cancel::CHECK_STRIDE)
+    {
+        return Ok(());
+    }
+    meter.observe(rows).inspect_err(|_| {
+        WRITE_LOOKUP_METER_STOPS.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+/// At the end of a write lookup: account the rows after the last stride
+/// too, and check the total.
+pub(crate) fn finish_write_lookup(
+    meter: &mut GrowthMeter,
+    rows: &Vec<Row>,
+) -> Result<(), ExecError> {
+    meter.finish(rows).inspect_err(|_| {
+        WRITE_LOOKUP_METER_STOPS.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
 impl GrowthMeter {
+    /// A meter for the rows a write statement's node lookup produces; off
+    /// with `NAMIDB_WRITE_LOOKUP_METER=0`.
+    pub(crate) fn for_write_lookup() -> Self {
+        let mut meter = Self::new();
+        meter.active &= write_lookup_meter_enabled();
+        meter
+    }
+
+    /// Account the rows of `rows` not observed yet and check everything
+    /// accounted that was not checked: the last observation of a producer
+    /// whose rows stop short of the next check.
+    pub(crate) fn finish(&mut self, rows: &Vec<Row>) -> Result<(), ExecError> {
+        if !self.active {
+            return Ok(());
+        }
+        self.observe(rows)?;
+        if self.bytes > self.checked {
+            self.checked = self.bytes;
+            check_transient(self.bytes)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             active: memory_scoped(),

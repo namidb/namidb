@@ -461,3 +461,62 @@ async fn a_merge_at_the_memory_ceiling_is_deferred_and_completes_after() {
         ordinal
     );
 }
+
+/// A maintenance loop that does not give its pass up when told it is
+/// deferred (a vector or full-text base build) keeps working while the
+/// process stays at its memory ceiling, but never faster than it would just
+/// over the reclaim threshold; once the pressure is gone it is no longer
+/// deferred, so the next ceiling stops it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_that_ignores_deferral_stays_throttled_at_the_ceiling() {
+    use namidb_storage::background::{
+        deferred, memory_gate_stats, pace, set_memory_pressure, spawn_blocking, MemoryPressure,
+    };
+    use std::time::{Duration, Instant};
+    let _serial = SERIAL.lock().await;
+    if !namidb_storage::background::memory_gate_enabled() {
+        return;
+    }
+    let (_, throttles_before, deferrals_before) = memory_gate_stats();
+    set_memory_pressure(MemoryPressure::Ceiling);
+    let (deferred_at_ceiling, throttles_after_deferral, rearmed) = spawn_blocking(|| {
+        let unit = || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_micros(10) {
+                std::hint::spin_loop();
+            }
+            pace();
+        };
+        let started = Instant::now();
+        while !deferred() && started.elapsed() < Duration::from_secs(60) {
+            unit();
+        }
+        let deferred_at_ceiling = deferred();
+        let throttles_at_deferral = memory_gate_stats().1;
+        let after = Instant::now();
+        while after.elapsed() < Duration::from_secs(1) {
+            unit();
+        }
+        let throttles_after_deferral = memory_gate_stats().1 - throttles_at_deferral;
+        set_memory_pressure(MemoryPressure::Normal);
+        let calm = Instant::now();
+        while calm.elapsed() < Duration::from_millis(300) {
+            unit();
+        }
+        (deferred_at_ceiling, throttles_after_deferral, !deferred())
+    })
+    .await
+    .unwrap();
+    set_memory_pressure(MemoryPressure::Normal);
+    assert!(deferred_at_ceiling, "the pause at the ceiling ran out");
+    assert!(memory_gate_stats().2 > deferrals_before);
+    assert!(
+        throttles_after_deferral > 0,
+        "slices after the deferral, still at the ceiling, must be throttled"
+    );
+    assert!(memory_gate_stats().1 > throttles_before);
+    assert!(
+        rearmed,
+        "below the ceiling the thread is no longer deferred"
+    );
+}

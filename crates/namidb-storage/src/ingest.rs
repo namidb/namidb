@@ -2271,7 +2271,9 @@ impl WriterSession {
                     labels.clone(),
                     pairs.clone(),
                 ) && self.property_index_cache.count_seed_running()
+                    && crate::read::count_seed_rerequest_enabled()
                 {
+                    crate::read::note_count_seed_rerequest();
                     self.property_index_cache.request_count_seed(labels, pairs);
                 }
             }

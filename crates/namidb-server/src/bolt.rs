@@ -1670,40 +1670,17 @@ impl Backend for ServerBackend {
         // Take the global writer lock for the whole transaction, bounded so
         // a BEGIN queued behind a stuck/long transaction fails fast instead
         // of pinning the connection. Held across RUNs (and client
-        // think-time) until COMMIT/ROLLBACK — see TxState.
-        let timeout = self.state.writer_lock_timeout();
-        // A transaction holds the writer across client round trips, so it
-        // waits for memtable room first, like any write.
-        if !self.state.wait_for_memtable_room(timeout).await {
-            self.state.metrics.observe_writer_lock(
-                WriterLockKind::BoltTransaction,
-                std::time::Duration::ZERO,
-                false,
-            );
+        // think-time) until COMMIT/ROLLBACK — see TxState. Since it exists
+        // to write, it waits for memtable and L0 room first, like
+        // any data write: an explicit transaction admitted past the L0 hard
+        // bound would add L0 SSTs the bound exists to stop.
+        let Some(writer) = self
+            .state
+            .lock_writer_owned_for_write(WriterLockKind::BoltTransaction)
+            .await
+        else {
             return Err(writer_busy_error());
-        }
-        let lock = self.state.writer.clone().lock_owned();
-        let lock_started = std::time::Instant::now();
-        let writer = if timeout.is_zero() {
-            lock.await
-        } else {
-            match tokio::time::timeout(timeout, lock).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    self.state.metrics.observe_writer_lock(
-                        WriterLockKind::BoltTransaction,
-                        lock_started.elapsed(),
-                        false,
-                    );
-                    return Err(writer_busy_error());
-                }
-            }
         };
-        self.state.metrics.observe_writer_lock(
-            WriterLockKind::BoltTransaction,
-            lock_started.elapsed(),
-            true,
-        );
         // Grouped auto-commit writes may have staged rows and released the
         // lock while the committer waits out its window. This transaction's
         // COMMIT would make them durable without answering their waiters,
@@ -3094,6 +3071,70 @@ mod tests {
             "a rejected BEGIN must not pin the writer"
         );
         assert_eq!(governor.rejected_queries(), 2);
+    }
+
+    /// An explicit transaction is held at the L0 hard bound like any data
+    /// write: BEGIN waits for compaction and answers writer-busy when L0 does
+    /// not drain in time, without pinning the writer.
+    #[tokio::test]
+    async fn bolt_begin_waits_at_the_l0_hard_bound_like_any_write() {
+        const HARD_L0: usize = 3;
+        let (store, paths) = namidb_storage::parse_uri("memory://bolt-begin-l0-hard").unwrap();
+        let mut writer = namidb_storage::WriterSession::open(store, paths)
+            .await
+            .unwrap();
+        for i in 0..HARD_L0 {
+            let mut properties = BTreeMap::new();
+            properties.insert("n".to_string(), CoreValue::I64(i as i64));
+            writer
+                .upsert_node(
+                    "P",
+                    NodeId::new(),
+                    &NodeWriteRecord {
+                        properties,
+                        schema_version: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            writer.commit_batch().await.unwrap();
+            let schema = writer.snapshot().manifest().manifest.schema.clone();
+            writer.flush(schema).await.unwrap();
+        }
+        let state = AppState::new(writer, None, "bolt-l0-hard".into())
+            .with_write_hard_stall_l0(HARD_L0)
+            .with_writer_lock_timeout(std::time::Duration::from_millis(300));
+        let backend = ServerBackend::new(state.clone(), Arc::new(std::sync::Mutex::new(None)));
+        let (_, refused_before) = crate::write_hard_stall_stats();
+        let started = std::time::Instant::now();
+        let begin = backend
+            .begin_tx()
+            .await
+            .expect_err("BEGIN at the L0 hard bound must wait and be refused");
+        assert!(
+            matches!(&begin, BackendError::Storage(text) if text.contains("writer is busy")),
+            "got {begin:?}"
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(crate::write_hard_stall_stats().1 > refused_before);
+        assert!(
+            state.writer.try_lock().is_ok(),
+            "a refused BEGIN must not pin the writer"
+        );
+        {
+            let mut w = state.writer.lock().await;
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.compact_l0(&schema).await.unwrap();
+        }
+        backend
+            .begin_tx()
+            .await
+            .expect("BEGIN runs once L0 drained");
+        backend
+            .run_in_tx("CREATE (:T {k: 1})", Params::new())
+            .await
+            .unwrap();
+        backend.commit_tx().await.unwrap();
     }
 
     #[tokio::test]

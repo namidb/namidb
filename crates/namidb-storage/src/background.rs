@@ -352,7 +352,10 @@ fn yield_slice(mut state: SliceState) -> SliceState {
 //   still holds after that, marks the thread deferred: the merge loops see it
 //   through [`deferred`] and give their memory back by failing the pass with
 //   [`crate::Error::MemoryLimit`], which the caller retries later with a
-//   smaller plan instead of the kernel killing the process.
+//   smaller plan instead of the kernel killing the process. A loop that does
+//   not check it (a vector or full-text base build) goes on throttled as
+//   over the reclaim threshold, and is no longer deferred once the process
+//   leaves the ceiling.
 //
 // `NAMIDB_COMPACTION_MEMORY_GATE=0` turns the gate off (3.5.4 behaviour).
 
@@ -464,7 +467,14 @@ fn wait_out_memory_pressure() {
     if !memory_gate_enabled() {
         return;
     }
-    match memory_pressure() {
+    let pressure = memory_pressure();
+    if pressure != MemoryPressure::Ceiling {
+        // Out of the ceiling the thread is no longer deferred: a loop that
+        // carried on (one that does not check [`deferred`]) pauses again at
+        // the next ceiling. A merge loop gave its pass up already.
+        DEFERRED.with(|flag| flag.set(false));
+    }
+    match pressure {
         MemoryPressure::Normal => {}
         MemoryPressure::Reclaim => {
             PRESSURE_THROTTLES.fetch_add(1, Ordering::Relaxed);
@@ -472,6 +482,12 @@ fn wait_out_memory_pressure() {
         }
         MemoryPressure::Ceiling => {
             if deferred() {
+                // Still at the ceiling after this thread's pause ran out, and
+                // its loop did not give the pass up (a vector or full-text
+                // base build does not check `deferred`): it goes on, but no
+                // faster than over the reclaim threshold.
+                PRESSURE_THROTTLES.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(SLICE);
                 return;
             }
             PRESSURE_PAUSES.fetch_add(1, Ordering::Relaxed);

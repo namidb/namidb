@@ -52,6 +52,11 @@ pub(crate) struct CompactionScheduler {
     /// guard while it lists and deletes. Tokio's write-preferring FIFO lock
     /// prevents a trigger stream from starving a queued janitor.
     maintenance_gate: RwLock<()>,
+    /// Node/edge/search-base prepares of this namespace running now (the
+    /// short search-delta passes are not counted). The relief flush skips
+    /// this namespace while one runs (see
+    /// [`crate::memory::relief_flush_allowed_for`]).
+    long_prepares: std::sync::atomic::AtomicUsize,
     /// The full-text re-analysis running for this namespace, if any (see
     /// [`maybe_start_text_reanalysis`]). It runs beside the compaction
     /// worker, not inside it, and outside `maintenance_gate`.
@@ -87,6 +92,20 @@ enum Admission {
 impl CompactionScheduler {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether a node/edge/search-base prepare of this namespace is running.
+    pub(crate) fn long_prepare_in_flight(&self) -> bool {
+        self.long_prepares
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
+    /// Count one long prepare of this namespace for the guard's lifetime.
+    pub(crate) fn enter_long_prepare(&self) -> LongPrepare<'_> {
+        self.long_prepares
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LongPrepare(&self.long_prepares)
     }
 
     fn admit(&self, trigger: CompactionTrigger) -> Admission {
@@ -1412,7 +1431,8 @@ async fn run_scoped_pass(
     // I/O without monopolising a reactor thread.
     let schema = basis.schema().clone();
     let prepare_started = Instant::now();
-    let in_flight_prepare = PrepareInFlight::enter();
+    let in_flight_prepare =
+        (scope != PassScope::SearchDeltas).then(|| scheduler.enter_long_prepare());
     let prepared = match scope {
         PassScope::SearchDeltas => basis.prepare_search_deltas(&schema).await,
         PassScope::SearchOnly => basis.prepare_search_bases(&schema).await,
@@ -1630,28 +1650,13 @@ async fn run_scoped_pass(
     result
 }
 
-/// Compaction prepares running in this process (every namespace).
-static PREPARES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Counts one long prepare in [`CompactionScheduler::long_prepares`] for its
+/// lifetime.
+pub(crate) struct LongPrepare<'a>(&'a std::sync::atomic::AtomicUsize);
 
-/// How many compaction prepares are running now. The memory governor holds
-/// its relief flush back while one is.
-pub(crate) fn compaction_prepares_in_flight() -> usize {
-    PREPARES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Counts one prepare in [`PREPARES_IN_FLIGHT`] for its lifetime.
-struct PrepareInFlight;
-
-impl PrepareInFlight {
-    fn enter() -> Self {
-        PREPARES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self
-    }
-}
-
-impl Drop for PrepareInFlight {
+impl Drop for LongPrepare<'_> {
     fn drop(&mut self) {
-        PREPARES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

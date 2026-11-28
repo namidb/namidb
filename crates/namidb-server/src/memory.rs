@@ -969,16 +969,11 @@ impl MemoryGovernor {
             // Caches are gone and the allocator trimmed, yet the process is
             // still over the reclaim threshold: what remains reconstructible
             // is the memtables. Flush them rather than reject queries until
-            // a periodic tick happens to — unless a compaction is preparing:
-            // the pressure is then most likely its working set, which the
-            // maintenance memory gate pauses, and a flush would add another
-            // SST build on top of it plus one more L0 for it to merge. The
-            // memtable keeps its own hard bound meanwhile.
-            if relief_flush_allowed() {
-                request_pressure_flush();
-            } else {
-                RELIEF_FLUSHES_SKIPPED.fetch_add(1, Ordering::Relaxed);
-            }
+            // a periodic tick happens to. Each namespace's flush loop decides
+            // for itself (see `relief_flush_allowed_for`), so one
+            // namespace's long merge does not keep every other namespace's
+            // memtable in memory.
+            request_pressure_flush();
         }
 
         Some(resident)
@@ -1194,18 +1189,35 @@ fn pressure_flush_notify() -> &'static tokio::sync::Notify {
     NOTIFY.get_or_init(tokio::sync::Notify::new)
 }
 
-/// Relief flushes not requested because a compaction was preparing.
+/// Relief flushes a namespace skipped because its own compaction was
+/// preparing.
 static RELIEF_FLUSHES_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Relief flushes skipped while a compaction prepared (metrics).
+/// Relief flushes skipped while the namespace's compaction prepared
+/// (metrics).
 pub fn relief_flushes_skipped() -> u64 {
     RELIEF_FLUSHES_SKIPPED.load(Ordering::Relaxed)
 }
 
-/// Whether a reclaim pass may ask the flush loops for a relief flush: always
-/// with `NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION=1` (3.5.4 behaviour),
-/// otherwise only while no compaction prepare is in flight.
-fn relief_flush_allowed() -> bool {
+/// Whether a namespace's flush loop answers a relief-flush request (see
+/// [`pressure_flush_requested`]): always with
+/// `NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION=1` (3.5.4 behaviour), otherwise
+/// unless that namespace is preparing a node, edge or search-base merge. The
+/// pressure is then most likely that merge's working set, which the
+/// maintenance memory gate pauses, and a flush would add another SST build
+/// on top of it plus one more L0 for it to merge; the memtable keeps its own
+/// hard bound meanwhile. Other namespaces still flush. A skip is counted.
+pub(crate) fn relief_flush_allowed_for(
+    scheduler: &crate::maintenance::CompactionScheduler,
+) -> bool {
+    if relief_flush_always() || !scheduler.long_prepare_in_flight() {
+        return true;
+    }
+    RELIEF_FLUSHES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+fn relief_flush_always() -> bool {
     static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let always = *ALWAYS.get_or_init(|| {
         matches!(
@@ -1215,7 +1227,7 @@ fn relief_flush_allowed() -> bool {
             Ok("1" | "true" | "on" | "yes")
         )
     });
-    always || crate::maintenance::compaction_prepares_in_flight() == 0
+    always
 }
 
 /// Wake every flush loop now waiting (see [`pressure_flush_requested`]).

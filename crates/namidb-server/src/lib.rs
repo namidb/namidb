@@ -342,6 +342,11 @@ pub struct AppState {
     /// disables each. The server sets them from [`Config`] at boot.
     memtable_flush_bytes: usize,
     memtable_stall_bytes: usize,
+    /// L0 SSTs per bucket at which a data write waits for compaction (see
+    /// [`effective_write_hard_stall_l0`]). `0` disables it: the default for a
+    /// bare state, which runs no maintenance task to drain L0; the server
+    /// resolves it from [`Config`] at boot.
+    write_hard_stall_l0: usize,
     /// Process-wide RSS/working-set admission shared by HTTP, Bolt, and every
     /// namespace. Unlike the storage cache budget, this observes total
     /// resident memory.
@@ -431,6 +436,7 @@ impl AppState {
             write_stall_delay: Duration::ZERO,
             memtable_flush_bytes: 0,
             memtable_stall_bytes: 0,
+            write_hard_stall_l0: 0,
             memory: Arc::new(memory::MemoryGovernor::new(
                 memory::DEFAULT_MEMORY_MAX_BYTES,
             )),
@@ -507,6 +513,7 @@ impl AppState {
             write_stall_delay: shared.write_stall_delay,
             memtable_flush_bytes: shared.memtable_flush_bytes,
             memtable_stall_bytes: shared.memtable_stall_bytes,
+            write_hard_stall_l0: shared.write_hard_stall_l0,
             memory: shared.memory.clone(),
             writer_lock_timeout: shared.writer_lock_timeout,
             http_body_limit: shared.http_body_limit,
@@ -583,6 +590,17 @@ impl AppState {
         self
     }
 
+    /// Set the L0 hard write bound (builder style): at `l0` SSTs in one
+    /// bucket a data write waits for compaction to drain L0, and answers the
+    /// retryable writer-busy error when that does not happen within the
+    /// writer-lock bound. `0` disables it. Only set it where a maintenance
+    /// task drains L0 below `l0` on its own (see
+    /// [`effective_write_hard_stall_l0`]).
+    pub fn with_write_hard_stall_l0(mut self, l0: usize) -> Self {
+        self.write_hard_stall_l0 = l0;
+        self
+    }
+
     /// Attach the process-wide total-memory admission governor.
     pub fn with_memory_governor(mut self, memory: Arc<memory::MemoryGovernor>) -> Self {
         self.memory = memory;
@@ -609,11 +627,6 @@ impl AppState {
     pub fn with_http_body_limit(mut self, bytes: usize) -> Self {
         self.http_body_limit = bytes.max(1);
         self
-    }
-
-    /// The configured foreground writer-lock bound (`ZERO` = disabled).
-    pub(crate) fn writer_lock_timeout(&self) -> Duration {
-        self.writer_lock_timeout
     }
 
     /// If a write should be stalled given the worst bucket's current L0
@@ -669,7 +682,7 @@ impl AppState {
     }
 
     /// [`Self::lock_writer_bounded`] for a data write: also waits while the
-    /// memtable is at its hard bound (see [`lock_writer_with_memtable_room`]).
+    /// memtable or L0 is at its hard bound (see [`lock_writer_with_room`]).
     /// Schema DDL keeps the plain bounded lock, so an operator can still drop
     /// an index while writes are held back.
     pub(crate) async fn lock_writer_for_write(
@@ -677,10 +690,11 @@ impl AppState {
         kind: WriterLockKind,
     ) -> Option<tokio::sync::MutexGuard<'_, WriterSession>> {
         let started = std::time::Instant::now();
-        let guard = lock_writer_with_memtable_room(
+        let guard = lock_writer_with_room(
             &self.writer,
             self.writer_lock_timeout,
             memtable_hard_bytes(self.memtable_stall_bytes),
+            self.write_hard_stall_l0,
             &self.flush_notify,
         )
         .await;
@@ -689,30 +703,25 @@ impl AppState {
         guard
     }
 
-    /// Wait, without taking the writer, until the last published memtable
-    /// size is below its hard bound; `false` once `timeout` (when non-zero)
-    /// elapses first. For an explicit transaction, which then holds the
-    /// writer across client round trips.
-    pub(crate) async fn wait_for_memtable_room(&self, timeout: Duration) -> bool {
-        let hard = memtable_hard_bytes(self.memtable_stall_bytes);
-        if hard == 0 {
-            return true;
-        }
+    /// [`Self::lock_writer_for_write`] returning an owned guard: for an
+    /// explicit Bolt transaction, which holds the writer across client round
+    /// trips, and for an HTTP write that waits for room in its handler.
+    pub(crate) async fn lock_writer_owned_for_write(
+        &self,
+        kind: WriterLockKind,
+    ) -> Option<tokio::sync::OwnedMutexGuard<WriterSession>> {
         let started = std::time::Instant::now();
-        loop {
-            if self
-                .memtable_bytes_gauge
-                .load(std::sync::atomic::Ordering::Relaxed)
-                < hard
-            {
-                return true;
-            }
-            self.flush_notify.notify_one();
-            if !timeout.is_zero() && started.elapsed() >= timeout {
-                return false;
-            }
-            tokio::time::sleep(MEMTABLE_ROOM_POLL).await;
-        }
+        let guard = lock_writer_owned_with_room(
+            &self.writer,
+            self.writer_lock_timeout,
+            memtable_hard_bytes(self.memtable_stall_bytes),
+            self.write_hard_stall_l0,
+            &self.flush_notify,
+        )
+        .await;
+        self.metrics
+            .observe_writer_lock(kind, started.elapsed(), guard.is_some());
+        guard
     }
 
     /// Set the per-read-query timeout (builder style). `Duration::ZERO`
@@ -1606,6 +1615,10 @@ pub async fn run_with_memory_limits(
         .with_query_row_cap(config.query_row_cap)
         .with_write_stall(config.write_stall_l0, config.write_stall_delay)
         .with_memtable_thresholds(config.memtable_flush_bytes, config.memtable_stall_bytes)
+        .with_write_hard_stall_l0(resolve_write_hard_stall_l0(
+            config.flush_interval,
+            config.compaction_l0_trigger,
+        ))
         .with_memory_governor(memory)
         .with_writer_lock_timeout(config.writer_lock_timeout)
         .with_http_body_limit(config.http_max_body_bytes)
@@ -1662,7 +1675,13 @@ pub async fn run_with_memory_limits(
                     _ = state_for_flush.flush_notify.notified() => {}
                     // Over the memory ceiling after reclaim: the memtable is
                     // the reconstructible memory left to give back.
-                    _ = memory::pressure_flush_requested() => {}
+                    _ = memory::pressure_flush_requested() => {
+                        if !memory::relief_flush_allowed_for(
+                            &state_for_flush.compaction_scheduler,
+                        ) {
+                            continue;
+                        }
+                    }
                     // A full-text read found more unflushed documents than
                     // it merges (`namidb_storage::search_freshness`).
                     _ = namidb_storage::search_freshness::flush_requested() => {
@@ -3058,8 +3077,9 @@ pub(crate) fn memtable_hard_bytes(stall_bytes: usize) -> usize {
 /// How often a write held back by a full memtable re-checks it.
 const MEMTABLE_ROOM_POLL: Duration = Duration::from_millis(50);
 
-/// [`lock_writer_bounded`] for a write that will grow the memtable: the
-/// writer is returned only while the memtable is below `hard_bytes`.
+/// [`lock_writer_bounded`] for a data write: the writer is returned only
+/// while the memtable is below `hard_bytes` and every bucket holds fewer than
+/// `hard_l0` L0 SSTs.
 ///
 /// Past the stall threshold a write is only delayed, which bounds nothing
 /// when flushes cannot install (a search index at its segment ceiling, a
@@ -3067,28 +3087,10 @@ const MEMTABLE_ROOM_POLL: Duration = Duration::from_millis(50);
 /// the process's anonymous memory, without limit until the memory ceiling
 /// rejected every query. Now the write releases the writer, wakes the flush
 /// and waits, and fails like any writer-lock timeout (a retryable 503 /
-/// transient Bolt failure) when no flush makes room within `timeout`.
-/// `hard_bytes == 0` disables the bound; a zero `timeout` waits as long as
-/// it takes, as the lock itself does.
-pub(crate) async fn lock_writer_with_memtable_room<'w>(
-    writer: &'w tokio::sync::Mutex<WriterSession>,
-    timeout: Duration,
-    hard_bytes: usize,
-    flush_notify: &tokio::sync::Notify,
-) -> Option<tokio::sync::MutexGuard<'w, WriterSession>> {
-    lock_writer_with_room(
-        writer,
-        timeout,
-        hard_bytes,
-        write_hard_stall_l0(),
-        flush_notify,
-    )
-    .await
-}
-
-/// [`lock_writer_with_memtable_room`] with an explicit L0 hard bound (`0` =
-/// none): the writer is returned only while the memtable is below
-/// `hard_bytes` and every bucket holds fewer than `hard_l0` L0 SSTs.
+/// transient Bolt failure) when no flush makes room within `timeout`. The
+/// L0 bound works the same way, with compaction (requested by the woken
+/// flush loop) making the room. `0` disables either bound; a zero `timeout`
+/// waits as long as it takes, as the lock itself does.
 pub(crate) async fn lock_writer_with_room<'w>(
     writer: &'w tokio::sync::Mutex<WriterSession>,
     timeout: Duration,
@@ -3096,6 +3098,63 @@ pub(crate) async fn lock_writer_with_room<'w>(
     hard_l0: usize,
     flush_notify: &tokio::sync::Notify,
 ) -> Option<tokio::sync::MutexGuard<'w, WriterSession>> {
+    acquire_writer_with_room(
+        |remaining| lock_writer_bounded(writer, remaining),
+        timeout,
+        hard_bytes,
+        hard_l0,
+        flush_notify,
+    )
+    .await
+}
+
+/// [`lock_writer_with_room`] returning an owned guard, for a holder that
+/// outlives the borrow: an explicit Bolt transaction, or an HTTP write
+/// that waits for room in its handler (where a client that leaves stops
+/// the wait) and then hands the writer to its drop-shielded section.
+pub(crate) async fn lock_writer_owned_with_room(
+    writer: &Arc<tokio::sync::Mutex<WriterSession>>,
+    timeout: Duration,
+    hard_bytes: usize,
+    hard_l0: usize,
+    flush_notify: &tokio::sync::Notify,
+) -> Option<tokio::sync::OwnedMutexGuard<WriterSession>> {
+    acquire_writer_with_room(
+        |remaining| {
+            let writer = Arc::clone(writer);
+            async move {
+                if remaining.is_zero() {
+                    Some(writer.lock_owned().await)
+                } else {
+                    tokio::time::timeout(remaining, writer.lock_owned())
+                        .await
+                        .ok()
+                }
+            }
+        },
+        timeout,
+        hard_bytes,
+        hard_l0,
+        flush_notify,
+    )
+    .await
+}
+
+/// The wait shared by [`lock_writer_with_room`] and
+/// [`lock_writer_owned_with_room`]: `acquire(remaining)` takes the writer
+/// within `remaining` (`ZERO` = unbounded).
+async fn acquire_writer_with_room<G, F, Fut>(
+    mut acquire: F,
+    timeout: Duration,
+    hard_bytes: usize,
+    hard_l0: usize,
+    flush_notify: &tokio::sync::Notify,
+) -> Option<G>
+where
+    G: std::ops::Deref<Target = WriterSession>,
+    F: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = Option<G>>,
+{
     let started = std::time::Instant::now();
     let mut warned = false;
     let mut l0_waited = false;
@@ -3113,7 +3172,7 @@ pub(crate) async fn lock_writer_with_room<'w>(
                 }
             }
         };
-        let guard = match lock_writer_bounded(writer, remaining).await {
+        let guard = match acquire(remaining).await {
             Some(guard) => guard,
             None => {
                 if l0_waited {
@@ -3187,34 +3246,61 @@ pub fn write_hard_stall_stats() -> (u64, u64) {
 
 /// L0 SSTs in one bucket at which a data write waits, without the writer,
 /// for compaction to drain L0 below it, and answers the retryable 503 of a
-/// writer-lock timeout when that does not happen within the lock bound
-/// (`NAMIDB_WRITE_HARD_STALL_L0`, default [`DEFAULT_WRITE_HARD_STALL_L0`];
-/// `0` disables it, the 3.5.4 behaviour). The soft stall only delays a
-/// committed write, which a serial client barely notices, so L0 could grow
-/// without bound while every read and merge paid for each extra SST. The
-/// hard bound is also off when reactive and periodic compaction are both
-/// configured off (`NAMIDB_COMPACTION_L0_TRIGGER=0` and
-/// `NAMIDB_COMPACTION_INTERVAL=0s`): nothing would drain L0 then.
-pub(crate) fn write_hard_stall_l0() -> usize {
+/// writer-lock timeout when that does not happen within the lock bound, as
+/// configured (`NAMIDB_WRITE_HARD_STALL_L0`, default
+/// [`DEFAULT_WRITE_HARD_STALL_L0`]; `0` disables it, the 3.5.4 behaviour).
+/// The soft stall only delays a committed write, which a serial client
+/// barely notices, so L0 could grow without bound while every read and merge
+/// paid for each extra SST. What a server applies is
+/// [`effective_write_hard_stall_l0`] of this.
+pub(crate) fn configured_write_hard_stall_l0() -> usize {
     static HARD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *HARD.get_or_init(|| {
-        let configured = std::env::var("NAMIDB_WRITE_HARD_STALL_L0")
+        std::env::var("NAMIDB_WRITE_HARD_STALL_L0")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_WRITE_HARD_STALL_L0);
-        let trigger_off = std::env::var("NAMIDB_COMPACTION_L0_TRIGGER")
-            .ok()
-            .is_some_and(|value| value.trim() == "0");
-        let interval_off = std::env::var("NAMIDB_COMPACTION_INTERVAL")
-            .ok()
-            .and_then(|value| humantime::parse_duration(value.trim()).ok())
-            .is_some_and(|interval| interval.is_zero());
-        if trigger_off && interval_off {
-            0
-        } else {
-            configured
-        }
+            .unwrap_or(DEFAULT_WRITE_HARD_STALL_L0)
     })
+}
+
+/// The L0 hard bound a server applies, from the configured bound and the
+/// resolved maintenance settings (CLI flag, env or an embedder's
+/// [`Config`] alike): `configured` while a reactive compaction pass fires
+/// at or below it, otherwise `0` (off, as in 3.5.4).
+///
+/// A held write drains nothing itself: it wakes the namespace's flush loop,
+/// which requests a pass only when `l0_trigger > 0` and the worst bucket has
+/// reached `l0_trigger` (and runs only when `flush_interval > 0`). With no
+/// such trigger at or below the bound, L0 could leave the bound only on a
+/// periodic tick (minutes away, or never with `compaction_interval = 0`), and
+/// every data write would be refused until then.
+pub fn effective_write_hard_stall_l0(
+    configured: usize,
+    flush_interval: Duration,
+    l0_trigger: usize,
+) -> usize {
+    let reactive_drains = !flush_interval.is_zero() && l0_trigger > 0 && l0_trigger <= configured;
+    if reactive_drains {
+        configured
+    } else {
+        0
+    }
+}
+
+/// [`effective_write_hard_stall_l0`] of the configured bound, with a
+/// startup line when the configured bound is switched off.
+pub(crate) fn resolve_write_hard_stall_l0(flush_interval: Duration, l0_trigger: usize) -> usize {
+    let configured = configured_write_hard_stall_l0();
+    let effective = effective_write_hard_stall_l0(configured, flush_interval, l0_trigger);
+    if configured > 0 && effective == 0 {
+        tracing::info!(
+            configured,
+            l0_trigger,
+            flush_interval_ms = flush_interval.as_millis() as u64,
+            "L0 hard write stall off: no reactive compaction fires at or below it"
+        );
+    }
+    effective
 }
 
 /// Outcome of awaiting a group-commit ACK under the write deadline.
@@ -4901,12 +4987,24 @@ enum WriteSection {
 /// cancel a commit in flight (the hazard deferred from item 59). On its own
 /// task the section always reaches a definite outcome and releases the
 /// writer cleanly; the abandoned handler simply never reads the result.
+///
+/// `writer` is the writer the handler already waited for (see
+/// [`http_write_wait_in_handler`]); `None` waits for it here.
 async fn run_write_section(
     state: AppState,
     plan: namidb_query::LogicalPlan,
     params: Params,
+    writer: Option<tokio::sync::OwnedMutexGuard<WriterSession>>,
 ) -> WriteSection {
-    let Some(mut writer) = state.lock_writer_for_write(WriterLockKind::Http).await else {
+    let writer = match writer {
+        Some(writer) => Some(writer),
+        None => {
+            state
+                .lock_writer_owned_for_write(WriterLockKind::Http)
+                .await
+        }
+    };
+    let Some(mut writer) = writer else {
         return WriteSection::Busy;
     };
     let budget = state.memory.query_budget();
@@ -5250,6 +5348,26 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                 response: rejection,
             };
         }
+        // The wait for the writer (and for memtable / L0 room) runs here,
+        // where a client that leaves ends it: nothing is staged yet.
+        let writer = if http_write_wait_in_handler() {
+            let wait = HandlerWriteWait::start();
+            let writer = state
+                .lock_writer_owned_for_write(WriterLockKind::Http)
+                .await;
+            wait.finish();
+            let Some(writer) = writer else {
+                return ObservedQuery {
+                    kind: Some(QueryKind::Write),
+                    ok: false,
+                    elapsed: started.elapsed(),
+                    response: writer_busy_response(),
+                };
+            };
+            Some(writer)
+        } else {
+            None
+        };
         // Shielded from handler drop (client disconnect / TimeoutLayer): the
         // commit reaches a definite outcome even if nobody is left to read
         // it. The operator-cancel flag is re-scoped onto the task because
@@ -5264,11 +5382,11 @@ async fn run_cypher(state: &AppState, req: &CypherRequest, principal: &Principal
                     Some(flag) => {
                         namidb_storage::cancel::with_cancel_flag(
                             flag,
-                            run_write_section(state, plan, params),
+                            run_write_section(state, plan, params, writer),
                         )
                         .await
                     }
-                    None => run_write_section(state, plan, params).await,
+                    None => run_write_section(state, plan, params, writer).await,
                 }
             })
         };
@@ -6943,18 +7061,18 @@ enum WriteSectionMulti {
     },
 }
 
-/// Multi-tenant twin of [`run_write_section`] — same drop-shield rationale.
-async fn run_write_section_multi(
-    ns_state: Arc<NamespaceState>,
-    shared: SharedAppState,
-    plan: namidb_query::LogicalPlan,
-    params: Params,
-) -> WriteSectionMulti {
+/// A multi-tenant data write's wait for its namespace writer, with memtable
+/// and L0 room (see [`lock_writer_with_room`]).
+async fn lock_namespace_writer_for_write(
+    ns_state: &Arc<NamespaceState>,
+    shared: &SharedAppState,
+) -> Option<tokio::sync::OwnedMutexGuard<WriterSession>> {
     let lock_started = std::time::Instant::now();
-    let writer = lock_writer_with_memtable_room(
+    let writer = lock_writer_owned_with_room(
         &ns_state.writer,
         shared.writer_lock_timeout,
         memtable_hard_bytes(shared.memtable_stall_bytes),
+        shared.write_hard_stall_l0,
         &ns_state.flush_notify,
     )
     .await;
@@ -6963,6 +7081,68 @@ async fn run_write_section_multi(
         lock_started.elapsed(),
         writer.is_some(),
     );
+    writer
+}
+
+/// Whether an HTTP data write waits for its writer, and for memtable and L0
+/// room, in its handler (`NAMIDB_HTTP_WRITE_WAIT_IN_HANDLER`, default on).
+/// A client that leaves then ends the wait, and its write never runs; only
+/// the work after the writer is held runs drop-shielded. With `0` the wait
+/// runs inside the shielded section, as in 3.5.4: an abandoned write kept
+/// its parsed batch and ran once room appeared, after its client had
+/// already sent it again.
+pub(crate) fn http_write_wait_in_handler() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !namidb_storage::background::env_flag_off("NAMIDB_HTTP_WRITE_WAIT_IN_HANDLER")
+    })
+}
+
+static WRITE_WAITS_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// HTTP data writes whose client left while they waited for the writer
+/// (metrics).
+pub fn write_waits_abandoned() -> u64 {
+    WRITE_WAITS_ABANDONED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Counts a handler-side writer wait in [`WRITE_WAITS_ABANDONED`] when the
+/// handler is dropped before the wait ends.
+struct HandlerWriteWait {
+    finished: bool,
+}
+
+impl HandlerWriteWait {
+    fn start() -> Self {
+        Self { finished: false }
+    }
+
+    fn finish(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for HandlerWriteWait {
+    fn drop(&mut self) {
+        if !self.finished {
+            WRITE_WAITS_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Multi-tenant twin of [`run_write_section`] — same drop-shield rationale.
+/// `writer` is the writer the handler already waited for; `None` waits here.
+async fn run_write_section_multi(
+    ns_state: Arc<NamespaceState>,
+    shared: SharedAppState,
+    plan: namidb_query::LogicalPlan,
+    params: Params,
+    writer: Option<tokio::sync::OwnedMutexGuard<WriterSession>>,
+) -> WriteSectionMulti {
+    let writer = match writer {
+        Some(writer) => Some(writer),
+        None => lock_namespace_writer_for_write(&ns_state, &shared).await,
+    };
     let Some(mut writer) = writer else {
         return WriteSectionMulti::Busy;
     };
@@ -7334,6 +7514,23 @@ async fn run_cypher_multi(
                 response: rejection,
             };
         }
+        // The wait for the writer runs here, as on the single-tenant path.
+        let writer = if http_write_wait_in_handler() {
+            let wait = HandlerWriteWait::start();
+            let writer = lock_namespace_writer_for_write(ns_state, shared).await;
+            wait.finish();
+            let Some(writer) = writer else {
+                return ObservedQuery {
+                    kind: Some(QueryKind::Write),
+                    ok: false,
+                    elapsed: started.elapsed(),
+                    response: writer_busy_response(),
+                };
+            };
+            Some(writer)
+        } else {
+            None
+        };
         // Shielded from handler drop, mirroring the single-tenant path.
         let cancel_flag = namidb_storage::cancel::current_cancel_flag();
         let section = {
@@ -7346,11 +7543,11 @@ async fn run_cypher_multi(
                     Some(flag) => {
                         namidb_storage::cancel::with_cancel_flag(
                             flag,
-                            run_write_section_multi(ns_state, shared, plan, params),
+                            run_write_section_multi(ns_state, shared, plan, params, writer),
                         )
                         .await
                     }
-                    None => run_write_section_multi(ns_state, shared, plan, params).await,
+                    None => run_write_section_multi(ns_state, shared, plan, params, writer).await,
                 }
             })
         };
@@ -11671,11 +11868,10 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(200));
         // An explicit transaction's BEGIN waits for room like a write; schema
         // DDL is not held back, so an index can still be dropped.
-        assert!(
-            !state
-                .wait_for_memtable_room(Duration::from_millis(100))
-                .await
-        );
+        assert!(state
+            .lock_writer_owned_for_write(WriterLockKind::BoltTransaction)
+            .await
+            .is_none());
         assert!(state
             .lock_writer_bounded(WriterLockKind::Http)
             .await
@@ -11695,11 +11891,10 @@ mod tests {
             .lock_writer_for_write(WriterLockKind::Http)
             .await
             .is_some());
-        assert!(
-            state
-                .wait_for_memtable_room(Duration::from_millis(100))
-                .await
-        );
+        assert!(state
+            .lock_writer_owned_for_write(WriterLockKind::BoltTransaction)
+            .await
+            .is_some());
     }
 
     /// A serial writer only noticed the soft L0 stall as a short delay, so
@@ -11790,6 +11985,123 @@ mod tests {
         )
         .await
         .is_some());
+    }
+
+    /// Flush `files` one-node L0 SSTs (label `P`) under the writer lock.
+    async fn flush_l0_files(writer: &tokio::sync::Mutex<WriterSession>, files: usize) {
+        let mut w = writer.lock().await;
+        for i in 0..files {
+            let mut properties = std::collections::BTreeMap::new();
+            properties.insert("n".to_string(), namidb_core::value::Value::I64(i as i64));
+            w.upsert_node(
+                "P",
+                namidb_core::id::NodeId::new(),
+                &namidb_storage::NodeWriteRecord {
+                    properties,
+                    schema_version: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            w.commit_batch().await.unwrap();
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.flush(schema).await.unwrap();
+        }
+    }
+
+    /// The hard L0 bound is armed only where a reactive pass fires at or
+    /// below it, from the resolved settings, and a bare state has it off.
+    #[tokio::test]
+    async fn the_l0_hard_bound_is_resolved_from_the_compaction_settings() {
+        let tick = Duration::from_secs(1);
+        assert_eq!(effective_write_hard_stall_l0(64, tick, 8), 64);
+        assert_eq!(effective_write_hard_stall_l0(64, tick, 64), 64);
+        assert_eq!(
+            effective_write_hard_stall_l0(64, tick, 65),
+            0,
+            "trigger above"
+        );
+        assert_eq!(
+            effective_write_hard_stall_l0(64, tick, 0),
+            0,
+            "reactive off"
+        );
+        assert_eq!(
+            effective_write_hard_stall_l0(64, Duration::ZERO, 8),
+            0,
+            "no flush loop"
+        );
+        assert_eq!(
+            effective_write_hard_stall_l0(0, tick, 8),
+            0,
+            "configured off"
+        );
+
+        let (store, paths) = namidb_storage::parse_uri("memory://test-l0-hard-bare").unwrap();
+        let state = AppState::new(
+            WriterSession::open(store, paths).await.unwrap(),
+            None,
+            "t".into(),
+        )
+        .with_writer_lock_timeout(Duration::from_millis(200));
+        assert_eq!(state.write_hard_stall_l0, 0);
+        flush_l0_files(&state.writer, 3).await;
+        assert!(state
+            .lock_writer_for_write(WriterLockKind::Http)
+            .await
+            .is_some());
+        let state = state.with_write_hard_stall_l0(3);
+        assert!(state
+            .lock_writer_for_write(WriterLockKind::Http)
+            .await
+            .is_none());
+    }
+
+    /// An HTTP write held at the L0 bound waits in its handler: when the
+    /// client leaves (a disconnect, a request timeout) the wait ends with
+    /// it, and the write does not run later, after its client has already
+    /// sent it again, once compaction drains L0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_http_write_whose_client_left_at_the_l0_bound_never_runs() {
+        const HARD_L0: usize = 3;
+        let (store, paths) = namidb_storage::parse_uri("memory://test-l0-hard-abandoned").unwrap();
+        let state = AppState::new(
+            WriterSession::open(store, paths).await.unwrap(),
+            None,
+            "t".into(),
+        )
+        .with_write_hard_stall_l0(HARD_L0)
+        .with_writer_lock_timeout(Duration::from_secs(20));
+        flush_l0_files(&state.writer, HARD_L0).await;
+        let app = build_router(state.clone());
+        let abandoned_before = write_waits_abandoned();
+        let held = tokio::time::timeout(
+            Duration::from_millis(500),
+            post_json(
+                &app,
+                "/v0/cypher",
+                serde_json::json!({ "query": "CREATE (:Gone {k: 1}) RETURN 1 AS ok" }),
+            ),
+        )
+        .await;
+        assert!(held.is_err(), "the write is held at the bound");
+        assert!(write_waits_abandoned() > abandoned_before);
+        {
+            let mut w = state.writer.lock().await;
+            let schema = w.snapshot().manifest().manifest.schema.clone();
+            w.compact_l0(&schema).await.unwrap();
+            assert!(w.max_l0_bucket_len() < HARD_L0);
+        }
+        // Several polls of a waiter that would still be there.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let (status, body) = post_json(
+            &app,
+            "/v0/cypher",
+            serde_json::json!({ "query": "MATCH (n:Gone) RETURN count(n) AS c" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"c\":0"), "the abandoned write ran: {body}");
     }
 
     #[tokio::test]

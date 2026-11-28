@@ -839,7 +839,7 @@ fn execute_write_inner_mode<'a>(
                     let mut out = Vec::new();
                     // The looked-up nodes (whole property maps) ride on every row:
                     // count them against the statement's memory as they are added.
-                    let mut meter = crate::exec::memory::GrowthMeter::new();
+                    let mut meter = crate::exec::memory::GrowthMeter::for_write_lookup();
                     for (row, lookup_value) in evaluated_rows {
                         let matches = match lookup_value {
                             RuntimeValue::String(_) => batch_results.next().ok_or_else(|| {
@@ -863,10 +863,11 @@ fn execute_write_inner_mode<'a>(
                             );
                             out.push(new_row);
                             if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
-                                meter.observe(&out)?;
+                                crate::exec::memory::observe_write_lookup(&mut meter, &out)?;
                             }
                         }
                     }
+                    crate::exec::memory::finish_write_lookup(&mut meter, &out)?;
                     return Ok(out);
                 }
 
@@ -932,7 +933,7 @@ fn execute_write_inner_mode<'a>(
                     let mut out = Vec::with_capacity(evaluated_rows.len());
                     // The looked-up nodes (whole property maps) ride on every row:
                     // count them against the statement's memory as they are added.
-                    let mut meter = crate::exec::memory::GrowthMeter::new();
+                    let mut meter = crate::exec::memory::GrowthMeter::for_write_lookup();
                     for (row, lookup_value) in evaluated_rows {
                         let found = if matches!(&lookup_value, RuntimeValue::String(_)) {
                             if let Some(results) = &mut batch_results {
@@ -973,10 +974,11 @@ fn execute_write_inner_mode<'a>(
                             );
                             out.push(new_row);
                             if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
-                                meter.observe(&out)?;
+                                crate::exec::memory::observe_write_lookup(&mut meter, &out)?;
                             }
                         }
                     }
+                    crate::exec::memory::finish_write_lookup(&mut meter, &out)?;
                     return Ok(out);
                 }
 
@@ -1013,7 +1015,7 @@ fn execute_write_inner_mode<'a>(
                 let mut out = Vec::with_capacity(input_rows.len());
                 // The looked-up nodes (whole property maps) ride on every row:
                 // count them against the statement's memory as they are added.
-                let mut meter = crate::exec::memory::GrowthMeter::new();
+                let mut meter = crate::exec::memory::GrowthMeter::for_write_lookup();
                 for row in input_rows {
                     let lookup_val = evaluate(value, &row, params)?;
                     if *multi {
@@ -1043,7 +1045,7 @@ fn execute_write_inner_mode<'a>(
                             );
                             out.push(new_row);
                             if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
-                                meter.observe(&out)?;
+                                crate::exec::memory::observe_write_lookup(&mut meter, &out)?;
                             }
                         }
                     } else if let Some(view) = lookup_unique_node_for_write(
@@ -1064,10 +1066,11 @@ fn execute_write_inner_mode<'a>(
                         );
                         out.push(new_row);
                         if out.len() % namidb_storage::cancel::CHECK_STRIDE == 0 {
-                            meter.observe(&out)?;
+                            crate::exec::memory::observe_write_lookup(&mut meter, &out)?;
                         }
                     }
                 }
+                crate::exec::memory::finish_write_lookup(&mut meter, &out)?;
                 Ok(out)
             }
 

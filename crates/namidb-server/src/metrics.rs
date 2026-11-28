@@ -1571,8 +1571,8 @@ fn render_memory_bound_counters(out: &mut String) {
     );
     let _ = writeln!(
         out,
-        "# HELP namidb_relief_flush_skipped_total Relief flushes the memory governor did not \
-         request because a compaction was preparing."
+        "# HELP namidb_relief_flush_skipped_total Relief flushes a namespace did not run \
+         because its own compaction was preparing."
     );
     let _ = writeln!(out, "# TYPE namidb_relief_flush_skipped_total counter");
     let _ = writeln!(
@@ -1596,6 +1596,17 @@ fn render_memory_bound_counters(out: &mut String) {
     }
     let _ = writeln!(
         out,
+        "# HELP namidb_write_wait_abandoned_total HTTP data writes whose client left while they \
+         waited for the writer (or for memtable / L0 room); they never ran."
+    );
+    let _ = writeln!(out, "# TYPE namidb_write_wait_abandoned_total counter");
+    let _ = writeln!(
+        out,
+        "namidb_write_wait_abandoned_total {}",
+        crate::write_waits_abandoned()
+    );
+    let _ = writeln!(
+        out,
         "# HELP namidb_batch_lookup_probe_waves_total Waves of exact-record probes batch node \
          lookups ran, each folded before the next."
     );
@@ -1604,6 +1615,28 @@ fn render_memory_bound_counters(out: &mut String) {
         out,
         "namidb_batch_lookup_probe_waves_total {}",
         namidb_storage::read::batch_lookup_probe_waves()
+    );
+    let _ = writeln!(
+        out,
+        "# HELP namidb_count_seed_rerequests_total Label count seed requests a commit kept for \
+         a later commit because another seed was still running."
+    );
+    let _ = writeln!(out, "# TYPE namidb_count_seed_rerequests_total counter");
+    let _ = writeln!(
+        out,
+        "namidb_count_seed_rerequests_total {}",
+        namidb_storage::read::count_seed_rerequests()
+    );
+    let _ = writeln!(
+        out,
+        "# HELP namidb_write_lookup_memory_stops_total Write statements stopped because the \
+         nodes their lookups added to the rows exceeded the statement's memory budget."
+    );
+    let _ = writeln!(out, "# TYPE namidb_write_lookup_memory_stops_total counter");
+    let _ = writeln!(
+        out,
+        "namidb_write_lookup_memory_stops_total {}",
+        namidb_query::exec::write_lookup_meter_stops()
     );
     let (seeded, scanned) = namidb_storage::read::count_seed_wait_stats();
     let _ = writeln!(

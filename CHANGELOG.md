@@ -55,15 +55,19 @@ crates.io release will establish and document that API explicitly.
   `NAMIDB_COMPACTION_PRESSURE_PAUSE` (default 10 s) gives its memory back and
   is retried later with half the L0 fan-in (restored as passes complete), and
   a long pass does not start while the process is at its ceiling.
+  A loop that cannot give its pass up (a vector or full-text base build)
+  keeps running at the ceiling after the pause, but throttled as over the
+  reclaim threshold, and it stops again at the next ceiling.
   `NAMIDB_COMPACTION_MEMORY_GATE=0` turns this off. Counted as
   `namidb_maintenance_memory_gate_total{event="throttle"|"pause"|"deferral"}`
   and `namidb_compactions_total{status="deferred"}`.
 - **No relief flush on top of a running compaction.** When reclaiming caches
   left the process over its reclaim threshold, the governor asked every
   namespace to flush its memtable, which built another SST beside the merge
-  and added one more L0 file for it. While a compaction prepares, it no
-  longer does (the memtable keeps its own hard bound);
-  `NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION=1` restores it. Counted as
+  and added one more L0 file for it. A namespace whose own node, edge or
+  search-base merge is preparing now skips that flush (its memtable keeps its
+  own hard bound); every other namespace still flushes.
+  `NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION=1` restores the flush. Counted as
   `namidb_relief_flush_skipped_total`.
 - **Writes get real backpressure from L0 debt.** Past `NAMIDB_WRITE_STALL_L0`
   a committed write was only delayed by 50 ms, which a serial client barely
@@ -72,23 +76,34 @@ crates.io release will establish and document that API explicitly.
   without holding the writer, for compaction to bring L0 back under the
   bound, and answers the retryable `503` of a writer-lock timeout (now with
   `Retry-After`) when that does not happen within `NAMIDB_WRITER_LOCK_TIMEOUT`.
-  Schema DDL and maintenance are not held back. The bound is off when both
-  reactive and periodic compaction are configured off. Counted as
-  `namidb_write_hard_stall_total{outcome="waited"|"refused"}`.
+  Explicit Bolt transactions wait at `BEGIN` like any data write. Schema DDL
+  and maintenance are not held back. The bound is armed only when a reactive
+  compaction pass can drain L0 below it: a flush interval above zero and a
+  `--compaction-l0-trigger` (flag or env) between 1 and the bound. Otherwise
+  it is off, as in 3.5.4, and a startup line says so. An HTTP write waits in
+  its handler, so a client that disconnects or times out ends the wait and
+  its write never runs; `NAMIDB_HTTP_WRITE_WAIT_IN_HANDLER=0` waits inside
+  the detached write task as before. Counted as
+  `namidb_write_hard_stall_total{outcome="waited"|"refused"}` and
+  `namidb_write_wait_abandoned_total`.
 - **A batch lookup over many overlapping SSTs holds one wave of results.**
   A batch write that looks up thousands of nodes by id probed every
   overlapping node SST before folding any result, so it held the encoded and
   decoded versions found in all of them at once, outside any memory account.
   Probes now run eight SSTs at a time and each wave is folded before the next
   starts; the governor's stop of the statement takes effect between waves.
-  The nodes a write's property lookup attaches to its rows are also charged
-  to the statement's memory budget as they are added.
   `NAMIDB_BATCH_LOOKUP_WAVES=0` restores probing everything first. Counted as
-  `namidb_batch_lookup_probe_waves_total`.
+  `namidb_batch_lookup_probe_waves_total`. The rows a write's property lookup
+  builds (each with its looked-up node) are also charged to the statement's
+  memory budget as they are added, including the rows after the last
+  1024-row check; `NAMIDB_WRITE_LOOKUP_METER=0` leaves them uncharged, as in
+  3.5.4. Counted as `namidb_write_lookup_memory_stops_total`.
 - **A label count right after an open is not left without its seed.** A
   label's background count seed requested while another seed was running
   was dropped, so the label kept paying the exact reconciliation; the
-  request is now kept for a later commit. An uncached label count can also
+  request is now kept for a later commit (`NAMIDB_COUNT_SEED_REREQUEST=0`
+  drops it as before; counted as `namidb_count_seed_rerequests_total`). An
+  uncached label count can also
   wait for (and speed up) the label's own seed, which reads only that
   label, instead of reconciling every node of every label:
   `NAMIDB_COUNT_WAIT_FOR_SEED=1` (off by default, since the one

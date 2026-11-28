@@ -181,6 +181,11 @@ impl NamespaceRegistry {
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The background-maintenance settings every namespace opens with.
+    pub(crate) fn maintenance(&self) -> MaintenanceConfig {
+        self.maintenance
+    }
+
     pub(crate) fn sweep_settings(&self) -> crate::maintenance::SweepSettings {
         crate::maintenance::SweepSettings {
             min_age: self.maintenance.sweep_min_age,
@@ -548,7 +553,13 @@ impl NamespaceRegistry {
                         _ = cancel.wait_for(|evicted| *evicted) => break,
                         _ = tick.tick() => {}
                         _ = s.flush_notify.notified() => {}
-                        _ = crate::memory::pressure_flush_requested() => {}
+                        // This namespace's own long merge holds its relief
+                        // flush back; other namespaces still flush.
+                        _ = crate::memory::pressure_flush_requested() => {
+                            if !crate::memory::relief_flush_allowed_for(&s.compaction_scheduler) {
+                                continue;
+                            }
+                        }
                         // A full-text read found more unflushed documents
                         // than it merges; only this namespace's request flushes.
                         _ = namidb_storage::search_freshness::flush_requested() => {
@@ -1426,6 +1437,46 @@ mod tests {
                 .expect("maintenance task did not exit after eviction")
                 .expect("maintenance task panicked");
         }
+    }
+
+    /// A relief flush asked for under memory pressure runs in every
+    /// namespace but one whose own node/edge merge is preparing: one tenant's
+    /// long merge no longer keeps every other tenant's memtable in memory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_merge_holds_back_only_its_own_namespace_relief_flush() {
+        let maint = MaintenanceConfig {
+            flush_interval: Duration::from_secs(3600),
+            ..MaintenanceConfig::default()
+        };
+        let (store, _) = namidb_storage::parse_uri("memory://registry-relief-per-ns").unwrap();
+        let metrics = Metrics::new(env!("CARGO_PKG_VERSION"), Duration::ZERO);
+        let reg = NamespaceRegistry::new(store, String::new(), 8, Duration::ZERO, metrics, maint);
+        let merging = reg.get_or_open("merging").await.expect("open merging");
+        let idle = reg.get_or_open("idle").await.expect("open idle");
+        create_person(&merging, "ada").await;
+        create_person(&idle, "grace").await;
+        let _prepare = merging.compaction_scheduler.enter_long_prepare();
+        let skipped_before = crate::memory::relief_flushes_skipped();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while idle.writer.lock().await.memtable_bytes() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the other namespace never answered the relief flush"
+            );
+            crate::memory::request_pressure_flush();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Keep asking for a while: the merging namespace's loop has had
+        // every chance to answer.
+        for _ in 0..15 {
+            crate::memory::request_pressure_flush();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            merging.writer.lock().await.memtable_bytes() > 0,
+            "the merging namespace keeps its memtable while its merge prepares"
+        );
+        assert!(crate::memory::relief_flushes_skipped() > skipped_before);
     }
 
     /// Eviction must stop BOTH maintenance loops (they used to run forever,

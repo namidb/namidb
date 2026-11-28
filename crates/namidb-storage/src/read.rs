@@ -14232,6 +14232,28 @@ fn batch_lookup_probe_segments(
     segments
 }
 
+/// Count-seed requests a commit kept for a later commit because another
+/// seed was still running.
+static COUNT_SEED_REREQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a commit that cannot start a requested count seed, because
+/// another one is still running, keeps the request for a later commit
+/// (`NAMIDB_COUNT_SEED_REREQUEST`, default on; `0` drops it, as 3.5.4 did,
+/// and the count that asked waits out its patience, then scans).
+pub(crate) fn count_seed_rerequest_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::background::env_flag_off("NAMIDB_COUNT_SEED_REREQUEST"))
+}
+
+pub(crate) fn note_count_seed_rerequest() {
+    COUNT_SEED_REREQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count-seed requests kept for a later commit since start (metrics).
+pub fn count_seed_rerequests() -> u64 {
+    COUNT_SEED_REREQUESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Label counts answered by waiting for the label's seed, and label counts
 /// that fell back to a label scan (see `Snapshot::count_nodes`).
 static COUNT_SEED_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
