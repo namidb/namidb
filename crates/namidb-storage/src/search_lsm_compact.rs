@@ -4828,6 +4828,9 @@ fn build_search_compactions_blocking(
             break;
         };
         crate::background::pace();
+        if crate::background::deferred() {
+            return Err(Error::MemoryLimit);
+        }
         progress.scanned(1);
         let exhausted = {
             let source = cursors[entry.src]

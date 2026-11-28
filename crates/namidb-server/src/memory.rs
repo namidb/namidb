@@ -245,6 +245,10 @@ pub struct MemoryGovernor {
     resume_bytes: usize,
     resident_bytes: AtomicUsize,
     pressure_active: AtomicBool,
+    /// Set on the governor that runs the process watchdog: only it publishes
+    /// its samples to storage's maintenance memory gate, so a governor built
+    /// for one request path (or a test) cannot hold maintenance back.
+    publishes_pressure: AtomicBool,
     /// At most one blocking-pool reclaim job may be queued or running.
     ///
     /// `ReclaimState::running` protects the actual cache clear, but setting it
@@ -337,6 +341,7 @@ impl MemoryGovernor {
             resume_bytes: percent(max_bytes, RESUME_PERCENT),
             resident_bytes: AtomicUsize::new(0),
             pressure_active: AtomicBool::new(false),
+            publishes_pressure: AtomicBool::new(false),
             reclaim_job_scheduled: AtomicBool::new(false),
             reclaim_completed,
             reclaim_state: Mutex::new(ReclaimState::default()),
@@ -835,6 +840,9 @@ impl MemoryGovernor {
     fn observe_resident(&self) -> Option<usize> {
         let resident = (self.resident_sampler)()?;
         self.resident_bytes.store(resident, Ordering::Relaxed);
+        // Every sample, not only the ones that start a reclaim: maintenance
+        // held at the ceiling must see the process come back under it.
+        self.publish_pressure(resident);
         if resident <= self.resume_bytes {
             self.pressure_active.store(false, Ordering::Release);
         }
@@ -935,6 +943,7 @@ impl MemoryGovernor {
             return None;
         };
         self.resident_bytes.store(resident, Ordering::Relaxed);
+        self.publish_pressure(resident);
 
         let new_pressure_episode = resident >= self.reclaim_bytes
             && self
@@ -949,6 +958,7 @@ impl MemoryGovernor {
             if let Some(after) = sample_resident_bytes() {
                 resident = after;
                 self.resident_bytes.store(after, Ordering::Relaxed);
+                self.publish_pressure(after);
             }
             self.finish_reclaim(resident);
         }
@@ -959,11 +969,31 @@ impl MemoryGovernor {
             // Caches are gone and the allocator trimmed, yet the process is
             // still over the reclaim threshold: what remains reconstructible
             // is the memtables. Flush them rather than reject queries until
-            // a periodic tick happens to.
+            // a periodic tick happens to. Each namespace's flush loop decides
+            // for itself (see `relief_flush_allowed_for`), so one
+            // namespace's long merge does not keep every other namespace's
+            // memtable in memory.
             request_pressure_flush();
         }
 
         Some(resident)
+    }
+
+    /// Tell storage's maintenance memory gate what the last sample showed.
+    fn publish_pressure(&self, resident: usize) {
+        use namidb_storage::background::{set_memory_pressure, MemoryPressure};
+        if !self.publishes_pressure.load(Ordering::Relaxed) {
+            return;
+        }
+        set_memory_pressure(if self.max_bytes == 0 {
+            MemoryPressure::Normal
+        } else if resident >= self.max_bytes {
+            MemoryPressure::Ceiling
+        } else if resident >= self.reclaim_bytes {
+            MemoryPressure::Reclaim
+        } else {
+            MemoryPressure::Normal
+        });
     }
 
     /// Start the one process-wide pressure watchdog.
@@ -976,6 +1006,7 @@ impl MemoryGovernor {
         self: Arc<Self>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
+        self.publishes_pressure.store(true, Ordering::Relaxed);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(WATCHDOG_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1005,6 +1036,11 @@ impl MemoryGovernor {
                     }
                 }
             }
+            // No more samples: do not leave maintenance held at a stale level.
+            self.publishes_pressure.store(false, Ordering::Relaxed);
+            namidb_storage::background::set_memory_pressure(
+                namidb_storage::background::MemoryPressure::Normal,
+            );
         })
     }
 
@@ -1151,6 +1187,47 @@ fn percent(value: usize, percentage: usize) -> usize {
 fn pressure_flush_notify() -> &'static tokio::sync::Notify {
     static NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
     NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Relief flushes a namespace skipped because its own compaction was
+/// preparing.
+static RELIEF_FLUSHES_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Relief flushes skipped while the namespace's compaction prepared
+/// (metrics).
+pub fn relief_flushes_skipped() -> u64 {
+    RELIEF_FLUSHES_SKIPPED.load(Ordering::Relaxed)
+}
+
+/// Whether a namespace's flush loop answers a relief-flush request (see
+/// [`pressure_flush_requested`]): always with
+/// `NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION=1` (3.5.4 behaviour), otherwise
+/// unless that namespace is preparing a node, edge or search-base merge. The
+/// pressure is then most likely that merge's working set, which the
+/// maintenance memory gate pauses, and a flush would add another SST build
+/// on top of it plus one more L0 for it to merge; the memtable keeps its own
+/// hard bound meanwhile. Other namespaces still flush. A skip is counted.
+pub(crate) fn relief_flush_allowed_for(
+    scheduler: &crate::maintenance::CompactionScheduler,
+) -> bool {
+    if relief_flush_always() || !scheduler.long_prepare_in_flight() {
+        return true;
+    }
+    RELIEF_FLUSHES_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+fn relief_flush_always() -> bool {
+    static ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let always = *ALWAYS.get_or_init(|| {
+        matches!(
+            std::env::var("NAMIDB_PRESSURE_FLUSH_DURING_COMPACTION")
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Ok("1" | "true" | "on" | "yes")
+        )
+    });
+    always
 }
 
 /// Wake every flush loop now waiting (see [`pressure_flush_requested`]).
@@ -1805,5 +1882,32 @@ mod tests {
             exact,
             "a statement exactly at the limit is not elided"
         );
+    }
+
+    static SAMPLED: AtomicUsize = AtomicUsize::new(0);
+
+    fn sampled() -> Option<usize> {
+        Some(SAMPLED.load(Ordering::Relaxed))
+    }
+
+    /// Only the watchdog's governor tells maintenance what it sampled, on
+    /// every sample, so the gate also sees the process come back down.
+    /// (Stays under the ceiling: the gate is process-wide and other tests
+    /// compact concurrently.)
+    #[test]
+    fn the_watchdog_governor_publishes_every_sample_to_the_maintenance_gate() {
+        use namidb_storage::background::{memory_pressure, MemoryPressure};
+        let other = MemoryGovernor::new(1000).with_resident_sampler(sampled);
+        SAMPLED.store(950, Ordering::Relaxed);
+        other.observe_resident();
+        assert_eq!(memory_pressure(), MemoryPressure::Normal);
+
+        let watchdog = MemoryGovernor::new(1000).with_resident_sampler(sampled);
+        watchdog.publishes_pressure.store(true, Ordering::Relaxed);
+        watchdog.observe_resident();
+        assert_eq!(memory_pressure(), MemoryPressure::Reclaim);
+        SAMPLED.store(100, Ordering::Relaxed);
+        watchdog.observe_resident();
+        assert_eq!(memory_pressure(), MemoryPressure::Normal);
     }
 }

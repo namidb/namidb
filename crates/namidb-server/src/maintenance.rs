@@ -52,6 +52,11 @@ pub(crate) struct CompactionScheduler {
     /// guard while it lists and deletes. Tokio's write-preferring FIFO lock
     /// prevents a trigger stream from starving a queued janitor.
     maintenance_gate: RwLock<()>,
+    /// Node/edge/search-base prepares of this namespace running now (the
+    /// short search-delta passes are not counted). The relief flush skips
+    /// this namespace while one runs (see
+    /// [`crate::memory::relief_flush_allowed_for`]).
+    long_prepares: std::sync::atomic::AtomicUsize,
     /// The full-text re-analysis running for this namespace, if any (see
     /// [`maybe_start_text_reanalysis`]). It runs beside the compaction
     /// worker, not inside it, and outside `maintenance_gate`.
@@ -87,6 +92,20 @@ enum Admission {
 impl CompactionScheduler {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether a node/edge/search-base prepare of this namespace is running.
+    pub(crate) fn long_prepare_in_flight(&self) -> bool {
+        self.long_prepares
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
+    /// Count one long prepare of this namespace for the guard's lifetime.
+    pub(crate) fn enter_long_prepare(&self) -> LongPrepare<'_> {
+        self.long_prepares
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LongPrepare(&self.long_prepares)
     }
 
     fn admit(&self, trigger: CompactionTrigger) -> Admission {
@@ -1387,17 +1406,67 @@ async fn run_scoped_pass(
         return Ok(CompactionPass::Noop);
     }
 
+    // A long pass started at the memory ceiling would only add its working
+    // set to what the governor is already trying to give back.
+    if scope != PassScope::SearchDeltas && compaction_start_deferred() {
+        metrics.observe_compaction_result(
+            trigger,
+            CompactionStatus::Deferred,
+            l0_before,
+            l0_before,
+            0,
+            0,
+        );
+        info!(
+            namespace,
+            ?trigger,
+            ?scope,
+            "memory pressure: deferring a compaction pass"
+        );
+        return Ok(CompactionPass::Noop);
+    }
+
     // Storage moves the synchronous node/edge merges and Vamana/BM25 builds
     // to Tokio's blocking pool; this outer future retains async object-store
     // I/O without monopolising a reactor thread.
     let schema = basis.schema().clone();
     let prepare_started = Instant::now();
+    let in_flight_prepare =
+        (scope != PassScope::SearchDeltas).then(|| scheduler.enter_long_prepare());
     let prepared = match scope {
         PassScope::SearchDeltas => basis.prepare_search_deltas(&schema).await,
         PassScope::SearchOnly => basis.prepare_search_bases(&schema).await,
         PassScope::WithoutSearch => basis.prepare_without_search(&schema).await,
     };
+    drop(in_flight_prepare);
     let prepared = match prepared {
+        Err(namidb_storage::Error::MemoryLimit) => {
+            // The memory gate stopped the merge at the ceiling and it gave
+            // its memory back. Plan smaller merges until one completes; the
+            // next trigger retries.
+            metrics.observe_compaction_phase(
+                trigger,
+                CompactionPhase::Prepare,
+                prepare_started.elapsed(),
+            );
+            metrics.observe_compaction_result(
+                trigger,
+                CompactionStatus::Deferred,
+                l0_before,
+                l0_before,
+                0,
+                0,
+            );
+            namidb_storage::compact::note_compaction_memory_deferral();
+            warn!(
+                namespace,
+                ?trigger,
+                ?scope,
+                max_l0_inputs = namidb_storage::compact::max_l0_inputs(),
+                "memory pressure: compaction pass deferred at the memory ceiling"
+            );
+            return Ok(CompactionPass::Noop);
+        }
         Ok(prepared) => {
             metrics.observe_compaction_phase(
                 trigger,
@@ -1528,6 +1597,9 @@ async fn run_scoped_pass(
                 CompactionPhase::InstallHold,
                 install_started.elapsed(),
             );
+            if scope == PassScope::WithoutSearch {
+                namidb_storage::compact::note_compaction_completed();
+            }
             if outcome.source_ssts_removed > 0 {
                 Ok(CompactionPass::Applied {
                     outcome: Box::new(outcome),
@@ -1576,6 +1648,24 @@ async fn run_scoped_pass(
         discard_unreferenced_uploads(&store, &prefix, unreferenced, namespace).await;
     }
     result
+}
+
+/// Counts one long prepare in [`CompactionScheduler::long_prepares`] for its
+/// lifetime.
+pub(crate) struct LongPrepare<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for LongPrepare<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a long compaction pass should not start now: the maintenance
+/// memory gate is on and the process is at its memory ceiling.
+fn compaction_start_deferred() -> bool {
+    namidb_storage::background::memory_gate_enabled()
+        && namidb_storage::background::memory_pressure()
+            == namidb_storage::background::MemoryPressure::Ceiling
 }
 
 fn is_cancelled(cancel: Option<&watch::Receiver<bool>>) -> bool {

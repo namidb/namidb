@@ -43,6 +43,10 @@ pub struct SharedAppState {
     pub memtable_flush_bytes: usize,
     /// Memtable bytes above which writes are softly stalled (backpressure).
     pub memtable_stall_bytes: usize,
+    /// L0 SSTs per bucket at which a data write waits for compaction,
+    /// resolved from the registry's maintenance settings (see
+    /// [`crate::effective_write_hard_stall_l0`]); `0` = off.
+    pub write_hard_stall_l0: usize,
     /// Process-wide total resident-memory admission.
     pub memory: Arc<MemoryGovernor>,
     /// Foreground writer-lock acquisition bound (`ZERO` disables); see the
@@ -121,6 +125,11 @@ impl SharedAppState {
         default_namespace: String,
     ) -> Self {
         registry.set_memtable_hard_bytes(crate::memtable_hard_bytes(memtable_stall_bytes));
+        let maintenance = registry.maintenance();
+        let write_hard_stall_l0 = crate::resolve_write_hard_stall_l0(
+            maintenance.flush_interval,
+            maintenance.compaction_l0_trigger,
+        );
         Self {
             registry,
             auth,
@@ -132,6 +141,7 @@ impl SharedAppState {
             write_stall_delay,
             memtable_flush_bytes,
             memtable_stall_bytes,
+            write_hard_stall_l0,
             memory,
             writer_lock_timeout,
             default_namespace,

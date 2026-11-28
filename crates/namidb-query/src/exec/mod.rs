@@ -29,8 +29,8 @@ pub use factor::{
 pub use leapfrog::{LeapfrogIntersect, MergeSortedUnion, OrdIterator, SortedSliceIter};
 pub use memory::{
     current_query_memory, parse_unreclaimable_resident, process_resident_bytes,
-    resident_memory_probe, system_memory_bytes, with_query_memory, MemoryProbe, QueryMemoryBudget,
-    QueryMemoryExceeded, QueryMemoryPool, QueryMemoryScope,
+    resident_memory_probe, system_memory_bytes, with_query_memory, write_lookup_meter_stops,
+    MemoryProbe, QueryMemoryBudget, QueryMemoryExceeded, QueryMemoryPool, QueryMemoryScope,
 };
 pub use row::Row;
 pub use show::{

@@ -927,6 +927,29 @@ pub(crate) struct IncrementalNodeSstWriter {
     label: LabelDef,
     chunk: Vec<NodeRow>,
     chunk_rows: usize,
+    /// Encoded payload bytes buffered in `chunk`.
+    chunk_bytes: usize,
+    /// Flush the chunk once `chunk_bytes` reaches this (`0` = rows only).
+    chunk_max_bytes: usize,
+}
+
+/// Default byte bound of one buffered node chunk.
+pub(crate) const DEFAULT_NODE_SST_CHUNK_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Byte bound of the rows a node SST writer buffers before encoding them
+/// (`NAMIDB_COMPACTION_MERGE_CHUNK_BYTES`, default
+/// [`DEFAULT_NODE_SST_CHUNK_MAX_BYTES`]; `0` bounds the chunk by rows only,
+/// as 3.5.4 did). Each buffered row is materialised again as Arrow columns
+/// when the chunk is encoded, so with wide rows the 16 Ki row chunk alone was
+/// hundreds of MiB.
+pub(crate) fn node_sst_chunk_max_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("NAMIDB_COMPACTION_MERGE_CHUNK_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_NODE_SST_CHUNK_MAX_BYTES)
+    })
 }
 
 impl IncrementalNodeSstWriter {
@@ -942,13 +965,20 @@ impl IncrementalNodeSstWriter {
             label: label.clone(),
             chunk: Vec::new(),
             chunk_rows: chunk_rows.max(1),
+            chunk_bytes: 0,
+            chunk_max_bytes: node_sst_chunk_max_bytes(),
         })
     }
 
     /// Buffer one row; flushes a full chunk into the Parquet writer.
     pub(crate) fn push(&mut self, row: NodeRow) -> Result<()> {
+        if let MemOp::Upsert(payload) = &row.op {
+            self.chunk_bytes = self.chunk_bytes.saturating_add(payload.len());
+        }
         self.chunk.push(row);
-        if self.chunk.len() >= self.chunk_rows {
+        if self.chunk.len() >= self.chunk_rows
+            || (self.chunk_max_bytes > 0 && self.chunk_bytes >= self.chunk_max_bytes)
+        {
             self.flush_chunk()?;
         }
         Ok(())
@@ -965,6 +995,7 @@ impl IncrementalNodeSstWriter {
                 .write_batch_with_binary_keys(&batch, binary_keys)?;
         }
         self.chunk.clear();
+        self.chunk_bytes = 0;
         Ok(())
     }
 

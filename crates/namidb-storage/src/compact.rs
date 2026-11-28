@@ -1374,6 +1374,31 @@ fn plan_bucket_merge<'a>(
     base: u64,
     ratio: u64,
 ) -> Option<BucketPlan<'a>> {
+    plan_bucket_merge_capped(sources, base, ratio, max_l0_inputs())
+}
+
+/// [`plan_bucket_merge`] with an explicit L0 fan-in cap (`0` = none).
+///
+/// A bucket holding more than `cap` L0 SSTs is not merged whole: the pass
+/// takes a run of `cap` L0s that are consecutive in LSN order and writes
+/// their merge back to L0 as one SST (a size-tiered step). The run with the
+/// fewest bytes is chosen, so an earlier step's output is not rewritten
+/// while smaller runs remain. A merge's memory grows with its inputs (one
+/// decoder per live source), so the cap bounds it however deep the backlog
+/// is; each step removes `cap - 1` L0s, and once at most `cap` remain the
+/// ordinary leveled merge below drains them into L1.
+///
+/// Last-writer-wins stays exact: every L0 outside the run holds only LSNs
+/// older or newer than all of the run's, so the output takes the run's place
+/// in LSN order. When the L0 LSN ranges are not disjoint the cap is not
+/// applied and the whole L0 merges, as before. A tiered output is never the
+/// bucket's deepest level, so it keeps its tombstones.
+fn plan_bucket_merge_capped<'a>(
+    sources: &[&'a SstDescriptor],
+    base: u64,
+    ratio: u64,
+    cap: usize,
+) -> Option<BucketPlan<'a>> {
     let mut l0: Vec<&SstDescriptor> = Vec::new();
     let mut leveled: BTreeMap<u32, Vec<&SstDescriptor>> = BTreeMap::new();
     for d in sources {
@@ -1382,6 +1407,15 @@ fn plan_bucket_merge<'a>(
             l0.push(*d);
         } else {
             leveled.entry(lvl).or_default().push(*d);
+        }
+    }
+    if cap >= 2 && l0.len() > cap {
+        if let Some(run) = select_l0_run(&l0, cap) {
+            return Some(BucketPlan {
+                inputs: run,
+                target_level: 0,
+                is_deepest: false,
+            });
         }
     }
     let deepest_present = leveled.keys().copied().max().unwrap_or(0);
@@ -1423,6 +1457,116 @@ fn plan_bucket_merge<'a>(
         target_level: target,
         is_deepest,
     })
+}
+
+/// Default most L0 SSTs one merge takes (`NAMIDB_COMPACTION_MAX_L0_INPUTS`).
+const DEFAULT_MAX_L0_INPUTS: usize = 32;
+/// The adaptive cap never goes below this many inputs.
+const MIN_ADAPTIVE_L0_INPUTS: usize = 4;
+
+/// Configured L0 fan-in cap: `NAMIDB_COMPACTION_MAX_L0_INPUTS`, default
+/// [`DEFAULT_MAX_L0_INPUTS`]; `0` merges the whole L0 in one pass (3.5.4).
+fn configured_max_l0_inputs() -> usize {
+    std::env::var("NAMIDB_COMPACTION_MAX_L0_INPUTS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|cap| if cap == 1 { 2 } else { cap })
+        .unwrap_or(DEFAULT_MAX_L0_INPUTS)
+}
+
+/// Current adaptive cap (`0` = not lowered). A merge deferred at the memory
+/// ceiling halves it; every pass that completes doubles it back.
+static ADAPTIVE_MAX_L0_INPUTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static TIERED_L0_MERGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The L0 fan-in cap in force: the configured cap, lowered while merges are
+/// being deferred under memory pressure. `0` = no cap.
+pub fn max_l0_inputs() -> usize {
+    let configured = configured_max_l0_inputs();
+    if configured == 0 {
+        return 0;
+    }
+    match ADAPTIVE_MAX_L0_INPUTS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => configured,
+        adaptive => adaptive.min(configured),
+    }
+}
+
+/// A merge gave up at the memory ceiling: plan smaller ones for a while.
+pub fn note_compaction_memory_deferral() {
+    let current = max_l0_inputs();
+    if current == 0 {
+        return;
+    }
+    let lowered = (current / 2).max(MIN_ADAPTIVE_L0_INPUTS);
+    ADAPTIVE_MAX_L0_INPUTS.store(lowered, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A merge completed: raise a lowered cap back toward the configured one.
+pub fn note_compaction_completed() {
+    let adaptive = ADAPTIVE_MAX_L0_INPUTS.load(std::sync::atomic::Ordering::Relaxed);
+    if adaptive == 0 {
+        return;
+    }
+    let raised = adaptive.saturating_mul(2);
+    let next = if raised >= configured_max_l0_inputs() {
+        0
+    } else {
+        raised
+    };
+    ADAPTIVE_MAX_L0_INPUTS.store(next, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Counters of the bounded compaction since start: `(tiered L0 merges
+/// planned, exhausted merge inputs released early)`.
+pub fn compaction_bound_stats() -> (u64, u64) {
+    (
+        TIERED_L0_MERGES.load(std::sync::atomic::Ordering::Relaxed),
+        MERGE_INPUTS_RELEASED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Count a planned merge that a pass is about to run.
+fn note_planned_merge(plan: &BucketPlan<'_>) {
+    if plan.target_level == 0 {
+        TIERED_L0_MERGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            inputs = plan.inputs.len(),
+            "compaction: merging a capped run of L0 SSTs back into L0"
+        );
+    }
+}
+
+/// The run of `cap` L0 SSTs, consecutive in LSN order, with the fewest
+/// bytes (the oldest such run on a tie), in their manifest order. `None`
+/// when two L0 LSN ranges overlap, which rules a partial run out.
+fn select_l0_run<'a>(l0: &[&'a SstDescriptor], cap: usize) -> Option<Vec<&'a SstDescriptor>> {
+    let mut order: Vec<usize> = (0..l0.len()).collect();
+    order.sort_by_key(|&i| (l0[i].min_lsn, l0[i].max_lsn));
+    for pair in order.windows(2) {
+        let (older, newer) = (l0[pair[0]], l0[pair[1]]);
+        if older.max_lsn >= newer.min_lsn {
+            return None;
+        }
+    }
+    let mut best_start = 0usize;
+    let mut best_bytes = u64::MAX;
+    let mut window: u64 = order[..cap].iter().map(|&i| l0[i].size_bytes).sum();
+    for start in 0..=(order.len() - cap) {
+        if start > 0 {
+            window = window
+                .saturating_sub(l0[order[start - 1]].size_bytes)
+                .saturating_add(l0[order[start + cap - 1]].size_bytes);
+        }
+        if window < best_bytes {
+            best_bytes = window;
+            best_start = start;
+        }
+    }
+    let mut chosen: Vec<usize> = order[best_start..best_start + cap].to_vec();
+    chosen.sort_unstable();
+    Some(chosen.into_iter().map(|i| l0[i]).collect())
 }
 
 /// Node-specific planner wrapper that performs a one-time online format
@@ -2348,6 +2492,7 @@ async fn prepare_leveled_scoped(
         ) else {
             continue;
         };
+        note_planned_merge(&plan);
         // A lone, otherwise-current legacy SST needs only its access bundle
         // (`.nloc2` + `.npp`). Rewriting its complete Parquet body would retain
         // another multi-gigabyte vector corpus and double disk/network I/O for
@@ -2615,6 +2760,7 @@ async fn prepare_leveled_scoped(
         let Some(plan) = plan_bucket_merge(&sources, base_bytes, ratio) else {
             continue;
         };
+        note_planned_merge(&plan);
         let (desc, wrote_bloom, removed) = compact_and_write_edges(
             store.clone(),
             paths,
@@ -2642,6 +2788,7 @@ async fn prepare_leveled_scoped(
         let Some(plan) = plan_bucket_merge(&sources, base_bytes, ratio) else {
             continue;
         };
+        note_planned_merge(&plan);
         let (desc, wrote_bloom, removed) = compact_and_write_edges(
             store.clone(),
             paths,
@@ -4122,6 +4269,22 @@ struct NodeMergeInput {
 /// sequential page decode.
 const NODE_MERGE_INPUT_BATCH_ROWS: usize = 64;
 
+/// Whether an exhausted merge input drops its decoder and body mapping at
+/// once (`NAMIDB_COMPACTION_RELEASE_EXHAUSTED_INPUTS`, default on; `0` keeps
+/// them until the merge ends, as 3.5.4 did).
+fn release_exhausted_merge_inputs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        !crate::background::env_flag_off("NAMIDB_COMPACTION_RELEASE_EXHAUSTED_INPUTS")
+    });
+    if on {
+        MERGE_INPUTS_RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    on
+}
+
+static MERGE_INPUTS_RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Sorted row cursor over one node source SST.
 ///
 /// Opening the cursor parses metadata and constructs a lazy Parquet reader but
@@ -4130,7 +4293,11 @@ const NODE_MERGE_INPUT_BATCH_ROWS: usize = 64;
 /// one `NODE_MERGE_INPUT_BATCH_ROWS` batch is retained; a complete row group is
 /// never collected into memory.
 struct NodeSourceCursor {
-    batches: ParquetRecordBatchReader,
+    /// `None` once the source is exhausted: its decoder state (dictionary
+    /// pages, column buffers) and its body mapping are released then rather
+    /// than when the whole merge ends, so a merge over many inputs holds
+    /// decoder state for the sources still being read only.
+    batches: Option<ParquetRecordBatchReader>,
     /// Decoded CURRENT batch only.
     view: Option<NodeBatchView>,
     /// Row index into `view`.
@@ -4144,7 +4311,7 @@ struct NodeSourceCursor {
     /// Total row count per the Parquet footer (bloom sizing upper bound).
     total_rows: u64,
     /// Hands the pages of fully consumed row groups back to the kernel.
-    release: ConsumedPages,
+    release: Option<ConsumedPages>,
 }
 
 /// Returns the pages of a sequentially scanned body to the kernel once the
@@ -4255,14 +4422,14 @@ impl NodeSourceCursor {
             .build()
             .map_err(|e| Error::invariant(format!("parquet build: {e}")))?;
         Ok(Self {
-            batches,
+            batches: Some(batches),
             view: None,
             row: 0,
             current: None,
             started: false,
             batches_decoded: 0,
             total_rows,
-            release,
+            release: Some(release),
         })
     }
 
@@ -4284,11 +4451,17 @@ impl NodeSourceCursor {
                     self.current = Some(view.key(self.row)?);
                     return Ok(());
                 }
-                self.release.consumed(view.len());
+                if let Some(release) = &mut self.release {
+                    release.consumed(view.len());
+                }
                 self.view = None;
                 self.row = 0;
             }
-            match self.batches.next() {
+            let Some(batches) = self.batches.as_mut() else {
+                self.current = None;
+                return Ok(());
+            };
+            match batches.next() {
                 Some(Ok(batch)) => {
                     self.batches_decoded += 1;
                     if batch.num_rows() > 0 {
@@ -4300,6 +4473,10 @@ impl NodeSourceCursor {
                 }
                 None => {
                     self.current = None;
+                    if release_exhausted_merge_inputs() {
+                        self.batches = None;
+                        self.release = None;
+                    }
                     return Ok(());
                 }
             }
@@ -4635,6 +4812,9 @@ fn merge_node_sources(
             break;
         };
         crate::background::pace();
+        if crate::background::deferred() {
+            return Err(Error::MemoryLimit);
+        }
         let cursor = &mut cursors[entry.src];
         if last_id != Some(entry.id) {
             // First (highest-LSN) observation of this id: the winner.
@@ -5283,6 +5463,9 @@ fn merge_edge_sources(
     let mut last: Option<([u8; 16], [u8; 16])> = None;
     while let Some(Reverse(entry)) = heap.pop() {
         crate::background::pace();
+        if crate::background::deferred() {
+            return Err(Error::MemoryLimit);
+        }
         let cursor = &mut cursors[entry.src];
         let pair = (entry.key_id, entry.partner_id);
         if last != Some(pair) {
@@ -8909,6 +9092,93 @@ mod tests {
             search_indexes_need_rebuild(&manifest),
             "a catalog signature change must retry FTS"
         );
+    }
+
+    /// L0 descriptors with disjoint, increasing LSN ranges and the given
+    /// sizes, cloned from a real node descriptor.
+    async fn l0_backlog(sizes: &[u64]) -> Vec<SstDescriptor> {
+        let (.., base) = build_two_l0_node_ssts().await;
+        let template = base.manifest.ssts[0].clone();
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &size)| SstDescriptor {
+                id: Uuid::now_v7(),
+                level: SstLevel::L0,
+                size_bytes: size,
+                min_lsn: (i as u64) * 10 + 1,
+                max_lsn: (i as u64) * 10 + 5,
+                ..template.clone()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn capped_plan_merges_one_run_of_the_backlog_back_into_l0() {
+        let backlog = l0_backlog(&[100; 300]).await;
+        let refs: Vec<&SstDescriptor> = backlog.iter().collect();
+        let plan = plan_bucket_merge_capped(&refs, 1024, 10, 32).expect("a deep backlog merges");
+        assert_eq!(plan.inputs.len(), 32, "one pass takes at most the cap");
+        assert_eq!(plan.target_level, 0, "a partial run stays in L0");
+        assert!(!plan.is_deepest, "a partial run never drops tombstones");
+        // Equal sizes: the oldest run, consecutive in LSN order.
+        let lsns: Vec<u64> = plan.inputs.iter().map(|d| d.min_lsn).collect();
+        let expected: Vec<u64> = (0..32).map(|i| i * 10 + 1).collect();
+        assert_eq!(lsns, expected);
+
+        // A backlog at or under the cap keeps the whole-L0 leveled merge.
+        let small = l0_backlog(&[100; 32]).await;
+        let refs: Vec<&SstDescriptor> = small.iter().collect();
+        let plan = plan_bucket_merge_capped(&refs, 1024, 10, 32).unwrap();
+        assert_eq!(plan.inputs.len(), 32);
+        assert_eq!(plan.target_level, 1);
+
+        // Cap 0 is the 3.5.4 plan: everything at once.
+        let refs: Vec<&SstDescriptor> = backlog.iter().collect();
+        let plan = plan_bucket_merge_capped(&refs, 1024, 10, 0).unwrap();
+        assert_eq!(plan.inputs.len(), 300);
+        assert!(plan.target_level >= 1);
+    }
+
+    #[tokio::test]
+    async fn capped_plan_skips_an_earlier_tiered_output_and_respects_overlap() {
+        // The oldest file is a large earlier merge: the chosen run is the
+        // smallest consecutive one, which leaves it alone.
+        let mut sizes = vec![100u64; 10];
+        sizes[0] = 10_000;
+        let backlog = l0_backlog(&sizes).await;
+        let refs: Vec<&SstDescriptor> = backlog.iter().collect();
+        let plan = plan_bucket_merge_capped(&refs, 1024, 10, 4).unwrap();
+        assert_eq!(plan.inputs.len(), 4);
+        assert!(plan.inputs.iter().all(|d| d.size_bytes == 100));
+        assert_eq!(plan.target_level, 0);
+
+        // Overlapping L0 LSN ranges rule a partial run out: the whole L0
+        // merges, exactly as without a cap.
+        let mut overlapping = l0_backlog(&[100; 10]).await;
+        overlapping[3].max_lsn = overlapping[5].min_lsn;
+        let refs: Vec<&SstDescriptor> = overlapping.iter().collect();
+        let plan = plan_bucket_merge_capped(&refs, 1024, 10, 4).unwrap();
+        assert_eq!(plan.inputs.len(), 10);
+        assert_eq!(plan.target_level, 1);
+    }
+
+    #[test]
+    fn adaptive_cap_halves_on_deferral_and_recovers() {
+        // Only this test touches the adaptive state; the configured cap is
+        // the default unless the environment overrides it.
+        let configured = configured_max_l0_inputs();
+        if configured == 0 {
+            return;
+        }
+        note_compaction_memory_deferral();
+        let lowered = max_l0_inputs();
+        assert!(lowered < configured || configured <= MIN_ADAPTIVE_L0_INPUTS);
+        assert!(lowered >= MIN_ADAPTIVE_L0_INPUTS.min(configured));
+        for _ in 0..16 {
+            note_compaction_completed();
+        }
+        assert_eq!(max_l0_inputs(), configured);
     }
 
     #[tokio::test]

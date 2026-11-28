@@ -101,6 +101,10 @@ const BINARY_PROPS_KEYS_METADATA: &str = "namidb.binary_props";
 pub struct NodeSstWriterOptions {
     pub compression: Compression,
     pub row_group_target_rows: usize,
+    /// Close the open row group once its encoded size reaches this many
+    /// bytes, whatever its row count (`0` = rows only). See
+    /// [`node_sst_row_group_max_bytes`].
+    pub row_group_max_bytes: usize,
     pub data_page_size: usize,
     pub write_batch_size: usize,
     pub bits_per_key: u8,
@@ -120,11 +124,39 @@ pub fn node_sst_row_group_target_rows() -> usize {
         .unwrap_or(128 * 1024)
 }
 
+/// Default byte bound of an open node row group.
+pub const DEFAULT_NODE_SST_ROW_GROUP_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Byte bound of an open node row group: `NAMIDB_NODE_SST_ROW_GROUP_MAX_BYTES`,
+/// default [`DEFAULT_NODE_SST_ROW_GROUP_MAX_BYTES`]; `0` closes row groups by
+/// row count only (3.5.4). The writer keeps the open row group's encoded
+/// pages in memory, and with wide rows (embeddings, long texts) the 128 Ki
+/// row target alone let one row group of a flush or a merge reach hundreds
+/// of MiB. Readers take row-group boundaries from the footer, so the bound
+/// changes no format.
+pub fn node_sst_row_group_max_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("NAMIDB_NODE_SST_ROW_GROUP_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_NODE_SST_ROW_GROUP_MAX_BYTES)
+    })
+}
+
+static BYTE_BOUNDED_ROW_GROUPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Node row groups closed by the byte bound since start.
+pub fn byte_bounded_row_groups() -> u64 {
+    BYTE_BOUNDED_ROW_GROUPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Default for NodeSstWriterOptions {
     fn default() -> Self {
         Self {
             compression: Compression::ZSTD(ZstdLevel::try_new(6).unwrap()),
             row_group_target_rows: node_sst_row_group_target_rows(),
+            row_group_max_bytes: node_sst_row_group_max_bytes(),
             data_page_size: 1024 * 1024,
             write_batch_size: 8192,
             bits_per_key: DEFAULT_BITS_PER_KEY,
@@ -491,6 +523,7 @@ pub struct NodeSstWriter {
     label: LabelDef,
     schema: SchemaRef,
     inner: ArrowWriter<File>,
+    row_group_max_bytes: usize,
     bloom: BloomFilter,
     // running stats
     row_count: u64,
@@ -558,6 +591,7 @@ impl NodeSstWriter {
             label,
             schema,
             inner,
+            row_group_max_bytes: options.row_group_max_bytes,
             bloom,
             row_count: 0,
             tombstone_count: 0,
@@ -686,6 +720,13 @@ impl NodeSstWriter {
         self.inner
             .write(batch)
             .map_err(|e| Error::invariant(format!("parquet write: {e}")))?;
+        if self.row_group_max_bytes > 0 && self.inner.in_progress_size() >= self.row_group_max_bytes
+        {
+            self.inner
+                .flush()
+                .map_err(|e| Error::invariant(format!("parquet row group flush: {e}")))?;
+            BYTE_BOUNDED_ROW_GROUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
