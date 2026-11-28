@@ -245,6 +245,10 @@ pub struct MemoryGovernor {
     resume_bytes: usize,
     resident_bytes: AtomicUsize,
     pressure_active: AtomicBool,
+    /// Set on the governor that runs the process watchdog: only it publishes
+    /// its samples to storage's maintenance memory gate, so a governor built
+    /// for one request path (or a test) cannot hold maintenance back.
+    publishes_pressure: AtomicBool,
     /// At most one blocking-pool reclaim job may be queued or running.
     ///
     /// `ReclaimState::running` protects the actual cache clear, but setting it
@@ -337,6 +341,7 @@ impl MemoryGovernor {
             resume_bytes: percent(max_bytes, RESUME_PERCENT),
             resident_bytes: AtomicUsize::new(0),
             pressure_active: AtomicBool::new(false),
+            publishes_pressure: AtomicBool::new(false),
             reclaim_job_scheduled: AtomicBool::new(false),
             reclaim_completed,
             reclaim_state: Mutex::new(ReclaimState::default()),
@@ -835,6 +840,9 @@ impl MemoryGovernor {
     fn observe_resident(&self) -> Option<usize> {
         let resident = (self.resident_sampler)()?;
         self.resident_bytes.store(resident, Ordering::Relaxed);
+        // Every sample, not only the ones that start a reclaim: maintenance
+        // held at the ceiling must see the process come back under it.
+        self.publish_pressure(resident);
         if resident <= self.resume_bytes {
             self.pressure_active.store(false, Ordering::Release);
         }
@@ -979,6 +987,9 @@ impl MemoryGovernor {
     /// Tell storage's maintenance memory gate what the last sample showed.
     fn publish_pressure(&self, resident: usize) {
         use namidb_storage::background::{set_memory_pressure, MemoryPressure};
+        if !self.publishes_pressure.load(Ordering::Relaxed) {
+            return;
+        }
         set_memory_pressure(if self.max_bytes == 0 {
             MemoryPressure::Normal
         } else if resident >= self.max_bytes {
@@ -1000,6 +1011,7 @@ impl MemoryGovernor {
         self: Arc<Self>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
+        self.publishes_pressure.store(true, Ordering::Relaxed);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(WATCHDOG_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1029,6 +1041,11 @@ impl MemoryGovernor {
                     }
                 }
             }
+            // No more samples: do not leave maintenance held at a stale level.
+            self.publishes_pressure.store(false, Ordering::Relaxed);
+            namidb_storage::background::set_memory_pressure(
+                namidb_storage::background::MemoryPressure::Normal,
+            );
         })
     }
 
@@ -1853,5 +1870,32 @@ mod tests {
             exact,
             "a statement exactly at the limit is not elided"
         );
+    }
+
+    static SAMPLED: AtomicUsize = AtomicUsize::new(0);
+
+    fn sampled() -> Option<usize> {
+        Some(SAMPLED.load(Ordering::Relaxed))
+    }
+
+    /// Only the watchdog's governor tells maintenance what it sampled, on
+    /// every sample, so the gate also sees the process come back down.
+    /// (Stays under the ceiling: the gate is process-wide and other tests
+    /// compact concurrently.)
+    #[test]
+    fn the_watchdog_governor_publishes_every_sample_to_the_maintenance_gate() {
+        use namidb_storage::background::{memory_pressure, MemoryPressure};
+        let other = MemoryGovernor::new(1000).with_resident_sampler(sampled);
+        SAMPLED.store(950, Ordering::Relaxed);
+        other.observe_resident();
+        assert_eq!(memory_pressure(), MemoryPressure::Normal);
+
+        let watchdog = MemoryGovernor::new(1000).with_resident_sampler(sampled);
+        watchdog.publishes_pressure.store(true, Ordering::Relaxed);
+        watchdog.observe_resident();
+        assert_eq!(memory_pressure(), MemoryPressure::Reclaim);
+        SAMPLED.store(100, Ordering::Relaxed);
+        watchdog.observe_resident();
+        assert_eq!(memory_pressure(), MemoryPressure::Normal);
     }
 }
